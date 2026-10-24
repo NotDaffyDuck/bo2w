@@ -1,0 +1,6 @@
+[alias]
+xtask = "run --quiet --package xtask --"
+
+# bo2zm: build output on D: (C: is a QLC SSD; incremental Rust builds write
+# tens of GB of small files). Local machine path, bo2zm fork only.
+[build]

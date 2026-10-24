@@ -1,0 +1,1299 @@
+use crate::damage::{DamageAttempt, DamageOutcome, DeathCommit};
+use crate::frame::FrameWorld;
+use crate::identities::DamageSource;
+use crate::match_state::{ClientLifecycle, EventAudience, SimEvent};
+use crate::step::{arm_held_weapon, seed_ps_ammo_tables};
+use crate::world::{
+    ClientId, Tick, gsc_give_weapon_is_akimbo, inventory_add_weapon, spawn_player_state,
+};
+use movement_iw4::SHORT2ANGLE;
+
+pub(crate) fn spectator_lifecycle(team: i32) -> ClientLifecycle {
+    if team == entity_iw4::TEAM_SPECTATOR {
+        ClientLifecycle::Spectating
+    } else {
+        ClientLifecycle::ChoosingClass
+    }
+}
+
+pub(crate) fn spawn(
+    world: &mut FrameWorld,
+    tick: Tick,
+    id: ClientId,
+    origin: [f32; 3],
+    angles: [f32; 3],
+    sessionstate: &str,
+) {
+    let (origin, angles) = match world.client_meta_mut(id).forced_spawn.take() {
+        Some(pick) if sessionstate == "playing" => {
+            forced_point(world, id, pick).unwrap_or((origin, angles))
+        }
+        _ => (origin, angles),
+    };
+    world.unlink_player_area(id);
+    let mut ps = spawn_player_state(origin, angles);
+    if let Some(max) = world
+        .client_meta(id)
+        .map(|m| m.max_health)
+        .filter(|&n| n > 0)
+    {
+        ps.max_health = max;
+        ps.health = max;
+    }
+    if let Some(cmd) = world.old_cmd_angles(id) {
+        ps.delta_angles = std::array::from_fn(|axis| angles[axis] - cmd[axis] as f32 * SHORT2ANGLE);
+    }
+    let prev_teleport = world
+        .player(id)
+        .map(|p| p.e_flags & playerstate_iw4::eflags::TELEPORT)
+        .unwrap_or(0);
+    ps.e_flags = (ps.e_flags & !playerstate_iw4::eflags::TELEPORT) | prev_teleport;
+    ps.e_flags ^= playerstate_iw4::eflags::TELEPORT;
+    // Black Ops II's spawn runs the player up to the level time before their first command, so that
+    // command moves one frame, as the client predicts it, not the whole time since the clock started.
+    ps.command_time = crate::corpse::level_time_ms(tick);
+    let lifecycle = match sessionstate {
+        "playing" => ClientLifecycle::Alive,
+        "intermission" => {
+            ps.pm_type = playerstate_iw4::PM_TYPE_INTERMISSION;
+            ClientLifecycle::Intermission
+        }
+        "dead" => {
+            ps.pm_type = playerstate_iw4::PM_TYPE_DEAD;
+            ClientLifecycle::Dead
+        }
+        _ => {
+            ps.pm_type = playerstate_iw4::PM_TYPE_SPECTATOR;
+            spectator_lifecycle(
+                world
+                    .client_meta(id)
+                    .map_or(entity_iw4::TEAM_FREE, |m| m.client_state_team),
+            )
+        }
+    };
+    *world.ensure_player(id) = ps;
+    diag::info!(
+        Sim,
+        "spawn: script client={} {sessionstate} at [{:.1}, {:.1}, {:.1}]",
+        id.0,
+        origin[0],
+        origin[1],
+        origin[2]
+    );
+    let life_sequence = {
+        let meta = world.client_meta_mut(id);
+        meta.lifecycle = lifecycle;
+        meta.controls.switch_to = 0;
+        meta.controls.linked = false;
+        // Black Ops II's spawn clears the player state, and with it the
+        // allow* switches (they live in its movement flags).
+        meta.controls.prone_disabled = false;
+        meta.controls.crouch_disabled = false;
+        meta.controls.stand_disabled = false;
+        meta.controls.sprint_disabled = false;
+        meta.controls.melee_disabled = false;
+        meta.controls.ads_disabled = false;
+        if lifecycle != ClientLifecycle::Alive {
+            return;
+        }
+        meta.life_sequence = meta.life_sequence.next();
+        meta.dead_since_tick = None;
+        meta.item_use_spawn_ms = crate::corpse::level_time_ms(tick);
+        meta.item_use_entity = None;
+        meta.clear_ammo_inventory();
+        meta.weapon_shot_count = 0;
+        meta.burst_latch = false;
+        meta.burst_latch_secondary = false;
+        meta.rechamber_pending = false;
+        meta.rechamber_pending_secondary = false;
+        meta.t6_gun = None;
+        meta.life_sequence
+    };
+    let class_id = world
+        .client_meta(id)
+        .and_then(|m| m.loadout.as_ref().map(|l| l.class_id))
+        .unwrap_or(crate::ClassId(0));
+    world.push_event(
+        tick,
+        EventAudience::Client(id),
+        SimEvent::Spawned {
+            class_id,
+            spawn_index: 0,
+            life_sequence,
+        },
+    );
+    world.link_player_standing_area(id);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Hit {
+    pub victim: ClientId,
+    pub attacker: Option<ClientId>,
+    pub amount: i32,
+    pub flags: i32,
+    pub means: &'static str,
+    pub weapon: u32,
+    pub point: [f32; 3],
+    pub dir: [f32; 3],
+    pub hitloc: u8,
+    pub inflictor: Option<crate::ProjectileId>,
+    pub commit: Option<DeathCommit>,
+}
+
+pub(crate) const IDFLAGS_RADIUS: i32 = 1;
+
+fn means_of_death(world: &FrameWorld, intent: &DamageAttempt) -> &'static str {
+    means(
+        world,
+        intent.source,
+        intent.weapon,
+        intent.hitloc,
+        intent.inflictor_origin.is_some(),
+    )
+}
+
+pub(crate) fn means(
+    world: &FrameWorld,
+    source: DamageSource,
+    weapon: u32,
+    hitloc: u8,
+    splash: bool,
+) -> &'static str {
+    let facts = world.combat_facts_for(weapon);
+    let grenade = facts.is_some_and(|f| f.weap_class == weapon_iw4::WEAPCLASS_GRENADE);
+    match source {
+        DamageSource::Melee => "MOD_MELEE",
+        DamageSource::Shot(_) if hud_iw4::obituary_is_headshot(hitloc) => "MOD_HEAD_SHOT",
+        DamageSource::Shot(_)
+            if facts.is_some_and(|f| f.weap_class == weapon_iw4::WEAPCLASS_PISTOL) =>
+        {
+            "MOD_PISTOL_BULLET"
+        }
+        DamageSource::Shot(_) => "MOD_RIFLE_BULLET",
+        DamageSource::Projectile(_) if splash && grenade => "MOD_GRENADE_SPLASH",
+        DamageSource::Projectile(_) if splash => "MOD_PROJECTILE_SPLASH",
+        DamageSource::Projectile(_) if grenade => "MOD_GRENADE",
+        DamageSource::Projectile(_) => "MOD_PROJECTILE",
+        DamageSource::Radius(_) => "MOD_EXPLOSIVE",
+    }
+}
+
+fn normalized(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 0.0 {
+        v.map(|c| c / len)
+    } else {
+        [0.0; 3]
+    }
+}
+
+pub(crate) fn damage(
+    world: &mut FrameWorld,
+    tick: Tick,
+    intent: &DamageAttempt,
+    amount: i32,
+) -> DamageOutcome {
+    let victim_origin = world.player(intent.target).map_or([0.0; 3], |ps| ps.origin);
+    let from = intent
+        .inflictor_origin
+        .or_else(|| world.player(intent.attacker).map(|ps| ps.origin))
+        .unwrap_or(victim_origin);
+    let splash = matches!(intent.source, DamageSource::Radius(_))
+        || (matches!(intent.source, DamageSource::Projectile(_))
+            && intent.inflictor_origin.is_some());
+    let hit = Hit {
+        victim: intent.target,
+        attacker: Some(intent.attacker),
+        amount,
+        flags: if splash { IDFLAGS_RADIUS } else { 0 },
+        means: means_of_death(world, intent),
+        weapon: intent.weapon,
+        point: intent.inflictor_origin.unwrap_or(victim_origin),
+        dir: normalized([0, 1, 2].map(|i| victim_origin[i] - from[i])),
+        hitloc: intent.hitloc,
+        inflictor: match intent.source {
+            DamageSource::Projectile(id) => Some(id),
+            _ => None,
+        },
+        commit: Some(DeathCommit {
+            victim: intent.target,
+            victim_life: intent.target_life,
+            attacker: intent.attacker,
+            attacker_life: intent.attacker_life,
+            source: intent.source,
+            pellet: intent.pellet,
+            weapon: intent.weapon,
+            amount,
+            killcam_entity_start_time: intent.killcam_entity_start_time,
+            inflictor_origin: intent.inflictor_origin,
+            hitloc: intent.hitloc,
+        }),
+    };
+    let commit = hit.commit;
+    crate::script::player_damage(world.ecs(), tick, &hit);
+    let meta = world.client_meta(intent.target);
+    if meta.is_some_and(|m| {
+        m.lifecycle == ClientLifecycle::Dead && m.life_sequence == intent.target_life
+    }) {
+        return DamageOutcome::Died(commit.expect("set above"));
+    }
+    DamageOutcome::Nonlethal {
+        health_after: world.player(intent.target).map_or(0, |ps| ps.health),
+    }
+}
+
+pub(crate) fn debug_damage(world: &mut FrameWorld, tick: Tick, id: ClientId, amount: i32) {
+    let origin = world.player(id).map_or([0.0; 3], |ps| ps.origin);
+    let hit = Hit {
+        victim: id,
+        attacker: None,
+        amount,
+        flags: 0,
+        means: "MOD_UNKNOWN",
+        weapon: 0,
+        point: origin,
+        dir: [0.0; 3],
+        hitloc: 0,
+        inflictor: None,
+        commit: None,
+    };
+    crate::script::player_damage(world.ecs(), tick, &hit);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Finish {
+    Hurt,
+    LastStand,
+    Killed,
+}
+
+/// `bo2` = Black Ops II's hit flinch and wider aim, sized by the share of
+/// health the frame's hits took (else one small flinch a hit).
+pub(crate) fn finish_damage(
+    world: &mut FrameWorld,
+    id: ClientId,
+    amount: i32,
+    dir: Option<[f32; 3]>,
+    bo2: bool,
+) -> Finish {
+    if !world
+        .client_meta(id)
+        .is_some_and(|m| m.lifecycle == ClientLifecycle::Alive)
+    {
+        return Finish::Hurt;
+    }
+    if bo2 {
+        bo2_damage_feedback(world, id, amount, dir);
+    }
+    let Some(ps) = world.player_mut(id) else {
+        return Finish::Hurt;
+    };
+    movement_iw4::update_damage_timer(ps, amount, dir);
+    ps.health = (ps.health - amount.max(0)).max(0);
+    if !bo2 {
+        ps.damage_count = ps.damage_count.saturating_add(1);
+        ps.damage_event = ps.damage_event.wrapping_add(1);
+    }
+    if ps.health > 0 {
+        return Finish::Hurt;
+    }
+    use playerstate_iw4::pm_flags::LAST_STAND;
+    if ps.perks[0] & playerstate_iw4::PERK_PISTOLDEATH != 0 && ps.pm_flags & LAST_STAND == 0 {
+        ps.health = 1;
+        ps.pm_type = playerstate_iw4::PM_TYPE_LAST_STAND;
+        ps.view_height_target = movement_iw4::view_height::LAST_STAND;
+        ps.pm_flags |= LAST_STAND;
+        return Finish::LastStand;
+    }
+    Finish::Killed
+}
+
+/// bo2zm: Black Ops II sends one flinch a frame for all of that frame's
+/// hits: their share of his max health and the last hit's direction. The
+/// same share widens his aim.
+fn bo2_damage_feedback(world: &mut FrameWorld, id: ClientId, amount: i32, dir: Option<[f32; 3]>) {
+    let frame = world.entity_kernel().frame_serial();
+    let meta = world.client_meta_mut(id);
+    if meta.hit_frame != Some(frame) {
+        meta.hit_frame = Some(frame);
+        meta.hit_blood = 0;
+        meta.hit_sent = None;
+    }
+    meta.hit_blood = meta.hit_blood.saturating_add(amount.max(0));
+    let (blood, sent) = (meta.hit_blood, meta.hit_sent);
+    let Some(ps) = world.player_mut(id) else {
+        return;
+    };
+    let Some((count, yaw, pitch)) = weapon_iw4::damage_feedback_bo2(blood, ps.max_health, dir)
+    else {
+        return;
+    };
+    let widen = (count - sent.unwrap_or(0)) as f32;
+    ps.aim_spread_scale = (ps.aim_spread_scale + widen).min(weapon_iw4::BO2_AIM_SPREAD_MAX);
+    if sent.is_none() {
+        ps.damage_event = ps.damage_event.wrapping_add(1);
+    }
+    ps.damage_count = count;
+    ps.damage_yaw = yaw;
+    ps.damage_pitch = pitch;
+    world.client_meta_mut(id).hit_sent = Some(count);
+}
+
+pub(crate) fn revive(world: &mut FrameWorld, id: ClientId) {
+    if let Some(ps) = world.player_mut(id) {
+        ps.pm_type = 0;
+        ps.pm_flags &= !playerstate_iw4::pm_flags::LAST_STAND;
+        ps.view_height_target = movement_iw4::view_height::CROUCH;
+    }
+}
+
+pub(crate) fn kill(
+    world: &mut FrameWorld,
+    tick: Tick,
+    victim: ClientId,
+    attacker: Option<ClientId>,
+    commit: Option<DeathCommit>,
+) {
+    if !world
+        .client_meta(victim)
+        .is_some_and(|m| m.lifecycle == ClientLifecycle::Alive)
+    {
+        return;
+    }
+    let life_sequence = {
+        let meta = world.client_meta_mut(victim);
+        meta.lifecycle = ClientLifecycle::Dead;
+        meta.dead_since_tick = Some(tick.0);
+        meta.controls.switch_to = 0;
+        meta.life_sequence
+    };
+    crate::damage::play_death(world, victim, attacker, commit.as_ref());
+    if let Some(ps) = world.player_mut(victim) {
+        ps.health = 0;
+        ps.pm_flags &= !playerstate_iw4::pm_flags::LAST_STAND;
+    }
+    world.unlink_player_area(victim);
+    let attacker_life = attacker.and_then(|a| world.client_meta(a).map(|m| m.life_sequence));
+    world.push_event(
+        tick,
+        EventAudience::All,
+        SimEvent::Died {
+            victim,
+            life_sequence,
+            attacker,
+            attacker_life,
+            source: commit.map(|c| c.source),
+            weapon: commit.map_or(0, |c| c.weapon),
+            killcam_entity_start_time: commit.map_or(0, |c| c.killcam_entity_start_time),
+        },
+    );
+    crate::t6_gun::death_grenade_drop(world, tick, victim);
+}
+
+pub(crate) fn obituary(
+    world: &mut FrameWorld,
+    tick: Tick,
+    victim: ClientId,
+    attacker: Option<ClientId>,
+    weapon: u32,
+    means: &str,
+) {
+    let (weap_type, weap_class) = world
+        .combat_facts_for(weapon)
+        .map_or((0, 0), |f| (f.weap_type, f.weap_class));
+    let means = match means {
+        "MOD_HEAD_SHOT" => hud_iw4::MOD_HEAD_SHOT,
+        "MOD_MELEE" => hud_iw4::MOD_MELEE,
+        "MOD_SUICIDE" => hud_iw4::MOD_SUICIDE,
+        _ => 0,
+    };
+    let attacker = attacker.unwrap_or(victim);
+    world.push_entity_event(
+        tick,
+        EventAudience::All,
+        entity_iw4::EntityEventKind::OBITUARY,
+        crate::EntityEventPayload {
+            number: victim.0 as i32,
+            other_entity_num: victim.0 as i32,
+            attacker_entity_num: attacker.0 as i32,
+            event_parm: hud_iw4::pack_obituary_event_parm(weapon, means, weap_type, weap_class),
+            weapon,
+            ..Default::default()
+        },
+    );
+}
+
+pub(crate) fn clone_corpse(world: &mut FrameWorld, tick: Tick, id: ClientId) -> Option<u8> {
+    let ps = world.player(id).copied()?;
+    let slot =
+        crate::corpse::occupy_player_clone(world, id, &ps, crate::corpse::level_time_ms(tick));
+    if let Some(ps) = world.player_mut(id) {
+        ps.corpse_index = i32::from(slot);
+        ps.e_flags |= 0x20000;
+    }
+    Some(slot)
+}
+
+fn forced_point(
+    world: &mut FrameWorld,
+    id: ClientId,
+    pick: crate::SpawnPick,
+) -> Option<([f32; 3], [f32; 3])> {
+    let team = world
+        .client_meta(id)
+        .map_or(entity_iw4::TEAM_FREE, |m| m.client_state_team);
+    let avoid: Vec<[f32; 3]> = world
+        .alive_origins()
+        .into_iter()
+        .filter(|&o| world.player(id).is_none_or(|ps| ps.origin != o))
+        .collect();
+    let report = crate::spawn::decide_forced_spawn(world, pick, &avoid, team);
+    crate::step::log_forced_spawn(id, pick, &report);
+    report.accepted.map(|d| (d.traced_origin, d.raw_angles))
+}
+
+pub(crate) fn move_to_forced_spawn(world: &mut FrameWorld, id: ClientId, pick: crate::SpawnPick) {
+    let Some((origin, angles)) = forced_point(world, id, pick) else {
+        return;
+    };
+    world.unlink_player_area(id);
+    world.set_origin(id, origin);
+    world.set_viewangles(id, angles);
+    if let Some(ps) = world.player_mut(id) {
+        ps.velocity = [0.0; 3];
+        ps.health = ps.max_health;
+        ps.e_flags ^= playerstate_iw4::eflags::TELEPORT;
+    }
+    let meta = world.client_meta_mut(id);
+    meta.life_sequence = meta.life_sequence.next();
+    world.link_player_standing_area(id);
+}
+
+pub(crate) fn weapon_named(world: &FrameWorld, name: &str) -> Result<u32, String> {
+    if name == "none" {
+        return Ok(0);
+    }
+    world
+        .weapon_index_by_script_name(name)
+        .filter(|&w| w != 0)
+        .ok_or_else(|| format!("unknown weapon '{name}'"))
+}
+
+pub(crate) fn weapon_name(world: &FrameWorld, weapon: u32) -> String {
+    if weapon == 0 {
+        "none".into()
+    } else {
+        world.weapon_script_name(weapon).to_owned()
+    }
+}
+
+fn living(world: &FrameWorld, id: ClientId) -> Result<(), String> {
+    if world.player(id).is_none() {
+        return Err("player has not spawned".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn give_weapon(
+    world: &mut FrameWorld,
+    id: ClientId,
+    weapon: u32,
+    akimbo: bool,
+) -> Result<(), String> {
+    living(world, id)?;
+    if world.weapon_is_melee_only(weapon) {
+        return Ok(());
+    }
+    let facts = world
+        .combat_facts_for(weapon)
+        .ok_or_else(|| format!("weapon {} has no combat data", weapon_name(world, weapon)))?;
+    // bo2zm: a Black Ops II dual-wield weapon is always both guns.
+    let akimbo = akimbo
+        || gsc_give_weapon_is_akimbo(world.weapon_script_name(weapon))
+        || facts.dual_wield_weapon != 0;
+    let offhand = world
+        .equipment_facts_for(weapon)
+        .filter(|eq| eq.is_offhand());
+    let had = world
+        .player(id)
+        .is_some_and(|ps| ps.weapons.contains(&(weapon as i32)));
+    let ps = world.player_mut(id).expect("checked above");
+    inventory_add_weapon(ps, weapon, akimbo);
+    if !ps.weapons.contains(&(weapon as i32)) {
+        return Err("the player's inventory is full".into());
+    }
+    if had {
+        return Ok(());
+    }
+    let (clip, clip_alt, stock) = match &offhand {
+        Some(eq) => (eq.spawn_clip_count(), 0, 0),
+        None => weapon_iw4::spawn_clip_stock(&facts, i32::from(akimbo)),
+    };
+    seed_ps_ammo_tables(ps, weapon, &facts, clip, clip_alt, akimbo, stock);
+    world.client_meta_mut(id).set_ammo(weapon, clip, stock);
+    // bo2mp: BO2's G_InitializeAmmo also starts the gun's alternate weapon (a
+    // launcher attachment's grenades) unless the two share their ammo.
+    let alt = facts.alternate_weapon;
+    if offhand.is_none()
+        && facts.dual_wield_weapon == 0
+        && alt != 0
+        && alt != weapon
+        && let Some(alt_facts) = world.combat_facts_for(alt)
+        && (
+            weapon_iw4::ammo_table_key(alt_facts.ammo_index, alt),
+            weapon_iw4::clip_table_key(alt_facts.clip_index, alt),
+        ) != (
+            weapon_iw4::ammo_table_key(facts.ammo_index, weapon),
+            weapon_iw4::clip_table_key(facts.clip_index, weapon),
+        )
+    {
+        let (clip, _, stock) = weapon_iw4::spawn_clip_stock(&alt_facts, 0);
+        let ps = world.player_mut(id).expect("checked above");
+        seed_ps_ammo_tables(ps, alt, &alt_facts, clip, 0, false, stock);
+        world.client_meta_mut(id).set_ammo(alt, clip, stock);
+    }
+    Ok(())
+}
+
+pub(crate) fn take_weapon(world: &mut FrameWorld, id: ClientId, weapon: u32) {
+    let Some(ps) = world.player_mut(id) else {
+        return;
+    };
+    if let Some(slot) = ps.weapons.iter().position(|&w| w == weapon as i32) {
+        ps.weapons[slot] = 0;
+        ps.weapon_data[slot * 5..slot * 5 + 5].fill(0);
+    }
+    if ps.weapon == weapon {
+        ps.weapon = 0;
+    }
+    if ps.weapon_primary == weapon {
+        ps.weapon_primary = 0;
+    }
+    let meta = world.client_meta_mut(id);
+    meta.ammo_by_weapon.retain(|row| row.0 != weapon);
+    if meta.controls.switch_to == weapon {
+        meta.controls.switch_to = 0;
+    }
+}
+
+pub(crate) fn take_all_weapons(world: &mut FrameWorld, id: ClientId) {
+    let Some(ps) = world.player_mut(id) else {
+        return;
+    };
+    ps.weapons = [0; 15];
+    ps.weapon_data.fill(0);
+    ps.ammo.fill(0);
+    ps.ammoclip.fill(0);
+    ps.weapon = 0;
+    ps.weapon_primary = 0;
+    ps.offhand_primary = 0;
+    ps.offhand_secondary = 0;
+    let meta = world.client_meta_mut(id);
+    meta.clear_ammo_inventory();
+    meta.controls.switch_to = 0;
+}
+
+pub(crate) fn set_spawn_weapon(
+    world: &mut FrameWorld,
+    id: ClientId,
+    weapon: u32,
+) -> Result<(), String> {
+    living(world, id)?;
+    let facts = world
+        .combat_facts_for(weapon)
+        .unwrap_or_else(weapon_iw4::WeaponCombatFacts::none);
+    let ammo = world.client_meta(id).map(|m| m.ammo_for(weapon));
+    let ps = world.player_mut(id).expect("checked above");
+    let (ammo_before, clip_before) = (ps.ammo, ps.ammoclip);
+    ps.weapon = weapon;
+    arm_held_weapon(ps, weapon, &facts);
+    ps.ammo = ammo_before;
+    ps.ammoclip = clip_before;
+    let meta = world.client_meta_mut(id);
+    if let Some((clip, stock)) = ammo {
+        meta.set_ammo(weapon, clip, stock);
+    }
+    meta.mirror_held_ammo(weapon);
+    meta.controls.switch_to = 0;
+    Ok(())
+}
+
+pub(crate) fn switch_to_weapon(world: &mut FrameWorld, id: ClientId, weapon: u32) {
+    if world
+        .player(id)
+        .is_some_and(|ps| ps.weapons.contains(&(weapon as i32)))
+    {
+        world.client_meta_mut(id).controls.switch_to = weapon;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WeaponList {
+    All,
+    Primaries,
+    Offhands,
+    Items,
+    Exclusives,
+}
+
+pub(crate) fn weapons(world: &FrameWorld, id: ClientId, list: WeaponList) -> Vec<u32> {
+    let Some(ps) = world.player(id) else {
+        return Vec::new();
+    };
+    ps.weapons
+        .iter()
+        .filter(|&&w| w > 0)
+        .map(|&w| w as u32)
+        .filter(|&w| {
+            let kind = world.combat_facts_for(w).map_or(0, |f| f.inventory_type);
+            match list {
+                WeaponList::All => true,
+                WeaponList::Primaries => kind == 0,
+                WeaponList::Offhands => kind == 1,
+                WeaponList::Items => kind == 2,
+                WeaponList::Exclusives => kind == 4,
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn has_weapon(world: &FrameWorld, id: ClientId, weapon: u32) -> bool {
+    weapon != 0
+        && world
+            .player(id)
+            .is_some_and(|ps| ps.weapons.contains(&(weapon as i32)))
+}
+
+/// bo2mp gun brain: the held weapons with each gun's alternate mode after it (BO2 gives the
+/// mode as a weapon of its own right after its gun, `t6_gun::alt_mode_held_with`).
+pub(crate) fn weapons_with_alt_modes(world: &FrameWorld, id: ClientId) -> Vec<u32> {
+    let held = weapons(world, id, WeaponList::All);
+    if world.gun_facts().is_empty() {
+        return held;
+    }
+    let mut out = Vec::with_capacity(held.len() * 2);
+    for &w in &held {
+        out.push(w);
+        let alt = crate::t6_gun::alt_mode_held_with(world.gun_facts(), &held, w);
+        if alt != 0 {
+            out.push(alt);
+        }
+    }
+    out
+}
+
+/// BO2's hasweapon: any held weapon, a gun's alternate mode included.
+pub(crate) fn holds_weapon(world: &FrameWorld, id: ClientId, weapon: u32) -> bool {
+    has_weapon(world, id, weapon)
+        || (weapon != 0 && weapons_with_alt_modes(world, id).contains(&weapon))
+}
+
+pub(crate) fn ammo_clip(world: &FrameWorld, id: ClientId, weapon: u32) -> i32 {
+    let (Some(ps), Some(facts)) = (world.player(id), world.combat_facts_for(weapon)) else {
+        return 0;
+    };
+    let key = weapon_iw4::clip_table_key(facts.clip_index, weapon);
+    weapon_iw4::get_clip_for_hand(&ps.ammoclip, key, 0)
+}
+
+/// bo2zm: the held Black Ops II dual-wield weapon whose left hand `weapon`
+/// is (the scripts name the left gun to read and set its clip), when the
+/// player does not hold `weapon` itself.
+pub(crate) fn dual_wield_right_of(world: &FrameWorld, id: ClientId, weapon: u32) -> Option<u32> {
+    let ps = world.player(id)?;
+    if weapon == 0 || ps.weapons.contains(&(weapon as i32)) {
+        return None;
+    }
+    ps.weapons
+        .iter()
+        .filter(|&&w| w > 0)
+        .map(|&w| w as u32)
+        .find(|&w| {
+            world
+                .combat_facts_for(w)
+                .is_some_and(|f| f.dual_wield_weapon == weapon)
+        })
+}
+
+/// bo2zm: a dual-wield weapon's left clip.
+pub(crate) fn left_clip(world: &FrameWorld, id: ClientId, weapon: u32) -> i32 {
+    let (Some(ps), Some(facts)) = (world.player(id), world.combat_facts_for(weapon)) else {
+        return 0;
+    };
+    let key = weapon_iw4::clip_table_key(facts.clip_index, weapon);
+    weapon_iw4::get_clip_for_hand(&ps.ammoclip, key, 1)
+}
+
+/// bo2zm: a dual-wield weapon's left clip set.
+pub(crate) fn set_left_clip(world: &mut FrameWorld, id: ClientId, weapon: u32, count: i32) {
+    let Some(facts) = world.combat_facts_for(weapon) else {
+        return;
+    };
+    let count = count.clamp(0, facts.clip_size.max(0));
+    let key = weapon_iw4::clip_table_key(facts.clip_index, weapon);
+    if let Some(ps) = world.player_mut(id) {
+        let _ = weapon_iw4::set_clip_for_hand(&mut ps.ammoclip, key, 1, count);
+    }
+}
+
+pub(crate) fn ammo_stock(world: &FrameWorld, id: ClientId, weapon: u32) -> i32 {
+    let (Some(ps), Some(facts)) = (world.player(id), world.combat_facts_for(weapon)) else {
+        return 0;
+    };
+    let key = weapon_iw4::ammo_table_key(facts.ammo_index, weapon);
+    weapon_iw4::get_ammo_not_in_clip(&ps.ammo, key)
+}
+
+pub(crate) fn set_ammo_clip(world: &mut FrameWorld, id: ClientId, weapon: u32, count: i32) {
+    let Some(facts) = world.combat_facts_for(weapon) else {
+        return;
+    };
+    let count = count.clamp(0, facts.clip_size.max(0));
+    let key = weapon_iw4::clip_table_key(facts.clip_index, weapon);
+    if let Some(ps) = world.player_mut(id) {
+        let _ = weapon_iw4::set_clip_for_hand(&mut ps.ammoclip, key, 0, count);
+    }
+    let stock = ammo_stock(world, id, weapon);
+    world.client_meta_mut(id).set_ammo(weapon, count, stock);
+}
+
+pub(crate) fn set_ammo_stock(world: &mut FrameWorld, id: ClientId, weapon: u32, count: i32) {
+    let Some(facts) = world.combat_facts_for(weapon) else {
+        return;
+    };
+    let count = count.clamp(0, facts.max_ammo.max(0));
+    let key = weapon_iw4::ammo_table_key(facts.ammo_index, weapon);
+    if let Some(ps) = world.player_mut(id) {
+        let _ = weapon_iw4::set_ammo_not_in_clip(&mut ps.ammo, key, count);
+    }
+    let clip = ammo_clip(world, id, weapon);
+    world.client_meta_mut(id).set_ammo(weapon, clip, count);
+}
+
+pub(crate) fn give_max_ammo(world: &mut FrameWorld, id: ClientId, weapon: u32) {
+    let Some(facts) = world.combat_facts_for(weapon) else {
+        return;
+    };
+    if let Some(eq) = world
+        .equipment_facts_for(weapon)
+        .filter(|eq| eq.is_offhand())
+    {
+        set_ammo_clip(world, id, weapon, eq.clip_size.max(eq.start_ammo));
+        return;
+    }
+    set_ammo_stock(world, id, weapon, facts.max_ammo);
+}
+
+/// A gun's ammo (clip and stock) over the most it holds, or with `start`
+/// over what it starts with; a grenade or mine counts its clip against its
+/// clip size (`getfractionmaxammo` / `getfractionstartammo`).
+pub(crate) fn ammo_fraction(world: &FrameWorld, id: ClientId, weapon: u32, start: bool) -> f32 {
+    let Some(facts) = world.combat_facts_for(weapon) else {
+        return 0.0;
+    };
+    let have = ammo_clip(world, id, weapon) + ammo_stock(world, id, weapon);
+    let most = match world
+        .equipment_facts_for(weapon)
+        .filter(|eq| eq.is_offhand())
+    {
+        Some(eq) if start => eq.spawn_clip_count(),
+        Some(eq) => eq.clip_size.max(eq.start_ammo),
+        None if start => {
+            let (clip, _, stock) = weapon_iw4::spawn_clip_stock(&facts, 0);
+            clip + stock
+        }
+        None => facts.max_ammo + facts.clip_size,
+    };
+    if most <= 0 {
+        0.0
+    } else {
+        have as f32 / most as f32
+    }
+}
+
+pub(crate) fn give_start_ammo(world: &mut FrameWorld, id: ClientId, weapon: u32) {
+    let Some(facts) = world.combat_facts_for(weapon) else {
+        return;
+    };
+    if let Some(eq) = world
+        .equipment_facts_for(weapon)
+        .filter(|eq| eq.is_offhand())
+    {
+        set_ammo_clip(world, id, weapon, eq.spawn_clip_count());
+        return;
+    }
+    let (clip, _, stock) = weapon_iw4::spawn_clip_stock(&facts, 0);
+    set_ammo_clip(world, id, weapon, clip);
+    set_ammo_stock(world, id, weapon, stock);
+}
+
+fn perk_bits(name: &str) -> (u32, u32) {
+    let perk = match name {
+        "specialty_fastreload" => weapon_iw4::PERK_FASTRELOAD,
+        "specialty_coldblooded" => playerstate_iw4::PERK_COLDBLOODED,
+        "specialty_lightweight" => weapon_iw4::PERK_LIGHTWEIGHT_VIEW_BOB_BIT,
+        "specialty_scavenger" => playerstate_iw4::PERK_SCAVENGER,
+        "specialty_quieter" => playerstate_iw4::PERK_QUIETER,
+        "specialty_heartbreaker" => playerstate_iw4::PERK_HEARTBREAKER,
+        "specialty_marathon" => movement_iw4::PERK_MARATHON,
+        "specialty_bulletaccuracy" => weapon_iw4::PERK_BULLETACCURACY,
+        "specialty_pistoldeath" => playerstate_iw4::PERK_PISTOLDEATH,
+        "specialty_fallheight" => movement_iw4::PERK_FALLHEIGHT,
+        "specialty_flakjacket" => movement_iw4::PERK_FLAKJACKET,
+        "specialty_fastads" => movement_iw4::PERK_FASTADS,
+        "specialty_fastmantle" => movement_iw4::PERK_FASTMANTLE,
+        "specialty_longersprint" => movement_iw4::PERK_LONGERSPRINT,
+        "specialty_bulletflinch" => weapon_iw4::PERK_BULLETFLINCH,
+        "specialty_movefaster" => movement_iw4::PERK_MOVEFASTER,
+        "specialty_stalker" => movement_iw4::PERK_STALKER,
+        "specialty_sprintrecovery" => weapon_iw4::PERK_SPRINTRECOVERY,
+        "specialty_unlimitedsprint" => movement_iw4::PERK_MARATHON,
+        _ => 0,
+    };
+    let e_flags = match name {
+        "specialty_localjammer" => playerstate_iw4::eflags::RADAR_JAM,
+        _ => 0,
+    };
+    (perk, e_flags)
+}
+
+pub(crate) fn set_perk(world: &mut FrameWorld, id: ClientId, name: &str, on: bool) {
+    let (perk, e_flags) = perk_bits(name);
+    if let Some(n) = weapon_t6::env::perk::by_name(name) {
+        let meta = world.client_meta_mut(id);
+        if on {
+            meta.t6_perks |= 1u64 << n;
+        } else {
+            meta.t6_perks &= !(1u64 << n);
+        }
+    }
+    if let Some(ps) = world.player_mut(id) {
+        if on {
+            ps.perks[0] |= perk;
+            ps.e_flags |= e_flags;
+        } else {
+            ps.perks[0] &= !perk;
+            ps.e_flags &= !e_flags;
+        }
+    }
+}
+
+pub(crate) fn clear_perks(world: &mut FrameWorld, id: ClientId) {
+    world.client_meta_mut(id).t6_perks = 0;
+    if let Some(ps) = world.player_mut(id) {
+        ps.perks = [0; 2];
+        ps.perk_slots = [0; 8];
+        ps.e_flags &= !playerstate_iw4::eflags::RADAR_JAM;
+    }
+}
+
+pub(crate) fn stance(world: &FrameWorld, id: ClientId) -> &'static str {
+    let flags = world.player(id).map_or(0, |ps| ps.e_flags);
+    if flags & playerstate_iw4::eflags::PRONE != 0 {
+        "prone"
+    } else if flags & playerstate_iw4::eflags::DUCK != 0 {
+        "crouch"
+    } else {
+        "stand"
+    }
+}
+
+pub(crate) fn buttons(world: &mut FrameWorld, id: ClientId) -> u32 {
+    let input = &world.ecs().resource::<crate::step::StepRequest>().input;
+    let mut commands = input
+        .cmds
+        .iter()
+        .filter(|(client, _)| *client == id)
+        .peekable();
+    if commands.peek().is_some() {
+        return commands.fold(0, |buttons, (_, cmd)| buttons | cmd.buttons);
+    }
+    world
+        .old_buttons_mut()
+        .iter()
+        .find(|(c, _)| *c == id)
+        .map_or(0, |(_, b)| *b)
+}
+
+/// `getnormalizedmovement`: this frame's move stick as (forward, right, 0),
+/// each -1..1 (127 = full). No command this frame reads as standing still.
+pub(crate) fn movement(world: &mut FrameWorld, id: ClientId) -> [f32; 3] {
+    let input = &world.ecs().resource::<crate::step::StepRequest>().input;
+    input
+        .cmds
+        .iter()
+        .filter(|(client, _)| *client == id)
+        .last()
+        .map_or([0.0; 3], |(_, cmd)| {
+            [
+                (cmd.forwardmove as f32 / 127.0).clamp(-1.0, 1.0),
+                (cmd.rightmove as f32 / 127.0).clamp(-1.0, 1.0),
+                0.0,
+            ]
+        })
+}
+
+/// bo2mp: BO2's `allowprone` / `allowcrouch` / `allowstand` / `allowsprint` /
+/// `allowmelee` / `allowads` (false): the request is dropped before pmove.
+/// Stance requests are held buttons (no button = stand), so a stand that is
+/// not allowed keeps him in the stance he has, or the first allowed one.
+pub(crate) fn apply_allow_controls(
+    controls: &crate::match_state::ScriptControls,
+    pm_flags: u32,
+    cmd: &mut playerstate_iw4::UserCmd,
+) {
+    use playerstate_iw4::{buttons, pm_flags as pmf};
+    if controls.prone_disabled {
+        cmd.buttons &= !buttons::PRONE;
+    }
+    if controls.crouch_disabled {
+        cmd.buttons &= !buttons::CROUCH;
+    }
+    if controls.stand_disabled && cmd.buttons & (buttons::PRONE | buttons::CROUCH) == 0 {
+        let prone_ok = !controls.prone_disabled;
+        let crouch_ok = !controls.crouch_disabled;
+        if pm_flags & pmf::PRONE != 0 && prone_ok {
+            cmd.buttons |= buttons::PRONE;
+        } else if crouch_ok {
+            cmd.buttons |= buttons::CROUCH;
+        } else if prone_ok {
+            cmd.buttons |= buttons::PRONE;
+        }
+    }
+    if controls.sprint_disabled {
+        cmd.buttons &= !buttons::SPRINT;
+    }
+    if controls.melee_disabled {
+        cmd.buttons &= !buttons::MELEE_CHARGE;
+    }
+    if controls.ads_disabled {
+        cmd.buttons &= !buttons::ADS;
+    }
+}
+
+/// bo2zm: Black Ops II Zombies' stance rule when scripts disallow a stance
+/// (the TranZit bus, Mob's afterlife, Origins' tank and claw): the stance he
+/// asks for becomes the nearest allowed one, by the stance he is in now. No
+/// prone also means no dive (the dive starts on a prone press).
+pub(crate) fn bo2_zombies_stance(
+    controls: &crate::match_state::ScriptControls,
+    pm_flags: u32,
+    cmd: &mut playerstate_iw4::UserCmd,
+) {
+    use playerstate_iw4::{buttons, pm_flags as pmf};
+    let stand_off = controls.stand_disabled;
+    let crouch_off = controls.crouch_disabled;
+    let prone_off = controls.prone_disabled;
+    let prone = pm_flags & pmf::PRONE != 0;
+    let down = pm_flags & (pmf::PRONE | pmf::CROUCH) != 0;
+    let to = if cmd.buttons & buttons::PRONE != 0 {
+        if !prone_off {
+            return;
+        }
+        if (!down && !stand_off) || crouch_off {
+            0
+        } else {
+            buttons::CROUCH
+        }
+    } else if cmd.buttons & buttons::CROUCH != 0 {
+        if !crouch_off {
+            return;
+        }
+        if (down || prone_off) && !stand_off {
+            0
+        } else {
+            buttons::PRONE
+        }
+    } else {
+        if !stand_off {
+            return;
+        }
+        if (!prone || prone_off) && !crouch_off {
+            buttons::CROUCH
+        } else {
+            buttons::PRONE
+        }
+    };
+    cmd.buttons = cmd.buttons & !(buttons::PRONE | buttons::CROUCH) | to;
+}
+
+pub(crate) fn constrain_cmd(
+    world: &mut FrameWorld,
+    id: ClientId,
+    cmd: &mut playerstate_iw4::UserCmd,
+    zombies: bool,
+) {
+    use playerstate_iw4::buttons;
+    let held = world.player(id).map_or(0, |ps| ps.weapon);
+    let Some(mut controls) = world.client_meta(id).map(|m| m.controls) else {
+        return;
+    };
+    // Kept until his own command asks for it too: BO2's G_SelectWeapon has
+    // his client select the gun, so a gun set at once (setSpawnWeapon, an
+    // immediate switch) is not put away by the stale select still in flight.
+    if controls.switch_to != 0 && controls.switch_to == held && u32::from(cmd.weapon) == held {
+        controls.switch_to = 0;
+        world.client_meta_mut(id).controls.switch_to = 0;
+    }
+    if controls.frozen {
+        cmd.forwardmove = 0;
+        cmd.rightmove = 0;
+        cmd.buttons &= !(buttons::JUMP
+            | buttons::SPRINT
+            | buttons::ATTACK
+            | buttons::MELEE_CHARGE
+            | buttons::FRAG
+            | buttons::SMOKE
+            | buttons::RELOAD
+            | buttons::USE_RELOAD);
+    }
+    if controls.stunned {
+        cmd.forwardmove /= 2;
+        cmd.rightmove /= 2;
+        cmd.buttons &= !(buttons::JUMP | buttons::SPRINT);
+    }
+    if controls.linked {
+        cmd.forwardmove = 0;
+        cmd.rightmove = 0;
+        cmd.buttons &= !(buttons::JUMP | buttons::SPRINT);
+    }
+    if controls.jump_disabled {
+        cmd.buttons &= !buttons::JUMP;
+    }
+    let pm_flags = world.player(id).map_or(0, |ps| ps.pm_flags);
+    if zombies {
+        bo2_zombies_stance(&controls, pm_flags, cmd);
+    }
+    apply_allow_controls(&controls, pm_flags, cmd);
+    if controls.weapons_disabled {
+        cmd.buttons &= !(buttons::ATTACK | buttons::THROW | buttons::ADS | buttons::MELEE_CHARGE);
+    }
+    if controls.offhands_disabled || controls.weapons_disabled {
+        cmd.buttons &= !(buttons::FRAG | buttons::SMOKE);
+    }
+    if controls.usability_disabled {
+        cmd.buttons &= !(buttons::USE | buttons::USE_RELOAD);
+    }
+    if controls.switch_to != 0 {
+        cmd.weapon = controls.switch_to as u16;
+    } else if controls.switch_disabled || controls.frozen {
+        cmd.weapon = held as u16;
+    }
+}
+
+#[cfg(test)]
+mod bo2_hit_tests {
+    use super::*;
+
+    #[test]
+    fn bo2_perks_have_their_own_bits() {
+        assert_eq!(perk_bits("specialty_movefaster").0, 1 << 9);
+        assert_eq!(perk_bits("specialty_sprintrecovery").0, 1 << 10);
+        assert_eq!(perk_bits("specialty_unlimitedsprint").0, movement_iw4::PERK_MARATHON);
+    }
+
+    #[test]
+    fn a_frames_hits_send_one_flinch_sized_by_their_share() {
+        let mut sim = crate::carrier::SimWorld::default();
+        let mut world = sim.frame();
+        let id = ClientId(0);
+        world.client_meta_mut(id).lifecycle = ClientLifecycle::Alive;
+        let ps = world.ensure_player(id);
+        ps.max_health = 150;
+        ps.health = 150;
+        ps.aim_spread_scale = 0.0;
+        let event = ps.damage_event;
+        // Two hits in one frame: one flinch for 45 of 150 health (30
+        // percent), along the last hit's travel (+y = yaw byte 64).
+        world.entity_kernel_mut().begin_frame(50);
+        finish_damage(&mut world, id, 15, Some([1.0, 0.0, 0.0]), true);
+        finish_damage(&mut world, id, 30, Some([0.0, 1.0, 0.0]), true);
+        let ps = world.player(id).unwrap();
+        assert_eq!(ps.damage_event, event.wrapping_add(1));
+        assert_eq!((ps.damage_count, ps.damage_yaw, ps.damage_pitch), (30, 64, 0));
+        assert_eq!(ps.aim_spread_scale, 30.0);
+        assert_eq!(ps.health, 105);
+        // The next frame's hit is a flinch of its own; no direction = 255/255.
+        world.entity_kernel_mut().begin_frame(100);
+        finish_damage(&mut world, id, 3, None, true);
+        let ps = world.player(id).unwrap();
+        assert_eq!(ps.damage_event, event.wrapping_add(2));
+        assert_eq!((ps.damage_count, ps.damage_yaw, ps.damage_pitch), (2, 255, 255));
+        assert_eq!(ps.aim_spread_scale, 32.0);
+        // MW2's rules: one small flinch a hit.
+        finish_damage(&mut world, id, 3, None, false);
+        assert_eq!(world.player(id).unwrap().damage_event, event.wrapping_add(3));
+    }
+}
+
+#[cfg(test)]
+mod allow_controls_tests {
+    use super::apply_allow_controls;
+    use crate::match_state::ScriptControls;
+    use playerstate_iw4::{UserCmd, buttons, pm_flags};
+
+    fn cmd(held: u32) -> UserCmd {
+        let mut c = UserCmd::default();
+        c.buttons = held;
+        c
+    }
+
+    #[test]
+    fn allowed_by_default_changes_nothing() {
+        let all = buttons::PRONE | buttons::CROUCH | buttons::SPRINT | buttons::MELEE_CHARGE | buttons::ADS;
+        let mut c = cmd(all);
+        apply_allow_controls(&ScriptControls::default(), 0, &mut c);
+        assert_eq!(c.buttons, all);
+    }
+
+    #[test]
+    fn each_allow_false_drops_its_own_request_only() {
+        let all = buttons::PRONE | buttons::CROUCH | buttons::SPRINT | buttons::MELEE_CHARGE | buttons::ADS;
+        let cases = [
+            (ScriptControls { prone_disabled: true, ..Default::default() }, buttons::PRONE),
+            (ScriptControls { crouch_disabled: true, ..Default::default() }, buttons::CROUCH),
+            (ScriptControls { sprint_disabled: true, ..Default::default() }, buttons::SPRINT),
+            (ScriptControls { melee_disabled: true, ..Default::default() }, buttons::MELEE_CHARGE),
+            (ScriptControls { ads_disabled: true, ..Default::default() }, buttons::ADS),
+        ];
+        for (controls, dropped) in cases {
+            let mut c = cmd(all);
+            apply_allow_controls(&controls, 0, &mut c);
+            assert_eq!(c.buttons, all & !dropped);
+        }
+    }
+
+    #[test]
+    fn allowstand_false_holds_the_stance_he_has() {
+        let controls = ScriptControls { stand_disabled: true, ..Default::default() };
+        // Standing asks for nothing: he is put into a crouch.
+        let mut c = cmd(0);
+        apply_allow_controls(&controls, 0, &mut c);
+        assert_eq!(c.buttons, buttons::CROUCH);
+        // Prone and asking for nothing: he stays prone.
+        let mut c = cmd(0);
+        apply_allow_controls(&controls, pm_flags::PRONE, &mut c);
+        assert_eq!(c.buttons, buttons::PRONE);
+        // No crouch either: prone.
+        let both = ScriptControls { stand_disabled: true, crouch_disabled: true, ..Default::default() };
+        let mut c = cmd(0);
+        apply_allow_controls(&both, 0, &mut c);
+        assert_eq!(c.buttons, buttons::PRONE);
+        // He already asks for a stance: untouched.
+        let mut c = cmd(buttons::CROUCH);
+        apply_allow_controls(&controls, 0, &mut c);
+        assert_eq!(c.buttons, buttons::CROUCH);
+    }
+}
+
+#[cfg(test)]
+mod bo2_zombies_stance_tests {
+    use super::{apply_allow_controls, bo2_zombies_stance};
+    use crate::match_state::ScriptControls;
+    use playerstate_iw4::{UserCmd, buttons, pm_flags};
+
+    const STAND: u32 = 0;
+    const CROUCH: u32 = buttons::CROUCH;
+    const PRONE: u32 = buttons::PRONE;
+
+    /// What he asks for, in the stance he is in, comes out as (Zombies' rule,
+    /// then MP's drop as constrain_cmd runs them).
+    fn stance(off: (bool, bool, bool), now: u32, asks: u32) -> u32 {
+        let controls = ScriptControls {
+            stand_disabled: off.0,
+            crouch_disabled: off.1,
+            prone_disabled: off.2,
+            ..Default::default()
+        };
+        let mut c = UserCmd::default();
+        c.buttons = asks | buttons::SPRINT;
+        bo2_zombies_stance(&controls, now, &mut c);
+        apply_allow_controls(&controls, now, &mut c);
+        assert_ne!(c.buttons & buttons::SPRINT, 0, "only the stance changes");
+        c.buttons & (buttons::PRONE | buttons::CROUCH)
+    }
+
+    const NO_PRONE: (bool, bool, bool) = (false, false, true);
+    const NO_CROUCH: (bool, bool, bool) = (false, true, false);
+    const NO_STAND: (bool, bool, bool) = (true, false, false);
+    const ONLY_PRONE: (bool, bool, bool) = (true, true, false);
+    const ONLY_CROUCH: (bool, bool, bool) = (true, false, true);
+    const ONLY_STAND: (bool, bool, bool) = (false, true, true);
+
+    #[test]
+    fn only_zombies_moves_him_past_the_crouch() {
+        // constrain_cmd runs Zombies' rule in Zombies only; MP drops the press.
+        for (zombies, want) in [(true, PRONE), (false, STAND)] {
+            let mut sim = crate::carrier::SimWorld::default();
+            let mut world = sim.frame();
+            let id = crate::world::ClientId(0);
+            world.client_meta_mut(id).controls.crouch_disabled = true;
+            let mut c = UserCmd::default();
+            c.buttons = CROUCH;
+            super::constrain_cmd(&mut world, id, &mut c, zombies);
+            assert_eq!(c.buttons & (PRONE | CROUCH), want, "zombies {zombies}");
+        }
+    }
+
+    #[test]
+    fn all_allowed_changes_nothing() {
+        for now in [0, pm_flags::CROUCH, pm_flags::PRONE] {
+            for asks in [STAND, CROUCH, PRONE] {
+                assert_eq!(stance((false, false, false), now, asks), asks);
+            }
+        }
+    }
+
+    #[test]
+    fn no_prone_keeps_him_standing_or_crouched() {
+        // The TranZit bus: a prone press (or a dive) while standing stays standing.
+        assert_eq!(stance(NO_PRONE, 0, PRONE), STAND);
+        // Crouched, a prone press stays crouched (MP's plain drop would stand him up).
+        assert_eq!(stance(NO_PRONE, pm_flags::CROUCH, PRONE), CROUCH);
+        // Prone when it was turned off: the prone button now crouches him.
+        assert_eq!(stance(NO_PRONE, pm_flags::PRONE, PRONE), CROUCH);
+        assert_eq!(stance(ONLY_STAND, pm_flags::CROUCH, PRONE), STAND);
+        assert_eq!(stance(NO_PRONE, 0, CROUCH), CROUCH);
+    }
+
+    #[test]
+    fn no_crouch_moves_him_past_the_crouch() {
+        // Standing, a crouch press goes on down to prone; down already, it stands.
+        assert_eq!(stance(NO_CROUCH, 0, CROUCH), PRONE);
+        assert_eq!(stance(NO_CROUCH, pm_flags::PRONE, CROUCH), STAND);
+        assert_eq!(stance(ONLY_PRONE, 0, CROUCH), PRONE);
+        assert_eq!(stance(ONLY_STAND, 0, CROUCH), STAND);
+    }
+
+    #[test]
+    fn no_stand_keeps_him_down() {
+        assert_eq!(stance(NO_STAND, 0, STAND), CROUCH);
+        assert_eq!(stance(NO_STAND, pm_flags::PRONE, STAND), PRONE);
+        assert_eq!(stance(ONLY_CROUCH, pm_flags::PRONE, STAND), CROUCH);
+        assert_eq!(stance(ONLY_PRONE, 0, STAND), PRONE);
+        assert_eq!(stance(NO_STAND, 0, CROUCH), CROUCH);
+    }
+
+    #[test]
+    fn a_spawn_allows_everything_again() {
+        let mut sim = crate::carrier::SimWorld::default();
+        let mut world = sim.frame();
+        let id = crate::world::ClientId(0);
+        world.client_meta_mut(id).controls = ScriptControls {
+            stand_disabled: true,
+            crouch_disabled: true,
+            prone_disabled: true,
+            sprint_disabled: true,
+            melee_disabled: true,
+            ads_disabled: true,
+            jump_disabled: true,
+            ..Default::default()
+        };
+        super::spawn(&mut world, crate::world::Tick(1), id, [0.0; 3], [0.0; 3], "playing");
+        let jump_only = ScriptControls {
+            jump_disabled: true,
+            ..Default::default()
+        };
+        assert_eq!(world.client_meta(id).unwrap().controls, jump_only);
+    }
+}
