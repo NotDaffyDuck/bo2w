@@ -1,4 +1,4 @@
-# bo2w: Black Ops II on its own engine
+# bo2w: Black Ops II on a new engine (work in progress)
 
 bo2w is a fan rebuild of Call of Duty: Black Ops II for PC: **Multiplayer against bots** and **Zombies**, played from
 your own copy of the game, on a new engine written in Rust (on [bevy](https://bevyengine.org/) and
@@ -11,6 +11,10 @@ Ops II for PC; bo2w reads its files read-only and never patches, copies or redis
 fan project, not affiliated with or endorsed by Activision, Treyarch or Infinity Ward.
 
 **Last updated:** 2026-10-23
+
+> **Work in progress.** The engine is not finished: it is part-way through being rewritten as its own (about a third
+> of its code still comes from IW4L, the project it started from). Zombies is not merged into it yet; that merge
+> started on 10-23. Both games play today, each from its own branch. See [Where it stands](#where-it-stands-2026-10-23).
 
 ## Download
 
@@ -64,14 +68,14 @@ branch). Needs a DirectX 12 or Vulkan GPU; built and played on Windows 11 x64 on
 ### The engine
 
 The project started as a fork of [IW4L](https://github.com/vladtrc/iw4L), an open-source Modern Warfare 2 runtime
-(Apache 2.0, credited in [NOTICE](NOTICE)). Now it is becoming fully its own engine:
+(Apache 2.0, credited in [NOTICE](NOTICE)). It is **not yet** fully its own engine; that is this week's work:
 
-- **Done (10-21):** every piece of IW4L's Modern Warfare 2 engine is out: all 20 MW2 crates deleted (about 82,000
-  lines), and no IW4/IW5 or IW4L name is left in the code, build files or file names.
-- **This week:** each crate that still holds code first written for IW4L is being written fresh from what it has
-  to do (its tests, its callers, Black Ops II's own rules), crate by crate. At the start (10-21) about 42% of the
-  lines came from IW4L. The first rewrites are merged, and most of the other crates are rewritten and in testing:
-  network, front end and HUD, simulation, game scripts, rendering, tools, assets, and effects and audio.
+- **Done (10-21):** the Modern Warfare 2 parts are removed: all 20 MW2 crates deleted (about 82,000 lines), and the
+  IW4/IW5/IW4L names are gone from the code, build files and file names.
+- **In progress:** the code that remains from IW4L (the shared engine underneath) is being rewritten fresh, crate by
+  crate, from what each part has to do (its tests, its callers, Black Ops II's own rules). On 10-21 about 42% of the
+  lines came from IW4L; after the first merges it is about a third. Network, front end and HUD, simulation, game
+  scripts, rendering, tools, assets, and effects and audio are each part-way through, and merge one batch at a time.
 - **Every merge must keep the game playing exactly as before:** about 2,500 tests pass, and four hidden test matches
   in different modes, a three-map check and a bots check all pass.
 
@@ -97,8 +101,9 @@ Map-by-map bars and the full change list: [MULTIPLAYER.md](MULTIPLAYER.md).
 - Nuketown and TranZit are at 100% mechanics. Die Rise is at 98%, Mob of the Dead at 97%, and Buried and Origins at 94%.
 - BO2's own zombie scripts run it all: rounds, wall buys, the Mystery Box, perks, Pack-a-Punch, power-ups, going
   down and reviving. Brutus, the Panzer Soldat, Cerberus, Afterlife and the TranZit bus work too.
-- **Being merged into the new engine right now**, so Multiplayer and Zombies end up as one game on one engine. The
-  `zombies` branch is its last stand-alone build. It still carries the older IW4L-based engine underneath.
+- **Not merged yet.** The merge into the new engine started on 10-23 (the gun and movement code first) and is
+  expected to finish around 10-26 to 10-30, so Multiplayer and Zombies end up as one game on one engine. Until then
+  the `zombies` branch is its stand-alone build, and it still runs on the older IW4L-based engine.
 
 ## The plan: next few days to a week
 
