@@ -1,5 +1,13 @@
+//! Retained model runtime shared by the authority and the client: pose a
+//! model's bones from its animation tree and read back its collision shapes.
+//! The pieces live in `dobj_t6` and `xanim_t6`; this crate is the one door
+//! both sides come through.
+
 mod destructible;
 
+pub use destructible::{DebrisPreset, T5DestructibleDef, T5DestructiblePiece, T5DestructibleStage};
+
+// Bone sets, tag attachment and the player controller.
 pub use dobj_t6::{
     AIM_PITCH_CLAMP_RAD, Attach, Bone, DObj, DObjBoneOrientation, DObjBoneOrientationError,
     DObjError, HidePartBits, LocalPose, ModelPoseSrc, ModelSlot, PLAYER_CONTROLLER_TAGS, PartBits,
@@ -10,6 +18,18 @@ pub use dobj_t6::{
     set_angles, set_control_tag_angles, set_local_tag, tp_head_attach_tag, tp_weapon_attach_tag,
     yaw_bone,
 };
+
+// Sampled clips and the node tree that blends them.
+pub use xanim_t6::{
+    AnimClip, ClipError, ClipNotify, FrameIndices, Keyed, RawDeltaTrans, RawXAnimParts, Rotation,
+    SampledTrack, Track, Translation,
+};
+pub use xanim_t6::{
+    XAnimNodeDefinition, XAnimNodeId, XAnimNodeKind, XAnimNodeState, XAnimTreeDefinition,
+    XAnimTreeError, XAnimTreeRuntime,
+};
+
+// A posed model and the collision it carries.
 pub use xanim_t6::{AnimInstance, DObjAnim};
 pub use xanim_t6::{
     BoneCollision, CollSurfCollision, CollTri, CollisionBone, CollmapBox, DObjAnimRuntime,
@@ -20,13 +40,3 @@ pub use xanim_t6::{
     collision_models_with_controller, model_token, pose_dobj, pose_dobj_with_controller,
     reuse_matches,
 };
-pub use xanim_t6::{
-    AnimClip, ClipError, ClipNotify, FrameIndices, Keyed, RawDeltaTrans, RawXAnimParts, Rotation,
-    SampledTrack, Track, Translation,
-};
-pub use xanim_t6::{
-    XAnimNodeDefinition, XAnimNodeId, XAnimNodeKind, XAnimNodeState, XAnimTreeDefinition,
-    XAnimTreeError, XAnimTreeRuntime,
-};
-
-pub use destructible::{DebrisPreset, T5DestructibleDef, T5DestructiblePiece, T5DestructibleStage};

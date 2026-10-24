@@ -74,7 +74,7 @@ impl Plugin for NetPlugin {
                 app.init_resource::<ClientCommandInbox>()
                     .init_resource::<ClientActionInbox>();
             }
-            crate::client::runtime::register_client_runtime(app);
+            crate::client::drive::register_client_runtime(app);
             crate::client::presentation::entities::register_client_entities(app);
             crate::client::presentation::entity_event_dispatch::register_entity_event_dispatch(app);
         }
@@ -84,7 +84,7 @@ impl Plugin for NetPlugin {
             || self.role == RuntimeRole::Client
             || self.role == RuntimeRole::Replay
         {
-            crate::client::runtime::register_listen_prediction_arm(app);
+            crate::client::drive::register_listen_prediction_arm(app);
         }
         if self.role == RuntimeRole::Replay {
             app.insert_resource(crate::authority::runtime::AuthorityLoadHold(true));

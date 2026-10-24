@@ -1,3 +1,6 @@
+//! What the frontend prepares from the loaded world each frame: the camera,
+//! visibility, model lighting, and the world's GPU data.
+
 pub mod camera;
 pub mod cell_frustum_cmds;
 pub mod cull;

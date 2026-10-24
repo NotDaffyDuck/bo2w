@@ -2,7 +2,7 @@
 
 use bevy::{ecs::system::SystemParam, prelude::*};
 use bots::{
-    BotAddQueue, BotFireQueue, BotHold, BotRoster, BotTpQueue, BotTpRequest, BotTpTarget,
+    BotAddQueue, BotHold, BotRoster, BotTpQueue, BotTpRequest, BotTpTarget,
     BotTpWhere,
 };
 use net::{ActionRequestIds, ClientActionInbox};
@@ -15,7 +15,7 @@ use crate::ConsoleCommand;
 pub(super) const USAGE: &[(&str, &str)] = &[
     (
         "bot",
-        "bot add [N] | dummy [N] | hold [on|off] | give <id> <weapon> [att...] | fire [all|<id>] | tp all|<id> above <h> | tp all|<id> <x> <y> <z>",
+        "bot add [N] | hold [on|off] | give <id> <weapon> [att...] | tp all|<id> above <h> | tp all|<id> <x> <y> <z>",
     ),
     (
         "hurt",
@@ -23,24 +23,22 @@ pub(super) const USAGE: &[(&str, &str)] = &[
     ),
 ];
 
-const BOT_USAGE: &str = "usage: bot add [N] | dummy [N] | hold [on|off] | give <id> <weapon> [att...] | fire [all|<id>] | tp all|<id> above <h> | tp all|<id> <x> <y> <z> [yaw] [pitch]";
+const BOT_USAGE: &str = "usage: bot add [N] | hold [on|off] | give <id> <weapon> [att...] | tp all|<id> above <h> | tp all|<id> <x> <y> <z> [yaw] [pitch]";
 
 const GIVE_USAGE: &str = "usage: bot give <id> <weapon> [attachment...]";
 
-/// The most bots one `bot add` or `bot dummy` makes.
+/// The most bots one `bot add` makes.
 const MOST_BOTS: u32 = 16;
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum BotVerb {
     Add(u32),
-    Dummy(u32),
     Hold(bool),
     Give {
         id: ClientId,
         weapon: String,
         attachments: Vec<String>,
     },
-    Fire(BotTpTarget),
     Tp(BotTpRequest),
 }
 
@@ -55,7 +53,7 @@ fn client_id(word: &str) -> Option<ClientId> {
     word.parse().ok().map(ClientId)
 }
 
-/// Who a `fire` or `tp` is about: `all`, or one client's number.
+/// Who a `tp` is about: `all`, or one client's number.
 fn target_of(word: &str) -> Option<BotTpTarget> {
     match word {
         "all" => Some(BotTpTarget::All),
@@ -90,19 +88,6 @@ pub(crate) fn parse_bot(args: &[String]) -> Result<BotVerb, String> {
             let count = rest.first().and_then(|word| word.parse().ok()).unwrap_or(1);
             Ok(BotVerb::Add(count.clamp(1, MOST_BOTS)))
         }
-        ["dummy", rest @ ..] => {
-            let usage = || "usage: bot dummy [N]".to_owned();
-            let count = match rest {
-                [] => 1,
-                [word] => word.parse::<u32>().map_err(|_| usage())?,
-                _ => return Err(usage()),
-            };
-            if (1..=MOST_BOTS).contains(&count) {
-                Ok(BotVerb::Dummy(count))
-            } else {
-                Err(format!("bot dummy: count must be 1..{MOST_BOTS}"))
-            }
-        }
         ["hold"] | ["hold", "on" | "1"] => Ok(BotVerb::Hold(true)),
         ["hold", "off" | "0"] => Ok(BotVerb::Hold(false)),
         ["hold", other, ..] => Err(format!("usage: bot hold [on|off] (got `{other}`)")),
@@ -115,10 +100,6 @@ pub(crate) fn parse_bot(args: &[String]) -> Result<BotVerb, String> {
             None => Err(GIVE_USAGE.into()),
         },
         ["give", ..] => Err(GIVE_USAGE.into()),
-        ["fire"] => Ok(BotVerb::Fire(BotTpTarget::All)),
-        ["fire", who, ..] => target_of(who)
-            .map(BotVerb::Fire)
-            .ok_or_else(|| "usage: bot fire [all|<id>]".into()),
         ["tp", rest @ ..] => parse_teleport(rest),
         _ => Err(BOT_USAGE.into()),
     }
@@ -172,7 +153,6 @@ pub(crate) struct BotQueues<'w> {
     add: ResMut<'w, BotAddQueue>,
     hold: ResMut<'w, BotHold>,
     teleport: ResMut<'w, BotTpQueue>,
-    fire: ResMut<'w, BotFireQueue>,
 }
 
 impl BotQueues<'_> {
@@ -184,10 +164,6 @@ impl BotQueues<'_> {
                 self.add.push(count);
                 format!("bot: queued add {count}")
             }
-            BotVerb::Dummy(count) => {
-                self.add.push_dummy(count);
-                format!("bot: queued dummy {count}")
-            }
             BotVerb::Hold(on) => {
                 self.hold.0 = on;
                 format!("bot: hold {}", if on { "on" } else { "off" })
@@ -195,10 +171,6 @@ impl BotQueues<'_> {
             BotVerb::Tp(request) => {
                 self.teleport.push(request);
                 "bot: queued tp".into()
-            }
-            BotVerb::Fire(target) => {
-                self.fire.push(target);
-                "bot: queued fire".into()
             }
             BotVerb::Give { .. } => return None,
         })
@@ -262,16 +234,6 @@ mod tests {
     }
 
     #[test]
-    fn dummy_wants_a_whole_count_from_one_to_sixteen() {
-        assert_eq!(parse("dummy"), Ok(BotVerb::Dummy(1)));
-        assert_eq!(parse("dummy 16"), Ok(BotVerb::Dummy(16)));
-        assert_eq!(error("dummy 0"), "bot dummy: count must be 1..16");
-        assert_eq!(error("dummy 17"), "bot dummy: count must be 1..16");
-        assert_eq!(error("dummy x"), "usage: bot dummy [N]");
-        assert_eq!(error("dummy 1 2"), "usage: bot dummy [N]");
-    }
-
-    #[test]
     fn hold_is_on_unless_told_off() {
         for line in ["hold", "hold on", "hold 1"] {
             assert_eq!(parse(line), Ok(BotVerb::Hold(true)), "{line}");
@@ -298,17 +260,6 @@ mod tests {
         assert_eq!(error("give"), GIVE_USAGE);
         assert_eq!(error("give 3"), GIVE_USAGE);
         assert_eq!(error("give x an94"), GIVE_USAGE);
-    }
-
-    #[test]
-    fn fire_is_for_everyone_or_one_client() {
-        assert_eq!(parse("fire"), Ok(BotVerb::Fire(BotTpTarget::All)));
-        assert_eq!(parse("fire all"), Ok(BotVerb::Fire(BotTpTarget::All)));
-        assert_eq!(
-            parse("fire 2"),
-            Ok(BotVerb::Fire(BotTpTarget::Id(ClientId(2))))
-        );
-        assert_eq!(error("fire everyone"), "usage: bot fire [all|<id>]");
     }
 
     #[test]

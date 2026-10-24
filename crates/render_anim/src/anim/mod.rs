@@ -10,6 +10,8 @@ pub mod pose_types;
 pub mod remote_body;
 pub mod scene_submission;
 pub mod t6_loop_seam;
+#[cfg(test)]
+pub(crate) mod test_skel;
 pub mod view_kick_state;
 pub mod view_sway;
 pub mod viewmodel_controller;

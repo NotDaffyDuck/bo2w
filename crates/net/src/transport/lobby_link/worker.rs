@@ -21,7 +21,7 @@ use super::room::Room;
 use super::state::{MasterBridgeState, SessionIdentity};
 use crate::session_core::HostMatchEvent;
 use crate::transport::bootstrap::BootstrapLane;
-use crate::transport::udp_session::RelayMailbox;
+use crate::transport::relay::RelayMailbox;
 
 /// Relayed packets the mailbox holds each way before it refuses more.
 const RELAY_QUEUE: usize = 64;

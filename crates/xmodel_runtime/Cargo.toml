@@ -3,7 +3,7 @@ name = "xmodel_runtime"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Pure retained XModel DObj pose and collision runtime shared by authority and presentation."
+description = "Retained model pose and collision runtime shared by the authority and the client."
 
 [dependencies]
 dobj_t6.workspace = true

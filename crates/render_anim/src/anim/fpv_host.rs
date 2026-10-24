@@ -1,3 +1,6 @@
+//! Resources the first-person presenter keeps between frames, and the step
+//! that turns the equipped weapon's playing clips into this frame's hand poses.
+
 use std::sync::Arc;
 
 use bevy::math::{Mat4, Vec3};
@@ -9,6 +12,7 @@ use crate::anim::fpv::{
 use crate::anim::fpv_pose::{FpvBoltFrame, PosedClip};
 use crate::anim::fpv_prepared::FpvRigSet;
 use crate::anim::fpv_rig::{FpvHandPose, PreparedFpvRig};
+use crate::anim::viewmodel_controller::ViewmodelController;
 use asset_game::WeaponAnimSlot;
 use assets::FpvMeshIndex;
 
@@ -26,6 +30,8 @@ pub struct PendingFpvSpawnRequest {
     pub parent_weapon: u32,
 }
 
+/// Notetrack names the held weapon's clips raised, waiting for the audio and
+/// effects side to pick them up.
 #[derive(Resource, Default)]
 pub struct PendingFpvNotetracks {
     pub weapon: u32,
@@ -38,6 +44,8 @@ pub struct FpvHeldSettled(pub Option<u32>);
 #[derive(Resource, Default)]
 pub struct FpvHeldLife(pub Option<u32>);
 
+/// Where the first-person attachment points are this frame, per hand, for the
+/// effects that follow them.
 #[derive(Resource, Default)]
 pub struct FpvBoltTargets {
     pub pose: [Option<FpvBoltFrame>; 2],
@@ -55,15 +63,7 @@ pub struct FpvBoltTargets {
 
 impl FpvBoltTargets {
     pub fn clear(&mut self) {
-        self.pose = [None, None];
-        self.tracker_screen = None;
-        self.tracker_light = None;
-        self.hud = None;
-        self.flash = [None, None];
-        self.brass = [None, None];
-        self.knife = [None, None];
-        self.laser = [None, None];
-        self.target = [None, None];
+        *self = Self::default();
     }
 
     pub fn set_pose(&mut self, hand: usize, bolt: FpvBoltFrame) {
@@ -71,6 +71,7 @@ impl FpvBoltTargets {
     }
 }
 
+/// Why a frame produced no viewmodel pose.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FpvPoseRefuse {
     CatalogMissing,
@@ -85,21 +86,18 @@ pub enum FpvPoseRefuse {
     },
 }
 
+#[derive(Default)]
 pub enum FpvPoseKind {
+    /// Nothing is held, or it is not shown.
+    #[default]
     Hide,
     Refuse(FpvPoseRefuse),
     Posed(FpvPosedFrame),
 }
 
-impl Default for FpvPoseKind {
-    fn default() -> Self {
-        Self::Hide
-    }
-}
-
-/// What one frame asked of the rig: bones per hand, and the lens the right hand
-/// carries. No geometry — the surfaces this rig draws were settled when it was
-/// prepared, and the vertices are written straight into the published plan.
+/// What one frame asked of the rig: bones per hand, and the lens the right
+/// hand carries. No geometry: the surfaces this rig draws were settled when it
+/// was prepared, and the vertices are written straight into the published plan.
 pub struct FpvPosedFrame {
     pub poses: [Option<FpvHandPose>; 2],
     pub lens: Mat4,
@@ -132,6 +130,47 @@ pub struct FpvGenerateArgs<'a> {
     pub mantle_camera: Option<f32>,
 }
 
+/// The clips a controller has playing, as the rig wants them.
+fn playing_clips(controller: &ViewmodelController) -> Vec<PosedClip<'_>> {
+    controller
+        .active_anims()
+        .map(|anim| PosedClip {
+            node: anim.node,
+            clip: anim.clip,
+            time: anim.time,
+            weight: anim.weight,
+        })
+        .collect()
+}
+
+/// The climb camera clip, `fraction` of the way through, when the weapon has one.
+fn climb_camera_clip(controller: &ViewmodelController, fraction: f32) -> Option<PosedClip<'_>> {
+    let slot = WeaponAnimSlot::CameraMantle;
+    let clip = controller.weapon().clip(slot)?;
+    Some(PosedClip {
+        node: slot.index(),
+        clip,
+        time: fraction.clamp(0.0, 1.0) * clip.duration(),
+        weight: 1.0,
+    })
+}
+
+/// How far the off hand's gun is pushed aside, in eye space.
+fn off_hand_shift(dual_offset: Option<f32>) -> Vec3 {
+    match dual_offset {
+        Some(offset) if offset != 0.0 => Vec3::from_array(
+            weapon_t6::placement::dual_wield_view_model_origin_add(1, [-1.0, 0.0, 0.0], offset),
+        ),
+        _ => Vec3::ZERO,
+    }
+}
+
+fn eye_pose_failed(equipped: &EquippedFpv) -> FpvPoseKind {
+    FpvPoseKind::Refuse(FpvPoseRefuse::EyePoseFailed {
+        gun_xmodel: equipped.gun_xmodel.clone(),
+    })
+}
+
 pub fn generate_fpv_pose(args: FpvGenerateArgs<'_>) -> FpvPoseKind {
     let FpvGenerateArgs {
         dt,
@@ -148,120 +187,143 @@ pub fn generate_fpv_pose(args: FpvGenerateArgs<'_>) -> FpvPoseKind {
         dual_offset,
         mantle_camera,
     } = args;
-    let (_pose, notifies) =
+    let (_pose, notetracks) =
         tick_equipped_fpv_with_predicted_fire(equipped, cursor, sample, predicted_fire, dt);
 
-    let right: Vec<PosedClip<'_>> = equipped
-        .controller
-        .active_anims()
-        .map(|a| PosedClip {
-            node: a.node,
-            clip: a.clip,
-            time: a.time,
-            weight: a.weight,
-        })
-        .collect();
+    let right = playing_clips(&equipped.controller);
     if right.is_empty() {
         return FpvPoseKind::Refuse(FpvPoseRefuse::NoActiveClips);
     }
-    let left: Vec<PosedClip<'_>> = match (dual, equipped.left.as_ref()) {
-        (true, Some(left)) => left
-            .active_anims()
-            .map(|a| PosedClip {
-                node: a.node,
-                clip: a.clip,
-                time: a.time,
-                weight: a.weight,
-            })
-            .collect(),
+    let left = match (dual, equipped.left.as_ref()) {
+        (true, Some(controller)) => playing_clips(controller),
         _ => Vec::new(),
     };
-    let dual_drawn = !left.is_empty();
-    let camera = mantle_camera.and_then(|frac| {
-        let clip = equipped
-            .controller
-            .weapon()
-            .clip(WeaponAnimSlot::CameraMantle)?;
-        Some(PosedClip {
-            node: WeaponAnimSlot::CameraMantle.index(),
-            clip,
-            time: frac.clamp(0.0, 1.0) * clip.duration(),
-            weight: 1.0,
-        })
-    });
+    let left_drawn = !left.is_empty();
+    let camera =
+        mantle_camera.and_then(|fraction| climb_camera_clip(&equipped.controller, fraction));
 
-    let Some(prepared) = rigs.pick(rocket, dual_drawn, melee, ads) else {
+    let Some(rig) = rigs.pick(rocket, left_drawn, melee, ads) else {
         *active = None;
-        return FpvPoseKind::Refuse(FpvPoseRefuse::EyePoseFailed {
-            gun_xmodel: equipped.gun_xmodel.clone(),
-        });
+        return eye_pose_failed(equipped);
     };
-    if active
+    let already_active = active
         .as_ref()
-        .is_none_or(|current| current.generation() != prepared.generation())
-    {
-        *active = Some(Arc::clone(prepared));
+        .is_some_and(|current| current.generation() == rig.generation());
+    if !already_active {
+        *active = Some(Arc::clone(rig));
     }
+    let logging = crate::anim::fpv::vm_log_enabled();
 
     // bo2zm: Black Ops II dual wield: both hands' clips on the one rig.
-    if rigs.combined && dual_drawn {
-        let Some(pose) = prepared.pose_combined(&right, &left, camera.as_ref()) else {
-            return FpvPoseKind::Refuse(FpvPoseRefuse::EyePoseFailed {
-                gun_xmodel: equipped.gun_xmodel.clone(),
-            });
+    if rigs.combined && left_drawn {
+        let Some(pose) = rig.pose_combined(&right, &left, camera.as_ref()) else {
+            return eye_pose_failed(equipped);
         };
-        if crate::anim::fpv::vm_log_enabled() {
-            let all: Vec<PosedClip<'_>> = right.iter().chain(&left).cloned().collect();
-            crate::anim::fpv::vm_log_note(&format!("POSE dual {}", prepared.debug_pose_line(&all, &pose)));
+        if logging {
+            let everything: Vec<PosedClip<'_>> = right.iter().chain(&left).cloned().collect();
+            crate::anim::fpv::vm_log_note(&format!(
+                "POSE dual {}",
+                rig.debug_pose_line(&everything, &pose)
+            ));
         }
-        let lens = pose.lens;
         return FpvPoseKind::Posed(FpvPosedFrame {
+            lens: pose.lens,
             poses: [Some(pose), None],
-            lens,
             idle_sampled: true,
-            notetracks: notifies,
+            notetracks,
         });
     }
-    let Some(right_pose) = prepared.pose_hand(0, &right, Vec3::ZERO, camera.as_ref()) else {
-        return FpvPoseKind::Refuse(FpvPoseRefuse::EyePoseFailed {
-            gun_xmodel: equipped.gun_xmodel.clone(),
-        });
+
+    let Some(right_pose) = rig.pose_hand(0, &right, Vec3::ZERO, camera.as_ref()) else {
+        return eye_pose_failed(equipped);
     };
-    if crate::anim::fpv::vm_log_enabled() {
+    if logging {
         crate::anim::fpv::vm_log_note(&format!(
             "POSE right dual={dual} {}",
-            prepared.debug_pose_line(&right, &right_pose)
+            rig.debug_pose_line(&right, &right_pose)
         ));
     }
     let lens = right_pose.lens;
-    let left_pose = if dual_drawn {
-        let offset = dual_offset
-            .filter(|offset| *offset != 0.0)
-            .map(|offset| {
-                Vec3::from_array(weapon_t6::placement::dual_wield_view_model_origin_add(
-                    1,
-                    [-1.0, 0.0, 0.0],
-                    offset,
-                ))
-            })
-            .unwrap_or(Vec3::ZERO);
-        // The rig laid out a left hand, so a left hand that cannot be posed is
-        // a plan with a hole in it. Refusing the frame is the honest answer.
-        let Some(pose) = prepared.pose_hand(1, &left, offset, None) else {
-            return FpvPoseKind::Refuse(FpvPoseRefuse::EyePoseFailed {
-                gun_xmodel: equipped.gun_xmodel.clone(),
-            });
-        };
-        Some(pose)
+    // The rig laid out a left hand whenever one is drawn, so a left hand that
+    // cannot be posed is a plan with a hole in it: refuse the frame.
+    let left_pose = if left_drawn {
+        match rig.pose_hand(1, &left, off_hand_shift(dual_offset), None) {
+            Some(pose) => Some(pose),
+            None => return eye_pose_failed(equipped),
+        }
     } else {
         None
     };
-
-    let poses = [Some(right_pose), left_pose];
     FpvPoseKind::Posed(FpvPosedFrame {
-        poses,
+        poses: [Some(right_pose), left_pose],
         lens,
         idle_sampled: true,
-        notetracks: notifies,
+        notetracks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bolt() -> FpvBoltFrame {
+        FpvBoltFrame {
+            bones: vec![Mat4::IDENTITY; 3],
+            ..FpvBoltFrame::default()
+        }
+    }
+
+    #[test]
+    fn a_fresh_pose_product_hides_the_viewmodel() {
+        let product = FpvPoseProduct::default();
+        assert!(product.drawgun.is_none());
+        assert!(matches!(product.kind, FpvPoseKind::Hide));
+    }
+
+    #[test]
+    fn clearing_bolt_targets_drops_every_hand() {
+        let mut targets = FpvBoltTargets::default();
+        targets.set_pose(0, bolt());
+        targets.set_pose(1, bolt());
+        targets.tracker_screen = Some([Vec3::ONE; 3]);
+        assert!(targets.pose.iter().all(Option::is_some));
+
+        targets.clear();
+        assert!(targets.pose.iter().all(Option::is_none));
+        assert!(targets.tracker_screen.is_none());
+        assert!(targets.flash.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn set_pose_fills_only_the_hand_asked_for() {
+        let mut targets = FpvBoltTargets::default();
+        targets.set_pose(1, bolt());
+        assert!(targets.pose[0].is_none());
+        assert_eq!(targets.pose[1].as_ref().map(|b| b.bones.len()), Some(3));
+    }
+
+    #[test]
+    fn the_off_hand_stays_put_without_an_offset() {
+        assert_eq!(off_hand_shift(None), Vec3::ZERO);
+        assert_eq!(off_hand_shift(Some(0.0)), Vec3::ZERO);
+    }
+
+    #[test]
+    fn the_off_hand_shift_is_what_the_placement_table_gives() {
+        let expected = Vec3::from_array(weapon_t6::placement::dual_wield_view_model_origin_add(
+            1,
+            [-1.0, 0.0, 0.0],
+            2.5,
+        ));
+        assert_eq!(off_hand_shift(Some(2.5)), expected);
+    }
+
+    #[test]
+    fn refusals_compare_by_what_they_name() {
+        let a = FpvPoseRefuse::EyePoseFailed {
+            gun_xmodel: "gun".into(),
+        };
+        assert_eq!(a, a.clone());
+        assert_ne!(a, FpvPoseRefuse::NoActiveClips);
+    }
 }

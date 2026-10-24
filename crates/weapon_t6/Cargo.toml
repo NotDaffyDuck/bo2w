@@ -7,6 +7,7 @@ description = "BO2 (T6) weapon brain: BO2's weapon states, per-weapon player dat
 
 [dependencies]
 fastfile_t6.workspace = true
+frame.workspace = true
 game_math.workspace = true
 libm = { version = "0.2.16", default-features = false }
 

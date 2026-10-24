@@ -1,13 +1,24 @@
+//! Presented models: the posed DObjs, first-person viewmodel, remote bodies,
+//! items, missiles and script models, and the draw plans they publish for the
+//! renderer.
+
+mod draw_build;
+mod guest_gravgun;
+mod plugin;
+
 pub mod anim;
 pub mod draw;
-mod draw_build;
 pub mod gaps;
 pub mod geometry;
-mod guest_gravgun;
 pub mod guest_weapons;
 pub mod lighting;
 pub mod occupancy;
-mod plugin;
+
+pub use anim::*;
+pub use draw::*;
+pub use draw_build::*;
+pub use lighting_t6::viewmodel_lighting_origin;
+pub use plugin::RenderAnimPlugin;
 
 pub use anim::dobj_pose::{
     HostDObjPoseFrame, HostDObjPoseRefuse, PosedPlayer, PosedPlayerFrame, PosedPlayerHead,
@@ -25,13 +36,9 @@ pub use anim::model_materials::{PreparedModelMaterials, prepare_model_materials}
 pub use anim::viewmodel_controller::{
     AdvanceResult, EventResult, ViewmodelController, ViewmodelEvent, WeaponState,
 };
-pub use anim::*;
-pub use draw::*;
-pub use draw_build::*;
 pub use lighting::{
-    VIEWMODEL_GUN_TAG, attach_bone, base_trans, fpv_dobj_lighting_box_half, fpv_dobj_radius,
-    lighting_box_half, script_model_lighting_box_half, radius_lighting_box_half,
-    viewmodel_lighting_origin,
+    attach_bone, base_trans, fpv_dobj_lighting_box_half, fpv_dobj_radius, radius_lighting_box_half,
+    script_model_lighting_box_half,
 };
 pub use occupancy::{
     DynEntCellBits, DynEntPhysClip, DynEntPhysWorld, FpvGeometrySet, FpvPlacementRoot,
@@ -39,4 +46,3 @@ pub use occupancy::{
     RenderFocus, ScriptModelDrawSet, ScriptModelSkinSet, SessionViewmodel, occupy_fpv_scene,
     spawn_pending_fpv, stamp_fpv_placement_matrix, sync_camera_from_presented, tick_fpv_viewmodel,
 };
-pub use plugin::RenderAnimPlugin;

@@ -72,9 +72,11 @@ pub fn add_runtime_plugins(app: &mut App) {
     add_runtime_plugins_with_role(app, RuntimeRole::Listen);
 }
 
-/// Adds the game's own plugins for a process that plays `role`, and makes
-/// every stage of the frame run its systems one after another.
+/// Adds the game's own plugins for a process that plays `role`, registers
+/// BO2's stock classes, and makes every stage of the frame run its systems one
+/// after another.
 pub fn add_runtime_plugins_with_role(app: &mut App, role: RuntimeRole) {
+    weapon_t6::class_presets::register();
     insert_window_pacing(app);
     app.add_plugins(AssetPlugin)
         .add_plugins(UiPlugin)

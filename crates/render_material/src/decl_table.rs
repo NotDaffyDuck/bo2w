@@ -6,16 +6,6 @@
 //! types are still MW2's.
 //! TODO(fact): BO2's colour byte order (R,G,B,A kept, as the CPU had it).
 
-pub const OFFSET_NAME: usize = 0x00;
-
-pub const OFFSET_STREAM_COUNT: usize = 0x04;
-
-pub const OFFSET_HAS_OPTIONAL_SOURCE: usize = 0x05;
-
-pub const OFFSET_ROUTING_DATA: usize = 0x08;
-
-pub const OFFSET_DECL: usize = 0x24;
-
 pub const ROUTING_COUNT: usize = 13;
 
 pub const VERTEX_TYPE_COUNT: usize = 16;

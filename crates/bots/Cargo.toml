@@ -1,25 +1,16 @@
-[package]
-name = "bots"
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-description = "Host-only bot controllers: sensor observations into UserCmd."
-
-[dependencies]
-asset_transport.workspace = true
-assets.workspace = true
-diag.workspace = true
-bevy.workspace = true
-frame.workspace = true
-sim = { path = "../sim" }
-net = { path = "../net" }
-playerstate_t6.workspace = true
-entity_t6.workspace = true
-movement_t6.workspace = true
-weapon_t6.workspace = true
-game_math = { path = "../game_math" }
-trace_t6.workspace = true
-gamemode_t6.workspace = true
-
-[lints]
-workspace = true
+# The host's side of bots: console bot commands, lobby gamertags, and the join/class/command plumbing for the
+# test clients BO2's own bot scripts add (their brain is the game script, run by sim's t6 module).
+package.name = "bots"
+package.version = "0.1.0"
+package.edition = { workspace = true }
+package.license = { workspace = true }
+package.description = "Console bot commands and the host plumbing for BO2's script bots."
+lints = { workspace = true }
+dependencies.bevy = { workspace = true }
+dependencies.diag = { workspace = true }
+dependencies.entity_t6 = { workspace = true }
+dependencies.frame = { workspace = true }
+dependencies.game_math = { workspace = true }
+dependencies.net = { workspace = true }
+dependencies.playerstate_t6 = { workspace = true }
+dependencies.sim = { workspace = true }

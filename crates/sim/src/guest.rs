@@ -164,10 +164,6 @@ pub fn set_held_bodies(ents: Vec<u32>) {
     *HELD_BODIES.lock().unwrap() = ents;
 }
 
-pub fn held_bodies() -> Vec<u32> {
-    HELD_BODIES.lock().unwrap().clone()
-}
-
 /// World side -> rules.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ask {

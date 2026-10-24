@@ -6,6 +6,7 @@
 
 pub mod consts;
 pub mod flags;
+#[path = "live/mod.rs"]
 pub mod game;
 pub mod hud;
 pub mod perks;

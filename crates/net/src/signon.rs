@@ -8,7 +8,7 @@ use crate::session_core::{
 };
 use crate::transport::lobby_link::{MasterBridge, MasterBridgeState};
 use crate::transport::protocol::HandshakeReject;
-use crate::transport::udp_session::UdpClientLink;
+use crate::transport::relay::UdpClientLink;
 use master_protocol::SessionCloseReason;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -517,7 +517,7 @@ pub fn drive_map_loaded(
 
 pub fn drive_match_boundary(
     mut torn: bevy::prelude::MessageReader<MatchTornDown>,
-    mut hub: Option<bevy::prelude::ResMut<crate::transport::udp_session::UdpAuthorityHub>>,
+    mut hub: Option<bevy::prelude::ResMut<crate::transport::relay::UdpAuthorityHub>>,
     mut link: Option<bevy::prelude::ResMut<UdpClientLink>>,
     bridge: Option<bevy::prelude::Res<MasterBridge>>,
     mut live: bevy::prelude::Local<bool>,

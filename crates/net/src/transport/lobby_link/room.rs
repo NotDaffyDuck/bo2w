@@ -462,7 +462,7 @@ mod tests {
 
     use super::*;
     use crate::transport::bootstrap::BootstrapLane;
-    use crate::transport::udp_session::RelayMailbox;
+    use crate::transport::relay::RelayMailbox;
     use super::super::state::MasterBridgeState;
 
     const ROOM: AdvertId = AdvertId([7; 16]);

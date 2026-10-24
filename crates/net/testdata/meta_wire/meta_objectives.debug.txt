@@ -19,50 +19,6 @@ SnapshotMeta {
             120,
             95,
         ],
-        compass: [
-            CompassObjective {
-                index: 2,
-                state: Active,
-                origin: [
-                    100.0,
-                    -100.0,
-                    8.0,
-                ],
-                team: Allies,
-                icon: "compass_waypoint_capture",
-            },
-            CompassObjective {
-                index: 5,
-                state: Invisible,
-                origin: [
-                    0.0,
-                    0.0,
-                    0.0,
-                ],
-                team: Axis,
-                icon: "",
-            },
-        ],
-        vehicles: [
-            CompassVehicle {
-                origin: [
-                    50.0,
-                    60.0,
-                    70.0,
-                ],
-                yaw: 135.0,
-                owner: 3,
-                team: 2,
-                icons: [
-                    "compass_uav",
-                    "compass_uav_red",
-                ],
-                size: [
-                    16,
-                    24,
-                ],
-            },
-        ],
         server_info: [
             (
                 "g_gametype",
@@ -74,6 +30,50 @@ SnapshotMeta {
             ),
         ],
         game_end_time: 900000,
+        compass: [
+            CompassObjective {
+                index: 2,
+                state: Active,
+                team: Allies,
+                origin: [
+                    100.0,
+                    -100.0,
+                    8.0,
+                ],
+                icon: "compass_waypoint_capture",
+            },
+            CompassObjective {
+                index: 5,
+                state: Invisible,
+                team: Axis,
+                origin: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                icon: "",
+            },
+        ],
+        vehicles: [
+            CompassVehicle {
+                owner: 3,
+                team: 2,
+                origin: [
+                    50.0,
+                    60.0,
+                    70.0,
+                ],
+                yaw: 135.0,
+                icons: [
+                    "compass_uav",
+                    "compass_uav_red",
+                ],
+                size: [
+                    16,
+                    24,
+                ],
+            },
+        ],
         scripted_effects: true,
         effects: [
             ScriptEffect {
@@ -195,18 +195,18 @@ SnapshotMeta {
                 set_ms: 10,
             },
         ),
-        missile_vision: Some(
-            VisionChange {
-                name: "missile_pitch_black",
-                duration_ms: 500,
-                set_ms: 20,
-            },
-        ),
         night_vision: Some(
             VisionChange {
                 name: "nightvision",
                 duration_ms: 700,
                 set_ms: 30,
+            },
+        ),
+        missile_vision: Some(
+            VisionChange {
+                name: "missile_pitch_black",
+                duration_ms: 500,
+                set_ms: 20,
             },
         ),
         pain_vision: Some(

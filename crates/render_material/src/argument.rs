@@ -1,3 +1,5 @@
+//! One argument of a pass: where a shader register or sampler gets its value.
+
 use crate::RuntimeShaderStage;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -33,7 +35,7 @@ pub enum RuntimeArgumentBinding {
     },
 }
 
-/// Shader argument kinds, in the order passes list their arguments.
+/// Argument kind numbers; a pass lists its arguments in this order.
 pub mod mtl_arg {
     pub const MATERIAL_VERTEX_CONST: u16 = 0;
     pub const LITERAL_VERTEX_CONST: u16 = 1;
@@ -46,57 +48,48 @@ pub mod mtl_arg {
 }
 
 impl RuntimeArgumentBinding {
+    /// The kind number this argument sorts under.
     pub fn mtl_arg_type(&self) -> u16 {
+        use RuntimeShaderStage::{Pixel, Vertex};
         match self {
-            Self::MaterialConstant {
-                stage: RuntimeShaderStage::Vertex,
-                ..
-            } => mtl_arg::MATERIAL_VERTEX_CONST,
-            Self::LiteralConstant {
-                stage: RuntimeShaderStage::Vertex,
-                ..
-            } => mtl_arg::LITERAL_VERTEX_CONST,
             Self::MaterialTexture { .. } => mtl_arg::MATERIAL_PIXEL_SAMPLER,
-            Self::CodeConstant {
-                stage: RuntimeShaderStage::Vertex,
-                ..
-            } => mtl_arg::CODE_VERTEX_CONST,
             Self::CodeTexture { .. } => mtl_arg::CODE_PIXEL_SAMPLER,
-            Self::CodeConstant {
-                stage: RuntimeShaderStage::Pixel,
-                ..
-            } => mtl_arg::CODE_PIXEL_CONST,
-            Self::MaterialConstant {
-                stage: RuntimeShaderStage::Pixel,
-                ..
-            } => mtl_arg::MATERIAL_PIXEL_CONST,
-            Self::LiteralConstant {
-                stage: RuntimeShaderStage::Pixel,
-                ..
-            } => mtl_arg::LITERAL_PIXEL_CONST,
+            Self::MaterialConstant { stage, .. } => match stage {
+                Vertex => mtl_arg::MATERIAL_VERTEX_CONST,
+                Pixel => mtl_arg::MATERIAL_PIXEL_CONST,
+            },
+            Self::LiteralConstant { stage, .. } => match stage {
+                Vertex => mtl_arg::LITERAL_VERTEX_CONST,
+                Pixel => mtl_arg::LITERAL_PIXEL_CONST,
+            },
+            Self::CodeConstant { stage, .. } => match stage {
+                Vertex => mtl_arg::CODE_VERTEX_CONST,
+                Pixel => mtl_arg::CODE_PIXEL_CONST,
+            },
             Self::Unknown { argument_type, .. } => *argument_type,
         }
     }
 
-    fn dest(&self) -> u16 {
+    fn destination(&self) -> Option<u16> {
         match self {
             Self::MaterialTexture { destination, .. }
             | Self::CodeTexture { destination, .. }
             | Self::MaterialConstant { destination, .. }
             | Self::LiteralConstant { destination, .. }
-            | Self::CodeConstant { destination, .. } => *destination,
-            Self::Unknown { .. } => u16::MAX,
+            | Self::CodeConstant { destination, .. } => Some(*destination),
+            Self::Unknown { .. } => None,
         }
     }
 
+    /// Kind first, then the material name for material-fed arguments and the
+    /// register for the rest.
     pub fn runtime_sort_key(&self) -> (u16, u32) {
-        let ty = self.mtl_arg_type();
-        let secondary = match self {
+        let tie_break = match self {
             Self::MaterialConstant { name_hash, .. } | Self::MaterialTexture { name_hash, .. } => {
                 *name_hash
             }
-            _ => u32::from(self.dest()),
+            _ => u32::from(self.destination().unwrap_or(u16::MAX)),
         };
-        (ty, secondary)
+        (self.mtl_arg_type(), tie_break)
     }
 }

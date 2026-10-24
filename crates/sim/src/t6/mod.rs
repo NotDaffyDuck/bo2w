@@ -26,6 +26,8 @@ mod autoplay;
 mod bots;
 mod brushes;
 mod clientfields;
+// bo2mp: the console's `bot add` and `bot hold`.
+pub(crate) mod console_bots;
 // bo2mp: the map's damage triggers (Encore's drums, the billboards).
 pub(crate) mod damage_triggers;
 pub(crate) mod destructible;
@@ -1570,7 +1572,9 @@ fn advance_inner(world: &mut World) {
     timed("bots", world, |world| {
         // The test player's buttons go in before the triggers read them.
         autoplay::drive(world, now);
-        // bo2mp: the bots' commands too.
+        // bo2mp: console-asked bots go to BO2's spawn_bot before the bots
+        // steer, then the bots' commands go in too.
+        console_bots::spawn_waiting(world);
         if world.resource::<Zm>().mp {
             bots::drive(world, now);
         }
@@ -2760,10 +2764,6 @@ pub(crate) fn weapon_text_of(world: &mut World, who: Option<u32>, w: u32) -> Str
         .and_then(|p| p.given_names.get(&w))
         .cloned();
     given.unwrap_or_else(|| weapon_text(world, w))
-}
-
-pub(crate) fn names(set: &BTreeSet<String>) -> String {
-    set.iter().cloned().collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]

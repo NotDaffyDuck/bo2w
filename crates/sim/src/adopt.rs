@@ -1,95 +1,59 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AdoptGap {
-    pub field: &'static str,
+//! Putting an authoritative snapshot over a predicting client's world ("adopting" it).
+//!
+//! A snapshot carries what a client must agree with the host on, not every field the world holds. What an adoption
+//! leaves alone, and why that is safe:
+//!
+//! - **Random streams** (spawn, combat, bot). Snapshots carry only how many numbers each stream has drawn, not where it
+//!   is, so a client cannot resume one. It never needs to: every draw feeds a decision the host already made and
+//!   replicated (a spawn place, a spread). A client that re-runs a step draws something else and has it overwritten at
+//!   the next adoption, which is why shots that depend on spread are settled by the host rather than predicted.
+//! - **Shot and projectile id counters.** A predicted shot gets an id the host never issued; the real one arrives with
+//!   the snapshot that is adopted over it. Nothing presented may be keyed by a predicted id, and events come from the
+//!   adopted snapshot, not from predicted output. A projectile's flight is predicted; only its id waits.
+//! - **Lag compensation state** (the pose history, the script-model collision history, the per-shooter sample record).
+//!   Only the host resolves damage, so only the host rewinds. A client keeps a history from its own poses and never
+//!   reads it.
+//! - **The event journal and its counter.** The journal is emptied at the start of every step and republished from the
+//!   adopted state; adopting it too would show one-shot events twice, once from the snapshot and once from the re-run.
+//! - **The previous command's buttons and angles.** They are not in the snapshot but are not lost: they are on the
+//!   previous user command, and the client puts them back on every adoption, a retired or missing acknowledgement
+//!   included. Skipping the retired case once made a held sprint button look like a new press on a snapshot that
+//!   already had the player sprinting.
+//! - **Content** (collision brushes, weapon tables, equipment tables). The same on both sides by construction and
+//!   checked by the content digest; adopting it would mean sending the map and the weapon data every tick.
+//! - **Match identity** (the root seed and the started flag), fixed when the match is set up.
 
-    pub reason: &'static str,
-}
-
-pub const ADOPT_GAPS: &[AdoptGap] = &[
-    AdoptGap {
-        field: "spawn_rng / combat_rng / bot_rng",
-        reason: "authority-only draws. A snapshot carries draw counters (RngDebugMeta) but not \
-                 generator state, so a client cannot resume the sequence. It does not need to: \
-                 every draw belongs to a decision authority already made and replicated \
-                 (spawn placement, spread). A client that re-runs step draws from its own \
-                 stream, gets a different answer, and has that answer overwritten on the next \
-                 adopt — which is why spread-bearing shot results are authority-validated \
-                 rather than predicted.",
-    },
-    AdoptGap {
-        field: "next_shot / next_projectile",
-        reason: "id allocators. A predicted shot gets a client-local id that authority never \
-                 issued; the authoritative ids arrive with the snapshot that adopts over them. \
-                 Predicted ids therefore must not escape into presentation keyed by id — \
-                 events are read from the adopted snapshot, not from predicted output. \
-                 Projectile flight itself is predicted (deterministic ballistics); only the id \
-                 is withheld until adopt. Presentation merges by (owner, weapon) via \
-                 net::merge_presented_projectiles.",
-    },
-    AdoptGap {
-        field: "collision_history",
-        reason: "lag-compensation rewind buffer. Only authority runs lag comp, because only \
-                 authority resolves damage. A client's history is rebuilt from its own \
-                 post-movement poses each predicted tick and is never read by anything the \
-                 client presents.",
-    },
-    AdoptGap {
-        field: "entity_collision_history",
-        reason: "script-model materialized collision ring for hitscan rewind. Authority-only, \
-                 same argument as collision_history: a predicting client does not resolve \
-                 damage and must not restore live OBB from a snapshot.",
-    },
-    AdoptGap {
-        field: "lagcomp_sample",
-        reason: "per-attacker presentation-sample provenance for hitscan rewind — what the \
-                 shooter's command was aimed at. Authority-only: the predicting client does \
-                 not resolve damage, so it never reads this map. Host and remote shooters go \
-                 through the same resolver; there is no zero-rewind seat.",
-    },
-    AdoptGap {
-        field: "journal",
-        reason: "cleared at the top of every step and republished from the adopted meta. \
-                 Adopting it would make the client present one-shot events twice: once from \
-                 the snapshot and once from its own re-run.",
-    },
-    AdoptGap {
-        field: "next_event",
-        reason: "sequence allocator for the journal above. Same argument.",
-    },
-    AdoptGap {
-        field: "old_buttons / old_cmd_angles / old_cmd_moves",
-        reason: "pmove edge state. Not in the snapshot, but not lost \
-                 either: buttons and angles are on the previous usercmd. A matched ack is that \
-                 command; a retired or missing ack still has the last predicted command. \
-                 `SimWorld::set_old_cmd` (and `set_old_cmd_move`) is how the client puts                  them back, and \
-                 `net::ClientPrediction` calls it on every adopt — including Retired. \
-                 Skipping Retired was the predicted-sprint toggle: held `BUTTON_SPRINT` on a \
-                 snapshot that already has `pm_flags::SPRINTING` looks like a fresh press.",
-    },
-    AdoptGap {
-        field: "clip_brushes / weapon_def_scales / weapon_combat / equipment_runtime / bootstrap",
-        reason: "content, not state. Identical on both sides by construction and checked by \
-                 `content_digest`; adopting it from a snapshot would mean shipping the map and \
-                 the weapon tables every tick.",
-    },
-    AdoptGap {
-        field: "root_seed / running",
-        reason: "match identity, fixed at bootstrap. `running` is latched by the first step on \
-                 either side.",
-    },
-];
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The tally of one adoption.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AdoptReport {
+    /// How many players had their state replaced.
     pub players: usize,
-
+    /// How many clients had their match record replaced.
     pub clients: usize,
-
+    /// How many projectiles came over from the snapshot.
     pub projectiles: usize,
-
+    /// How many predicted things the snapshot had no match for and so were dropped.
     pub dropped: usize,
-
+    /// True when the snapshot was made against other content than this world holds.
     pub content_mismatch: bool,
 }
 
-pub const ADOPT_GAP_COUNT: usize = ADOPT_GAPS.len();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_report_starts_with_nothing_adopted() {
+        let report = AdoptReport::default();
+        assert_eq!((report.players, report.clients, report.projectiles, report.dropped), (0, 0, 0, 0));
+        assert!(!report.content_mismatch);
+    }
+
+    #[test]
+    fn two_reports_are_equal_only_when_every_count_is() {
+        let base = AdoptReport { players: 2, clients: 2, projectiles: 1, dropped: 0, content_mismatch: false };
+        assert_eq!(base, base);
+        assert_ne!(base, AdoptReport { dropped: 1, ..base });
+        assert_ne!(base, AdoptReport { content_mismatch: true, ..base });
+    }
+}

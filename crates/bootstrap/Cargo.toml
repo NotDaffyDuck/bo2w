@@ -37,6 +37,7 @@ replay.workspace = true
 session.workspace = true
 sim.workspace = true
 ui.workspace = true
+weapon_t6.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

@@ -1,249 +1,201 @@
-use crate::Tick;
+//! Once per tick every live entity gets a turn to think, and a parent gets its turn before the entities that ride
+//! on it.
+//!
+//! This file settles who goes when, and keeps anything from thinking twice in one frame. What a think does is
+//! decided per entity kind in [`take_turn`].
+
+use crate::corpse::{level_time_ms, phase_run_corpse_move};
+use crate::entity_local::{
+    entnum_matched, link_entity_needs_rotated_radius, link_entity_world_bounds, parent_link_apply_local,
+    parent_link_pose,
+};
 use crate::frame::FrameWorld;
 use crate::gentity::{EntityRunKind, ThinkEnter, apos_from_entity_state, pos_from_entity_state};
+use crate::{EntityRef, GENTITY_RESERVED_COUNT, MATCH_TICK_MS, Tick};
 use entity_t6::evaluate_trajectory;
-use crate::entity_local::{
-    link_entity_needs_rotated_radius, link_entity_world_bounds, parent_link_apply_local,
-    parent_link_pose, parent_link_world_from_tag,
-};
 use game_math::snap_angles;
 
+type Vec3 = [f32; 3];
+
+/// Why the entities are being walked.
+#[derive(Clone, Copy)]
+enum Walk {
+    /// A real tick, in which each kind runs its own think.
+    Think { tick: Tick, time_ms: i32 },
+    /// Every entity just spends its turn for this frame, so that it cannot be given one again before the frame ends.
+    SpendTurns,
+}
+
+/// One tick of thinking: falling bodies move first, then each entity takes its turn.
 pub(crate) fn phase_run_entity_thinks(world: &mut FrameWorld, tick: Tick) {
-    let time_ms = crate::corpse::level_time_ms(tick);
-    crate::corpse::phase_run_corpse_move(world, time_ms);
-    crate::corpse::phase_sync_corpse_info(world);
-    let WalkedThinks { order, dispatch } = walk_thinks(world, tick, time_ms, true);
-    world.stamp_think_order_rows(order);
-    world.stamp_think_dispatch(dispatch);
+    let time_ms = level_time_ms(tick);
+    phase_run_corpse_move(world, time_ms);
+    walk_entities(world, Walk::Think { tick, time_ms });
 }
 
+/// Spends the turn of every entity for this frame; nothing runs.
 pub(crate) fn phase_walk_entity_thinks(world: &mut FrameWorld) {
-    let WalkedThinks { order, .. } = walk_thinks(world, Tick(0), 0, false);
-    world.stamp_think_order_rows(order);
-    world.stamp_think_dispatch(Vec::new());
+    walk_entities(world, Walk::SpendTurns);
 }
 
-struct WalkedThinks {
-    order: Vec<crate::EntityRef>,
-    dispatch: Vec<(i32, EntityRunKind)>,
-}
-
-struct WalkCtx<'a> {
-    tick: Tick,
-    time_ms: i32,
-    order: &'a mut Vec<crate::EntityRef>,
-    dispatch: &'a mut Vec<(i32, EntityRunKind)>,
-    dispatch_machines: bool,
-}
-
-fn walk_thinks(
-    world: &mut FrameWorld,
-    tick: Tick,
-    time_ms: i32,
-    dispatch_machines: bool,
-) -> WalkedThinks {
-    let mut order = Vec::new();
-    let mut dispatch = Vec::new();
-    {
-        let mut ctx = WalkCtx {
-            tick,
-            time_ms,
-            order: &mut order,
-            dispatch: &mut dispatch,
-            dispatch_machines,
-        };
-        let mut number = crate::GENTITY_RESERVED_COUNT;
-        while number < world.entity_kernel().high_water() {
-            run_think(world, number, &mut ctx);
-            number += 1;
+fn walk_entities(world: &mut FrameWorld, how: Walk) {
+    // The end is looked up for every entity because a think can create more of them, and they take their turn in
+    // this very walk.
+    for number in GENTITY_RESERVED_COUNT.. {
+        if number >= world.entity_kernel().high_water() {
+            break;
         }
+        take_turn(world, number, how);
     }
-    WalkedThinks { order, dispatch }
 }
 
-fn run_think(world: &mut FrameWorld, number: i32, ctx: &mut WalkCtx<'_>) {
-    let entered = match world.entity_kernel_mut().begin_think(number) {
-        Ok(ThinkEnter::Run {
-            entity,
-            kind: _,
-            parent,
-        }) => (entity, parent),
+fn take_turn(world: &mut FrameWorld, number: i32, how: Walk) {
+    let (entity, parent) = match world.entity_kernel_mut().begin_think(number) {
+        Ok(ThinkEnter::Run { entity, parent, .. }) => (entity, parent),
         Ok(ThinkEnter::Skip) | Err(_) => return,
     };
-    if let Some(parent) = entered.1 {
-        run_think(world, parent.number(), ctx);
+    // Whatever rides on a parent needs the parent's pose from this frame.
+    if let Some(parent) = parent {
+        take_turn(world, parent.number(), how);
     }
-    let Ok(view) = world.entity_kernel().resolve(entered.0) else {
+    let Walk::Think { tick, time_ms } = how else {
         return;
     };
-    let kind = view.kind;
-    let entity = entered.0;
-    ctx.order.push(entity);
-    if !ctx.dispatch_machines {
-        return;
-    }
-    ctx.dispatch.push((entity.number(), kind));
-    match kind {
-        EntityRunKind::Missile => {
-            crate::equipment::think_projectile(world, ctx.tick, entity.number());
-        }
-        EntityRunKind::Item => {
-            let parented = view.relations.parent.is_some();
-            think_parent_link(world, ctx.time_ms, entity);
-            if parented {
-                think_scheduled_or_refuse(world, entity);
-            } else {
-                crate::item::think_item_move(world, ctx.time_ms, entity.number());
-            }
-        }
-        EntityRunKind::ScriptMover | EntityRunKind::PrimaryLight => {
-            think_script_mover(world, ctx.tick, entity);
-        }
-        EntityRunKind::TempEvent => {}
-        EntityRunKind::General => {
-            think_parent_link(world, ctx.time_ms, entity);
-            think_scheduled_or_refuse(world, entity);
-        }
-        EntityRunKind::PlayerCorpse => {
-            think_player_corpse(world, entity);
-        }
-    }
-}
-
-fn think_player_corpse(world: &mut FrameWorld, entity: crate::EntityRef) {
-    let number = entity.number();
-    let entnums = world.corpses().entnums();
-    if !crate::entity_local::entnum_matched(&entnums, number) {
-        panic!(
-            "ET_PLAYER_CORPSE occupancy number not in the corpse table; a miss falls back to slot 0"
-        );
-    }
-    let slot = crate::entity_local::slot_for_entnum(&entnums, number);
-    crate::corpse::sync_corpse_info_player_anims(world, slot);
-    think_scheduled_or_refuse(world, entity);
-}
-
-fn think_scheduled_or_refuse(world: &mut FrameWorld, entity: crate::EntityRef) {
-    let due = world
-        .entity_kernel_mut()
-        .take_due_think(entity)
-        .expect("scheduled think occupancy vanished");
-    if due {
-        panic!("generic think has no handler");
-    }
-}
-
-fn think_script_mover(world: &mut FrameWorld, tick: Tick, entity: crate::EntityRef) {
-    let time_ms = crate::corpse::level_time_ms(tick);
     let Ok(view) = world.entity_kernel().resolve(entity) else {
         return;
     };
-    if view.relations.parent.is_some() {
-        think_parent_link(world, time_ms, entity);
-        think_scheduled_or_refuse(world, entity);
-        return;
-    }
-    let at_time = i32::try_from(tick.0.saturating_mul(crate::MATCH_TICK_MS)).unwrap_or(i32::MAX);
-    let Some(mover) = world.script_mover_by_number(entity.number()) else {
-        return;
-    };
-    let apos = apos_from_entity_state(&mover.state);
-    for capabilities in world.entity_collision_capabilities_mut() {
-        if capabilities.owner.script_model() != Some(mover.id) {
-            continue;
+    let has_parent = view.relations.parent.is_some();
+    let number = entity.number();
+
+    match view.kind {
+        EntityRunKind::Missile => crate::equipment::think_projectile(world, tick, number),
+        EntityRunKind::Item if has_parent => {
+            follow_parent(world, time_ms, entity);
+            settle_think(world, entity);
         }
-        if let Some(dobj) = capabilities.dobj.as_mut() {
-            dobj.apply_trajectory_apos_at(apos, at_time);
+        EntityRunKind::Item => {
+            follow_parent(world, time_ms, entity);
+            crate::item::think_item_move(world, time_ms, number);
+        }
+        EntityRunKind::ScriptMover | EntityRunKind::PrimaryLight if has_parent => {
+            follow_parent(world, time_ms, entity);
+            settle_think(world, entity);
+        }
+        EntityRunKind::ScriptMover | EntityRunKind::PrimaryLight => pose_mover_models(world, tick, number),
+        EntityRunKind::TempEvent => {}
+        EntityRunKind::General => {
+            follow_parent(world, time_ms, entity);
+            settle_think(world, entity);
+        }
+        EntityRunKind::PlayerCorpse => {
+            let numbers = world.corpses().entnums();
+            assert!(
+                entnum_matched(&numbers, number),
+                "ET_PLAYER_CORPSE occupancy number not in the corpse table; a miss falls back to slot 0"
+            );
+            settle_think(world, entity);
         }
     }
 }
 
-fn think_parent_link(world: &mut FrameWorld, time_ms: i32, entity: crate::EntityRef) {
+/// An entity that has nothing scheduled has nothing to do. If its scheduled time has come, it would need a handler,
+/// which these plain kinds do not have.
+fn settle_think(world: &mut FrameWorld, entity: EntityRef) {
+    let was_due = world
+        .entity_kernel_mut()
+        .take_due_think(entity)
+        .expect("scheduled think occupancy vanished");
+    assert!(!was_due, "generic think has no handler");
+}
+
+/// A script mover that stands free turns the animated models on it to its present angles.
+fn pose_mover_models(world: &mut FrameWorld, tick: Tick, number: i32) {
+    let Some(mover) = world.script_mover_by_number(number) else {
+        return;
+    };
+    let (owner, angles) = (mover.id, apos_from_entity_state(&mover.state));
+    let at_ms = i32::try_from(tick.0.saturating_mul(MATCH_TICK_MS)).unwrap_or(i32::MAX);
+    let owned = world
+        .entity_collision_capabilities_mut()
+        .iter_mut()
+        .filter(|caps| caps.owner.script_model() == Some(owner));
+    for caps in owned {
+        if let Some(dobj) = caps.dobj.as_mut() {
+            dobj.apply_trajectory_apos_at(angles, at_ms);
+        }
+    }
+}
+
+/// Puts `entity` where its parent is now, shifted by the offset it was linked with. An entity without a parent stays
+/// where it is.
+fn follow_parent(world: &mut FrameWorld, time_ms: i32, entity: EntityRef) {
     let Ok(view) = world.entity_kernel().resolve(entity) else {
         return;
     };
     let Some(parent) = view.relations.parent else {
         return;
     };
-    let tag = view.relations.parent_tag;
-    let Some((origin, angles)) = parent_world_pose(world, parent, time_ms) else {
-        panic!("parented think has no parent currentOrigin/angles");
-    };
-    let (origin, angles) = if tag >= 0 {
-        let Some(mat) = world.anim_mat(parent.number(), tag) else {
-            panic!("tag-linked think needs a computed bone matrix for the parent tag");
-        };
-        parent_link_world_from_tag(origin, angles, mat)
-    } else {
-        (origin, angles)
-    };
+    let (parent_origin, parent_angles) =
+        parent_pose(world, parent, time_ms).expect("parented think has no parent currentOrigin/angles");
+    assert!(
+        view.relations.parent_tag < 0,
+        "tag-linked think needs a computed bone matrix for the parent tag"
+    );
     let (origin, angles) = parent_link_apply_local(
-        origin,
-        angles,
+        parent_origin,
+        parent_angles,
         view.relations.parent_link_axis,
         view.relations.parent_link_origin,
     );
-    apply_parent_link_pose(world, entity.number(), view.kind, origin, angles);
+    place(world, entity.number(), view.kind, origin, angles);
 }
 
-fn parent_world_pose(
-    world: &FrameWorld,
-    parent: crate::EntityRef,
-    time_ms: i32,
-) -> Option<([f32; 3], [f32; 3])> {
+/// The origin and angles of a parent at `time_ms`; only movers and dropped items can be parents.
+fn parent_pose(world: &FrameWorld, parent: EntityRef, time_ms: i32) -> Option<(Vec3, Vec3)> {
     let kind = world.entity_kernel().resolve(parent).ok()?.kind;
+    let number = parent.number();
     match kind {
         EntityRunKind::ScriptMover | EntityRunKind::PrimaryLight => {
-            world.script_mover_by_number(parent.number()).map(|mover| {
-                (
-                    evaluate_trajectory(&pos_from_entity_state(&mover.state), time_ms),
-                    evaluate_trajectory(&apos_from_entity_state(&mover.state), time_ms),
-                )
-            })
+            let state = &world.script_mover_by_number(number)?.state;
+            let origin = evaluate_trajectory(&pos_from_entity_state(state), time_ms);
+            Some((origin, evaluate_trajectory(&apos_from_entity_state(state), time_ms)))
         }
-        EntityRunKind::Item => world.dropped_item_by_number(parent.number()).map(|item| {
-            (
-                item.origin,
-                evaluate_trajectory(&apos_from_entity_state(&item.state), time_ms),
-            )
-        }),
-        EntityRunKind::Missile
-        | EntityRunKind::TempEvent
-        | EntityRunKind::General
-        | EntityRunKind::PlayerCorpse => None,
+        EntityRunKind::Item => {
+            let item = world.dropped_item_by_number(number)?;
+            let angles = evaluate_trajectory(&apos_from_entity_state(&item.state), time_ms);
+            Some((item.origin, angles))
+        }
+        EntityRunKind::Missile | EntityRunKind::TempEvent | EntityRunKind::General | EntityRunKind::PlayerCorpse => {
+            None
+        }
     }
 }
 
-fn apply_parent_link_pose(
-    world: &mut FrameWorld,
-    number: i32,
-    kind: EntityRunKind,
-    origin: [f32; 3],
-    angles: [f32; 3],
-) {
+/// Stores a followed pose in the record of the child. Only movers and dropped items keep one.
+fn place(world: &mut FrameWorld, number: i32, kind: EntityRunKind, origin: Vec3, angles: Vec3) {
     match kind {
         EntityRunKind::ScriptMover | EntityRunKind::PrimaryLight => {
-            let mut linked_id = None;
-            if let Some(mover) = world.script_mover_mut_by_number(number) {
-                parent_link_pose(&mut mover.state, origin, angles);
-                let snapped = snap_angles(angles);
-                if link_entity_needs_rotated_radius(snapped, mover.box_half) {
-                    panic!("link yaw/pitch radius Bounds when r.half is non-zero");
-                }
-                let bounds = link_entity_world_bounds(origin, mover.box_mid, mover.box_half);
-                mover.link_mid = bounds.mid;
-                mover.link_half = bounds.half;
-                linked_id = Some(mover.id);
-            }
-            if let Some(id) = linked_id {
-                for capabilities in world.entity_collision_capabilities_mut() {
-                    if capabilities.owner.script_model() != Some(id) {
-                        continue;
-                    }
-                    for brush in &mut capabilities.linked_brushes {
-                        brush.origin = origin;
-                        brush.angles = angles;
-                    }
+            let Some(mover) = world.script_mover_mut_by_number(number) else {
+                return;
+            };
+            parent_link_pose(&mut mover.state, origin, angles);
+            assert!(
+                !link_entity_needs_rotated_radius(snap_angles(angles), mover.box_half),
+                "link yaw/pitch radius Bounds when r.half is non-zero"
+            );
+            let bounds = link_entity_world_bounds(origin, mover.box_mid, mover.box_half);
+            mover.link_mid = bounds.mid;
+            mover.link_half = bounds.half;
+            let owner = mover.id;
+            // The mover's brushes travel with it.
+            let owned = world
+                .entity_collision_capabilities_mut()
+                .iter_mut()
+                .filter(|caps| caps.owner.script_model() == Some(owner));
+            for caps in owned {
+                for brush in &mut caps.linked_brushes {
+                    brush.origin = origin;
+                    brush.angles = angles;
                 }
             }
         }
@@ -253,9 +205,130 @@ fn apply_parent_link_pose(
                 parent_link_pose(&mut item.state, origin, angles);
             }
         }
-        EntityRunKind::Missile
-        | EntityRunKind::TempEvent
-        | EntityRunKind::General
-        | EntityRunKind::PlayerCorpse => {}
+        EntityRunKind::Missile | EntityRunKind::TempEvent | EntityRunKind::General | EntityRunKind::PlayerCorpse => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SimWorld;
+    use crate::corpse::PlayerCorpseSlot;
+
+    /// A world whose clock has started its first frame, so entities can think.
+    fn started() -> SimWorld {
+        let mut world = SimWorld::new();
+        world.frame().entity_kernel_mut().begin_frame(50);
+        world
+    }
+
+    fn spawn(world: &mut SimWorld, kind: EntityRunKind) -> EntityRef {
+        world.frame().entity_kernel_mut().allocate(kind).expect("room for an entity")
+    }
+
+    /// True if entity `entity` is still allowed to think this frame.
+    fn can_still_think(world: &mut SimWorld, entity: EntityRef) -> bool {
+        matches!(
+            world.frame().entity_kernel_mut().begin_think(entity.number()),
+            Ok(ThinkEnter::Run { .. })
+        )
+    }
+
+    #[test]
+    fn marking_walk_uses_up_every_entitys_turn() {
+        let mut world = started();
+        let general = spawn(&mut world, EntityRunKind::General);
+        let event = spawn(&mut world, EntityRunKind::TempEvent);
+
+        phase_walk_entity_thinks(&mut world.frame());
+
+        assert!(!can_still_think(&mut world, general));
+        assert!(!can_still_think(&mut world, event));
+    }
+
+    #[test]
+    fn untouched_entities_can_think_before_the_walk() {
+        let mut world = started();
+        let general = spawn(&mut world, EntityRunKind::General);
+
+        assert!(can_still_think(&mut world, general));
+    }
+
+    #[test]
+    fn a_full_tick_leaves_idle_entities_alone_and_uses_their_turn() {
+        let mut world = started();
+        let general = spawn(&mut world, EntityRunKind::General);
+        let event = spawn(&mut world, EntityRunKind::TempEvent);
+
+        phase_run_entity_thinks(&mut world.frame(), Tick(1));
+
+        assert!(!can_still_think(&mut world, general));
+        assert!(!can_still_think(&mut world, event));
+    }
+
+    #[test]
+    fn a_new_frame_lets_every_entity_think_again() {
+        let mut world = started();
+        let general = spawn(&mut world, EntityRunKind::General);
+        phase_walk_entity_thinks(&mut world.frame());
+
+        world.frame().entity_kernel_mut().begin_frame(100);
+
+        assert!(can_still_think(&mut world, general));
+    }
+
+    #[test]
+    fn walking_twice_in_one_frame_is_the_same_as_once() {
+        let mut world = started();
+        let general = spawn(&mut world, EntityRunKind::General);
+
+        phase_run_entity_thinks(&mut world.frame(), Tick(1));
+        phase_run_entity_thinks(&mut world.frame(), Tick(1));
+
+        assert!(!can_still_think(&mut world, general));
+    }
+
+    #[test]
+    fn an_empty_world_walks_without_incident() {
+        let mut world = started();
+        phase_run_entity_thinks(&mut world.frame(), Tick(3));
+        phase_walk_entity_thinks(&mut world.frame());
+    }
+
+    #[test]
+    #[should_panic(expected = "ET_PLAYER_CORPSE")]
+    fn a_body_entity_missing_from_the_corpse_table_is_refused() {
+        let mut world = started();
+        spawn(&mut world, EntityRunKind::PlayerCorpse);
+
+        phase_run_entity_thinks(&mut world.frame(), Tick(1));
+    }
+
+    #[test]
+    fn a_body_entity_with_a_matching_slot_thinks_quietly() {
+        let mut world = started();
+        let body = spawn(&mut world, EntityRunKind::PlayerCorpse);
+        world.frame().corpses_mut().place(2, body.number(), PlayerCorpseSlot::default());
+
+        phase_run_entity_thinks(&mut world.frame(), Tick(1));
+
+        assert!(!can_still_think(&mut world, body));
+    }
+
+    #[test]
+    fn bodies_in_the_air_fall_during_a_full_tick_only() {
+        let mut world = started();
+        let body = spawn(&mut world, EntityRunKind::PlayerCorpse);
+        let mut falling = PlayerCorpseSlot { falling: true, ..PlayerCorpseSlot::default() };
+        falling.tr_type = entity_t6::tr_type::GRAVITY;
+        falling.tr_base = [0.0, 0.0, 500.0];
+        world.frame().corpses_mut().place(0, body.number(), falling);
+
+        phase_walk_entity_thinks(&mut world.frame());
+        assert_eq!(world.frame().corpses().slots[0].origin, [0.0; 3]);
+
+        world.frame().entity_kernel_mut().begin_frame(100);
+        phase_run_entity_thinks(&mut world.frame(), Tick(2));
+        assert!(world.frame().corpses().slots[0].origin != [0.0; 3]);
     }
 }

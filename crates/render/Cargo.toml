@@ -10,25 +10,24 @@ diag.workspace = true
 bevy.workspace = true
 fx.workspace = true
 hud = { path = "../hud" }
-hud_t6.workspace = true # bo2mp: Target Finder screen (publish_ui3d_frame)
+hud_t6.workspace = true
 frame.workspace = true
 render_frame.workspace = true
 render_anim.workspace = true
 render_frontend.workspace = true
 render_fx.workspace = true
 render_gpu.workspace = true
+render_material.workspace = true
 render_scene.workspace = true
 net = { path = "../net" }
 assets.workspace = true
-asset_world.workspace = true # bo2zm
 lighting_t6.workspace = true
-asset_material.workspace = true # bo2zm
-asset_core.workspace = true # bo2zm
-asset_model.workspace = true # bo2zm
-asset_t6.workspace = true # bo2zm
+asset_material.workspace = true
+asset_core.workspace = true
+asset_model.workspace = true
+asset_t6.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-naga = { version = "29", features = ["wgsl-in"] }
 perf.workspace = true
 
 [lints]

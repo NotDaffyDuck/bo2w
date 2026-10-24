@@ -1,47 +1,45 @@
+//! Static-model draw inputs: the material a pass draws with, the LOD choice by
+//! camera distance, and the maps a runtime material supplies.
+
 use bevy::prelude::*;
+use bevy::render::render_resource::Face;
 use render_material::RuntimeMaterialCatalog;
 
+/// Everything a static-model pass needs of one material.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SmodelPassMaterial {
     pub model_lighting_required: bool,
     pub color: Option<Handle<Image>>,
     pub specular: Option<Handle<Image>>,
     pub probe: Option<Handle<Image>>,
-
     pub atlas: Option<Handle<Image>>,
     pub alpha_mode: AlphaMode,
-
     pub draw_mode: Option<asset_material::MaterialDrawMode>,
-
-    pub cull_mode: Option<bevy::render::render_resource::Face>,
+    pub cull_mode: Option<Face>,
     pub env_map_parms: [f32; 4],
-
     pub lighting_lookup_scale: [f32; 4],
     pub atlas_lookup: [f32; 4],
-
     pub sort_key: u8,
-
     pub material_sorted_index: Option<u32>,
-
-    /// bo2zm: a Black Ops II material's catalog index. BO2 materials have
-    /// no technique set, so no sorted ordinal; the fallback draw finds them
-    /// by this.
+    /// The material's index in the runtime catalog, for materials that carry no
+    /// technique set and so no sorted ordinal; the fallback draw finds them by it.
     pub t6_material: Option<u32>,
 }
 
+/// The distance ramp that stretches or shrinks LOD ranges.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LodRampArgs {
     pub scale_mid: Option<f32>,
     pub bias_mid: Option<f32>,
     pub scale_last: Option<f32>,
-
     pub world_unit: Option<f32>,
-
     pub t5: asset_model::LodParmsAxis,
-
     pub t5_no_lod_cull_out: bool,
 }
 
+/// The LOD level to draw a model at from the eye, or `None` when it is beyond its
+/// last level and culled. Without an eye or LOD data there is nothing to choose
+/// by, so the first level is drawn.
 pub fn smodel_camera_lod(
     lod: Option<asset_model::ModelLodSelector>,
     origin: [f32; 3],
@@ -53,55 +51,57 @@ pub fn smodel_camera_lod(
         return Some(0);
     };
     let asset_model::ModelLodSelector::T5 { num_lods, lod_dist } = lod;
-    let dx = eye.x - origin[0];
-    let dy = eye.y - origin[1];
-    let dz = eye.z - origin[2];
-    let d = (dx * dx + dy * dy + dz * dz).sqrt();
-    let (ramped, base) = ramp.t5.smodel_call_dists(d, scale);
+    let distance = eye.distance(Vec3::from_array(origin));
+    let (ramped, base) = ramp.t5.smodel_call_dists(distance, scale);
     asset_model::xmodel_get_lod_for_dist(num_lods, lod_dist, ramped, base, ramp.t5_no_lod_cull_out)
 }
 
-pub fn runtime_cull_face(cull_mode: Option<u8>) -> Option<bevy::render::render_resource::Face> {
+/// Which faces a material culls: 0 drops back faces, 1 front faces, anything
+/// else (or nothing) draws both.
+pub fn runtime_cull_face(cull_mode: Option<u8>) -> Option<Face> {
     match cull_mode {
-        Some(0) => Some(bevy::render::render_resource::Face::Back),
-        Some(1) => Some(bevy::render::render_resource::Face::Front),
+        Some(0) => Some(Face::Back),
+        Some(1) => Some(Face::Front),
         _ => None,
     }
 }
 
+/// The maps and draw state a runtime material gives a model.
 #[derive(Clone, Debug)]
 pub struct AuthoredMaps {
     pub color: Option<Handle<Image>>,
     pub specular: Option<Handle<Image>>,
     pub alpha_mode: AlphaMode,
-
     pub draw_mode: Option<asset_material::MaterialDrawMode>,
-    pub cull_mode: Option<bevy::render::render_resource::Face>,
+    pub cull_mode: Option<Face>,
     pub env_map_parms: [f32; 4],
 }
 
+/// Looks a material up in the catalog and picks out its colour and specular
+/// maps from the loaded images. A material the catalog lacks gets no maps.
 pub fn runtime_maps(
     material: Option<assets::MaterialIndex>,
     catalog: &RuntimeMaterialCatalog,
     exact_handles: &[Option<Handle<Image>>],
 ) -> AuthoredMaps {
     let runtime = material.and_then(|id| catalog.derived(id));
-    let tex = |semantic: u8| {
-        runtime.and_then(|m| {
-            m.texture_semantic(semantic)
-                .and_then(|id| exact_handles.get(id.0 as usize).and_then(Clone::clone))
-        })
+    let map_for = |semantic: u8| {
+        runtime
+            .and_then(|m| m.texture_semantic(semantic))
+            .and_then(|image| exact_handles.get(image.0 as usize))
+            .and_then(Clone::clone)
     };
     AuthoredMaps {
-        color: tex(asset_material::TS_COLOR_MAP),
-        specular: tex(asset_material::TS_SPECULAR_MAP),
+        color: map_for(asset_material::TS_COLOR_MAP),
+        specular: map_for(asset_material::TS_SPECULAR_MAP),
         alpha_mode: AlphaMode::Opaque,
         draw_mode: None,
         cull_mode: runtime.and_then(|m| runtime_cull_face(m.cull_mode)),
-        env_map_parms: runtime.map(|m| m.env_map_parms()).unwrap_or([0.0; 4]),
+        env_map_parms: runtime.map_or([0.0; 4], |m| m.env_map_parms()),
     }
 }
 
+/// The skinned-model LOD ramp as the player's settings give it.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct LodRampSkinnedDvar {
     pub scale_mid: Option<f32>,
@@ -130,6 +130,8 @@ impl Default for LodRampSkinnedDvar {
 }
 
 impl LodRampSkinnedDvar {
+    /// The ramp to hand to [`smodel_camera_lod`]: skinned models are culled
+    /// past their last level, never kept at it.
     #[must_use]
     pub fn args(self) -> LodRampArgs {
         LodRampArgs {
@@ -140,5 +142,48 @@ impl LodRampSkinnedDvar {
             t5: self.t5,
             t5_no_lod_cull_out: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cull_mode_zero_and_one_pick_a_face() {
+        assert_eq!(runtime_cull_face(Some(0)), Some(Face::Back));
+        assert_eq!(runtime_cull_face(Some(1)), Some(Face::Front));
+        assert_eq!(runtime_cull_face(Some(2)), None);
+        assert_eq!(runtime_cull_face(None), None);
+    }
+
+    #[test]
+    fn no_eye_or_no_lod_data_draws_the_first_level() {
+        let lod = asset_model::ModelLodSelector::T5 { num_lods: 3, lod_dist: [1.0; 4] };
+        let ramp = LodRampArgs::default();
+        assert_eq!(smodel_camera_lod(Some(lod), [0.0; 3], 1.0, None, ramp), Some(0));
+        assert_eq!(smodel_camera_lod(None, [0.0; 3], 1.0, Some(Vec3::X), ramp), Some(0));
+    }
+
+    #[test]
+    fn a_model_with_no_levels_is_culled_with_an_eye() {
+        let lod = asset_model::ModelLodSelector::T5 { num_lods: 0, lod_dist: [0.0; 4] };
+        let ramp = LodRampArgs::default();
+        assert_eq!(smodel_camera_lod(Some(lod), [0.0; 3], 1.0, Some(Vec3::X), ramp), None);
+    }
+
+    #[test]
+    fn the_skinned_ramp_never_keeps_a_model_past_its_last_level() {
+        let dvar = LodRampSkinnedDvar::default();
+        assert!(!dvar.args().t5_no_lod_cull_out);
+        assert_eq!(dvar.t5_scale, asset_model::R_LOD_SCALE_SKINNED_DEFAULT);
+    }
+
+    #[test]
+    fn a_missing_material_gets_no_maps() {
+        let maps = runtime_maps(None, &RuntimeMaterialCatalog::default(), &[]);
+        assert!(maps.color.is_none() && maps.specular.is_none());
+        assert_eq!(maps.cull_mode, None);
+        assert_eq!(maps.env_map_parms, [0.0; 4]);
     }
 }

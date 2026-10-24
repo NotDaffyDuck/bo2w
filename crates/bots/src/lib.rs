@@ -1,38 +1,11 @@
-mod controller;
-mod intent;
-mod memory;
-mod motor;
-mod nav;
-mod observation;
-mod plugin;
-mod query;
-mod roster;
-mod sensor;
-mod task;
-pub mod unique_loadout;
-mod weapon;
-
-pub use controller::HostController;
-pub use intent::{BotIntent, MotorReport, MoveMode, PathOutcome};
-pub use nav::{
-    NAV_HULL, NAV_SCHEMA, NavEdge, NavGraph, PathError, RouteStats, RouteStep, RouteWork,
-    SupportProbe, TraversalKind, bake, bake_seeded, brush_bounds, find_path, find_route,
-    find_route_resumable, playable_bounds, roam_node, supported_walk,
-};
-pub use observation::{
-    BotEvent, BotObservation, Contact, DEFAULT_OBJECTIVE_RADIUS, KnowledgeSource, ModeObjective,
-    ObjectiveAction, SelfState, Stance, TeamRole, Visibility, WeaponAction, WeaponClass,
-    WeaponFacts, WeaponSlot,
-};
-pub use plugin::BotsPlugin;
-pub use query::{
-    Budgeted, HullTrace, ObstacleKind, QueryCounters, QueryDenied, QueryResult, QuerySubsystem,
-    SightSample, TraceBudget, WalkSample, WorldQuery,
-};
-pub use roster::{
-    BotAddQueue, BotAddRequest, BotFireQueue, BotHold, BotRoster, BotTpQueue, BotTpRequest,
-    BotTpTarget, BotTpWhere, MAX_HOST_BOTS,
-};
-pub use sensor::{observe, observe_focused};
-pub use task::{ActionStage, Decision, SwitchReason, Task, TaskKind};
-pub use weapon::{WeaponAct, WeaponFailure, WeaponSkill, WeaponStatus};
+//! Host-side bots for BO2 multiplayer. The bots themselves are BO2's: its bot script adds them as test clients and
+//! its bot code steers them inside sim's t6 module. This crate carries the console's `bot` commands to the game,
+//! seats and joins the clients the script adds, gives them gamertags and default classes, and keeps a command
+//! queued for each one.
+mod commands;
+mod gamertags;
+mod lineup;
+mod wiring;
+pub use commands::{BotAddQueue, BotHold, BotTpQueue, BotTpRequest, BotTpTarget, BotTpWhere};
+pub use lineup::BotRoster;
+pub use wiring::BotsPlugin;

@@ -349,6 +349,7 @@ mod tests {
 
     #[test]
     fn a_class_goes_back_to_the_preset_it_is_named_for() {
+        weapon_t6::class_presets::register();
         let catalog = catalog();
         let preset = &ui::showcase_classes()[0];
         let class = slot(preset.name);

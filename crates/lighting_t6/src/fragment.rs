@@ -69,7 +69,7 @@ pub fn model_lighting_local_tile_nearest_index(normal: [f32; 3]) -> Option<usize
     }
     let inverse = 1.0 / largest;
     let texel = |component: f32| -> usize {
-        let coord = component * LOOKUP_SPAN * inverse + 0.5;
+        let coord = component * (LOOKUP_SPAN / MODEL_LIGHTING_TILE_DIM as f32) * inverse + 0.5;
         libm::roundf(coord * MODEL_LIGHTING_TILE_DIM as f32 - 0.5).clamp(0.0, 3.0) as usize
     };
     let (x, y, z) = (texel(normal[0]), texel(normal[1]), texel(normal[2]));
@@ -164,9 +164,14 @@ mod tests {
     #[test]
     fn a_big_lean_back_clamps_to_the_first_texel() {
         assert_eq!(
-            model_lighting_local_tile_nearest_index([-0.5, 0.0, 1.0]),
+            model_lighting_local_tile_nearest_index([-1.0, 0.0, 1.0]),
             Some(0 + 4 * 2 + 16 * 3)
         );
+    }
+
+    #[test]
+    fn a_half_normal_reaches_the_middle_of_the_tile_like_the_old_scale() {
+        assert_eq!(model_lighting_local_tile_nearest_index([0.5, 0.5, 1.0]), Some(2 + 4 * 2 + 16 * 3));
     }
 
     #[test]

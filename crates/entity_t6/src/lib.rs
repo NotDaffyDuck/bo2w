@@ -13,7 +13,7 @@ pub mod corpse;
 pub mod entity_state;
 pub mod entity_type;
 pub mod event;
-pub mod event_kind;
+pub mod client_event;
 pub mod event_ring;
 pub mod link;
 pub mod missile;
@@ -29,10 +29,9 @@ pub use entity_state::{
     LerpUnion, PlayerAnimState, Un2,
 };
 pub use entity_type::{BO2_MAX_GENTITIES, ENTITYNUM_NONE, ENTITYNUM_WORLD, MAX_GENTITIES, et};
-pub use event_kind::{
-    EntityEventAction, EntityEventKind, LOCAL_SOUND_ENTITY, UnsupportedEntityEvent, bullet_hit_event,
-    consume_entity_events, entity_event_action, gunner_fire_event, is_gunner_fire_event,
-    is_left_hand_fire_event, is_weapon_fire_last_shot_event, packet_entity_uses_event_ring,
+pub use client_event::{
+    EntityEventAction, EntityEventKind, LOCAL_SOUND_ENTITY, SequencedEntityEvent, UnsupportedEntityEvent,
+    bullet_hit_event, consume_entity_events, entity_event_action, gunner_fire_event, packet_entity_uses_event_ring,
     predicted_weapon_fire_event,
 };
 pub use event_ring::{BadEvent, EventList, player_state_events, player_to_entity_events};

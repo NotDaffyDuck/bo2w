@@ -5,7 +5,6 @@
 pub mod artifact_cache;
 pub mod discover;
 pub mod iwd;
-pub mod load_jobs;
 pub mod namespace_trees;
 pub mod progress;
 pub mod zone;
@@ -19,7 +18,6 @@ pub use discover::{
     map_load_title, split_zone_key, zone_game_for_path,
 };
 pub use iwd::{IwdSoundIndex, game_main_for_zone, read_iwd_named};
-pub use load_jobs::{CacheResult, JobKind};
 pub use namespace_trees::{NamespaceSoundIwd, NamespaceTree, NamespaceTrees};
 pub use progress::{
     LoadLaneTiming, LoadProgress, LoadSnapshot, StageEnd, StageHandle, StageId, StageKey,

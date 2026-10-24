@@ -1596,6 +1596,7 @@ pub(super) fn drive(world: &mut World, now: i64) {
     log_negotiations(world);
     let dv = BotDvars::read(world);
     let crowd = crowd(world);
+    let held = super::console_bots::frozen(world);
     for n in ids {
         if !alive(world, n) {
             // Dead, its steering starts over (BO2 clears its bot state).
@@ -2431,6 +2432,10 @@ pub(super) fn drive(world: &mut World, now: i64) {
                 .is_some_and(|ids| ids.split(',').any(|i| i.trim().parse::<u32>() == Ok(n)));
             let attack = if firing && (now / 100) % 2 == 0 { buttons::ATTACK } else { 0 };
             (forward, right, press, want) = (0, 0, attack, view);
+        }
+        // `bot hold on`: keep looking where it looks, move and press nothing.
+        if held {
+            (forward, right, press, want) = (0, 0, 0, view);
         }
         if let Some((allow, delay_until, looking)) = fire_dbg {
             let line = FireLog {

@@ -1,11 +1,9 @@
-//! sim's own entity helpers: link bounds, parent links, the corpse's copy
-//! of a player's anims, and grenade and missile trajectories, on BO2's
-//! types (`entity_t6`).
+//! sim's own entity helpers: link bounds, parent links, and grenade and
+//! missile trajectories, on BO2's types (`entity_t6`).
 
 use entity_t6::missile::{
     GRENADE_APOS_PITCH_OFFSET, LAND_EASE_PITCH_DEG, LAND_KEEP_PITCH_DEG, LAND_WALL_NORMAL_Z,
 };
-use entity_t6::tag_link::DObjAnimMat;
 use entity_t6::trajectory::tr_type;
 use entity_t6::{EntityState, Trajectory, evaluate_trajectory};
 use game_math::{angle_normalize_360, angle_subtract, pitch_for_yaw_on_normal, vect_to_angles};
@@ -62,18 +60,6 @@ pub fn parent_link_pose(es: &mut EntityState, origin: [f32; 3], angles: [f32; 3]
     es.lerp.apos.tr_type = tr_type::INTERPOLATE;
 }
 
-pub fn parent_link_world_from_tag(
-    parent_origin: [f32; 3],
-    parent_angles: [f32; 3],
-    mat: DObjAnimMat,
-) -> ([f32; 3], [f32; 3]) {
-    let parent_axis = game_math::angles_to_axis(parent_angles);
-    let bone_axis = mat.axis();
-    let world_axis = game_math::matrix_multiply(bone_axis, parent_axis);
-    let world_origin = game_math::matrix_transform_vector43(mat.trans, parent_axis, parent_origin);
-    (world_origin, game_math::axis_to_angles(world_axis))
-}
-
 pub fn parent_link_apply_local(
     world_origin: [f32; 3],
     world_angles: [f32; 3],
@@ -86,28 +72,6 @@ pub fn parent_link_apply_local(
     (origin, game_math::axis_to_angles(axis))
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CorpseInfoPlayerAnimCopy {
-    pub legs_anim: i32,
-
-    pub torso_anim: i32,
-
-    pub torso_pitch: u32,
-
-    pub waist_pitch: u32,
-}
-
-pub fn slot_for_entnum(entnums: &[i32], s_number: i32) -> usize {
-    let mut i = 0;
-    while i < entnums.len() {
-        if entnums[i] == s_number {
-            return i;
-        }
-        i += 1;
-    }
-    0
-}
-
 pub fn entnum_matched(entnums: &[i32], s_number: i32) -> bool {
     let mut i = 0;
     while i < entnums.len() {
@@ -117,13 +81,6 @@ pub fn entnum_matched(entnums: &[i32], s_number: i32) -> bool {
         i += 1;
     }
     false
-}
-
-pub fn copy_player_anims(
-    server_dobj: bool,
-    src: CorpseInfoPlayerAnimCopy,
-) -> Option<CorpseInfoPlayerAnimCopy> {
-    if server_dobj { Some(src) } else { None }
 }
 
 /// `G_FireGrenade`'s launch: the stored velocity is cut to whole units.

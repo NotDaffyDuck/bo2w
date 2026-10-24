@@ -214,7 +214,7 @@ mod tests {
     fn menu_and_frontend_refuse_what_they_do_not_know() {
         assert!(mode("menu now").unwrap_err().contains("menu"));
         assert!(mode("frontend").unwrap_err().contains("frontend t6mp"));
-        assert!(mode("frontend iw4").unwrap_err().contains("frontend t6mp"));
+        assert!(mode("frontend other").unwrap_err().contains("frontend t6mp"));
         assert!(
             mode("frontend t6mp extra")
                 .unwrap_err()

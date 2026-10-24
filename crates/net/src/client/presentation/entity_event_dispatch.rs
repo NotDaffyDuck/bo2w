@@ -12,7 +12,7 @@ use crate::client::input::ClientActionInput;
 use crate::client::presentation::centity_runtime::CEntityRuntime;
 use crate::client::presentation::entity_event_registry::{EntityEventDispatch, ev_dispatch_row};
 use crate::client::presentation::presented::LocalPresentClient;
-use crate::client::runtime::{LastAdoptedSnapshot, PendingPresentedEntityEvents};
+use crate::client::drive::{LastAdoptedSnapshot, PendingPresentedEntityEvents};
 use crate::gaps::{NetGapCause, NetIdentityGaps};
 use crate::schedule::ClientSet;
 
@@ -569,10 +569,10 @@ fn set_ads_from_reset(
 fn switch_when_out_of_ammo(
     sound: On<net::EntityEventSound>,
     local: Res<LocalPresentClient>,
-    prediction: Option<Res<crate::client::runtime::ClientPredictionState>>,
+    prediction: Option<Res<crate::client::drive::ClientPredictionState>>,
     view: Option<Res<frame::ViewSubject>>,
     clock: Option<Res<crate::client::frame_clock::FrameClock>>,
-    select: Option<ResMut<crate::client::runtime::WeaponSelect>>,
+    select: Option<ResMut<crate::client::drive::WeaponSelect>>,
     mut input: ResMut<ClientActionInput>,
 ) {
     let event = &(*sound).event;

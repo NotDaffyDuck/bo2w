@@ -153,7 +153,7 @@ struct Thrown {
 /// Something to grab or punt, and how far.
 enum Aim {
     Body(GuestZombie, f32),
-    Zombie(GuestZombie, f32),
+    Zombie(GuestZombie),
 }
 
 #[derive(Default)]
@@ -296,7 +296,7 @@ impl GravPlay {
             }
             if d < best_d {
                 best_d = d;
-                best = Some(if z.alive { Aim::Zombie(*z, d) } else { Aim::Body(*z, d) });
+                best = Some(if z.alive { Aim::Zombie(*z) } else { Aim::Body(*z, d) });
             }
         }
         best
@@ -312,7 +312,7 @@ impl GravPlay {
                 self.held = Some((z.ent, z.wire));
                 self.body_missing = 0.0;
             }
-            Aim::Zombie(z, _) => {
+            Aim::Zombie(z) => {
                 // The Super one's grab kills it, then holds the body.
                 let damage = sim::guest::zombie_health() * 20;
                 hit(z.ent, damage, f.eye + f.look * B, f.look, Vec3::new(0.0, 0.0, 40.0));
@@ -336,7 +336,7 @@ impl GravPlay {
         }
         // Nothing held: a punt on what it points at.
         let look = autoaim_look(f.eye, f.look, aim.map(|a| match a {
-            Aim::Body(z, _) | Aim::Zombie(z, _) => z.ent,
+            Aim::Body(z, _) | Aim::Zombie(z) => z.ent,
         }), zombies);
         match aim {
             Some(Aim::Body(z, d)) if *d <= RANGE || upgraded => {
@@ -345,7 +345,7 @@ impl GravPlay {
                 self.thrown.push(Thrown { ent: z.ent, wire: z.wire, age: 0.0, upgraded, struck: Vec::new(), last: None });
                 Action::Fire
             }
-            Some(Aim::Zombie(z, _)) => {
+            Some(Aim::Zombie(z)) => {
                 // It hits as a thing thrown at the punt's speed would (Half-
                 // Life 2's impact table, 500); one it kills flies off as a
                 // body that knocks down others. The Super one kills any.

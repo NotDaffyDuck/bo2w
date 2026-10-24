@@ -1,15 +1,35 @@
+//! What kind of process this is, which screen it is on, and the identity of
+//! the match it is in. The match keys, lifecycle messages, class loadout
+//! types and view state live in submodules and are re-exported from here.
+
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use bevy::prelude::*;
 
+mod keys;
+mod lifecycle;
+mod loadout;
+mod view;
+
+pub use keys::{AdmissionKey, LocalLoadKey, MatchKey, WorldGeneration, WorldProducts};
+pub use lifecycle::{
+    LifeEndCause, LifeEnded, LifeStartReason, LifeStarted, MapLoadApproved, MapLoadFailed,
+    MatchInstalled, MatchTornDown, ReturnedToMenu, TeardownReason,
+};
+pub use loadout::{CacWeaponOffer, ClassSelectHandoff, HostClassLoadouts, HostClassSlot};
+pub use view::{BotNavigationReady, HudInputView, UiCamera, ViewSubject};
+
+/// Which halves of the engine this process runs.
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeRole {
+    /// A player hosting a match they also play in.
     Listen,
-
+    /// A server with no local player.
     Dedicated,
-
+    /// A player connected to someone else's match.
     Client,
-
+    /// Playback of a recorded match.
     Replay,
 }
 
@@ -23,16 +43,24 @@ impl RuntimeRole {
     }
 }
 
+/// A run with no window, no graphics device and no sound device: the server,
+/// its scripts, the bots and the client's game logic all run, nothing is drawn
+/// or heard.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Headless;
 
 impl Headless {
-    /// BO2MP_HEADLESS=1: a test run with no window, no graphics device and no
-    /// sound device. The server, its scripts, the bots and the client's game
-    /// logic all run; nothing is drawn or heard. Read once.
+    const ENV: &'static str = "BO2MP_HEADLESS";
+
+    /// Whether the environment asks for a headless run (`BO2MP_HEADLESS=1`).
+    /// Read once; later changes to the environment are not seen.
     pub fn requested() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("BO2MP_HEADLESS").is_ok_and(|v| v == "1"))
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| Self::enabled_by(std::env::var(Self::ENV).ok().as_deref()))
+    }
+
+    fn enabled_by(value: Option<&str>) -> bool {
+        value == Some("1")
     }
 }
 
@@ -41,11 +69,11 @@ pub enum AppScreen {
     #[default]
     MainMenu,
     Loading,
-
     ClassSelect,
     InGame,
 }
 
+/// Whether the UI is drawn this frame. On unless something turns it off.
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UiDraw(pub bool);
 
@@ -55,6 +83,7 @@ impl Default for UiDraw {
     }
 }
 
+/// How this process was launched.
 #[derive(Resource, Clone, Debug, Default)]
 pub struct LaunchIdentity {
     pub role_label: String,
@@ -63,25 +92,25 @@ pub struct LaunchIdentity {
     pub zone: String,
 }
 
+/// What the last map-load attempt found, for the diagnostics screen.
 #[derive(Resource, Clone, Debug)]
 pub struct LaunchReport {
     pub zone: String,
     pub common_mp: Result<PathBuf, String>,
     pub zone_ff: Result<PathBuf, String>,
-
     pub zone_alias: Option<String>,
     pub sim_gap: &'static str,
-
     pub prediction_metrics: Option<String>,
     pub world_report: Vec<String>,
 }
 
 impl Default for LaunchReport {
     fn default() -> Self {
+        let not_requested = || Err("not requested".to_owned());
         Self {
             zone: String::new(),
-            common_mp: Err("not requested".into()),
-            zone_ff: Err("not requested".into()),
+            common_mp: not_requested(),
+            zone_ff: not_requested(),
             zone_alias: None,
             sim_gap: "no map load yet",
             prediction_metrics: None,
@@ -90,287 +119,82 @@ impl Default for LaunchReport {
     }
 }
 
+/// Whether a loaded world is installed.
 #[derive(Resource, Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct HasWorld(pub bool);
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CacWeaponOffer {
-    pub key: String,
-    pub item_group: Option<String>,
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub attachments: Vec<String>,
-}
-
-impl From<String> for CacWeaponOffer {
-    fn from(key: String) -> Self {
-        Self {
-            key,
-            item_group: None,
-            attachments: Vec::new(),
-        }
-    }
-}
-
-impl From<&str> for CacWeaponOffer {
-    fn from(key: &str) -> Self {
-        Self {
-            key: key.to_owned(),
-            item_group: None,
-            attachments: Vec::new(),
-        }
-    }
-}
-
-#[derive(Resource, Clone, Debug, Default)]
-pub struct ClassSelectHandoff {
-    pub pending: bool,
-    pub primary: Vec<CacWeaponOffer>,
-    pub secondary: Vec<CacWeaponOffer>,
-    pub lethal: Vec<CacWeaponOffer>,
-    pub tactical: Vec<CacWeaponOffer>,
-    pub excluded: Vec<(String, String)>,
-    pub lock_reasons: Vec<Option<String>>,
-}
-
-#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct WorldGeneration(pub Option<u64>);
-
-impl WorldGeneration {
-    pub fn from_install(request_id: u64) -> Self {
-        Self(Some(request_id))
-    }
-}
-
-#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct WorldProducts(pub Option<u64>);
-
-impl WorldProducts {
-    pub fn from_walk(products_id: u64) -> Self {
-        Self((products_id != 0).then_some(products_id))
+    #[test]
+    fn authority_runs_on_listen_and_dedicated_only() {
+        let runs: Vec<bool> = [
+            RuntimeRole::Listen,
+            RuntimeRole::Dedicated,
+            RuntimeRole::Client,
+            RuntimeRole::Replay,
+        ]
+        .map(RuntimeRole::runs_authority)
+        .into();
+        assert_eq!(runs, [true, true, false, false]);
     }
 
-    pub fn same_as(self, other: Self) -> bool {
-        self.0.is_some() && self == other
+    #[test]
+    fn the_client_half_runs_everywhere_but_on_a_dedicated_server() {
+        let runs: Vec<bool> = [
+            RuntimeRole::Listen,
+            RuntimeRole::Dedicated,
+            RuntimeRole::Client,
+            RuntimeRole::Replay,
+        ]
+        .map(RuntimeRole::runs_client)
+        .into();
+        assert_eq!(runs, [true, false, true, true]);
     }
-}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct MatchKey {
-    pub session_id: [u8; 16],
-    pub match_epoch: u32,
-}
-
-impl MatchKey {
-    pub const NONE: Self = Self {
-        session_id: [0; 16],
-        match_epoch: 0,
-    };
-
-    pub fn new(session_id: [u8; 16], match_epoch: u32) -> Self {
-        Self {
-            session_id,
-            match_epoch,
+    #[test]
+    fn every_role_runs_at_least_one_half() {
+        for role in [
+            RuntimeRole::Listen,
+            RuntimeRole::Dedicated,
+            RuntimeRole::Client,
+            RuntimeRole::Replay,
+        ] {
+            assert!(role.runs_authority() || role.runs_client(), "{role:?}");
         }
     }
 
-    pub fn is_none(self) -> bool {
-        self.match_epoch == 0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct LocalLoadKey {
-    pub incarnation: u64,
-    pub match_key: MatchKey,
-    pub local_load_request_id: u64,
-}
-
-impl LocalLoadKey {
-    pub fn from_request(request_id: u64, match_key: MatchKey, incarnation: u64) -> Self {
-        Self {
-            incarnation,
-            match_key,
-            local_load_request_id: request_id,
+    #[test]
+    fn only_the_value_one_asks_for_a_headless_run() {
+        assert!(Headless::enabled_by(Some("1")));
+        for other in [None, Some(""), Some("0"), Some("true"), Some("11"), Some(" 1")] {
+            assert!(!Headless::enabled_by(other), "{other:?}");
         }
     }
 
-    pub fn belongs_to(self, match_key: MatchKey) -> bool {
-        !match_key.is_none() && self.match_key == match_key
+    #[test]
+    fn the_app_starts_on_the_main_menu_with_the_ui_drawn() {
+        assert_eq!(AppScreen::default(), AppScreen::MainMenu);
+        assert_eq!(UiDraw::default(), UiDraw(true));
+        assert_eq!(HasWorld::default(), HasWorld(false));
     }
 
-    pub fn matches_completion(self, other: Self) -> bool {
-        self == other
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct AdmissionKey {
-    pub match_key: MatchKey,
-    pub member_id: [u8; 16],
-    pub connection_id: u64,
-    pub bootstrap_id: u32,
-}
-
-#[derive(Message, Clone, Debug, PartialEq, Eq)]
-pub struct MatchInstalled {
-    pub request_id: u64,
-
-    pub load_key: LocalLoadKey,
-
-    pub zone: String,
-
-    pub spawn_count: usize,
-}
-
-#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MatchTornDown {
-    pub reason: TeardownReason,
-
-    pub world_generation: WorldGeneration,
-
-    pub match_key: MatchKey,
-
-    pub match_epoch: u32,
-}
-
-#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReturnedToMenu {
-    pub swap_id: u64,
-
-    pub had_world: bool,
-}
-
-#[derive(Message, Clone, Debug, PartialEq, Eq)]
-pub struct MapLoadApproved {
-    pub request_id: u64,
-    pub load_key: LocalLoadKey,
-    pub zone: String,
-}
-
-#[derive(Message, Clone, Debug, PartialEq, Eq)]
-pub struct MapLoadFailed {
-    pub request_id: u64,
-    pub load_key: LocalLoadKey,
-    pub zone: String,
-    pub error: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TeardownReason {
-    Disconnect,
-
-    Replaced,
-
-    MatchEnded,
-}
-
-impl TeardownReason {
-    pub fn keeps_session(self) -> bool {
-        matches!(self, TeardownReason::Replaced | TeardownReason::MatchEnded)
+    #[test]
+    fn a_fresh_launch_report_says_nothing_was_requested() {
+        let report = LaunchReport::default();
+        assert_eq!(report.common_mp, Err("not requested".to_owned()));
+        assert_eq!(report.zone_ff, Err("not requested".to_owned()));
+        assert_eq!(report.sim_gap, "no map load yet");
+        assert!(report.zone.is_empty() && report.zone_alias.is_none());
+        assert!(report.prediction_metrics.is_none() && report.world_report.is_empty());
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            TeardownReason::Disconnect => "Disconnect",
-            TeardownReason::Replaced => "Replaced",
-            TeardownReason::MatchEnded => "MatchEnded",
-        }
+    #[test]
+    fn a_fresh_launch_identity_is_blank() {
+        let identity = LaunchIdentity::default();
+        assert!(identity.role_label.is_empty() && identity.zone.is_empty());
+        assert!(identity.games_root.as_os_str().is_empty());
+        assert!(identity.artifacts.as_os_str().is_empty());
     }
 }
-
-#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LifeStarted {
-    pub client: u32,
-    pub life: u32,
-    pub reason: LifeStartReason,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LifeStartReason {
-    BecameAlive,
-}
-
-#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LifeEnded {
-    pub client: u32,
-    pub life: u32,
-    pub cause: LifeEndCause,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LifeEndCause {
-    LeftAlive,
-
-    Replaced,
-
-    Dropped,
-}
-
-#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum ViewSubject {
-    #[default]
-    None,
-    Own {
-        client: u32,
-    },
-    Seat {
-        viewer: u32,
-        focus: Option<u32>,
-    },
-}
-
-impl ViewSubject {
-    pub fn in_killcam(self) -> bool {
-        matches!(self, Self::Seat { .. })
-    }
-}
-
-#[derive(Resource, Clone, Debug, PartialEq, Eq)]
-pub struct HostClassLoadouts {
-    pub slots: Vec<HostClassSlot>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostClassSlot {
-    pub name: String,
-    pub primary: String,
-    pub primary_attachments: Vec<String>,
-    pub secondary: String,
-    pub secondary_attachments: Vec<String>,
-    pub lethal: String,
-    pub tactical: String,
-    pub perks: [String; 3],
-
-    pub deathstreak: String,
-}
-
-impl Default for HostClassLoadouts {
-    fn default() -> Self {
-        Self {
-            slots: crate::showcase_classes()
-                .iter()
-                .take(5)
-                .map(HostClassSlot::from)
-                .collect(),
-        }
-    }
-}
-
-#[derive(Resource, Clone, Debug, Default)]
-pub struct HudInputView {
-    pub use_key: Option<String>,
-    pub binding_keys: std::collections::BTreeMap<String, String>,
-    /// bo2zm M4: every key each command is bound to, in key order (BO2's
-    /// bind rows show a first and a second key).
-    pub binding_keys_all: std::collections::BTreeMap<String, Vec<String>>,
-    pub console_open: bool,
-    pub script_menu_open: bool,
-    pub action_slot_keys: [Option<String>; 4],
-}
-
-/// Authority navigation is prepared while the loading screen is still active.
-#[derive(bevy::prelude::Resource, Default)]
-pub struct BotNavigationReady(pub bool);
-
-#[derive(Component)]
-pub struct UiCamera;

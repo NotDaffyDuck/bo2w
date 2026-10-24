@@ -1,3 +1,7 @@
+//! The render frontend: everything the game builds each frame for the
+//! renderer to draw. It packs draw-surface lists, queues worker commands and
+//! tracks what occupies the scene, but never touches the GPU.
+
 extern crate self as render_frontend;
 
 pub mod adapters;
@@ -8,11 +12,14 @@ pub use adapters::RenderAdaptersPlugin;
 pub use assemble::RenderAssemblePlugin;
 pub use prepare::RenderPreparePlugin;
 
+// Draw-surface lists and their packing.
 pub use assemble::drawsurf::*;
 pub use assemble::pack::{
     HOST_XMODEL_RIGID_TESS_INFO_PACKED_ARM, PackDraw, PackKind, pack_spot_shadow_frontend,
     pack_sun_shadow_frontend,
 };
+
+// The scene's occupancy: what is placed where, under which caps.
 pub use prepare::gfx_scene::{
     AddBModelArgs, AddBModelPose, AddDObjArgs, AddDObjPose, GfxScene, GfxSceneBrush, GfxSceneDobj,
     GfxSceneModel, SCENE_BRUSH_CAP, SCENE_DOBJ_CAP, SCENE_GFX_ENT_CAP, SCENE_INDEX_EMPTY,
@@ -20,7 +27,11 @@ pub use prepare::gfx_scene::{
     SceneAddError, SceneAddKind, SceneEntSkinnedSurfs, pack_scene_info, scene_info_entnum,
 };
 pub use prepare::scene::world::*;
+
+// Sun shadows.
 pub use prepare::sun::{add_bsp_sun_shadow_partition, pack_sun_shadow_caster_lists};
+
+// The worker-command rings.
 pub use prepare::worker_cmds::{
     AddWorkerCmd, BoundEntWorkerCmd, CellFrustumWorkerCmd, DpvsEntWorkerCmd,
     SkinCachedStaticModelCmd, SpotShadowEntWorkerCmd, WORKER_CMD_BOUND_ENT, WORKER_CMD_BUSY,

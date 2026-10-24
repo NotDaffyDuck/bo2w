@@ -20,7 +20,7 @@ use super::quic::{IO_DEADLINE, within_deadline, write_control};
 use crate::session_core::HostMatchEvent;
 use crate::transport::bootstrap::{BootstrapLane, BootstrapMessage, decode_bootstrap};
 use crate::transport::fragment::{Fragmenter, Reassembler};
-use crate::transport::udp_session::RelayMailbox;
+use crate::transport::relay::RelayMailbox;
 
 /// One relayed game packet is at most the game's own packet size.
 pub(super) const RELAY_PACKET_BYTES: usize = crate::transport::protocol::MAX_PACKET_BYTES as usize;

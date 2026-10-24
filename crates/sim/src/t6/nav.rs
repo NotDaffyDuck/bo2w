@@ -8,9 +8,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use super::{T6PathNode, T6PathTables};
 
-pub(crate) const NODE_PATH: u32 = 1;
 pub(crate) const NODE_NEGOTIATION_BEGIN: u32 = 17;
-pub(crate) const NODE_NEGOTIATION_END: u32 = 18;
 
 /// BO2's names for the node kinds (by kind), as the scripts read
 /// `node.type`.
@@ -48,7 +46,6 @@ const CELL: f32 = 256.0;
 pub(crate) struct Nav {
     pub nodes: Vec<T6PathNode>,
     grid: HashMap<(i32, i32), Vec<u32>>,
-    pub by_targetname: HashMap<String, Vec<u32>>,
     /// Links an entity's `disconnectpaths` cut (a closed door, a debris
     /// pile), by entity, until its `connectpaths`; both directions.
     cut_by: HashMap<u32, Vec<(u32, u32)>>,
@@ -194,20 +191,12 @@ fn cell(p: [f32; 3]) -> (i32, i32) {
 impl Nav {
     pub(crate) fn new(nodes: Vec<T6PathNode>) -> Self {
         let mut grid: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
-        let mut by_targetname: HashMap<String, Vec<u32>> = HashMap::new();
         for (i, n) in nodes.iter().enumerate() {
             grid.entry(cell(n.origin)).or_default().push(i as u32);
-            if !n.targetname.is_empty() {
-                by_targetname
-                    .entry(n.targetname.clone())
-                    .or_default()
-                    .push(i as u32);
-            }
         }
         Self {
             nodes,
             grid,
-            by_targetname,
             ..Default::default()
         }
     }

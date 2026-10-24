@@ -21,7 +21,7 @@ use super::state::{
 use super::worker::{self, Errand};
 use crate::authority::runtime::AuthorityWorld;
 use crate::transport::protocol::{ContentFingerprint, HandshakeHello, MatchDescriptor};
-use crate::transport::udp_session::{UdpAuthorityHub, UdpClientLink};
+use crate::transport::relay::{UdpAuthorityHub, UdpClientLink};
 
 /// Set by the test harness: the link writes its state here on every change.
 const STATUS_FILE: &str = "BO2MP_MASTER_STATUS_FILE";

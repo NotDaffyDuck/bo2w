@@ -1,40 +1,309 @@
+//! The third-person kit of a remote player: which models make up the body
+//! (body, head, held gun, gun attachments), prepared once per catalog set and
+//! looked up per frame.
+
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use asset_model::ModelSkel;
 use bevy::prelude::*;
-use dobj_t6::{RadiusModel, compute_radius};
+use xmodel_runtime::Attach;
 
+/// The LOD a model is submitted at, as a byte: negative when none was chosen
+/// (or it does not fit).
 pub fn occupy_lod_byte(lod: Option<u8>) -> i8 {
-    lod.and_then(|lod| i8::try_from(lod).ok()).unwrap_or(-1)
+    lod.map_or(-1, |lod| i8::try_from(lod).unwrap_or(-1))
 }
 
-pub fn kit_dobj_radius(radii: impl IntoIterator<Item = f32>) -> Option<f32> {
-    radii
-        .into_iter()
-        .fold(None::<f32>, |acc, r| Some(acc.map_or(r, |a| a.max(r))))
-}
-
+/// Where a kit model's skeleton is held: a body-catalog key or a position in
+/// the world-weapon catalog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KitSource<'a> {
     Body(&'a str),
     World(usize),
 }
 
+/// [`KitSource`] with the key owned, so a prepared kit can outlive the borrow
+/// it was assembled under.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum PreparedKitSource {
+enum HeldSource {
     Body(String),
     World(usize),
 }
 
+impl From<KitSource<'_>> for HeldSource {
+    fn from(source: KitSource<'_>) -> Self {
+        match source {
+            KitSource::Body(key) => Self::Body(key.to_owned()),
+            KitSource::World(index) => Self::World(index),
+        }
+    }
+}
+
+/// One model of a kit. `hide_tags` are the bone tags whose surfaces the kit
+/// hides (only the gun carries any).
+pub struct KitModel<'a> {
+    pub name: &'a str,
+    pub skel: &'a ModelSkel,
+    pub hide_tags: Vec<String>,
+    pub source: KitSource<'a>,
+}
+
+/// The part-hide bits a kit's models add up to, each model's bones numbered
+/// after the previous model's.
+pub fn kit_hide_part_bits(models: &[KitModel<'_>]) -> [u32; 5] {
+    let mut bits = [0u32; 5];
+    let mut first_bone = 0;
+    for model in models {
+        render_scene::hide_part_bits_from_tags(&mut bits, model.skel, first_bone, &model.hide_tags);
+        first_bone += model.skel.bones.len();
+    }
+    bits
+}
+
+/// A kit's models in DObj order, with the attachment each is bolted on by.
+struct AssembledKit<'a> {
+    models: Vec<KitModel<'a>>,
+    attaches: Vec<Option<Attach>>,
+    radius: Option<f32>,
+}
+
+impl<'a> AssembledKit<'a> {
+    fn push(
+        &mut self,
+        skel: &'a ModelSkel,
+        source: KitSource<'a>,
+        hide_tags: Vec<String>,
+        attach: Option<Attach>,
+    ) {
+        self.models.push(KitModel {
+            name: skel.name.as_str(),
+            skel,
+            hide_tags,
+            source,
+        });
+        self.attaches.push(attach);
+    }
+}
+
+/// Collects the models of the kit `axis` wears while holding `weapon`: the
+/// body, its head where the body has somewhere to put one, and the held
+/// weapon with its attachments where the body has a weapon tag. `None` when
+/// there is no usable body.
+fn assemble_kit<'a>(
+    bodies: &'a assets::PreparedBodies,
+    weapons: Option<&'a assets::PreparedWeapons>,
+    world_weapons: Option<&'a assets::PreparedWorldWeapons>,
+    axis: bool,
+    weapon: u32,
+    with_hide_tags: bool,
+) -> Option<AssembledKit<'a>> {
+    let kits = bodies.0.kits();
+    let kit = kits.kit(axis)?;
+    let body = bodies.0.get(&kit.body)?;
+    let body_skel = &body.skel;
+    if body_skel.positions.is_empty() || body_skel.bones.is_empty() || body_skel.pose.is_none() {
+        return None;
+    }
+    let mut out = AssembledKit {
+        models: Vec::new(),
+        attaches: Vec::new(),
+        radius: None,
+    };
+    out.push(
+        body_skel,
+        KitSource::Body(kit.body.as_str()),
+        Vec::new(),
+        None,
+    );
+
+    if let Some(name) = kit.head.as_deref() {
+        let head = bodies.0.get(name).filter(|entry| entry.skel.pose.is_some());
+        if let (Some(head), Some(tag)) = (
+            head,
+            xmodel_runtime::tp_head_attach_tag(&body_skel.bone_names),
+        ) {
+            let attach = Attach {
+                parent_model: 0,
+                tag: tag.into(),
+            };
+            out.push(&head.skel, KitSource::Body(name), Vec::new(), Some(attach));
+        }
+    }
+
+    if weapon != 0 {
+        if let (Some(weapons), Some(catalog)) = (weapons, world_weapons) {
+            add_held_gun(&mut out, body_skel, weapons, catalog, weapon, with_hide_tags);
+        }
+    }
+
+    out.radius = out
+        .models
+        .iter()
+        .filter_map(|model| model.skel.radius)
+        .reduce(f32::max);
+    Some(out)
+}
+
+/// The gun `weapon` shows in a remote player's hands, then its attachments.
+/// Nothing is added when the gun has no model, no pose, or the body no tag
+/// to hold it by.
+fn add_held_gun<'a>(
+    out: &mut AssembledKit<'a>,
+    body_skel: &ModelSkel,
+    weapons: &'a assets::PreparedWeapons,
+    catalog: &'a assets::PreparedWorldWeapons,
+    weapon: u32,
+    with_hide_tags: bool,
+) {
+    let registry = &weapons.0;
+    let Some(gun_index) = registry
+        .world_model_edge_of(weapon)
+        .and_then(|edge| edge.bound_index())
+    else {
+        return;
+    };
+    let Some(gun) = registry.world_model_entry(weapon, &catalog.0) else {
+        return;
+    };
+    let Some(tag) = xmodel_runtime::tp_weapon_attach_tag(&body_skel.bone_names) else {
+        return;
+    };
+    if gun.skel.pose.is_none() {
+        return;
+    }
+    let hide_tags = if with_hide_tags {
+        asset_game::effective_hide_tags(registry, weapon)
+    } else {
+        Vec::new()
+    };
+    let gun_model = out.models.len();
+    let attach = Attach {
+        parent_model: 0,
+        tag: tag.into(),
+    };
+    out.push(&gun.skel, KitSource::World(gun_index), hide_tags, Some(attach));
+    for attachment in world_attachments(registry, &catalog.0, weapon) {
+        let attach = Attach {
+            parent_model: gun_model,
+            tag: attachment.tag.into(),
+        };
+        out.push(
+            &attachment.entry.skel,
+            KitSource::World(attachment.index.order()),
+            Vec::new(),
+            Some(attach),
+        );
+    }
+}
+
+/// The kit's models and radius for `axis` holding `weapon`, assembled on the
+/// spot (the slow path when no [`PreparedRemoteKits`] is current).
+pub fn occupy_remote_kit_dobj<'a>(
+    bodies: &'a assets::PreparedBodies,
+    weapons: Option<&'a assets::PreparedWeapons>,
+    world_weapons: Option<&'a assets::PreparedWorldWeapons>,
+    axis: bool,
+    weapon: u32,
+    with_hide_tags: bool,
+) -> Option<(Vec<KitModel<'a>>, Option<f32>)> {
+    let kit = assemble_kit(bodies, weapons, world_weapons, axis, weapon, with_hide_tags)?;
+    Some((kit.models, kit.radius))
+}
+
+/// A world attachment of a weapon: its catalog entry and the tag of the gun
+/// it mounts on.
+pub(crate) struct WorldAttachment<'a> {
+    pub(crate) entry: &'a asset_model::WorldWeaponEntry,
+    pub(crate) index: assets::WorldWeaponIndex,
+    pub(crate) tag: String,
+}
+
+/// The attachments of `weapon` that have a world model with a pose and a
+/// mount tag. None when `catalog` is not the one the registry was built for.
+pub(crate) fn world_attachments<'a>(
+    registry: &asset_game::WeaponRegistry,
+    catalog: &'a asset_model::WorldWeaponCatalog,
+    weapon: u32,
+) -> Vec<WorldAttachment<'a>> {
+    if registry.world_catalog_identity() != catalog.identity() {
+        return Vec::new();
+    }
+    let edges = registry.attachment_world_model_edges_of(weapon);
+    let mounts = registry.attachment_world_mounts_of(weapon);
+    edges
+        .iter()
+        .zip(mounts)
+        .filter_map(|(edge, mount)| {
+            let order = edge.bound_index()?;
+            let entry = catalog.get_at(order)?;
+            entry.skel.pose.as_ref()?;
+            Some(WorldAttachment {
+                entry,
+                index: assets::WorldWeaponIndex::from_order(order),
+                tag: mount.clone()?,
+            })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Prepared kits
+// ---------------------------------------------------------------------------
+
+/// A kit assembled ahead of time: where its models are held, the numbers
+/// derived from them, and the DObj they make.
 pub struct PreparedRemoteKit {
-    sources: Vec<PreparedKitSource>,
+    sources: Vec<HeldSource>,
     pub radius: Option<f32>,
     pub hide_part_bits: [u32; 5],
-    pub dobj: Option<std::sync::Arc<xmodel_runtime::DObj>>,
+    pub dobj: Option<Arc<xmodel_runtime::DObj>>,
+    /// Bones for the muzzle flash, brass, knife and laser bolts.
     pub bolt_bones: [Option<u16>; 4],
     pub head_bone: Option<usize>,
 }
 
 impl PreparedRemoteKit {
+    fn assemble(
+        bodies: &assets::PreparedBodies,
+        weapons: &assets::PreparedWeapons,
+        world_weapons: &assets::PreparedWorldWeapons,
+        axis: bool,
+        weapon: u32,
+    ) -> Option<Self> {
+        let kit = assemble_kit(bodies, Some(weapons), Some(world_weapons), axis, weapon, true)?;
+        let sources = kit.models.iter().map(|m| m.source.into()).collect();
+        let hide_part_bits = kit_hide_part_bits(&kit.models);
+        let poses: Vec<_> = kit
+            .models
+            .iter()
+            .zip(kit.attaches)
+            .filter_map(|(model, attach)| Some((model.skel.pose.as_ref()?, attach)))
+            .collect();
+        let dobj = xmodel_runtime::DObj::build(&poses).ok().map(Arc::new);
+        let bone_of = |tag: &str| {
+            dobj.as_ref()
+                .and_then(|dobj| dobj.find(tag))
+                .and_then(|bone| u16::try_from(bone).ok())
+        };
+        Some(Self {
+            sources,
+            radius: kit.radius,
+            hide_part_bits,
+            bolt_bones: [
+                "tag_flash",
+                "tag_brass",
+                "tag_knife_fx",
+                fx_t6::FX_LASER_TAG,
+            ]
+            .map(bone_of),
+            head_bone: dobj.as_ref().and_then(|dobj| dobj.find("j_head")),
+            dobj,
+        })
+    }
+
+    /// The kit's models, looked up again in the catalogs. `None` if one has
+    /// gone from them.
     pub fn models<'a>(
         &'a self,
         bodies: &'a assets::PreparedBodies,
@@ -42,51 +311,50 @@ impl PreparedRemoteKit {
     ) -> Option<Vec<KitModel<'a>>> {
         self.sources
             .iter()
-            .map(|source| match source {
-                PreparedKitSource::Body(key) => {
-                    let entry = bodies.0.get(key)?;
-                    Some(KitModel {
-                        name: entry.skel.name.as_str(),
-                        skel: &entry.skel,
-                        hide_tags: Vec::new(),
-                        source: KitSource::Body(key.as_str()),
-                    })
-                }
-                PreparedKitSource::World(index) => {
-                    let entry = world.0.get_at(*index)?;
-                    Some(KitModel {
-                        name: entry.skel.name.as_str(),
-                        skel: &entry.skel,
-                        hide_tags: Vec::new(),
-                        source: KitSource::World(*index),
-                    })
-                }
+            .map(|held| {
+                let (skel, source): (&ModelSkel, KitSource<'a>) = match held {
+                    HeldSource::Body(key) => {
+                        (&bodies.0.get(key)?.skel, KitSource::Body(key.as_str()))
+                    }
+                    HeldSource::World(index) => {
+                        (&world.0.get_at(*index)?.skel, KitSource::World(*index))
+                    }
+                };
+                Some(KitModel {
+                    name: skel.name.as_str(),
+                    skel,
+                    hide_tags: Vec::new(),
+                    source,
+                })
             })
             .collect()
     }
 }
 
-#[derive(bevy::prelude::Resource, Default)]
+/// Every kit (both axes, every held weapon), prepared for one set of
+/// catalogs.
+#[derive(Resource, Default)]
 pub struct PreparedRemoteKits {
     owner: Option<(
-        std::sync::Arc<asset_model::BodyMeshCatalog>,
-        std::sync::Arc<asset_game::WeaponRegistry>,
+        Arc<asset_model::BodyMeshCatalog>,
+        Arc<asset_game::WeaponRegistry>,
         u64,
     )>,
-    kits: std::collections::HashMap<(bool, u32), PreparedRemoteKit>,
+    kits: HashMap<(bool, u32), PreparedRemoteKit>,
 }
 
 impl PreparedRemoteKits {
+    /// Whether these kits were prepared from exactly these catalogs.
     pub fn owned_by(
         &self,
         bodies: &assets::PreparedBodies,
         weapons: &assets::PreparedWeapons,
         world_weapons: &assets::PreparedWorldWeapons,
     ) -> bool {
-        self.owner.as_ref().is_some_and(|(b, w, catalog)| {
-            std::sync::Arc::ptr_eq(b, &bodies.0)
-                && std::sync::Arc::ptr_eq(w, &weapons.0)
-                && *catalog == world_weapons.0.identity()
+        self.owner.as_ref().is_some_and(|(b, w, world)| {
+            Arc::ptr_eq(b, &bodies.0)
+                && Arc::ptr_eq(w, &weapons.0)
+                && *world == world_weapons.0.identity()
         })
     }
 
@@ -99,58 +367,20 @@ impl PreparedRemoteKits {
         weapons: &assets::PreparedWeapons,
         world_weapons: &assets::PreparedWorldWeapons,
     ) -> Self {
-        let mut kits = std::collections::HashMap::new();
-        for axis in [false, true] {
-            for weapon in 0..=weapons.0.len() as u32 {
-                let Some((models, radius)) = occupy_remote_kit_dobj(
-                    bodies,
-                    Some(weapons),
-                    Some(world_weapons),
-                    axis,
-                    weapon,
-                    true,
-                ) else {
-                    continue;
-                };
-                let sources = models
-                    .iter()
-                    .map(|model| match model.source {
-                        KitSource::Body(key) => PreparedKitSource::Body(key.to_owned()),
-                        KitSource::World(index) => PreparedKitSource::World(index),
-                    })
-                    .collect();
-                let dobj =
-                    select_remote_models(bodies, Some(weapons), Some(world_weapons), axis, weapon)
-                        .ok()
-                        .and_then(|set| xmodel_runtime::DObj::build(&set.dobj_models).ok())
-                        .map(std::sync::Arc::new);
-                kits.insert(
-                    (axis, weapon),
-                    PreparedRemoteKit {
-                        sources,
-                        radius,
-                        hide_part_bits: kit_hide_part_bits(&models),
-                        bolt_bones: [
-                            "tag_flash",
-                            "tag_brass",
-                            "tag_knife_fx",
-                            fx_t6::FX_LASER_TAG,
-                        ]
-                        .map(|tag| {
-                            dobj.as_ref()
-                                .and_then(|dobj| dobj.find(tag))
-                                .and_then(|bone| u16::try_from(bone).ok())
-                        }),
-                        head_bone: dobj.as_ref().and_then(|dobj| dobj.find("j_head")),
-                        dobj,
-                    },
-                );
-            }
-        }
+        let weapon_count = weapons.0.len() as u32;
+        let kits = [false, true]
+            .into_iter()
+            .flat_map(|axis| (0..=weapon_count).map(move |weapon| (axis, weapon)))
+            .filter_map(|(axis, weapon)| {
+                let kit =
+                    PreparedRemoteKit::assemble(bodies, weapons, world_weapons, axis, weapon)?;
+                Some(((axis, weapon), kit))
+            })
+            .collect();
         Self {
             owner: Some((
-                std::sync::Arc::clone(&bodies.0),
-                std::sync::Arc::clone(&weapons.0),
+                Arc::clone(&bodies.0),
+                Arc::clone(&weapons.0),
                 world_weapons.0.identity(),
             )),
             kits,
@@ -158,295 +388,12 @@ impl PreparedRemoteKits {
     }
 }
 
-pub fn kit_hide_part_bits(models: &[KitModel<'_>]) -> [u32; 5] {
-    let mut bits = [0u32; 5];
-    let mut base = 0usize;
-    for model in models {
-        render_scene::hide_part_bits_from_tags(&mut bits, model.skel, base, &model.hide_tags);
-        base += model.skel.bones.len();
-    }
-    bits
-}
+// ---------------------------------------------------------------------------
+// Skinned submissions
+// ---------------------------------------------------------------------------
 
-pub struct KitModel<'a> {
-    pub name: &'a str,
-    pub skel: &'a asset_model::ModelSkel,
-    pub hide_tags: Vec<String>,
-    pub source: KitSource<'a>,
-}
-
-pub fn occupy_remote_kit_dobj<'a>(
-    bodies: &'a assets::PreparedBodies,
-    weapons: Option<&'a assets::PreparedWeapons>,
-    world_weapons: Option<&'a assets::PreparedWorldWeapons>,
-    axis: bool,
-    weapon: u32,
-    with_hide_tags: bool,
-) -> Option<(Vec<KitModel<'a>>, Option<f32>)> {
-    let kits = bodies.0.kits();
-    let kit = kits.kit(axis)?;
-    let body = bodies.0.get(&kit.body)?;
-    if body.skel.positions.is_empty() || body.skel.bones.is_empty() {
-        return None;
-    }
-    let _pose_src = body.skel.pose.as_ref()?;
-    let mut skels: Vec<KitModel<'a>> = vec![KitModel {
-        name: body.skel.name.as_str(),
-        skel: &body.skel,
-        hide_tags: Vec::new(),
-        source: KitSource::Body(kit.body.as_str()),
-    }];
-    if let Some(name) = kit.head.as_deref() {
-        if let Some(entry) = bodies.0.get(name) {
-            if let (Some(_head_pose), Some(_tag)) = (
-                entry.skel.pose.as_ref(),
-                xmodel_runtime::tp_head_attach_tag(&body.skel.bone_names),
-            ) {
-                skels.push(KitModel {
-                    name: entry.skel.name.as_str(),
-                    skel: &entry.skel,
-                    hide_tags: Vec::new(),
-                    source: KitSource::Body(name),
-                });
-            }
-        }
-    }
-    if weapon != 0 {
-        if let (Some(registry), Some(catalog)) = (weapons, world_weapons) {
-            let gun_index = registry
-                .0
-                .world_model_edge_of(weapon)
-                .and_then(|edge| edge.bound_index());
-            if let (Some(entry), Some(gun_index)) =
-                (registry.0.world_model_entry(weapon, &catalog.0), gun_index)
-            {
-                if let (Some(_gun_pose), Some(_tag)) = (
-                    entry.skel.pose.as_ref(),
-                    xmodel_runtime::tp_weapon_attach_tag(&body.skel.bone_names),
-                ) {
-                    skels.push(KitModel {
-                        name: entry.skel.name.as_str(),
-                        skel: &entry.skel,
-                        hide_tags: weapons
-                            .filter(|_| with_hide_tags)
-                            .map(|registry| asset_game::effective_hide_tags(&registry.0, weapon))
-                            .unwrap_or_else(Vec::new),
-                        source: KitSource::World(gun_index),
-                    });
-                    for attachment in world_attachments(&registry.0, &catalog.0, weapon) {
-                        skels.push(KitModel {
-                            name: attachment.entry.skel.name.as_str(),
-                            skel: &attachment.entry.skel,
-                            hide_tags: Vec::new(),
-                            source: KitSource::World(attachment.index.order()),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    let radius = kit_dobj_radius(skels.iter().filter_map(|model| model.skel.radius));
-    Some((skels, radius))
-}
-
-pub struct RemoteModelSet<'a> {
-    pub body_name: String,
-    pub head_name: String,
-    pub body: &'a asset_model::BodyMeshEntry,
-    pub head: Option<&'a asset_model::BodyMeshEntry>,
-    pub gun: Option<&'a asset_model::WorldWeaponEntry>,
-
-    pub world_gun_gap: Option<WorldGunGap>,
-    pub dobj_models: Vec<(&'a xmodel_runtime::ModelPoseSrc, Option<xmodel_runtime::Attach>)>,
-    pub gun_model_index: usize,
-    pub attachments: Vec<(&'a asset_model::WorldWeaponEntry, usize)>,
-}
-
-pub(crate) struct WorldAttachment<'a> {
-    pub(crate) entry: &'a asset_model::WorldWeaponEntry,
-    pub(crate) index: assets::WorldWeaponIndex,
-    pub(crate) tag: String,
-}
-
-pub(crate) fn world_attachments<'a>(
-    registry: &asset_game::WeaponRegistry,
-    catalog: &'a asset_model::WorldWeaponCatalog,
-    weapon: u32,
-) -> Vec<WorldAttachment<'a>> {
-    if registry.world_catalog_identity() != catalog.identity() {
-        return Vec::new();
-    }
-    registry
-        .attachment_world_model_edges_of(weapon)
-        .iter()
-        .zip(registry.attachment_world_mounts_of(weapon))
-        .filter_map(|(edge, tag)| {
-            let index = edge.bound_index()?;
-            let entry = catalog.get_at(index)?;
-            entry.skel.pose.as_ref()?;
-            let tag = tag.as_ref()?;
-            Some(WorldAttachment {
-                entry,
-                index: assets::WorldWeaponIndex::from_order(index),
-                tag: tag.clone(),
-            })
-        })
-        .collect()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorldGunGap {
-    pub weapon: u32,
-
-    pub world_model: String,
-}
-
-pub fn select_remote_models<'a>(
-    bodies: &'a assets::PreparedBodies,
-    weapons: Option<&assets::PreparedWeapons>,
-    world_weapons: Option<&'a assets::PreparedWorldWeapons>,
-    axis: bool,
-    weapon: u32,
-) -> Result<RemoteModelSet<'a>, String> {
-    let kits = bodies.0.kits();
-    let kit = kits
-        .kit(axis)
-        .ok_or_else(|| "no third-person kit".to_string())?;
-    let body = bodies
-        .0
-        .get(&kit.body)
-        .ok_or_else(|| format!("body `{}` missing from catalog", kit.body))?;
-    let pose_src = body
-        .skel
-        .pose
-        .as_ref()
-        .ok_or_else(|| format!("body `{}` has no ModelPoseSrc", kit.body))?;
-
-    let mut dobj_models = vec![(pose_src, None)];
-    let head = match kit.head.as_deref() {
-        None => None,
-        Some(name) => {
-            let entry = bodies
-                .0
-                .get(name)
-                .ok_or_else(|| format!("head `{name}` missing from catalog"))?;
-            let head_pose = entry
-                .skel
-                .pose
-                .as_ref()
-                .ok_or_else(|| format!("head `{name}` has no ModelPoseSrc"))?;
-            let tag = xmodel_runtime::tp_head_attach_tag(&body.skel.bone_names).ok_or_else(|| {
-                format!(
-                    "body `{}` has no {}; refusing a headless DObj for `{name}`",
-                    kit.body,
-                    xmodel_runtime::TP_HEAD_ATTACH_TAG
-                )
-            })?;
-            dobj_models.push((
-                head_pose,
-                Some(xmodel_runtime::Attach {
-                    parent_model: 0,
-                    tag: tag.into(),
-                }),
-            ));
-            Some(entry)
-        }
-    };
-    let gun_model_index = dobj_models.len();
-
-    let mut world_gun_gap = None;
-    let mut attachments = Vec::new();
-    let gun = match weapon {
-        0 => None,
-        index => {
-            let registry = weapons
-                .ok_or_else(|| format!("weapon {index} held but PreparedWeapons not installed"))?;
-            let catalog = world_weapons.ok_or_else(|| {
-                format!(
-                    "weapon {index} worldModel requested but PreparedWorldWeapons not installed"
-                )
-            })?;
-            let leftover = registry.0.world_model_of(index).unwrap_or("<none>");
-            let mut refuse_gun = |world_model: &str| -> Option<&'a asset_model::WorldWeaponEntry> {
-                world_gun_gap = Some(WorldGunGap {
-                    weapon: index,
-                    world_model: world_model.to_owned(),
-                });
-                None
-            };
-            match registry.0.world_model_entry(index, &catalog.0) {
-                None => refuse_gun(leftover),
-                Some(entry) => {
-                    let name = entry.skel.name.as_str();
-                    let gun_pose = entry
-                        .skel
-                        .pose
-                        .as_ref()
-                        .ok_or_else(|| format!("world gun `{name}` has no ModelPoseSrc"))?;
-                    match xmodel_runtime::tp_weapon_attach_tag(&body.skel.bone_names) {
-                        None => refuse_gun(name),
-                        Some(tag) => {
-                            dobj_models.push((
-                                gun_pose,
-                                Some(xmodel_runtime::Attach {
-                                    parent_model: 0,
-                                    tag: tag.into(),
-                                }),
-                            ));
-                            for attachment in world_attachments(&registry.0, &catalog.0, index) {
-                                let Some(pose) = attachment.entry.skel.pose.as_ref() else {
-                                    continue;
-                                };
-                                attachments.push((attachment.entry, dobj_models.len()));
-                                dobj_models.push((
-                                    pose,
-                                    Some(xmodel_runtime::Attach {
-                                        parent_model: gun_model_index,
-                                        tag: attachment.tag.into(),
-                                    }),
-                                ));
-                            }
-                            Some(entry)
-                        }
-                    }
-                }
-            }
-        }
-    };
-    Ok(RemoteModelSet {
-        body_name: kit.body.clone(),
-        head_name: kit.head.clone().unwrap_or_default(),
-        body,
-        head,
-        gun,
-        world_gun_gap,
-        dobj_models,
-        gun_model_index,
-        attachments,
-    })
-}
-
-/// The DObj radius of a remote body (`DObjComputeBounds`): the body, the
-/// head on no bone, the gun on the body's weapon tag. No body radius: none.
-// TODO(remote-head-attach): BO2 attaches the head with an empty tag; whether
-// that adds a bone offset is not in the facts (QUESTIONS.md), so it adds none.
-pub fn dobj_radius(
-    body: &asset_model::BodyMeshEntry,
-    head: Option<&asset_model::BodyMeshEntry>,
-    gun: Option<&asset_model::WorldWeaponEntry>,
-) -> Option<f32> {
-    let mut models = vec![RadiusModel::unattached(body.skel.radius?)];
-    if let Some(radius) = head.and_then(|head| head.skel.radius) {
-        models.push(RadiusModel::unattached(radius));
-    }
-    if let Some(radius) = gun.and_then(|gun| gun.skel.radius) {
-        let tag = xmodel_runtime::tp_weapon_attach_tag(&body.skel.bone_names).unwrap_or("tag_weapon_right");
-        models.push(RadiusModel { radius, attach: crate::attach_bone(&body.skel, tag) });
-    }
-    Some(compute_radius(&models, &crate::base_trans(&body.skel)))
-}
-
+/// A remote body's CPU-skinned geometry: packed vertices, triangle list and
+/// the surfaces cut from it.
 #[derive(Clone, Default)]
 pub struct CpuBodyGeom {
     pub packed: Vec<[u8; asset_t6::T6_PACKED_VERTEX]>,
@@ -462,6 +409,7 @@ pub struct CpuSurfMeta {
     pub name: Option<String>,
 }
 
+/// One remote body waiting to be drawn.
 pub struct RemoteBodySkinnedItem {
     pub geometry_revision: u64,
     pub client: u32,
@@ -471,6 +419,7 @@ pub struct RemoteBodySkinnedItem {
     pub radius: Option<f32>,
 }
 
+/// The remote bodies to draw this frame.
 #[derive(Resource, Default)]
 pub struct RemoteBodySkinnedQueue {
     items: Vec<RemoteBodySkinnedItem>,
@@ -489,7 +438,69 @@ impl RemoteBodySkinnedQueue {
         self.items.iter()
     }
 
+    /// Hands every queued body over, leaving the queue empty.
     pub fn take(&mut self) -> Vec<RemoteBodySkinnedItem> {
         std::mem::take(&mut self.items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anim::test_skel::blank_skel;
+
+    #[test]
+    fn a_lod_that_does_not_fit_a_signed_byte_is_none_chosen() {
+        assert_eq!(occupy_lod_byte(None), -1);
+        assert_eq!(occupy_lod_byte(Some(0)), 0);
+        assert_eq!(occupy_lod_byte(Some(127)), 127);
+        assert_eq!(occupy_lod_byte(Some(128)), -1);
+    }
+
+    #[test]
+    fn a_kit_with_no_hide_tags_hides_nothing() {
+        let skel = blank_skel("body");
+        let models = [KitModel {
+            name: "body",
+            skel: &skel,
+            hide_tags: Vec::new(),
+            source: KitSource::Body("body"),
+        }];
+        assert_eq!(kit_hide_part_bits(&models), [0; 5]);
+        assert_eq!(kit_hide_part_bits(&[]), [0; 5]);
+    }
+
+    #[test]
+    fn a_held_source_remembers_where_a_model_came_from() {
+        assert_eq!(
+            HeldSource::from(KitSource::Body("mp_body")),
+            HeldSource::Body("mp_body".to_owned())
+        );
+        assert_eq!(HeldSource::from(KitSource::World(3)), HeldSource::World(3));
+    }
+
+    #[test]
+    fn the_queue_hands_its_bodies_over_once() {
+        let mut queue = RemoteBodySkinnedQueue::default();
+        assert!(queue.is_empty());
+        queue.items.push(RemoteBodySkinnedItem {
+            geometry_revision: 1,
+            client: 2,
+            origin: [0.0; 3],
+            world_from_local: Mat4::IDENTITY,
+            geom: Arc::new(CpuBodyGeom::default()),
+            radius: None,
+        });
+        assert_eq!(queue.iter().count(), 1);
+        assert_eq!(queue.take().len(), 1);
+        assert!(queue.is_empty());
+        queue.clear();
+        assert!(queue.take().is_empty());
+    }
+
+    #[test]
+    fn no_kits_are_owned_before_preparation() {
+        let kits = PreparedRemoteKits::default();
+        assert!(kits.get(false, 0).is_none());
     }
 }

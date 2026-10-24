@@ -10,11 +10,11 @@ videos or executables from Black Ops II (or any other game), and no pictures of 
 Ops II for PC; bo2w reads its files read-only and never patches, copies or redistributes them. This is an unofficial
 fan project, not affiliated with or endorsed by Activision, Treyarch or Infinity Ward.
 
-**Last updated:** 2026-10-23
+**Last updated:** 2026-10-24
 
-> **Work in progress.** The engine is not finished: it is part-way through being rewritten as its own (about a third
-> of its code still comes from IW4L, the project it started from). Zombies is not merged into it yet; that merge
-> started on 10-23. Both games play today, each from its own branch. See [Where it stands](#where-it-stands-2026-10-23).
+> **Work in progress.** The engine is not finished: it is part-way through being rewritten as its own (under 3% of
+> its code still comes from IW4L, the project it started from). Zombies is not merged into it yet; that merge
+> started on 10-23. Both games play today, each from its own branch. See [Where it stands](#where-it-stands-2026-10-24).
 
 ## Download
 
@@ -63,7 +63,7 @@ build it yourself, which takes four steps.
 Full details for each part: [MULTIPLAYER.md](MULTIPLAYER.md) (this branch) and `ZOMBIES.md` (on the `zombies`
 branch). Needs a DirectX 12 or Vulkan GPU; built and played on Windows 11 x64 only so far.
 
-## Where it stands (2026-10-23)
+## Where it stands (2026-10-24)
 
 ### The engine
 
@@ -74,9 +74,9 @@ The project started as a fork of [IW4L](https://github.com/vladtrc/iw4L), an ope
   IW4/IW5/IW4L names are gone from the code, build files and file names.
 - **In progress:** the code that remains from IW4L (the shared engine underneath) is being rewritten fresh, crate by
   crate, from what each part has to do (its tests, its callers, Black Ops II's own rules). On 10-21 about 42% of the
-  lines came from IW4L; after the first merges it is about a third. Network, front end and HUD, simulation, game
+  lines came from IW4L; on 10-24 it is 2.6%. Network, front end and HUD, simulation, game
   scripts, rendering, tools, assets, and effects and audio are each part-way through, and merge one batch at a time.
-- **Every merge must keep the game playing exactly as before:** about 2,500 tests pass, and four hidden test matches
+- **Every merge must keep the game playing exactly as before:** about 6,700 tests pass, and four hidden test matches
   in different modes, a three-map check and a bots check all pass.
 
 ### Multiplayer (`main`)
@@ -133,6 +133,11 @@ Map-by-map bars and the full change list: [MULTIPLAYER.md](MULTIPLAYER.md).
 
 The full "coming soon" lists are in [MULTIPLAYER.md](MULTIPLAYER.md#coming-soon) and in `ZOMBIES.md` on the
 `zombies` branch.
+
+## Recent changes
+
+- 2026-10-24: IW4L code down to 2.6% of the engine (from about a third). Fixed: Shift went prone instead of sprinting
+  (stance events used Modern Warfare 2 numbers).
 
 ## Credits and licence
 

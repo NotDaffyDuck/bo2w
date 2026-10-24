@@ -1,10 +1,15 @@
-use weapon_t6::sway::{SwayContribution, SwaySpringState, WeaponSwayParams, calculate_weapon_movement_sway, lerp_sway_params, sway_contribution};
+//! The gun's turn sway on the player's view: the spring state that
+//! `weapon_t6::sway` moves each frame, plus the view angles of the frame before.
+
+use weapon_t6::sway::{
+    SwaySpringState, WeaponSwayParams, calculate_weapon_movement_sway, lerp_sway_params,
+};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewSwayState {
     springs: SwaySpringState,
+    /// The view angles the last frame ended on; `None` before the first frame.
     prev_view_angles: Option<[f32; 3]>,
-    last: SwayContribution,
 }
 
 impl ViewSwayState {
@@ -16,12 +21,16 @@ impl ViewSwayState {
         self.springs
     }
 
-    /// bo2zm: Black Ops II keeps following the view while the scope hides
-    /// the gun, so coming off the scope does not swing it.
+    /// Black Ops II keeps following the view while the scope hides the gun, so the
+    /// frame the scope comes off does not see a turn.
     pub fn follow_view(&mut self, view_angles: [f32; 3]) {
         self.prev_view_angles = Some(view_angles);
     }
 
+    /// One frame of sway. Nothing moves for a non-positive or non-finite `dt_secs`,
+    /// or while an overlay (the scope) covers the gun. The first frame only records
+    /// the view angles. Aiming blends the hip and aimed parameters by `weapon_pos_frac`.
+    #[allow(clippy::too_many_arguments)]
     pub fn advance(
         &mut self,
         hip: WeaponSwayParams,
@@ -33,14 +42,12 @@ impl ViewSwayState {
         landing_scale: f32,
         dt_secs: f32,
     ) {
-        if !dt_secs.is_finite() || dt_secs <= 0.0 {
-            return;
-        }
-        if overlay_active && weapon_pos_frac > 0.0 {
+        let usable_dt = dt_secs.is_finite() && dt_secs > 0.0;
+        let covered = overlay_active && weapon_pos_frac > 0.0;
+        if !usable_dt || covered {
             return;
         }
         let Some(prev) = self.prev_view_angles.replace(view_angles) else {
-            self.last = sway_contribution(self.springs);
             return;
         };
         let params = if aim_down_sight {
@@ -56,15 +63,14 @@ impl ViewSwayState {
             landing_scale,
             dt_secs,
         );
-        self.last = sway_contribution(self.springs);
     }
 }
 
 #[cfg(test)]
-mod bo2_tests {
+mod tests {
     use super::*;
 
-    const HIP: WeaponSwayParams = WeaponSwayParams {
+    const PARAMS: WeaponSwayParams = WeaponSwayParams {
         max_angle: 4.0,
         lerp_speed: 6.0,
         pitch_scale: 0.1,
@@ -72,29 +78,60 @@ mod bo2_tests {
         horiz_scale: 0.2,
         vert_scale: 0.2,
     };
+    const FRAME: f32 = 1.0 / 60.0;
 
-    /// Turns 90 degrees while scoped, then lets go of the aim.
-    fn sway_after_scope(follow: bool) -> f32 {
+    fn step(sway: &mut ViewSwayState, yaw: f32, frac: f32, overlay: bool) {
+        sway.advance(PARAMS, PARAMS, [0.0, yaw, 0.0], frac, true, overlay, 1.0, FRAME);
+    }
+
+    /// Turns 90 degrees behind the scope, then lets go of the aim.
+    fn yaw_spring_after_scope(follow_the_view: bool) -> f32 {
         let mut sway = ViewSwayState::default();
-        sway.advance(HIP, HIP, [0.0; 3], 0.0, true, true, 1.0, 1.0 / 60.0);
+        step(&mut sway, 0.0, 0.0, true);
         for frame in 1..=30 {
-            let view = [0.0, frame as f32 * 3.0, 0.0];
-            if follow {
-                sway.follow_view(view);
+            let yaw = frame as f32 * 3.0;
+            if follow_the_view {
+                sway.follow_view([0.0, yaw, 0.0]);
             } else {
-                sway.advance(HIP, HIP, view, 1.0, true, true, 1.0, 1.0 / 60.0);
+                step(&mut sway, yaw, 1.0, true);
             }
         }
-        sway.advance(HIP, HIP, [0.0, 90.0, 0.0], 0.0, true, true, 1.0, 1.0 / 60.0);
+        step(&mut sway, 90.0, 0.0, true);
         sway.springs().yaw.abs()
     }
 
     #[test]
-    fn coming_off_the_scope_does_not_swing_the_gun_in_bo2() {
-        let bo2 = sway_after_scope(true);
-        let legacy = sway_after_scope(false);
-        eprintln!("gun turn right after the scope comes off: bo2 {bo2:.3} legacy {legacy:.3}");
-        assert_eq!(bo2, 0.0);
-        assert!(legacy > 0.03);
+    fn coming_off_the_scope_does_not_swing_the_gun_when_the_view_was_followed() {
+        assert_eq!(yaw_spring_after_scope(true), 0.0);
+        assert!(yaw_spring_after_scope(false) > 0.03);
+    }
+
+    #[test]
+    fn the_first_frame_only_records_the_view() {
+        let mut sway = ViewSwayState::default();
+        step(&mut sway, 40.0, 0.0, false);
+        assert_eq!(sway.springs(), SwaySpringState::default());
+        step(&mut sway, 50.0, 0.0, false);
+        assert!(sway.springs().yaw != 0.0, "a turn on the second frame moves the gun");
+    }
+
+    #[test]
+    fn a_bad_frame_time_changes_nothing() {
+        let mut sway = ViewSwayState::default();
+        step(&mut sway, 0.0, 0.0, false);
+        let before = sway.clone();
+        for dt in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            sway.advance(PARAMS, PARAMS, [0.0, 30.0, 0.0], 0.0, false, false, 1.0, dt);
+            assert_eq!(sway, before);
+        }
+    }
+
+    #[test]
+    fn reset_forgets_the_springs_and_the_previous_view() {
+        let mut sway = ViewSwayState::default();
+        step(&mut sway, 0.0, 0.0, false);
+        step(&mut sway, 20.0, 0.0, false);
+        sway.reset();
+        assert_eq!(sway, ViewSwayState::default());
     }
 }

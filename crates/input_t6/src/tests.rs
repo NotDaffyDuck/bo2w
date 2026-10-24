@@ -202,6 +202,27 @@ mod stance {
     }
 
     #[test]
+    fn the_sprint_key_sprints_and_never_goes_prone() {
+        for command in ["+breath_sprint", "+sprint"] {
+            let mut c = bound(&[(1, command), (2, "toggleprone"), (3, "+stance")]);
+            down(&mut c, 1, 1000);
+            for now in [1016, 1300, 2000] {
+                let (bits, _) = sample_move(&mut c, now, FRAME);
+                assert!(bits.test(button::SPRINT), "{command} sprints at {now}");
+                assert!(!bits.test(button::PRONE), "{command} is not prone at {now}");
+                assert!(!bits.test(button::CROUCH), "{command} is not crouched at {now}");
+            }
+            assert_eq!(c.stance_latch, 0);
+            up(&mut c, 1, 2100);
+            c.kb.clear_was_pressed();
+            assert!(!sampled_has(&mut c, 2200, button::SPRINT));
+            // Ctrl (toggleprone) still toggles prone by itself.
+            down(&mut c, 2, 2300);
+            assert!(sampled_has(&mut c, 2316, button::PRONE));
+        }
+    }
+
+    #[test]
     fn a_tap_crouches_and_another_stands() {
         let mut c = bound(&[(1, "+stance")]);
         pressed(&mut c, 1000, Some(100));

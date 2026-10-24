@@ -1,4 +1,5 @@
 use bevy::prelude::Resource;
+use entity_t6::event;
 use input_t6::{
     ANGLE2SHORT, AdjustAnglesInput, CL_ANGLESPEEDKEY_DEFAULT, CL_PITCHSPEED_DEFAULT,
     CL_YAWSPEED_DEFAULT, ClientInput, CreateCmdInput, adjust_angles, axis_to_move, clamp_char,
@@ -123,8 +124,8 @@ impl ClientActionInput {
         self.client.kb.clear_was_pressed();
     }
 
-    /// BO2's CG_CheckPlayerstateEvents for the stance events (6 stand, 7
-    /// crouch, 8 prone): the predicted state is held against last frame's,
+    /// BO2's CG_CheckPlayerstateEvents for the stance events (EV_STANCE_FORCE_STAND,
+    /// _CROUCH, _PRONE: BO2's 8, 9, 10): the predicted state is held against last frame's,
     /// every frame. An event past last frame's sequence is new; one inside
     /// the four last frame held is new too when it changed (a correction
     /// replayed it at another number). The newest one sets the latch.
@@ -137,10 +138,10 @@ impl ClientActionInput {
             if behind > 0 && (behind > 4 || events[slot] == self.stance_events[slot]) {
                 continue;
             }
-            match events[slot] {
-                6 => self.client.stance_latch = 0,
-                7 => self.client.stance_latch = button::CROUCH as i32,
-                8 => self.client.stance_latch = button::PRONE as i32,
+            match u8::try_from(events[slot]) {
+                Ok(event::STANCE_FORCE_STAND) => self.client.stance_latch = 0,
+                Ok(event::STANCE_FORCE_CROUCH) => self.client.stance_latch = button::CROUCH as i32,
+                Ok(event::STANCE_FORCE_PRONE) => self.client.stance_latch = button::PRONE as i32,
                 _ => {}
             }
         }
@@ -338,7 +339,7 @@ mod tests {
     #[test]
     fn a_new_stand_event_clears_the_crouch_latch() {
         let mut input = crouched(9, [0; 4]);
-        input.read_stance_events(10, [0, 6, 0, 0]);
+        input.read_stance_events(10, [0, event::STANCE_FORCE_STAND as i32, 0, 0]);
         assert_eq!(input.client.stance_latch, 0);
     }
 
@@ -347,15 +348,38 @@ mod tests {
         // The client had run to 10; the server's state replayed lands the
         // sprint's stand event at 8.
         let mut input = crouched(10, [0; 4]);
-        input.read_stance_events(9, [6, 0, 0, 0]);
+        input.read_stance_events(9, [event::STANCE_FORCE_STAND as i32, 0, 0, 0]);
         assert_eq!(input.client.stance_latch, 0);
         assert_eq!(input.stance_event_sequence, 9);
     }
 
     #[test]
+    fn the_stand_event_a_sprint_sends_never_goes_prone() {
+        // Sprinting stands the player up every frame; the client must read that as
+        // "stand" (latch off), not as the prone event, or Shift lies the player down.
+        let mut input = ClientActionInput::default();
+        input.stance_event_sequence = 0;
+        let stand = event::STANCE_FORCE_STAND as i32;
+        input.read_stance_events(1, [stand, 0, 0, 0]);
+        assert_eq!(input.client.stance_latch, 0);
+        input.read_stance_events(2, [stand, stand, 0, 0]);
+        assert_eq!(input.client.stance_latch, 0);
+    }
+
+    #[test]
+    fn the_crouch_and_prone_events_set_their_latch() {
+        let mut input = ClientActionInput::default();
+        input.read_stance_events(1, [event::STANCE_FORCE_CROUCH as i32, 0, 0, 0]);
+        assert_eq!(input.client.stance_latch, button::CROUCH as i32);
+        input.read_stance_events(2, [0, event::STANCE_FORCE_PRONE as i32, 0, 0]);
+        assert_eq!(input.client.stance_latch, button::PRONE as i32);
+    }
+
+    #[test]
     fn events_already_seen_do_not_fire_again() {
-        let mut input = crouched(10, [0, 6, 0, 0]);
-        input.read_stance_events(10, [0, 6, 0, 0]);
+        let stand = event::STANCE_FORCE_STAND as i32;
+        let mut input = crouched(10, [0, stand, 0, 0]);
+        input.read_stance_events(10, [0, stand, 0, 0]);
         assert_eq!(input.client.stance_latch, button::CROUCH as i32);
     }
 

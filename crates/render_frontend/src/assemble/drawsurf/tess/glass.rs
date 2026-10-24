@@ -1,4 +1,4 @@
-use bevy::prelude::*;
+use bevy::prelude::{Res, ResMut, Resource};
 
 use crate::prepare::scene::world::WorldScene;
 
@@ -19,47 +19,59 @@ pub struct T6GlassCue {
     pub client: asset_world::T6GlassClientDef,
 }
 
-#[derive(Resource, Clone, Debug, Default)]
+/// The windows' client state and the clock/epoch they were last applied at.
+#[derive(Clone, Debug, Default, Resource)]
 pub struct GlassTable {
-    pub last_msec: i32,
-    pub generation: u32,
     pub map_round_epoch: u32,
+    pub generation: u32,
+    pub last_msec: i32,
     /// bo2mp: Black Ops II's windows as this client holds them; `None`
     /// until the first glass message, which applies as the gamestate.
     pub t6: Option<glass_t6::GlassesClient>,
 }
 
 impl GlassTable {
+    /// Forgets the windows and the clock; the epoch stays, `generation` moves
+    /// so readers see the reset.
     pub fn reset(&mut self) {
-        self.last_msec = 0;
-        self.generation = self.generation.wrapping_add(1);
-        self.t6 = None;
+        *self = Self {
+            map_round_epoch: self.map_round_epoch,
+            generation: self.generation.wrapping_add(1),
+            ..Self::default()
+        };
     }
 }
 
-fn presented_world_objects<'a>(
+/// The snapshot whose world objects are on screen: the presented one, or the
+/// next one adopted.
+fn on_screen_snapshot<'a>(
     presented: Option<&'a net::PresentedSnapshot>,
     adopted: Option<&'a net::LastAdoptedSnapshot>,
 ) -> Option<&'a sim::Snapshot> {
     presented
-        .and_then(|snap| snap.snapshot())
-        .or_else(|| adopted.and_then(|snap| snap.next()))
+        .and_then(net::PresentedSnapshot::snapshot)
+        .or_else(|| adopted.and_then(net::LastAdoptedSnapshot::next))
 }
 
-fn glass_viewer_is_archived(snap: Option<&sim::Snapshot>, local: Option<sim::ClientId>) -> bool {
-    let (Some(snap), Some(local)) = (snap, local) else {
-        return false;
+/// The clock the windows are applied against: the snapshot's own time while
+/// the local player watches an archived frame, the effects clock otherwise.
+fn presentation_clock(snap: Option<&sim::Snapshot>, local: Option<sim::ClientId>, fx_msec: i32) -> i32 {
+    let archived = match (snap, local) {
+        (Some(snap), Some(local)) => snap
+            .players
+            .iter()
+            .any(|(id, ps)| *id == local && !ps.is_live_frame()),
+        _ => false,
     };
-    snap.players
-        .iter()
-        .any(|(id, ps)| *id == local && !ps.is_live_frame())
+    if archived {
+        snap.map_or(0, |s| s.meta.world_objects.as_of_ms)
+    } else {
+        fx_msec
+    }
 }
 
-fn glass_presentation_now(msec_now: i32, as_of_ms: i32, archived: bool) -> i32 {
-    if archived { as_of_ms } else { msec_now }
-}
-
-fn glass_epoch_changed(seen: u32, incoming: u32) -> bool {
+/// A new map round: the epoch moved from one that was already set.
+fn new_round(seen: u32, incoming: u32) -> bool {
     seen != 0 && seen != incoming
 }
 
@@ -67,46 +79,32 @@ pub(crate) fn apply_glass_host(
     presented: Option<Res<net::PresentedSnapshot>>,
     adopted: Option<Res<net::LastAdoptedSnapshot>>,
     local: Option<Res<net::LocalPresentClient>>,
-    scene: Option<Res<crate::prepare::scene::world::WorldScene>>,
+    world: Option<Res<WorldScene>>,
     mut table: ResMut<GlassTable>,
     mut fx_host: Option<ResMut<render_fx::HostFxSystem>>,
     mut cues: ResMut<T6GlassCues>,
 ) {
     cues.0.clear();
-    let Some(scene) = scene else {
+    let Some(world) = world else {
         return;
     };
-    let Some(glass) = scene.t6_glass.as_ref() else {
+    let Some(glass) = world.t6_glass.as_ref() else {
         return;
     };
-    // codmp: a Black Ops II window's own def plays as it changes.
-    let mut cue = |pane: usize, shattered: bool, dir: [f32; 3]| {
-        if let Some(draw) = glass.panes.get(pane) {
-            cues.0.push(T6GlassCue {
-                pane: pane as u32,
-                shattered,
-                dir,
-                client: draw.client.clone(),
-            });
-        }
-    };
-    let snap = presented_world_objects(presented.as_deref(), adopted.as_deref());
-    let msec_now = fx_host.as_ref().map(|h| h.0.msec_now).unwrap_or(0);
-    let as_of_ms = snap.map(|s| s.meta.world_objects.as_of_ms).unwrap_or(0);
-    let epoch = snap
-        .map(|s| s.meta.world_objects.map_round_epoch)
-        .unwrap_or(0);
-    let now = glass_presentation_now(
-        msec_now,
-        as_of_ms,
-        glass_viewer_is_archived(snap, local.map(|c| c.0)),
-    );
+    let snap = on_screen_snapshot(presented.as_deref(), adopted.as_deref());
+    let objects = snap.map(|s| &s.meta.world_objects);
+    let epoch = objects.map_or(0, |o| o.map_round_epoch);
     // bo2mp: Black Ops II's windows come in BO2's own glass message.
-    let t6_rows = snap.map_or(&[][..], |s| s.meta.world_objects.t6_glass.as_slice());
-    let t6_live = !glass.panes.is_empty() && t6_rows.len() == glass.panes.len();
-    let rebuilt = glass_epoch_changed(table.map_round_epoch, epoch)
-        || t6_live && (now < table.last_msec || t6_glass_went_back(table.t6.as_ref(), t6_rows));
-    if rebuilt {
+    let rows = objects.map_or(&[][..], |o| o.t6_glass.as_slice());
+    let now = presentation_clock(
+        snap,
+        local.map(|c| c.0),
+        fx_host.as_ref().map_or(0, |h| h.0.msec_now),
+    );
+    let live = !glass.panes.is_empty() && rows.len() == glass.panes.len();
+    if new_round(table.map_round_epoch, epoch)
+        || (live && (now < table.last_msec || t6_glass_went_back(table.t6.as_ref(), rows)))
+    {
         table.reset();
         if let Some(host) = fx_host.as_mut() {
             host.0.glass = fx::FxGlassSystemHost::default();
@@ -117,13 +115,13 @@ pub(crate) fn apply_glass_host(
     if let Some(host) = fx_host.as_mut()
         && host.0.glass.t6.panes.len() != glass.panes.len()
     {
-        let floor = scene.world_bounds.map_or(-1.0e6, |b| b[2] - b[5] + 5.0);
+        let floor = world.world_bounds.map_or(-1.0e6, |b| b[2] - b[5] + 5.0);
         host.0.glass.t6.set_panes(t6_shard_panes(&glass.panes), floor);
         host.0.glass.shattered = vec![false; glass.panes.len()];
     }
     table.last_msec = now;
     table.map_round_epoch = epoch;
-    if !t6_live {
+    if !live {
         return;
     }
     // bo2mp: each state applied as BO2's client does (`CG_Glass_SetState`);
@@ -132,19 +130,25 @@ pub(crate) fn apply_glass_host(
     let gamestate = table.t6.is_none();
     let client = table
         .t6
-        .get_or_insert_with(|| glass_t6::GlassesClient::new(t6_rows.len()));
-    for u in t6_rows {
+        .get_or_insert_with(|| glass_t6::GlassesClient::new(rows.len()));
+    for u in rows {
         let (pos, dir) = u.hit.unwrap_or_default();
         client.set_state(u32::from(u.pane), u.state, pos, dir, gamestate);
     }
-    for c in client.take_cues() {
-        match c {
+    // codmp: a Black Ops II window's own def plays as it changes.
+    let mut play = |pane: u32, shattered: bool, dir: [f32; 3]| {
+        if let Some(draw) = glass.panes.get(pane as usize) {
+            cues.0.push(T6GlassCue { pane, shattered, dir, client: draw.client.clone() });
+        }
+    };
+    for cue in client.take_cues() {
+        match cue {
             glass_t6::Cue::RemoveShards { pane } => {
                 if let Some(host) = fx_host.as_mut() {
                     host.0.glass.t6.clear_pane(pane);
                 }
             }
-            glass_t6::Cue::CrackSound { pane } => cue(pane as usize, false, [0.0; 3]),
+            glass_t6::Cue::CrackSound { pane } => play(pane, false, [0.0; 3]),
             glass_t6::Cue::Shatter { pane, hit_pos, hit_dir, gamestate } => {
                 if let Some(host) = fx_host.as_mut() {
                     host.0.glass.t6.shatter(pane, hit_pos, hit_dir, None, !gamestate);
@@ -155,7 +159,7 @@ pub(crate) fn apply_glass_host(
                 }
                 client.shatter_started(pane);
                 if !gamestate {
-                    cue(pane as usize, true, hit_dir);
+                    play(pane, true, hit_dir);
                 }
             }
             _ => {}
@@ -202,7 +206,7 @@ fn t6_shard_panes(panes: &[asset_world::T6GlassPaneDraw]) -> Vec<fx::T6PaneShape
 /// legacy glass tess wants an legacy material ordinal these have none of). Each
 /// surface is lit by its own lightmap at its corners, as a mark on a wall
 /// is: its vertex colours hold that light (colour times sqrt(light / 32)).
-#[derive(Resource, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Resource)]
 pub struct T6GlassMesh {
     pub vertices: Vec<render_frame::SmodelVertex>,
     pub indices: Vec<u32>,
@@ -229,7 +233,7 @@ pub struct T6GlassMesh {
 }
 
 pub(crate) fn draw_t6_glass_panes(
-    scene: Option<Res<WorldScene>>,
+    world: Option<Res<WorldScene>>,
     runtime: Option<Res<crate::assemble::drawsurf::MaterialGeneration>>,
     table: Res<GlassTable>,
     fx_host: Option<Res<render_fx::HostFxSystem>>,
@@ -238,7 +242,7 @@ pub(crate) fn draw_t6_glass_panes(
 ) {
     let mesh = &mut *mesh;
     mesh.draws.clear();
-    let panes = scene
+    let panes = world
         .as_deref()
         .and_then(|s| s.t6_glass.as_ref())
         .map_or(&[][..], |g| g.panes.as_slice());

@@ -1,3 +1,6 @@
+//! Frame ordering sets, session identity keys and the shared UI/settings
+//! contracts. Plain data and set declarations; no systems.
+
 pub mod class_presets;
 pub mod pad;
 pub mod retire;
@@ -8,7 +11,7 @@ pub mod session;
 pub mod settings;
 pub mod ui;
 
-pub use class_presets::{ClassPreset, pick_showcase, showcase_classes};
+pub use class_presets::{ClassPreset, pick_showcase, register_showcase, showcase_classes};
 pub use pad::{ActivePad, InputDevices, PromptStyle, TestControllerRumble};
 pub use retire::Retiring;
 pub use schedule::{
@@ -30,7 +33,7 @@ pub use session::{
 };
 pub use settings::{DisplayResolution, GameSettings};
 pub use ui::{
-    GamePaused, HostMatchRules, LuiMenus, MenuDims, WorldBlur, WorldDim, UiBindRequest, UiBindingCapture, UiExecCommand,
-    UiMenuDvars, UiPartyState, UiPlayMusic, UiPlaySound, UiStopMusic,
-    register_ui_contracts,
+    GamePaused, HostMatchRules, LuiMenus, MenuDims, UiBindRequest, UiBindingCapture,
+    UiExecCommand, UiMenuDvars, UiPartyState, UiPlayMusic, UiPlaySound, UiStopMusic, WorldBlur,
+    WorldDim, register_ui_contracts,
 };

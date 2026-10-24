@@ -24,6 +24,7 @@ pub mod ammo_table;
 pub mod anim;
 pub mod asset_slots;
 pub mod base;
+pub mod class_presets;
 pub mod cmd;
 pub mod combat_facts;
 pub mod damage;

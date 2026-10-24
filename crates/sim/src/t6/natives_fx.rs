@@ -271,7 +271,7 @@ pub(super) fn fire_exploder(vm: &mut Vm<World>, world: &mut World, num: &Key) {
             let key = Key::Str(vm.intern(k));
             v.get(&key).filter(|x| !x.is_undefined())
         };
-        let mut run = |vm: &mut Vm<World>, world: &mut World, f: &str| {
+        let run = |vm: &mut Vm<World>, world: &mut World, f: &str| {
             vm.spawn_named(world, "maps/mp/_utility", f, ent.clone(), Vec::new());
         };
         if has(vm, "firefx").is_some() {

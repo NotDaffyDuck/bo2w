@@ -208,6 +208,7 @@ mod tests {
 
     #[test]
     fn with_no_host_the_showcase_classes_are_offered() {
+        weapon_t6::class_presets::register();
         let rows = bootstrap_class_rows(None);
         assert_eq!(rows.len(), HostClassLoadouts::default().slots.len());
         assert!(!rows.is_empty());
@@ -215,6 +216,7 @@ mod tests {
 
     #[test]
     fn a_host_with_no_classes_gets_the_showcase_ones() {
+        weapon_t6::class_presets::register();
         let host = HostClassLoadouts { slots: Vec::new() };
         assert_eq!(
             bootstrap_class_rows(Some(&host)).len(),
@@ -224,6 +226,7 @@ mod tests {
 
     #[test]
     fn the_hosts_own_classes_are_offered_when_it_has_some() {
+        weapon_t6::class_presets::register();
         let mut host = HostClassLoadouts::default();
         host.slots.truncate(2);
         assert_eq!(bootstrap_class_rows(Some(&host)).len(), 2);

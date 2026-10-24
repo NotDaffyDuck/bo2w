@@ -9,7 +9,7 @@ use crate::client::presentation::entities::CEntity;
 use crate::client::presentation::presented::{
     LocalPresentClient, PresentLocalCensus, PresentedSnapshot,
 };
-use crate::client::runtime::{ClientClock, ClientPredictionState, LastAdoptedSnapshot};
+use crate::client::drive::{ClientClock, ClientPredictionState, LastAdoptedSnapshot};
 use sim::ClientLifecycle;
 
 #[derive(Resource, Default)]

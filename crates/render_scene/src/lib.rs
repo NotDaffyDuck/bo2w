@@ -1,3 +1,7 @@
+//! The data a frame is assembled from: who is in the scene, how the camera
+//! sees it, which models still wait for lighting. Producers fill these in;
+//! the frontend and the GPU side read them.
+
 pub mod camera;
 pub mod dpvs_cells;
 pub mod dyn_atpoint;
@@ -38,7 +42,7 @@ pub use model_lighting::{
 };
 pub use model_lighting_atlas::{
     ModelLightingAtlasTileWrite, ModelLightingAtlasTileWrites, WorldModelLightingAtlas,
-    model_lighting_atlas_image, model_lighting_atlas_write_tile, model_lighting_tile_texels,
+    model_lighting_atlas_image, model_lighting_atlas_write_tile,
 };
 pub use plugin::RenderScenePlugin;
 pub use present::{TessMaterials, WorldPresentFacts};
@@ -47,9 +51,9 @@ pub use smodel::{
     runtime_maps, smodel_camera_lod,
 };
 pub use view_parms::{
-    LockPvsView, PreparedSceneView, RLockPvs, RZnearDepthhackDvar, RZnearDvar,
-    SmEnableDvar, SmSunEnableDvar, host_clip_from_view, lens_world_from_parent_child,
-    pack_live_view_parms, prepare_scene_view,
+    LockPvsView, PreparedSceneView, RLockPvs, RZnearDepthhackDvar, RZnearDvar, SmEnableDvar,
+    SmSunEnableDvar, host_clip_from_view, lens_world_from_parent_child, pack_live_view_parms,
+    prepare_scene_view,
 };
 pub use world_instances::{WorldDynEntInstance, WorldScriptModelInstance};
 pub use xmodel_draw::{XModelCasterBound, XModelColourRefusal, XModelSurfaceDraw};

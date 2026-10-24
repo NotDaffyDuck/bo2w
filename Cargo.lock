@@ -1955,26 +1955,21 @@ dependencies = [
  "session",
  "sim",
  "ui",
+ "weapon_t6",
 ]
 
 [[package]]
 name = "bots"
 version = "0.1.0"
 dependencies = [
- "asset_transport",
- "assets",
  "bevy",
  "diag",
  "entity_t6",
  "frame",
  "game_math",
- "gamemode_t6",
- "movement_t6",
  "net",
  "playerstate_t6",
  "sim",
- "trace_t6",
- "weapon_t6",
 ]
 
 [[package]]
@@ -2187,6 +2182,7 @@ dependencies = [
  "session",
  "sim",
  "ui",
+ "weapon_t6",
 ]
 
 [[package]]
@@ -4970,7 +4966,6 @@ dependencies = [
  "asset_material",
  "asset_model",
  "asset_t6",
- "asset_world",
  "assets",
  "bevy",
  "diag",
@@ -4979,7 +4974,6 @@ dependencies = [
  "hud",
  "hud_t6",
  "lighting_t6",
- "naga",
  "net",
  "perf",
  "render_anim",
@@ -4987,6 +4981,7 @@ dependencies = [
  "render_frontend",
  "render_fx",
  "render_gpu",
+ "render_material",
  "render_scene",
  "serde",
  "serde_json",
@@ -5063,7 +5058,6 @@ dependencies = [
  "audio",
  "bevy",
  "bytemuck",
- "d3d9_sm3",
  "d3d9_state",
  "diag",
  "dpvs_t6",
@@ -5076,7 +5070,6 @@ dependencies = [
  "hud_t6",
  "lighting_t6",
  "marks_t6",
- "naga",
  "net",
  "perf",
  "playerstate_t6",
@@ -5169,7 +5162,6 @@ dependencies = [
  "asset_world",
  "assets",
  "bevy",
- "diag",
  "dpvs_t6",
  "fx_t6",
  "game_math",
@@ -6579,6 +6571,7 @@ name = "weapon_t6"
 version = "0.1.0"
 dependencies = [
  "fastfile_t6",
+ "frame",
  "game_math",
  "libm",
 ]

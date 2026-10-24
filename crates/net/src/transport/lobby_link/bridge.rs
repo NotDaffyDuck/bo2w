@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use super::fault::TransportFault;
 use super::state::{MasterBridgeState, MasterLifecycleFact, SessionIdentity};
 use crate::transport::bootstrap::BootstrapLane;
-use crate::transport::udp_session::RelayMailbox;
+use crate::transport::relay::RelayMailbox;
 
 /// What the game asks of the link worker.
 #[derive(Debug)]

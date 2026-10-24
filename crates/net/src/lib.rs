@@ -76,7 +76,7 @@ pub use client::proxy::{
     ProxyPolicyRevision, ProxySample, ProxyStarvationReason, RemoteProxy,
 };
 pub use client::realtime::ClientRealtime;
-pub use client::runtime::{
+pub use client::drive::{
     ClientClock, ClientCmdTemplate, ClientPhaseTrace, ClientPredictionState, ClientReliableAck,
     ClockTick, LastAdoptedSnapshot, LocationCursor, PendingClientSends, PendingDebris, PendingPelletFx,
     PendingPresentedEntityEvents, ReceivedTicks, ReliableControlEvent, RemoteProxyState,
@@ -165,7 +165,7 @@ pub use transport::reliable::{
     ActionVerdict, MAX_PENDING_RELIABLE, ReliableEventHub, ReliableEventQueue, ReliablePayload,
     ReliableRow, decode_reliable_payload, encode_reliable_payload,
 };
-pub use transport::udp_session::{CommittedAdmission, UdpAuthorityHub, UdpClientLink};
+pub use transport::relay::{CommittedAdmission, UdpAuthorityHub, UdpClientLink};
 pub use transport::udp_socket::UdpSendError;
 pub use transport::wire::{WireError, WireReader, WireWriter};
 

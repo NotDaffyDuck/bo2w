@@ -1,65 +1,55 @@
 //! The frame clock and the schedule spans it encloses.
 //!
-//! Every span here opens and closes inside one turn of the main loop, and the
-//! clock is the boundary they are measured against: it closes the row for the
-//! frame that just ran and opens the next one at the top of `First`, before
-//! anything else this frame does. That ordering is the whole point: a clock
-//! that closes from inside `Update` cuts the row with `Update` still open, and
-//! the schedule reports a fraction of itself in its own column while the rest
-//! lands in the next row as carried-in time.
+//! The clock closes the row for the frame that just ran and opens the next at
+//! the very top of `First`. Closing it from inside `Update` would cut the row
+//! while `Update` is still open, and that schedule would report a fraction of
+//! itself with the rest carried into the next row.
 
 use bevy::app::{RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::prelude::*;
+use bevy::transform::TransformSystems;
+use perf::Span;
 
-/// The frame clock, and with it the one allocation figure that is per frame
-/// rather than per system: the process-wide count since the previous bookend.
-/// It is emitted where the clock closes so the count and the frame it belongs
-/// to are the same interval.
-fn bookend_wall_frame(mut wall_open: Local<bool>, mut allocations: Local<Option<u64>>) {
-    if *wall_open {
-        perf::Span::FramesWallFrameMs.end();
+/// Closes the previous frame's row, opens this one's, and publishes the
+/// process-wide allocation count since the last bookend, so the count and the
+/// frame it belongs to are one interval.
+fn frame_clock(mut open: Local<bool>, mut last_total: Local<Option<u64>>) {
+    if std::mem::replace(&mut *open, true) {
+        Span::FramesWallFrameMs.end();
     }
-    // Only when the allocator is actually counting: otherwise the total is a
-    // constant zero and the delta would publish "no allocations this frame",
-    // which is a different claim from "nobody counted".
+    // When the allocator is not counting the total is a constant zero, and a
+    // delta of it would claim "no allocations" where the truth is "unmeasured".
     if perf::stats::enabled() && diag::counting_enabled() {
         let total = diag::process_allocations().process_allocations;
-        if let Some(previous) = *allocations {
-            perf::Counter::CounterProcessAllocations.emit(total.saturating_sub(previous) as f64);
+        if let Some(before) = last_total.replace(total) {
+            perf::Counter::CounterProcessAllocations.emit(total.saturating_sub(before) as f64);
         }
-        *allocations = Some(total);
     }
-    perf::Span::FramesWallFrameMs.begin();
-    *wall_open = true;
+    Span::FramesWallFrameMs.begin();
 }
 
-fn begin_postupdate() {
-    perf::Span::FramesPostupdateMs.begin();
+fn open(span: Span) -> impl Fn() {
+    move || span.begin()
 }
 
-fn end_postupdate() {
-    perf::Span::FramesPostupdateMs.end();
+fn close(span: Span) -> impl Fn() {
+    move || span.end()
 }
 
-/// The clock and the three schedule spans, registered together because their
-/// order relative to one another is what the measurement is.
+/// The clock and the pre-update and post-update spans, registered together
+/// because their order against one another is what is being measured.
 pub(crate) fn register_frame_spans(app: &mut App) {
-    app.add_systems(First, (bookend_wall_frame, begin_preupdate).chain())
-        .add_systems(
-            RunFixedMainLoop,
-            end_preupdate.in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
-        )
-        .add_systems(
-            PostUpdate,
-            begin_postupdate.before(bevy::transform::TransformSystems::Propagate),
-        )
-        .add_systems(Last, end_postupdate);
-}
-
-fn begin_preupdate() {
-    perf::Span::FramesPreupdateMs.begin();
-}
-
-fn end_preupdate() {
-    perf::Span::FramesPreupdateMs.end();
+    app.add_systems(
+        First,
+        (frame_clock, open(Span::FramesPreupdateMs)).chain(),
+    )
+    .add_systems(
+        RunFixedMainLoop,
+        close(Span::FramesPreupdateMs).in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
+    )
+    .add_systems(
+        PostUpdate,
+        open(Span::FramesPostupdateMs).before(TransformSystems::Propagate),
+    )
+    .add_systems(Last, close(Span::FramesPostupdateMs));
 }

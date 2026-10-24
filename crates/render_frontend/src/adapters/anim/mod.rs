@@ -1,3 +1,6 @@
+//! Animation-side adapters: `render_anim`'s modules under the names the front end uses,
+//! and the loose-piece (dyn ent) systems.
+
 pub use render_anim::anim::{
     body_frustum, dobj_pose, fpv, fpv_host, fpv_pose, pose_types, scene_submission,
     view_kick_state, view_sway, viewmodel_controller, xmodel_pose,
