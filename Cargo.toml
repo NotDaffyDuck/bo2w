@@ -1,0 +1,267 @@
+# The bo2mp workspace: the game, its server and the tools that build and ship them.
+
+[workspace]
+resolver = "3"
+# Built on its own through the patch below, not as a member.
+exclude = ["third_party/wgpu-hal"]
+members = [
+    # Process entry, tooling and delivery
+    "crates/bootstrap",
+    "crates/console",
+    "crates/diag",
+    "crates/launcher",
+    "crates/perf",
+    "crates/updater",
+    "xtask",
+
+    # Network and servers
+    "crates/bo2mp-master",
+    "crates/bots",
+    "crates/master_protocol",
+    "crates/net",
+
+    # Reading game data
+    "crates/asset_anim",
+    "crates/asset_audio",
+    "crates/asset_core",
+    "crates/asset_game",
+    "crates/asset_material",
+    "crates/asset_model",
+    "crates/asset_source",
+    "crates/asset_t6",
+    "crates/asset_transport",
+    "crates/asset_world",
+    "crates/assets",
+    "crates/bo2_profile",
+    "crates/bo2zm_tools",
+    "crates/fastfile_t5",
+    "crates/fastfile_t6",
+    "crates/gsc_t6",
+    "crates/hks_t6",
+    "crates/ipak_t6",
+    "crates/sab_t6",
+    "crates/xanim_t6",
+    "crates/xmodel_runtime",
+
+    # Simulation and game rules
+    "crates/anim_t6",
+    "crates/clipmap_t6",
+    "crates/dobj_t6",
+    "crates/dpvs_t6",
+    "crates/entity_t6",
+    "crates/game_math",
+    "crates/gamemode_t6",
+    "crates/glass_t6",
+    "crates/input_t6",
+    "crates/killcam_t6",
+    "crates/marks_t6",
+    "crates/movement_t6",
+    "crates/playerstate_t6",
+    "crates/replay",
+    "crates/session",
+    "crates/sim",
+    "crates/trace_t6",
+    "crates/weapon_t6",
+
+    # What the player sees and hears
+    "crates/audio",
+    "crates/d3d9_decl",
+    "crates/d3d9_sm3",
+    "crates/d3d9_state",
+    "crates/frame",
+    "crates/fx",
+    "crates/fx_t6",
+    "crates/hud",
+    "crates/hud_t6",
+    "crates/lighting_t6",
+    "crates/render",
+    "crates/render_anim",
+    "crates/render_frame",
+    "crates/render_frontend",
+    "crates/render_fx",
+    "crates/render_gpu",
+    "crates/render_material",
+    "crates/render_scene",
+    "crates/ui",
+]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+
+# Third-party crates, then the workspace's own, both alphabetical.
+[workspace.dependencies]
+async-lock = "3"
+bcdec_rs = "0.2"
+bevy = { version = "0.19", default-features = false, features = [
+    "bevy_asset",
+    "bevy_audio",
+    "bevy_core_pipeline",
+    "bevy_gilrs",
+    "bevy_log",
+    "bevy_render",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_ui_render",
+    "bevy_ui_widgets",
+    "bevy_window",
+    "bevy_winit",
+    "multi_threaded",
+    "png",
+    "system_clipboard",
+    "ui_picking",
+    "wayland",
+    "x11",
+] }
+bevy_ecs = "0.19"
+dotenvy = "0.15"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+glam = "0.32.1"
+miniz_oxide = "0.8"
+png = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+zip = { version = "6", default-features = false, features = ["deflate"] }
+
+anim_t6 = { path = "crates/anim_t6" }
+asset_anim = { path = "crates/asset_anim" }
+asset_audio = { path = "crates/asset_audio" }
+asset_core = { path = "crates/asset_core" }
+asset_game = { path = "crates/asset_game" }
+asset_material = { path = "crates/asset_material" }
+asset_model = { path = "crates/asset_model" }
+asset_source = { path = "crates/asset_source" }
+asset_t6 = { path = "crates/asset_t6" }
+asset_transport = { path = "crates/asset_transport" }
+asset_world = { path = "crates/asset_world" }
+assets = { path = "crates/assets" }
+audio = { path = "crates/audio" }
+bo2_profile = { path = "crates/bo2_profile" }
+bots = { path = "crates/bots" }
+clipmap_t6 = { path = "crates/clipmap_t6" }
+console = { path = "crates/console" }
+d3d9_decl = { path = "crates/d3d9_decl" }
+d3d9_sm3 = { path = "crates/d3d9_sm3" }
+d3d9_state = { path = "crates/d3d9_state" }
+diag = { path = "crates/diag" }
+dobj_t6 = { path = "crates/dobj_t6" }
+dpvs_t6 = { path = "crates/dpvs_t6" }
+entity_t6 = { path = "crates/entity_t6" }
+fastfile_t5 = { path = "crates/fastfile_t5" }
+fastfile_t6 = { path = "crates/fastfile_t6" }
+frame = { path = "crates/frame" }
+fx = { path = "crates/fx" }
+fx_t6 = { path = "crates/fx_t6" }
+game_math = { path = "crates/game_math" }
+gamemode_t6 = { path = "crates/gamemode_t6" }
+glass_t6 = { path = "crates/glass_t6" }
+gsc_t6 = { path = "crates/gsc_t6" }
+hks_t6 = { path = "crates/hks_t6" }
+hud = { path = "crates/hud" }
+hud_t6 = { path = "crates/hud_t6" }
+input_t6 = { path = "crates/input_t6" }
+ipak_t6 = { path = "crates/ipak_t6" }
+killcam_t6 = { path = "crates/killcam_t6" }
+launcher = { path = "crates/launcher" }
+lighting_t6 = { path = "crates/lighting_t6" }
+marks_t6 = { path = "crates/marks_t6" }
+master_protocol = { path = "crates/master_protocol" }
+movement_t6 = { path = "crates/movement_t6" }
+net = { path = "crates/net" }
+perf = { path = "crates/perf" }
+playerstate_t6 = { path = "crates/playerstate_t6" }
+render = { path = "crates/render" }
+render_anim = { path = "crates/render_anim" }
+render_frame = { path = "crates/render_frame" }
+render_frontend = { path = "crates/render_frontend" }
+render_fx = { path = "crates/render_fx" }
+render_gpu = { path = "crates/render_gpu" }
+render_material = { path = "crates/render_material" }
+render_scene = { path = "crates/render_scene" }
+replay = { path = "crates/replay" }
+sab_t6 = { path = "crates/sab_t6" }
+session = { path = "crates/session" }
+sim = { path = "crates/sim" }
+trace_t6 = { path = "crates/trace_t6" }
+ui = { path = "crates/ui" }
+weapon_t6 = { path = "crates/weapon_t6" }
+xanim_t6 = { path = "crates/xanim_t6" }
+xmodel_runtime = { path = "crates/xmodel_runtime" }
+
+# Two upstream bugs worked around until a release carries the fix.
+#
+# quinn-proto 0.11.17 counts the bytes of an evicted DATAGRAM twice and panics
+# when the relay backs up. The git revision below has the fix (client and
+# master both use it). Drop it once a crates.io release includes
+# quinn-rs/quinn#2806.
+#
+# wgpu-hal 29.0.4 and 30.0.1 report a swap-chain image that takes longer than a
+# second to come back from the presentation engine as a lost device, which
+# ends the game. The copy under third_party/wgpu-hal waits again instead (see
+# "bo2mp patch" in src/vulkan/swapchain/native.rs). Drop it once an upstream
+# release stops turning that VK_TIMEOUT into DeviceError::Unexpected.
+[patch.crates-io]
+quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "f650e0f213b01ea7bebd60023e5df7df65e5c2bd" }
+wgpu-hal = { path = "third_party/wgpu-hal" }
+
+[workspace.lints.clippy]
+# Constants taken from the retail game are written at the precision they were
+# read: the f32 value 0.0005882352706976235 is the exact one in the image, and
+# shortening it to "enough digits" would silently change the physics.
+excessive_precision = "allow"
+# For the same reason a literal is never swapped for a std constant such as
+# PI: the two can differ in the last bit of the f32.
+approx_constant = "allow"
+assertions_on_constants = "deny"
+
+# Fat LTO and one codegen unit live on this profile only. The live recipes
+# (`make map`, `play`, `bench`, `bench-live`, ...) and the default `make deploy`
+# build `play` instead; `PROFILE=release` selects this one, for when a number
+# has to match the LTO binary.
+# Measured: wall p50 -5.7% and the binary 183 MB -> 114 MB. Do not change
+# `lto` or `codegen-units` without a new A/B on two maps with the same
+# protocol.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+# What the dev loop builds: `make play`, `make bench`, and the default Windows
+# and master deploy. It keeps release's opt-level (Bevy is too slow without it)
+# and gives up the two settings whose cost lands at link time. Fat LTO over
+# the whole dependency graph in one codegen unit is a single-threaded rustc
+# at about 6.6 GB that reruns after an edit in any crate; that link took
+# 13m03s and was what `make play` spent its time waiting on.
+#
+# `lto = false` still gets each crate's own thin LTO. Incremental builds pay
+# off for recompiles after the first fill of this profile's cache. `strip` is
+# set here, not in RUSTFLAGS, because RUSTFLAGS from the environment replace
+# the target's flags and would give play and release different fingerprints.
+#
+# A separate profile, not a loosened release, so the binary the published
+# numbers describe stays buildable. Play-versus-release frame time is not
+# measured here: `make bench <demo>` against `make bench <demo> PROFILE=release`
+# does that.
+[profile.play]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 16
+incremental = true
+strip = "symbols"
+
+# The binary a sampling profiler can read (`make bench-perf`). It is play with
+# the same opt-level and codegen-units, so the frame times it samples are the
+# ones `make bench-live` reports, plus the two things a profiler needs and
+# release drops: line tables (`debug = 1`) to name a frame, and a frame
+# pointer in every function (`-Cforce-frame-pointers=yes`, set by the recipe)
+# so `--call-graph fp` can walk the stack. Strip is off to keep the line
+# tables. Its own profile directory leaves play's and release's caches alone,
+# so switching between bench and perf does not relink.
+[profile.perf]
+inherits = "play"
+debug = 1
+strip = "none"

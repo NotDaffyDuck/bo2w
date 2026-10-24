@@ -1,0 +1,11 @@
+[package]
+name = "glass_t6"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Black Ops II windows: the server's pane health, cracks and shatters, and the client's shards, written from BO2's own rules"
+
+[dependencies]
+
+[lints]
+workspace = true

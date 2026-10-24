@@ -1,0 +1,13 @@
+[package]
+name = "playerstate_t6"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Black Ops II's player state and user command (playerState_s, usercmd_s): BO2's own fields, numbers and flags, with no ECS, bevy, or I/O."
+
+[dependencies]
+game_math.workspace = true
+libm = { version = "0.2.16", default-features = false }
+
+[lints]
+workspace = true

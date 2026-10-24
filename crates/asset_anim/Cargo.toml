@@ -1,0 +1,14 @@
+[package]
+name = "asset_anim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Animation clips and sets as the engine plays them."
+
+[dependencies]
+asset_core.workspace = true
+asset_t6.workspace = true
+xmodel_runtime.workspace = true
+
+[lints]
+workspace = true

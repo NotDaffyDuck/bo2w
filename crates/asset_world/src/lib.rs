@@ -1,0 +1,61 @@
+//! A map's world as engine-ready products: placed models, visibility,
+//! collision, glass and light.
+
+mod clip_error;
+mod clip_flags;
+mod clip_leafbrush;
+mod clip_t6;
+mod clip_tables;
+mod clip_trace;
+mod dyn_ent_defs;
+mod dyn_ent_kind;
+mod film_vision;
+mod fog_params;
+mod glass_windows;
+mod mesh_report;
+mod script_brush;
+mod spawn_points;
+mod sun_shadow_casters;
+mod surface_stamp;
+mod trigger_hull;
+
+pub mod model_draw;
+pub mod model_instances;
+pub mod model_scene_catalog;
+pub mod model_t6;
+pub mod t6_grade;
+pub mod world_draw_policy;
+pub mod world_lightmap;
+pub mod world_lights;
+pub mod world_scene;
+pub mod world_t6;
+pub mod world_visibility;
+
+pub use asset_core::*;
+pub use clip_error::ClipCollisionError;
+pub use clip_flags::t5_surface_flags;
+pub use clip_t6::*;
+pub use clip_tables::*;
+pub use clip_trace::ClipSweepHit;
+pub use dyn_ent_defs::*;
+pub use dyn_ent_kind::*;
+pub use film_vision::*;
+pub use fog_params::*;
+pub use glass_windows::*;
+pub use mesh_report::*;
+pub use model_draw::*;
+pub use model_instances::*;
+pub use model_scene_catalog::*;
+pub use model_t6::*;
+pub use script_brush::*;
+pub use spawn_points::*;
+pub use sun_shadow_casters::*;
+pub use surface_stamp::*;
+pub use t6_grade::*;
+pub use trigger_hull::*;
+pub use world_draw_policy::WorldDrawPolicy;
+pub use world_lightmap::*;
+pub use world_lights::*;
+pub use world_scene::*;
+pub use world_t6::*;
+pub use world_visibility::*;

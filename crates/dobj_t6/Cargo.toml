@@ -1,0 +1,12 @@
+[package]
+name = "dobj_t6"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Black Ops II DObj: 160-part bit sets, the anim calc masks, the per-part pose sum and the bounds radius"
+
+[dependencies]
+glam.workspace = true
+
+[lints]
+workspace = true

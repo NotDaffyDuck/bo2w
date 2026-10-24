@@ -1,0 +1,33 @@
+[package]
+name = "sim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The funnel: UserCmd in, Snapshot out. The single simulation path shared by live play, prediction and replay."
+
+[dependencies]
+bevy_ecs.workspace = true
+sha2.workspace = true
+diag.workspace = true
+movement_t6.workspace = true # bo2mp: BO2's own movement, always on in a BO2 game
+playerstate_t6.workspace = true
+game_math.workspace = true
+clipmap_t6.workspace = true # bo2mp: BO2 world traces
+trace_t6.workspace = true
+gamemode_t6.workspace = true
+hud_t6.workspace = true
+weapon_t6.workspace = true # bo2 gun brain
+entity_t6.workspace = true
+glass_t6.workspace = true # bo2 server glass
+anim_t6.workspace = true
+xanim_t6.workspace = true
+fx_t6.workspace = true
+xmodel_runtime.workspace = true
+glam.workspace = true
+gsc_t6.workspace = true # bo2zm
+bo2_profile.workspace = true # bo2mp
+perf.workspace = true
+asset_world.workspace = true # bo2mp: visionsetnaked
+
+[lints]
+workspace = true

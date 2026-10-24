@@ -1,0 +1,61 @@
+//! BO2's `hudelem_s`: one script HUD element, in BO2's field order.
+
+/// BO2's `hudelem_color_t`: red, green, blue, alpha bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct HudColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+/// BO2's `hudelem_s`. `type` is one of [`crate::consts::hud_type`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HudElem {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub font_scale: f32,
+    pub from_font_scale: f32,
+    pub font_scale_start_time: i32,
+    pub color: HudColor,
+    pub from_color: HudColor,
+    pub fade_start_time: i32,
+    pub scale_start_time: i32,
+    pub from_x: f32,
+    pub from_y: f32,
+    pub move_start_time: i32,
+    pub time: i32,
+    pub duration: i32,
+    pub value: f32,
+    pub sort: f32,
+    pub glow_color: HudColor,
+    pub fx_birth_time: i32,
+    pub flags: u32,
+    pub target_ent_num: i16,
+    pub font_scale_time: i16,
+    pub fade_time: i16,
+    pub label: i16,
+    pub width: i16,
+    pub height: i16,
+    pub from_width: i16,
+    pub from_height: i16,
+    pub scale_time: i16,
+    pub move_time: i16,
+    pub text: i16,
+    pub fx_letter_time: u16,
+    pub fx_decay_start_time: u16,
+    pub fx_decay_duration: u16,
+    pub fx_redact_decay_start_time: u16,
+    pub fx_redact_decay_duration: u16,
+    pub kind: u8,
+    pub font: u8,
+    pub align_org: u8,
+    pub align_screen: u8,
+    pub material_index: u8,
+    pub offscreen_material_idx: u8,
+    pub from_align_org: u8,
+    pub from_align_screen: u8,
+    pub sound_id: u8,
+    pub ui3d_window: i8,
+}

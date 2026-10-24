@@ -1,0 +1,11 @@
+[package]
+name = "anim_t6"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Black Ops II third-person player animation: the playeranim script, its picker and the packed legs/torso values"
+
+[dependencies]
+
+[lints]
+workspace = true

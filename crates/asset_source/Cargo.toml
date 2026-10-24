@@ -1,0 +1,16 @@
+[package]
+name = "asset_source"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Guest weapons: reads Source engine files (VPK archives, MDL/VVD/VTX models and their animations, VTF textures, WAV sounds) from the player's own Valve game install. Nothing of Valve's is shipped."
+
+[dependencies]
+bcdec_rs.workspace = true
+glam.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+png.workspace = true

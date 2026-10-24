@@ -1,0 +1,12 @@
+[package]
+name = "hud_t6"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "BO2 client HUD and 2D quantities from BO2 facts: fov, ammo, compass, crosshair, flash, iris, hud elems, 2D draw plumbing."
+
+[dependencies]
+libm = { version = "0.2.16", default-features = false }
+
+[lints]
+workspace = true

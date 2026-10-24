@@ -1,0 +1,13 @@
+# Settings that belong to one machine (game folders, channel, keys)
+.env
+
+# Cargo build output
+target/
+/dist/
+
+# Written by the game into the folder it runs from
+bo2mp-artifacts
+
+# Local working material: notes, extracted assets, reverse-engineering tools
+# and their databases. None of it is part of the source.
+/context/

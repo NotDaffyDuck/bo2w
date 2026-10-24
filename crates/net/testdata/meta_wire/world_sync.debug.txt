@@ -1,0 +1,869 @@
+tick 201: WorldObjectSnapshot {
+    as_of_ms: 10050,
+    map_round_epoch: 3,
+    t6_glass: [
+        PaneUpdate {
+            pane: 0,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 1,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 2,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 3,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 4,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 5,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 6,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 7,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 8,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 9,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 10,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 11,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 12,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 13,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 14,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 15,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 16,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 17,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 18,
+            state: Cracked,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 19,
+            state: Shattered,
+            hit: Some(
+                (
+                    [
+                        12.5,
+                        -40.0,
+                        96.25,
+                    ],
+                    [
+                        0.0,
+                        0.6,
+                        -0.8,
+                    ],
+                ),
+            ),
+        },
+    ],
+    destructible_loop_sounds: [
+        DestructibleLoopSound {
+            owner: ScriptModelId(
+                77,
+            ),
+            alias_index: 4,
+            origin: [
+                100.0,
+                200.5,
+                -8.0,
+            ],
+            volume: 200,
+            pitch: 90,
+        },
+        DestructibleLoopSound {
+            owner: ScriptModelId(
+                78,
+            ),
+            alias_index: 9,
+            origin: [
+                -1.0,
+                0.0,
+                1.0,
+            ],
+            volume: 255,
+            pitch: 128,
+        },
+    ],
+}
+tick 202: WorldObjectSnapshot {
+    as_of_ms: 10100,
+    map_round_epoch: 3,
+    t6_glass: [
+        PaneUpdate {
+            pane: 0,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 1,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 2,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 3,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 4,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 5,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 6,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 7,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 8,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 9,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 10,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 11,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 12,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 13,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 14,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 15,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 16,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 17,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 18,
+            state: Cracked,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 19,
+            state: Shattered,
+            hit: Some(
+                (
+                    [
+                        12.5,
+                        -40.0,
+                        96.25,
+                    ],
+                    [
+                        0.0,
+                        0.6,
+                        -0.8,
+                    ],
+                ),
+            ),
+        },
+    ],
+    destructible_loop_sounds: [
+        DestructibleLoopSound {
+            owner: ScriptModelId(
+                77,
+            ),
+            alias_index: 4,
+            origin: [
+                100.0,
+                200.5,
+                -8.0,
+            ],
+            volume: 200,
+            pitch: 90,
+        },
+        DestructibleLoopSound {
+            owner: ScriptModelId(
+                78,
+            ),
+            alias_index: 9,
+            origin: [
+                -1.0,
+                0.0,
+                1.0,
+            ],
+            volume: 255,
+            pitch: 128,
+        },
+    ],
+}
+tick 203: WorldObjectSnapshot {
+    as_of_ms: 10150,
+    map_round_epoch: 3,
+    t6_glass: [
+        PaneUpdate {
+            pane: 0,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 1,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 2,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 3,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 4,
+            state: Cracked,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 5,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 6,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 7,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 8,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 9,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 10,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 11,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 12,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 13,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 14,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 15,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 16,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 17,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 18,
+            state: Cracked,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 19,
+            state: Shattered,
+            hit: Some(
+                (
+                    [
+                        12.5,
+                        -40.0,
+                        96.25,
+                    ],
+                    [
+                        0.0,
+                        0.6,
+                        -0.8,
+                    ],
+                ),
+            ),
+        },
+    ],
+    destructible_loop_sounds: [
+        DestructibleLoopSound {
+            owner: ScriptModelId(
+                77,
+            ),
+            alias_index: 4,
+            origin: [
+                100.0,
+                200.5,
+                -8.0,
+            ],
+            volume: 200,
+            pitch: 90,
+        },
+        DestructibleLoopSound {
+            owner: ScriptModelId(
+                78,
+            ),
+            alias_index: 9,
+            origin: [
+                -1.0,
+                0.0,
+                1.0,
+            ],
+            volume: 255,
+            pitch: 128,
+        },
+    ],
+}
+tick 204: WorldObjectSnapshot {
+    as_of_ms: 10200,
+    map_round_epoch: 3,
+    t6_glass: [
+        PaneUpdate {
+            pane: 0,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 1,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 2,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 3,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 4,
+            state: Cracked,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 5,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 6,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 7,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 8,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 9,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 10,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 11,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 12,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 13,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 14,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 15,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 16,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 17,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 18,
+            state: Cracked,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 19,
+            state: Shattered,
+            hit: Some(
+                (
+                    [
+                        12.5,
+                        -40.0,
+                        96.25,
+                    ],
+                    [
+                        0.0,
+                        0.6,
+                        -0.8,
+                    ],
+                ),
+            ),
+        },
+    ],
+    destructible_loop_sounds: [
+        DestructibleLoopSound {
+            owner: ScriptModelId(
+                77,
+            ),
+            alias_index: 4,
+            origin: [
+                100.0,
+                200.5,
+                -8.0,
+            ],
+            volume: 200,
+            pitch: 90,
+        },
+    ],
+}
+tick 205: WorldObjectSnapshot {
+    as_of_ms: 10250,
+    map_round_epoch: 3,
+    t6_glass: [
+        PaneUpdate {
+            pane: 0,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 1,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 2,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 3,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 4,
+            state: Cracked,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 5,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 6,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 7,
+            state: Shattered,
+            hit: Some(
+                (
+                    [
+                        1.0,
+                        2.0,
+                        3.0,
+                    ],
+                    [
+                        0.0,
+                        0.0,
+                        -1.0,
+                    ],
+                ),
+            ),
+        },
+        PaneUpdate {
+            pane: 8,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 9,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 10,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 11,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 12,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 13,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 14,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 15,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 16,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 17,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 18,
+            state: Cracked,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 19,
+            state: Shattered,
+            hit: Some(
+                (
+                    [
+                        12.5,
+                        -40.0,
+                        96.25,
+                    ],
+                    [
+                        0.0,
+                        0.6,
+                        -0.8,
+                    ],
+                ),
+            ),
+        },
+    ],
+    destructible_loop_sounds: [
+        DestructibleLoopSound {
+            owner: ScriptModelId(
+                77,
+            ),
+            alias_index: 4,
+            origin: [
+                100.0,
+                200.5,
+                -8.0,
+            ],
+            volume: 200,
+            pitch: 90,
+        },
+    ],
+}
+tick 400: WorldObjectSnapshot {
+    as_of_ms: 10300,
+    map_round_epoch: 4,
+    t6_glass: [
+        PaneUpdate {
+            pane: 0,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 1,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 2,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 3,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 4,
+            state: Cracked,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 5,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 6,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 7,
+            state: Shattered,
+            hit: Some(
+                (
+                    [
+                        1.0,
+                        2.0,
+                        3.0,
+                    ],
+                    [
+                        0.0,
+                        0.0,
+                        -1.0,
+                    ],
+                ),
+            ),
+        },
+        PaneUpdate {
+            pane: 8,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 9,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 10,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 11,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 12,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 13,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 14,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 15,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 16,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 17,
+            state: Pristine,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 18,
+            state: Cracked,
+            hit: None,
+        },
+        PaneUpdate {
+            pane: 19,
+            state: Shattered,
+            hit: Some(
+                (
+                    [
+                        12.5,
+                        -40.0,
+                        96.25,
+                    ],
+                    [
+                        0.0,
+                        0.6,
+                        -0.8,
+                    ],
+                ),
+            ),
+        },
+    ],
+    destructible_loop_sounds: [
+        DestructibleLoopSound {
+            owner: ScriptModelId(
+                77,
+            ),
+            alias_index: 4,
+            origin: [
+                100.0,
+                200.5,
+                -8.0,
+            ],
+            volume: 200,
+            pitch: 90,
+        },
+    ],
+}

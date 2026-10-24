@@ -1,0 +1,20 @@
+[package]
+name = "asset_transport"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Filesystem transport: find games and zones, inflate zone files, index IWD sounds, cache blobs, report load progress."
+
+[dependencies]
+asset_core.workspace = true
+diag.workspace = true
+fastfile_t6.workspace = true
+zip.workspace = true
+flate2.workspace = true
+dotenvy.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+lnk = "0.6.4"
+
+[lints]
+workspace = true

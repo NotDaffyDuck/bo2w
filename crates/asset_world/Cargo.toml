@@ -1,0 +1,23 @@
+[package]
+name = "asset_world"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A map's world as engine-ready products: placed models, visibility, collision, glass and light."
+
+[dependencies]
+asset_core.workspace = true
+asset_material.workspace = true
+asset_model.workspace = true
+asset_t6.workspace = true
+bevy.workspace = true
+clipmap_t6.workspace = true
+dpvs_t6.workspace = true
+game_math.workspace = true
+lighting_t6.workspace = true
+movement_t6.workspace = true
+trace_t6.workspace = true
+xmodel_runtime.workspace = true
+
+[lints]
+workspace = true

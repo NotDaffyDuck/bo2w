@@ -1,0 +1,12 @@
+[package]
+name = "killcam_t6"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Black Ops II's killcam: the server's snapshot archive, the killcam entity types, the client camera's tuning and blend, and the script timings."
+
+[dependencies]
+game_math.workspace = true
+
+[lints]
+workspace = true

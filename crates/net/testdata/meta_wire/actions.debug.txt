@@ -1,0 +1,404 @@
+[
+    (
+        ClientId(
+            0,
+        ),
+        JoinMatch {
+            request_id: 1,
+        },
+    ),
+    (
+        ClientId(
+            3,
+        ),
+        LeaveMatch {
+            request_id: 2,
+        },
+    ),
+    (
+        ClientId(
+            6,
+        ),
+        SelectClass {
+            request_id: 3,
+            class_id: ClassId(
+                7,
+            ),
+            revision: 41,
+            loadout: PersonalClass {
+                weapons: [
+                    101,
+                    202,
+                    303,
+                    404,
+                ],
+                perks: [
+                    11,
+                    22,
+                    33,
+                ],
+                deathstreak: 3,
+            },
+        },
+    ),
+    (
+        ClientId(
+            9,
+        ),
+        GiveWeapon {
+            request_id: 4,
+            weapon: 16909060,
+        },
+    ),
+    (
+        ClientId(
+            12,
+        ),
+        ChangeWeaponConfiguration {
+            request_id: 5,
+            from: 17,
+            to: 18,
+        },
+    ),
+    (
+        ClientId(
+            15,
+        ),
+        ForceDeath {
+            request_id: 6,
+        },
+    ),
+    (
+        ClientId(
+            18,
+        ),
+        SpawnClient {
+            request_id: 7,
+        },
+    ),
+    (
+        ClientId(
+            21,
+        ),
+        ForceSpawn {
+            request_id: 8,
+            pick: Seeded(
+                1234605616436508552,
+            ),
+        },
+    ),
+    (
+        ClientId(
+            24,
+        ),
+        ForceSpawn {
+            request_id: 9,
+            pick: At {
+                origin: [
+                    1.5,
+                    -2.25,
+                    3.125,
+                ],
+                yaw: 270.5,
+            },
+        },
+    ),
+    (
+        ClientId(
+            27,
+        ),
+        SpawnIntermission {
+            request_id: 10,
+        },
+    ),
+    (
+        ClientId(
+            30,
+        ),
+        SetMatchPhase {
+            request_id: 11,
+            phase: Warmup,
+        },
+    ),
+    (
+        ClientId(
+            33,
+        ),
+        SetMatchPhase {
+            request_id: 12,
+            phase: Playing,
+        },
+    ),
+    (
+        ClientId(
+            36,
+        ),
+        SetMatchPhase {
+            request_id: 13,
+            phase: Intermission,
+        },
+    ),
+    (
+        ClientId(
+            39,
+        ),
+        SetMatchPhase {
+            request_id: 14,
+            phase: PostGame,
+        },
+    ),
+    (
+        ClientId(
+            42,
+        ),
+        Move {
+            request_id: 15,
+            origin: [
+                -512.0,
+                1024.5,
+                64.25,
+            ],
+            angles: [
+                -10.0,
+                359.5,
+                0.125,
+            ],
+        },
+    ),
+    (
+        ClientId(
+            45,
+        ),
+        BeginScriptMoverRotateVelocity {
+            request_id: 16,
+            speed: -45.75,
+        },
+    ),
+    (
+        ClientId(
+            48,
+        ),
+        DebugDamage {
+            request_id: 17,
+            amount: -250,
+        },
+    ),
+    (
+        ClientId(
+            51,
+        ),
+        SetName {
+            request_id: 18,
+            name: [
+                80,
+                108,
+                97,
+                121,
+                101,
+                114,
+                32,
+                79,
+                110,
+                101,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        },
+    ),
+    (
+        ClientId(
+            54,
+        ),
+        UseCopycat {
+            request_id: 19,
+        },
+    ),
+    (
+        ClientId(
+            57,
+        ),
+        ActionSlot {
+            request_id: 20,
+            slot: 3,
+        },
+    ),
+    (
+        ClientId(
+            60,
+        ),
+        ChooseDefaultClass {
+            request_id: 21,
+            index: 4,
+        },
+    ),
+    (
+        ClientId(
+            63,
+        ),
+        MenuResponse {
+            request_id: 22,
+            menu: [
+                99,
+                104,
+                97,
+                110,
+                103,
+                101,
+                99,
+                108,
+                97,
+                115,
+                115,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            response: [
+                99,
+                117,
+                115,
+                116,
+                111,
+                109,
+                49,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        },
+    ),
+    (
+        ClientId(
+            66,
+        ),
+        GiveKillstreak {
+            request_id: 23,
+            name: [
+                107,
+                105,
+                108,
+                108,
+                115,
+                116,
+                114,
+                101,
+                97,
+                107,
+                95,
+                114,
+                99,
+                98,
+                111,
+                109,
+                98,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        },
+    ),
+]

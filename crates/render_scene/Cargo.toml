@@ -1,0 +1,26 @@
+[package]
+name = "render_scene"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Scene occupancy storage and plugin. No frontend tess, anim, FX, or GPU."
+
+[dependencies]
+asset_game.workspace = true
+asset_material.workspace = true
+asset_model.workspace = true
+asset_world.workspace = true
+assets.workspace = true
+xmodel_runtime.workspace = true
+bevy.workspace = true
+diag.workspace = true
+dpvs_t6.workspace = true
+fx_t6.workspace = true
+hud_t6.workspace = true
+lighting_t6.workspace = true
+game_math.workspace = true
+render_material.workspace = true
+sim.workspace = true
+
+[lints]
+workspace = true

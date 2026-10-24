@@ -1,0 +1,460 @@
+//! Triggers: touch triggers (`trigger_multiple`, `trigger_radius`) notify
+//! `trigger` with the player every frame he is inside; use triggers
+//! (`trigger_use`, `trigger_use_touch`, `trigger_radius_use`) when he
+//! presses use inside the one he faces best; hurt triggers (`trigger_hurt`)
+//! hurt him while he is inside. A trigger hidden from a player
+//! (`setinvisibletoplayer`) ignores him.
+
+use bevy_ecs::prelude::World;
+use gsc_t6::{ObjRef, Value};
+
+use super::{Ent, Zm, frame, with_vm};
+use crate::bullet_collision::{PLAYER_MAXS, PLAYER_MINS};
+use crate::script::host::triggers::{Volume, t6_volume};
+use crate::world::ClientId;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Kind {
+    Touch,
+    Use,
+}
+
+pub(super) fn kind(classname: &str) -> Option<Kind> {
+    match classname {
+        "trigger_multiple" | "trigger_radius" | "trigger_once" | "trigger_box" => Some(Kind::Touch),
+        "trigger_use" | "trigger_use_touch" | "trigger_radius_use" | "trigger_box_use" => {
+            Some(Kind::Use)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn brush_index(e: &Ent) -> Option<u32> {
+    e.brush.as_deref()?.strip_prefix('*')?.parse().ok()
+}
+
+pub(super) fn cylinder(e: &Ent) -> Option<(f32, f32)> {
+    (e.radius > 0.0).then_some((e.radius, e.height.max(1.0)))
+}
+
+/// Does `e`'s volume touch the box `mins..maxs`?
+pub(super) fn touches(world: &mut World, e: &Ent, mins: [f32; 3], maxs: [f32; 3]) -> bool {
+    // A turned box: the other box's centre against it, grown by that box's
+    // reach along each of its axes.
+    if let Some([w, l, h]) = e.box_dims {
+        let (f, r, u) = gsc_t6::math::angle_vectors(e.angles);
+        let c: [f32; 3] = std::array::from_fn(|i| (mins[i] + maxs[i]) * 0.5 - e.origin[i]);
+        let half: [f32; 3] = std::array::from_fn(|i| (maxs[i] - mins[i]) * 0.5);
+        let reach =
+            |a: [f32; 3]| a[0].abs() * half[0] + a[1].abs() * half[1] + a[2].abs() * half[2];
+        let dot = |a: [f32; 3]| a[0] * c[0] + a[1] * c[1] + a[2] * c[2];
+        return dot(f).abs() <= w * 0.5 + reach(f)
+            && dot(r).abs() <= l * 0.5 + reach(r)
+            && dot(u).abs() <= h * 0.5 + reach(u);
+    }
+    let f = frame(world);
+    match t6_volume(&f, e.origin, cylinder(e), brush_index(e)) {
+        Some(v) => v.touches(mins, maxs),
+        None => false,
+    }
+}
+
+/// A look-at use trigger's test: how far along the player's view (from
+/// his eye, within the use radius) it meets the trigger's turned box, with
+/// nothing solid in front of it (the chalk board the weapon sits on is
+/// allowed: a few units). BO2 builds each wall buy's box from the
+/// weapon model on the wall, nudged out of the wall so the view meets it
+/// before the wall, and asks the engine for a look (`require_look_at`).
+fn look_hit(world: &mut World, e: &Ent, eye: [f32; 3], dir: [f32; 3], reach: f32) -> Option<f32> {
+    let [w, l, h] = e.box_dims?;
+    let (f, r, u) = gsc_t6::math::angle_vectors(e.angles);
+    let rel = gsc_t6::math::sub(eye, e.origin);
+    let (mut near, mut far) = (0.0f32, reach);
+    for (axis, half) in [(f, w * 0.5), (r, l * 0.5), (u, h * 0.5)] {
+        let o = gsc_t6::math::dot(rel, axis);
+        let d = gsc_t6::math::dot(dir, axis);
+        if d.abs() < 1e-6 {
+            if o.abs() > half {
+                return None;
+            }
+            continue;
+        }
+        let (a, b) = ((-half - o) / d, (half - o) / d);
+        near = near.max(a.min(b));
+        far = far.min(a.max(b));
+        if near > far {
+            return None;
+        }
+    }
+    let to: [f32; 3] = std::array::from_fn(|i| eye[i] + dir[i] * near);
+    let t = frame(world).trace_static_world(
+        eye,
+        to,
+        [0.0; 3],
+        [0.0; 3],
+        crate::bullet_collision::MASK_SHOT,
+    );
+    (t.fraction.clamp(0.0, 1.0) * near >= near - 8.0).then_some(near)
+}
+
+pub(super) fn center(world: &mut World, e: &Ent) -> [f32; 3] {
+    if e.box_dims.is_some() {
+        return e.origin;
+    }
+    if cylinder(e).is_some() {
+        return [e.origin[0], e.origin[1], e.origin[2] + e.height * 0.5];
+    }
+    let f = frame(world);
+    let model = brush_index(e).and_then(|n| {
+        f.clip_cmodels()
+            .models
+            .get(n as usize)
+            .map(|m| (m.mins, m.maxs))
+    });
+    match model {
+        Some((lo, hi)) => std::array::from_fn(|i| e.origin[i] + (lo[i] + hi[i]) * 0.5),
+        None => e.origin,
+    }
+}
+
+/// The world box an entity fills (the engine's absmin / absmax): its turned
+/// box's, its cylinder's, or its brush model's bounds around its origin.
+pub(super) fn abs_box(world: &mut World, e: &Ent) -> Option<([f32; 3], [f32; 3])> {
+    if let Some([w, l, h]) = e.box_dims {
+        let half = [w * 0.5, l * 0.5, h * 0.5];
+        let (f, r, u) = gsc_t6::math::angle_vectors(e.angles);
+        let reach: [f32; 3] =
+            std::array::from_fn(|i| f[i].abs() * half[0] + r[i].abs() * half[1] + u[i].abs() * half[2]);
+        return Some((
+            std::array::from_fn(|i| e.origin[i] - reach[i]),
+            std::array::from_fn(|i| e.origin[i] + reach[i]),
+        ));
+    }
+    if let Some((r, h)) = cylinder(e) {
+        let o = e.origin;
+        return Some(([o[0] - r, o[1] - r, o[2]], [o[0] + r, o[1] + r, o[2] + h]));
+    }
+    let n = brush_index(e)?;
+    let f = frame(world);
+    let m = f.clip_cmodels().models.get(n as usize)?;
+    Some((
+        std::array::from_fn(|i| e.origin[i] + m.mins[i]),
+        std::array::from_fn(|i| e.origin[i] + m.maxs[i]),
+    ))
+}
+
+/// The boxes of the entities a script barred tactical insertions from
+/// (`allowtacticalinsertion(0)`), for the gun step's
+/// Player_EntityBlocksTacticalInsertion.
+pub(super) fn publish_tac_insert_blockers(world: &mut World) {
+    let barred: Vec<Ent> = world
+        .resource::<Zm>()
+        .ents
+        .values()
+        .filter(|e| e.no_tac_insert)
+        .cloned()
+        .collect();
+    let boxes: Vec<([f32; 3], [f32; 3])> = barred.iter().filter_map(|e| abs_box(world, e)).collect();
+    frame(world).set_tac_insert_blockers(boxes);
+}
+
+/// His box for triggers and touch tests. Its top follows his stance, as BO2's
+/// ClientThink_real copies the move's box onto him: 70 standing, 50 crouched,
+/// 30 prone.
+pub(super) fn player_box(world: &mut World, client: u32) -> Option<([f32; 3], [f32; 3])> {
+    let frame = frame(world);
+    let ps = frame.player(ClientId(client))?;
+    let o = ps.origin;
+    let mut maxs = PLAYER_MAXS;
+    maxs[2] = crate::item::stance_maxs_z(ps);
+    Some((
+        std::array::from_fn(|i| o[i] + PLAYER_MINS[i]),
+        std::array::from_fn(|i| o[i] + maxs[i]),
+    ))
+}
+
+/// Fire the frame's triggers.
+pub(super) fn dispatch(world: &mut World) {
+    let players: Vec<(u32, ObjRef)> = world
+        .resource::<Zm>()
+        .players
+        .iter()
+        .filter(|(_, p)| p.sessionstate == "playing")
+        .map(|(c, p)| (*c, p.obj))
+        .collect();
+    let triggers: Vec<(u32, Ent, Kind)> = world
+        .resource::<Zm>()
+        .ents
+        .iter()
+        .filter_map(|(n, e)| kind(&e.classname).map(|k| (*n, e.clone(), k)))
+        .filter(|(_, e, _)| e.obj.is_some() && !e.trigger_off)
+        .collect();
+    // The use reach: the scripts raise player_useRadius_zm to their
+    // largest trigger's (64 on Nuketown).
+    let use_radius = with_vm(world, |vm, _| {
+        vm.dvars
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("player_useRadius_zm"))
+            .and_then(|(_, v)| v.parse::<f32>().ok())
+    })
+    .flatten()
+    .unwrap_or(64.0)
+    .max(1.0);
+    // bo2mp: a use trigger only its claimant (`clientclaimtrigger`) or its
+    // team (`setteamfortrigger`) may use: a turret's pick-up is its owner's.
+    // (trigger entity, claimant client, team) and each player's team.
+    let mp = world.resource::<Zm>().mp;
+    let (claims, teams): (Vec<(u32, Option<u32>, Option<String>)>, Vec<(u32, String)>) = if !mp {
+        Default::default()
+    } else {
+        with_vm(world, |vm, world| {
+            let (by, team) = (vm.intern("claimedby"), vm.intern("triggerteam"));
+            let pteam = vm.intern("team");
+            let claims = triggers
+                .iter()
+                .filter(|(_, _, k)| *k == Kind::Use)
+                .filter_map(|(n, e, _)| {
+                    let o = e.obj?;
+                    let claimant = super::entnum(vm, &vm.raw_field(o, by));
+                    let t = match vm.raw_field(o, team) {
+                        Value::Undefined => None,
+                        v => Some(vm.to_text(&v)),
+                    };
+                    (claimant.is_some() || t.is_some()).then_some((*n, claimant, t))
+                })
+                .collect();
+            let teams = world
+                .resource::<Zm>()
+                .players
+                .iter()
+                .map(|(c, p)| (*c, vm.to_text(&vm.raw_field(p.obj, pteam))))
+                .collect();
+            (claims, teams)
+        })
+        .unwrap_or_default()
+    };
+    let playing: Vec<u32> = players.iter().map(|(c, _)| *c).collect();
+    let mut fire: Vec<(ObjRef, ObjRef)> = Vec::new();
+    for (client, pobj) in players {
+        let Some((mins, maxs)) = player_box(world, client) else {
+            continue;
+        };
+        let held = crate::script_player::buttons(&mut frame(world), ClientId(client))
+            & (playerstate_t6::game::buttons::USE | playerstate_t6::game::buttons::USE_RELOAD)
+            != 0;
+        let pressed = {
+            let mut zm = world.resource_mut::<Zm>();
+            let was = zm.use_held.contains(&client);
+            if held {
+                zm.use_held.insert(client);
+            } else {
+                zm.use_held.remove(&client);
+            }
+            held && !was
+        };
+        let (eye, fwd) = {
+            let f = frame(world);
+            let ps = f.player(ClientId(client));
+            let eye = ps.map_or([0.0; 3], |p| {
+                [
+                    p.origin[0],
+                    p.origin[1],
+                    p.origin[2] + p.view_height_current,
+                ]
+            });
+            let fwd = gsc_t6::math::angle_vectors(ps.map_or([0.0; 3], |p| p.viewangles)).0;
+            (eye, fwd)
+        };
+        // In a vehicle he has no use hint and uses nothing (BO2's
+        // Player_UpdateCursorHints and the use scan both stop while
+        // eFlags 0x4000 is set).
+        let in_vehicle = super::killstreaks::riding(world, client);
+        let mut best: Option<(f32, ObjRef, Option<String>)> = None;
+        let my_team = teams
+            .iter()
+            .find(|(c, _)| *c == client)
+            .map(|(_, t)| t.as_str());
+        for (n, e, k) in &triggers {
+            if in_vehicle && *k == Kind::Use {
+                continue;
+            }
+            // (A claim by someone no longer playing holds nothing.)
+            if let Some((_, claimant, team)) = claims.iter().find(|(t, _, _)| t == n)
+                && (claimant.is_some_and(|c| c != client && playing.contains(&c))
+                    || team.as_deref().is_some_and(|t| Some(t) != my_team))
+            {
+                continue;
+            }
+            if e.invisible_to.contains(&client) || e.invisible_to_all {
+                continue;
+            }
+            let looked = *k == Kind::Use && e.look_at && e.box_dims.is_some();
+            if looked {
+                if look_hit(world, e, eye, fwd, use_radius).is_none() {
+                    continue;
+                }
+            } else if !touches(world, e, mins, maxs) {
+                continue;
+            }
+            let obj = e.obj.unwrap();
+            match k {
+                Kind::Touch => fire.push((obj, pobj)),
+                Kind::Use => {
+                    let c = center(world, e);
+                    let d = gsc_t6::math::normalize(gsc_t6::math::sub(c, eye));
+                    let score = gsc_t6::math::dot(d, fwd);
+                    if best.as_ref().is_none_or(|b| score > b.0) {
+                        best = Some((score, obj, e.hint.clone()));
+                    }
+                }
+            }
+        }
+        {
+            let mut zm = world.resource_mut::<Zm>();
+            // BO2MP_T6_HINTLOG=1: each change of the faced trigger's hint and
+            // the trigger it came from.
+            if std::env::var_os("BO2MP_T6_HINTLOG").is_some() {
+                let now_hint = best.as_ref().and_then(|b| b.2.clone());
+                if zm.hints.get(&client) != now_hint.as_ref() {
+                    let from = best.as_ref().and_then(|b| {
+                        triggers
+                            .iter()
+                            .find(|(_, e, _)| e.obj == Some(b.1))
+                            .map(|(n, e, _)| {
+                                format!(
+                                    "ent{n} {} at ({:.0} {:.0} {:.0}) angles {:?} box {:?}",
+                                    e.classname,
+                                    e.origin[0],
+                                    e.origin[1],
+                                    e.origin[2],
+                                    e.angles,
+                                    e.box_dims
+                                )
+                            })
+                    });
+                    diag::info!(
+                        Sim,
+                        "bo2zm t6 hint for {client}: {now_hint:?} from {from:?}"
+                    );
+                }
+            }
+            match &best {
+                Some((_, _, Some(h))) => {
+                    zm.hints.insert(client, h.clone());
+                }
+                _ => {
+                    zm.hints.remove(&client);
+                }
+            }
+        }
+        // bo2mp: else a usable model's (a care package's capture prompt).
+        if !in_vehicle
+            && best.as_ref().is_none_or(|b| b.2.is_none())
+            && let Some(origin) = frame(world).player(ClientId(client)).map(|ps| ps.origin)
+            && let Some(h) = super::killstreaks::usable_hint(world, origin)
+        {
+            world.resource_mut::<Zm>().hints.insert(client, h);
+        }
+        if pressed && let Some((_, obj, _)) = best {
+            if std::env::var("BO2MP_T6_TRIGLOG").is_ok() {
+                diag::info!(Sim, "bo2zm t6 use by {client} on {obj:?}");
+            }
+            fire.push((obj, pobj));
+        }
+    }
+    if fire.is_empty() {
+        return;
+    }
+    with_vm(world, |vm, world| {
+        for (t, p) in fire {
+            if vm.alive(t) {
+                vm.notify_str(world, t, "trigger", &[Value::Object(p)]);
+            }
+        }
+    });
+}
+
+/// BO2's trigger_hurt (SP_trigger_hurt, hurt_touch, G_DoTouchTriggers): a
+/// playing player touching one it is not hidden from gets its `trigger`
+/// notify and its `dmg` (5 when the map gives none) as MOD_TRIGGER_HURT,
+/// the trigger his inflictor and attacker, with no point and no direction.
+/// Then it rests 50 ms (1000 ms with spawnflags 16) on its one clock for
+/// everyone, and with spawnflags 32 it goes off. One with spawnflags 1
+/// starts off (BO2's hurt_use turns it on: unported). Players only: BO2's
+/// actors and vehicles touch them too.
+pub(super) fn hurt(world: &mut World) {
+    let players: Vec<(u32, ObjRef)> = world
+        .resource::<Zm>()
+        .players
+        .iter()
+        .filter(|(_, p)| p.sessionstate == "playing")
+        .map(|(c, p)| (*c, p.obj))
+        .collect();
+    if players.is_empty() {
+        return;
+    }
+    let hurts: Vec<(u32, Ent)> = world
+        .resource::<Zm>()
+        .ents
+        .iter()
+        .filter(|(_, e)| e.classname == "trigger_hurt" && e.obj.is_some() && !e.trigger_off && !e.hurt_off)
+        .map(|(n, e)| (*n, e.clone()))
+        .collect();
+    if hurts.is_empty() {
+        return;
+    }
+    for (client, pobj) in players {
+        if !frame(world).player(ClientId(client)).is_some_and(|ps| ps.health > 0) {
+            continue;
+        }
+        let Some((mins, maxs)) = player_box(world, client) else {
+            continue;
+        };
+        for (n, e) in &hurts {
+            if e.invisible_to.contains(&client) || e.invisible_to_all || !touches(world, e, mins, maxs) {
+                continue;
+            }
+            let t = e.obj.unwrap();
+            with_vm(world, |vm, world| {
+                let now = vm.time_ms;
+                if !vm.alive(t)
+                    || world
+                        .resource::<Zm>()
+                        .ents
+                        .get(n)
+                        .is_none_or(|e| e.trigger_off || e.hurt_off || e.hurt_at > now)
+                {
+                    return;
+                }
+                let (sf, dmg) = (vm.intern("spawnflags"), vm.intern("dmg"));
+                let flags = vm.raw_field(t, sf).as_int().unwrap_or(0);
+                if flags & 1 != 0 {
+                    return;
+                }
+                let amount = vm.raw_field(t, dmg).as_int().filter(|d| *d != 0).unwrap_or(5);
+                if let Some(e) = world.resource_mut::<Zm>().ents.get_mut(n) {
+                    e.hurt_at = now + if flags & 0x10 != 0 { 1000 } else { 50 };
+                    e.hurt_off = flags & 0x20 != 0;
+                }
+                vm.notify_str(world, t, "trigger", &[Value::Object(pobj)]);
+                super::natives_ai::player_damage_from(
+                    vm,
+                    world,
+                    client,
+                    Value::Object(t),
+                    Value::Object(t),
+                    amount,
+                    0,
+                    "MOD_TRIGGER_HURT",
+                    "none",
+                    Value::Undefined,
+                    Value::Undefined,
+                    "none",
+                );
+            });
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn _volume_type(_: Volume<'_>) {}

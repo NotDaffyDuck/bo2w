@@ -1,0 +1,7 @@
+# `unwrap_or_default()` picks a fallback without saying which; write the
+# fallback out (`unwrap_or(..)`, `unwrap_or_else(..)`, `map_or_else(..)`) so a
+# reader sees what a missing value turns into.
+disallowed-methods = [
+  { path = "std::option::Option::unwrap_or_default", reason = "name the fallback value" },
+  { path = "std::result::Result::unwrap_or_default", reason = "name the fallback value" },
+]

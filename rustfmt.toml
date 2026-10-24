@@ -1,0 +1,9 @@
+# One format for the workspace. Run rustfmt on the files you changed, not on
+# the whole tree.
+edition = "2024"
+style_edition = "2024"
+newline_style = "Unix"
+
+# `Point { x, y }` and `value?` over the longhand spellings.
+use_field_init_shorthand = true
+use_try_shorthand = true

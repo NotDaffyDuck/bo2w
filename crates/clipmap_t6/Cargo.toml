@@ -1,0 +1,13 @@
+[package]
+name = "clipmap_t6"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Black Ops II clip map: the map tree, leafs, leaf brush nodes, terrain meshes and brush models, and CM_Trace and point contents over them, written from BO2's own order and numbers"
+
+[dependencies]
+libm = { version = "0.2.16", default-features = false }
+trace_t6.workspace = true
+
+[lints]
+workspace = true

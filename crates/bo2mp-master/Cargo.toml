@@ -1,0 +1,15 @@
+package.name = "bo2mp-master"
+package.version = "0.1.0"
+package.edition.workspace = true
+package.license.workspace = true
+package.description = "Lobby service for bo2mp: room browser, request handling and packet relay over QUIC."
+# xtask installs and probes this binary by name.
+bin = [{ name = "bo2mp-master", path = "src/app.rs" }]
+dependencies.getrandom = "0.3"
+dependencies.master_protocol.workspace = true
+dependencies.quinn = { version = "0.11.11", default-features = false, features = ["platform-verifier", "runtime-tokio", "rustls-ring"] }
+dependencies.rustls = { version = "0.23.31", default-features = false, features = ["ring", "std"] }
+dependencies.rustls-pemfile = "2.2.0"
+dependencies.rustls-platform-verifier = "0.7.0"
+dependencies.tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time"] }
+lints.workspace = true

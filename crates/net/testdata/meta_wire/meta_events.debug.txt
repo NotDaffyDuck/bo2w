@@ -1,0 +1,1120 @@
+SnapshotMetaSectionBytes {
+    match_header: 21,
+    events: 1455,
+    aliases: 41,
+    entity_dobjs: 2,
+    corpses: 9,
+    entities: 2,
+    script_movers: 2,
+    entity_kernel: 16,
+    item_tables: 4,
+    area_entities: 1,
+    objectives: 31,
+    world_objects: 11,
+}
+SnapshotMeta {
+    objectives: ObjectiveMatch {
+        scores: [
+            0,
+            0,
+            0,
+        ],
+        compass: [],
+        vehicles: [],
+        server_info: [],
+        game_end_time: 0,
+        scripted_effects: false,
+        effects: [],
+        fog: None,
+        earthquakes: [],
+        naked_vision: None,
+        thermal_vision: None,
+        missile_vision: None,
+        night_vision: None,
+        pain_vision: None,
+    },
+    phase: Warmup,
+    match_elapsed_ms: 0,
+    prematch: Waiting {
+        elapsed_ms: 0,
+    },
+    score_limit: 0,
+    time_limit_ms: 0,
+    kind: FreeForAll,
+    clients: [],
+    journal: [
+        EventRecord {
+            sequence: EventSequence(
+                1,
+            ),
+            tick: Tick(
+                101,
+            ),
+            audience: All,
+            event: AttackReleased,
+        },
+        EventRecord {
+            sequence: EventSequence(
+                2,
+            ),
+            tick: Tick(
+                102,
+            ),
+            audience: AllExcept(
+                ClientId(
+                    3,
+                ),
+            ),
+            event: ScoreChanged {
+                client: ClientId(
+                    1,
+                ),
+                score: 100,
+                kills: 2,
+                deaths: 0,
+            },
+        },
+        EventRecord {
+            sequence: EventSequence(
+                3,
+            ),
+            tick: Tick(
+                103,
+            ),
+            audience: Client(
+                ClientId(
+                    2,
+                ),
+            ),
+            event: Spawned {
+                class_id: ClassId(
+                    1,
+                ),
+                spawn_index: 4,
+                life_sequence: LifeSequence(
+                    2,
+                ),
+            },
+        },
+        EventRecord {
+            sequence: EventSequence(
+                4,
+            ),
+            tick: Tick(
+                104,
+            ),
+            audience: Clients(
+                [
+                    ClientId(
+                        0,
+                    ),
+                    ClientId(
+                        5,
+                    ),
+                    ClientId(
+                        9,
+                    ),
+                ],
+            ),
+            event: WeaponSwitchRequested {
+                weapon: 77,
+            },
+        },
+    ],
+    entity_events: [
+        EntityEventRecord {
+            sequence: EventSequence(
+                10,
+            ),
+            tick: Tick(
+                200,
+            ),
+            audience: All,
+            event: EntityEventKind(
+                222,
+            ),
+            payload: EntityEventPayload {
+                number: 40,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+        EntityEventRecord {
+            sequence: EventSequence(
+                11,
+            ),
+            tick: Tick(
+                201,
+            ),
+            audience: Client(
+                ClientId(
+                    1,
+                ),
+            ),
+            event: EntityEventKind(
+                111,
+            ),
+            payload: EntityEventPayload {
+                number: 41,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+        EntityEventRecord {
+            sequence: EventSequence(
+                12,
+            ),
+            tick: Tick(
+                202,
+            ),
+            audience: All,
+            event: EntityEventKind(
+                105,
+            ),
+            payload: EntityEventPayload {
+                number: 42,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+        EntityEventRecord {
+            sequence: EventSequence(
+                13,
+            ),
+            tick: Tick(
+                203,
+            ),
+            audience: Client(
+                ClientId(
+                    3,
+                ),
+            ),
+            event: EntityEventKind(
+                113,
+            ),
+            payload: EntityEventPayload {
+                number: 43,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+        EntityEventRecord {
+            sequence: EventSequence(
+                14,
+            ),
+            tick: Tick(
+                204,
+            ),
+            audience: All,
+            event: EntityEventKind(
+                117,
+            ),
+            payload: EntityEventPayload {
+                number: 44,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+        EntityEventRecord {
+            sequence: EventSequence(
+                15,
+            ),
+            tick: Tick(
+                205,
+            ),
+            audience: Client(
+                ClientId(
+                    5,
+                ),
+            ),
+            event: EntityEventKind(
+                256,
+            ),
+            payload: EntityEventPayload {
+                number: 45,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+        EntityEventRecord {
+            sequence: EventSequence(
+                16,
+            ),
+            tick: Tick(
+                206,
+            ),
+            audience: All,
+            event: EntityEventKind(
+                131,
+            ),
+            payload: EntityEventPayload {
+                number: 46,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+        EntityEventRecord {
+            sequence: EventSequence(
+                17,
+            ),
+            tick: Tick(
+                207,
+            ),
+            audience: Client(
+                ClientId(
+                    7,
+                ),
+            ),
+            event: EntityEventKind(
+                217,
+            ),
+            payload: EntityEventPayload {
+                number: 47,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+        EntityEventRecord {
+            sequence: EventSequence(
+                18,
+            ),
+            tick: Tick(
+                208,
+            ),
+            audience: All,
+            event: EntityEventKind(
+                218,
+            ),
+            payload: EntityEventPayload {
+                number: 48,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+        EntityEventRecord {
+            sequence: EventSequence(
+                19,
+            ),
+            tick: Tick(
+                209,
+            ),
+            audience: Client(
+                ClientId(
+                    9,
+                ),
+            ),
+            event: EntityEventKind(
+                4,
+            ),
+            payload: EntityEventPayload {
+                number: 49,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+        EntityEventRecord {
+            sequence: EventSequence(
+                20,
+            ),
+            tick: Tick(
+                210,
+            ),
+            audience: All,
+            event: EntityEventKind(
+                11,
+            ),
+            payload: EntityEventPayload {
+                number: 50,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+        EntityEventRecord {
+            sequence: EventSequence(
+                21,
+            ),
+            tick: Tick(
+                211,
+            ),
+            audience: Client(
+                ClientId(
+                    11,
+                ),
+            ),
+            event: EntityEventKind(
+                18,
+            ),
+            payload: EntityEventPayload {
+                number: 51,
+                other_entity_num: 41,
+                attacker_entity_num: 3,
+                event_parm: 9,
+                weapon: 12,
+                correlation: 555,
+                pellet: 4,
+                hand: 1,
+                origin: [
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                origin2: [
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                direction: [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                surf_type: 7,
+                surface_flags: 32,
+                simulation_flags: 2,
+            },
+        },
+    ],
+    pellet_fx: [
+        PelletFxRecord {
+            attacker: 3,
+            weapon: 99,
+            correlation: 7,
+            pellet: 2,
+            hand: 1,
+            start: [
+                0.0,
+                0.0,
+                60.0,
+            ],
+            end: [
+                300.0,
+                20.0,
+                55.0,
+            ],
+            normal: [
+                -1.0,
+                0.0,
+                0.0,
+            ],
+            surf_type: 5,
+            surface_flags: 64,
+            flesh_flags: 1,
+        },
+        PelletFxRecord {
+            attacker: 0,
+            weapon: 0,
+            correlation: 0,
+            pellet: 0,
+            hand: 0,
+            start: [
+                0.0,
+                0.0,
+                0.0,
+            ],
+            end: [
+                0.0,
+                0.0,
+                0.0,
+            ],
+            normal: [
+                0.0,
+                0.0,
+                0.0,
+            ],
+            surf_type: 0,
+            surface_flags: 0,
+            flesh_flags: 0,
+        },
+    ],
+    debris: [
+        DebrisRecord {
+            model: "xmodel_glass_shard",
+            origin: [
+                10.0,
+                20.0,
+                30.0,
+            ],
+            rotation: [
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            velocity: [
+                0.0,
+                5.0,
+                100.0,
+            ],
+            mass: 2.0,
+            bounce: 0.3,
+            friction: 0.5,
+            bullet_force_scale: 1.0,
+            explosive_force_scale: 2.0,
+        },
+    ],
+    sound_aliases: [],
+    effect_names: [],
+    hud_materials: [],
+    hud_strings: [],
+    rng: RngDebugMeta {
+        root_seed: 0,
+        scheme: 0,
+        spawn_draws: 0,
+        combat_draws: 0,
+        bot_draws: 0,
+    },
+    world_objects: WorldObjectSnapshot {
+        as_of_ms: 0,
+        map_round_epoch: 0,
+        t6_glass: [],
+        destructible_loop_sounds: [],
+    },
+    area_entities: None,
+    entity_dobjs: [],
+    entities: [],
+    script_movers: [],
+    entity_kernel: EntityKernelSnapshot {
+        slots: [],
+        high_water: 26,
+        free_fifo: [],
+        level_time_ms: 0,
+        frame_serial: 0,
+    },
+    corpses: PlayerCorpsePool {
+        slots: [
+            PlayerCorpseSlot {
+                occupied: false,
+                entnum: -1,
+                victim: ClientId(
+                    0,
+                ),
+                origin: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                viewangles: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                anim: AnimPair {
+                    legs_anim: 0,
+                    torso_anim: 0,
+                },
+                view_height_current: 0.0,
+                weapon: 0,
+                e_flags: 0,
+                tr_type: 0,
+                tr_time: 0,
+                tr_duration: 0,
+                tr_delta: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                tr_base: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                falling: false,
+                ground_entity_num: 2047,
+            },
+            PlayerCorpseSlot {
+                occupied: false,
+                entnum: -1,
+                victim: ClientId(
+                    0,
+                ),
+                origin: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                viewangles: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                anim: AnimPair {
+                    legs_anim: 0,
+                    torso_anim: 0,
+                },
+                view_height_current: 0.0,
+                weapon: 0,
+                e_flags: 0,
+                tr_type: 0,
+                tr_time: 0,
+                tr_duration: 0,
+                tr_delta: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                tr_base: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                falling: false,
+                ground_entity_num: 2047,
+            },
+            PlayerCorpseSlot {
+                occupied: false,
+                entnum: -1,
+                victim: ClientId(
+                    0,
+                ),
+                origin: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                viewangles: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                anim: AnimPair {
+                    legs_anim: 0,
+                    torso_anim: 0,
+                },
+                view_height_current: 0.0,
+                weapon: 0,
+                e_flags: 0,
+                tr_type: 0,
+                tr_time: 0,
+                tr_duration: 0,
+                tr_delta: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                tr_base: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                falling: false,
+                ground_entity_num: 2047,
+            },
+            PlayerCorpseSlot {
+                occupied: false,
+                entnum: -1,
+                victim: ClientId(
+                    0,
+                ),
+                origin: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                viewangles: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                anim: AnimPair {
+                    legs_anim: 0,
+                    torso_anim: 0,
+                },
+                view_height_current: 0.0,
+                weapon: 0,
+                e_flags: 0,
+                tr_type: 0,
+                tr_time: 0,
+                tr_duration: 0,
+                tr_delta: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                tr_base: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                falling: false,
+                ground_entity_num: 2047,
+            },
+            PlayerCorpseSlot {
+                occupied: false,
+                entnum: -1,
+                victim: ClientId(
+                    0,
+                ),
+                origin: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                viewangles: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                anim: AnimPair {
+                    legs_anim: 0,
+                    torso_anim: 0,
+                },
+                view_height_current: 0.0,
+                weapon: 0,
+                e_flags: 0,
+                tr_type: 0,
+                tr_time: 0,
+                tr_duration: 0,
+                tr_delta: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                tr_base: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                falling: false,
+                ground_entity_num: 2047,
+            },
+            PlayerCorpseSlot {
+                occupied: false,
+                entnum: -1,
+                victim: ClientId(
+                    0,
+                ),
+                origin: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                viewangles: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                anim: AnimPair {
+                    legs_anim: 0,
+                    torso_anim: 0,
+                },
+                view_height_current: 0.0,
+                weapon: 0,
+                e_flags: 0,
+                tr_type: 0,
+                tr_time: 0,
+                tr_duration: 0,
+                tr_delta: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                tr_base: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                falling: false,
+                ground_entity_num: 2047,
+            },
+            PlayerCorpseSlot {
+                occupied: false,
+                entnum: -1,
+                victim: ClientId(
+                    0,
+                ),
+                origin: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                viewangles: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                anim: AnimPair {
+                    legs_anim: 0,
+                    torso_anim: 0,
+                },
+                view_height_current: 0.0,
+                weapon: 0,
+                e_flags: 0,
+                tr_type: 0,
+                tr_time: 0,
+                tr_duration: 0,
+                tr_delta: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                tr_base: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                falling: false,
+                ground_entity_num: 2047,
+            },
+            PlayerCorpseSlot {
+                occupied: false,
+                entnum: -1,
+                victim: ClientId(
+                    0,
+                ),
+                origin: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                viewangles: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                anim: AnimPair {
+                    legs_anim: 0,
+                    torso_anim: 0,
+                },
+                view_height_current: 0.0,
+                weapon: 0,
+                e_flags: 0,
+                tr_type: 0,
+                tr_time: 0,
+                tr_duration: 0,
+                tr_delta: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                tr_base: [
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                falling: false,
+                ground_entity_num: 2047,
+            },
+        ],
+        spawn_ring: 0,
+    },
+    item_ammo: [],
+    item_pickups: [],
+    oriented_blockers: [
+        OrientedBlocker {
+            entnum: 12,
+            origin: [
+                64.0,
+                -32.0,
+                8.0,
+            ],
+            axis: [
+                [
+                    1.0,
+                    0.0,
+                    0.0,
+                ],
+                [
+                    0.0,
+                    1.0,
+                    0.0,
+                ],
+                [
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+            ],
+            mins: [
+                -8.0,
+                -16.0,
+                -4.0,
+            ],
+            maxs: [
+                8.0,
+                16.0,
+                4.0,
+            ],
+        },
+    ],
+    feel: Some(
+        Bo2Feel {
+            sprint_strafe_speed_scale: 1.5,
+            jump_slowdown: true,
+            fall_damage_min_height: 2.5,
+            fall_damage_max_height: 3.5,
+            zombies: false,
+            gravity: 4,
+            fall_damage_perk: 5,
+            flak_jacket_perk: 6,
+            fast_ads_perk: 7,
+            fast_ads_multiplier: 8.5,
+            longer_sprint_perk: 9,
+            sprint_multiplier: 10.5,
+            move_faster_perk: 11,
+            speed_multiplier: 12.5,
+            g_speed: 13.5,
+            dive: true,
+            sprint_cycle_scale: 14.5,
+            ducked_sprint_cycle_scale: 15.5,
+            dtp_cycle_scale: 16.5,
+            omni: false,
+            mantle_weapon_height: 17.5,
+            mantle_weapon_anim_height: 18.5,
+            jump_height: 19.5,
+        },
+    ),
+    enemy_models: [],
+}

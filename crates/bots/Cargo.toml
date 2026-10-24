@@ -1,0 +1,25 @@
+[package]
+name = "bots"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Host-only bot controllers: sensor observations into UserCmd."
+
+[dependencies]
+asset_transport.workspace = true
+assets.workspace = true
+diag.workspace = true
+bevy.workspace = true
+frame.workspace = true
+sim = { path = "../sim" }
+net = { path = "../net" }
+playerstate_t6.workspace = true
+entity_t6.workspace = true
+movement_t6.workspace = true
+weapon_t6.workspace = true
+game_math = { path = "../game_math" }
+trace_t6.workspace = true
+gamemode_t6.workspace = true
+
+[lints]
+workspace = true
