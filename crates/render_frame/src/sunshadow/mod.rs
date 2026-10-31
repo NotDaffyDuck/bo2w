@@ -6,11 +6,11 @@ mod frame;
 mod volume;
 
 pub use self::atlas::{
-    SUN_SHADOW_CASTER_TECH, SUN_SHADOW_FORCED_PROFILE, SUN_SHADOW_PARTITION_COUNT,
-    SunShadowAtlasProfile, SunShadowViewport,
+    SUN_CASTER_TECH, DAYLIGHT_SHADOW_FORCED_PROFILE, SUNLIGHT_CASCADE_TOTAL,
+    DaylightShadowAtlasProfile, SunlightShadowRegion,
 };
 pub use self::frame::{
-    SunShadowCasterLists, SunShadowForcedFrame, SunShadowPartition, SunShadowPartitionLists,
-    SunShadowReceiverConstants,
+    DaylightShadowCasterLists, DaylightShadowForcedFrame, SunCascadeSlice, SunCascadeSliceLists,
+    DaylightShadowReceiverConstants,
 };
 pub use self::volume::{SUN_SHADOW_MAX_CLIP_PLANES, SunShadowClipPlanes};

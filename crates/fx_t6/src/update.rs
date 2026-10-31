@@ -34,23 +34,23 @@ pub fn should_process_this_frame(effect_frame_count: i32, system_frame_count: i3
 #[inline]
 pub fn culled_effect_alive(
     msec_since_begin: i32,
-    msec_looping_life: i32,
+    loop_lifetime_millis: i32,
     msec_non_looping_life: i32,
 ) -> bool {
-    msec_since_begin < msec_looping_life.max(msec_non_looping_life)
+    msec_since_begin < loop_lifetime_millis.max(msec_non_looping_life)
 }
 
 /// Looping elems spawn until the effect's looping life runs out.
 #[inline]
-pub fn looping_spawn_active(msec_since_begin: i32, msec_looping_life: i32) -> bool {
-    msec_since_begin < msec_looping_life
+pub fn looping_spawn_active(msec_since_begin: i32, loop_lifetime_millis: i32) -> bool {
+    msec_since_begin < loop_lifetime_millis
 }
 
 /// Elapsed over life, the elem's time along its curves. The life span is
 /// above 0.
 #[inline]
-pub fn normalized_time(msec_elapsed: i32, life_span_msec: i32) -> f32 {
-    msec_elapsed as f32 / life_span_msec as f32
+pub fn normalized_time(ms_gone_by: i32, lifespan_window_ms: i32) -> f32 {
+    ms_gone_by as f32 / lifespan_window_ms as f32
 }
 
 #[cfg(test)]

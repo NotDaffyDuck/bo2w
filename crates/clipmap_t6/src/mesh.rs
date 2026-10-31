@@ -5,9 +5,9 @@
 //! (`CM_MeshTestInLeaf`, `CM_PositionTestInAabbTree_r`,
 //! `CM_PositionTestCapsuleInTriangle`).
 
-use trace_t6::{SURFACE_CLIP_EPSILON, Trace, TraceWork};
+use trace_t6::{SURFACE_CLIP_SLACK, Trace, TraceWork};
 
-use crate::{AabbTree, CheckCount, ClipMap, Leaf, add, cross, dot, normalize_to, scale, sub};
+use crate::{AabbTree, CheckCount, ClipMap, Leaf, Normalized, add, cross, dot, unit_and_length, scale, sub};
 
 /// Nodes `CM_TraceThroughAabbTree_r` keeps waiting, at most.
 const AABB_STACK: usize = 128;
@@ -20,7 +20,7 @@ fn node_touched(tw: &TraceWork, node: &AabbTree) -> bool {
     let mut d = [0.0; 3];
     for i in 0..3 {
         e[i] = node.half_size[i] + tw.size[i];
-        d[i] = tw.midpoint[i] - node.origin[i];
+        d[i] = tw.middle[i] - node.origin[i];
         if d[i].abs() > tw.half_delta_abs[i] + e[i] {
             return false;
         }
@@ -42,17 +42,17 @@ pub(crate) fn trace_through_aabb_tree(
     check: &mut CheckCount<'_>,
     tw: &TraceWork,
     index: usize,
-    trace: &mut Trace,
+    hit: &mut Trace,
 ) {
     let material = &map.materials[map.aabb_trees[index].material_index as usize];
-    if material.content_flags & tw.contents == 0 {
+    if material.pack_presence_bits & tw.contents == 0 {
         return;
     }
-    let old_fraction = trace.fraction;
-    trace_through_aabb_tree_r(map, check, tw, index, trace);
-    if trace.fraction < old_fraction {
-        trace.sflags = material.surface_flags;
-        trace.cflags = material.content_flags;
+    let old_fraction = hit.fraction;
+    trace_through_aabb_tree_r(map, check, tw, index, hit);
+    if hit.fraction < old_fraction {
+        hit.sflags = material.surface_flags;
+        hit.cflags = material.pack_presence_bits;
     }
 }
 
@@ -63,29 +63,36 @@ fn trace_through_aabb_tree_r(
     check: &mut CheckCount<'_>,
     tw: &TraceWork,
     index: usize,
-    trace: &mut Trace,
+    hit: &mut Trace,
 ) {
     if !node_touched(tw, &map.aabb_trees[index]) {
         return;
     }
     let mut stack = [0usize; AABB_STACK];
     stack[0] = index;
-    let mut len = 1;
-    while len > 0 {
-        len -= 1;
-        let node = &map.aabb_trees[stack[len]];
-        if node.child_count == 0 {
-            aabb_tree_work(map, check, tw, node, trace);
-            continue;
+    let mut len = 1usize;
+    while let Some(top) = len.checked_sub(1) {
+        len = top;
+        let node = &map.aabb_trees[stack[top]];
+        let kids = node_children(node);
+        if kids.is_empty() {
+            aabb_tree_work(map, check, tw, node, hit);
         }
-        for c in (0..node.child_count as usize).rev() {
-            let child = node.u as usize + c;
+        // Pushed last to first, so the first child is the next one popped;
+        // a child that finds the stack full is skipped.
+        for child in kids.rev() {
             if len < AABB_STACK && node_touched(tw, &map.aabb_trees[child]) {
                 stack[len] = child;
                 len += 1;
             }
         }
     }
+}
+
+/// The tree indices of `node`'s children (none for a leaf node).
+fn node_children(sector_ix: &AabbTree) -> core::ops::Range<usize> {
+    let first = sector_ix.u as usize;
+    first..first + sector_ix.sub_element_total as usize
 }
 
 /// `CM_TraceThroughAabbTree_r`'s work on a leaf node: the triangles of its
@@ -97,8 +104,8 @@ fn aabb_tree_work(map: &ClipMap<'_>, check: &mut CheckCount<'_>, tw: &TraceWork,
     }
     let part = &map.partitions[p];
     let old_fraction = trace.fraction;
-    for t in 0..part.tri_count as usize {
-        let tri = part.first_tri as usize + t;
+    for t in 0..part.tri_tally as usize {
+        let tri = part.leading_triangle as usize + t;
         if tw.is_point {
             point_through_triangle(tw, map.tri_verts(tri), trace);
         } else {
@@ -119,7 +126,7 @@ fn point_through_triangle(tw: &TraceWork, [v0, v1, v2]: [[f32; 3]; 3], trace: &m
     if !(dn < 0.0) {
         return;
     }
-    let w = sub(v0, tw.extents.start);
+    let w = sub(v0, tw.extents.from);
     let d = dot(w, n);
     if !(d <= 0.0 && trace.fraction * dn < d) {
         return;
@@ -132,20 +139,27 @@ fn point_through_triangle(tw: &TraceWork, [v0, v1, v2]: [[f32; 3]; 3], trace: &m
     let f2 = dot(c, e2);
     if f2 >= 0.0 && dn <= f1 - f2 {
         trace.walkable = false;
-        trace.normal = normalize_to(n).0;
+        trace.normal = unit_and_length(n).unit;
         trace.fraction = d / dn;
     }
 }
 
-/// What `CM_TraceSphereThroughEdge` found.
+/// What `CM_TraceSphereThroughEdge` made of one edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum EdgeHit {
-    Miss,
-    /// The sphere hit the edge; the trace has it.
-    Hits,
-    /// The sphere passes the edge's first or second end: try that vertex.
-    MayHitV0,
-    MayHitV1,
+enum EdgeSweep {
+    /// The sphere does not reach the edge before the trace's hit.
+    Clear,
+    /// The sphere hit the edge itself; the trace now has it.
+    Struck,
+    /// The sphere goes past the edge's start (0) or end (1): the corner
+    /// there is worth a try.
+    PastEnd(usize),
+}
+
+/// Records a hit at `fraction` with surface normal `normal`.
+fn strike(tr_out: &mut Trace, face_dir: [f32; 3], fraction: f32) {
+    tr_out.normal = face_dir;
+    tr_out.fraction = fraction;
 }
 
 /// `CM_TraceCapsuleThroughTriangle`: the capsule's lower (or, under a
@@ -160,14 +174,14 @@ fn capsule_through_triangle(map: &ClipMap<'_>, tw: &TraceWork, tri: usize, trace
     if !(dn < 0.0) {
         return;
     }
-    let (nn, len) = normalize_to(n);
+    let Normalized { unit: nn, length: len } = unit_and_length(n);
     let oz = if nn[2] < 0.0 { -tw.offset_z } else { tw.offset_z };
-    let start = tw.extents.start;
+    let start = tw.extents.from;
     let p = [start[0], start[1], start[2] - oz];
     let q = sub(sub(p, scale(nn, tw.radius)), v0);
     let dist = dot(q, nn);
     let (q, frac, startsolid) = if dist >= 0.0 {
-        let frac = -((dist - SURFACE_CLIP_EPSILON) * len) / dn;
+        let frac = -((dist - SURFACE_CLIP_SLACK) * len) / dn;
         if trace.fraction <= frac {
             return;
         }
@@ -181,168 +195,126 @@ fn capsule_through_triangle(map: &ClipMap<'_>, tw: &TraceWork, tri: usize, trace
         (sub(r, scale(nn, dd)), 0.0, true)
     };
     let c = cross(tw.delta, q);
-    let base = tri * 3;
-    let mut hit_edge = false;
-    let mut walkable = true;
-    let mut vert = None;
     let f1 = dot(c, e1);
-    if f1 < 0.0 {
-        hit_edge = true;
-        let edge_walkable = map.edge_is_walkable(base + 2);
-        match sphere_through_edge(tw, trace, p, v0, e1) {
-            EdgeHit::Hits => {
-                trace.walkable = edge_walkable;
-                return;
-            }
-            EdgeHit::MayHitV0 => {
-                vert = Some(v0);
-                walkable = edge_walkable;
-            }
-            EdgeHit::MayHitV1 => {
-                vert = Some(v1);
-                walkable = edge_walkable;
-            }
-            EdgeHit::Miss => {}
-        }
-    }
     let f2 = dot(c, e2);
-    if f2 > 0.0 {
-        hit_edge = true;
-        let edge_walkable = map.edge_is_walkable(base + 1);
-        match sphere_through_edge(tw, trace, p, v0, e2) {
-            EdgeHit::Hits => {
+    let over_face = dn <= f2 - f1;
+    if over_face && !(f1 < 0.0 || f2 > 0.0) {
+        // Inside both near edges and short of the far one: the face itself.
+        strike(trace, nn, if frac <= 0.0 { 0.0 } else { frac });
+        trace.walkable = false;
+        trace.starts_inside = startsolid;
+        return;
+    }
+
+    // Each edge: whether the sweep crosses it, where it starts and runs,
+    // its walkable-edge slot and its two corners.
+    let base = tri * 3;
+    let edges = [
+        (f1 < 0.0, v0, e1, base + 2, [v0, v1]),
+        (f2 > 0.0, v0, e2, base + 1, [v0, v2]),
+        (!over_face, v1, sub(v1, v2), base, [v1, v2]),
+    ];
+    let mut corner = None;
+    let mut walkable = true;
+    for (crossed, from, along, slot, ends) in edges {
+        if !crossed {
+            continue;
+        }
+        let edge_walkable = map.edge_is_walkable(slot);
+        match sphere_through_edge(tw, trace, p, from, along) {
+            EdgeSweep::Struck => {
                 trace.walkable = edge_walkable;
                 return;
             }
-            EdgeHit::MayHitV0 => {
-                vert = Some(v0);
+            EdgeSweep::PastEnd(end) => {
+                corner = Some(ends[end]);
                 walkable &= edge_walkable;
             }
-            EdgeHit::MayHitV1 => {
-                vert = Some(v2);
-                walkable &= edge_walkable;
-            }
-            EdgeHit::Miss => {}
+            EdgeSweep::Clear => {}
         }
     }
-    if dn <= f2 - f1 {
-        if !hit_edge {
-            trace.normal = nn;
-            trace.walkable = false;
-            trace.fraction = if frac <= 0.0 { 0.0 } else { frac };
-            trace.startsolid = startsolid;
-            return;
-        }
-    } else {
-        let edge_walkable = map.edge_is_walkable(base);
-        match sphere_through_edge(tw, trace, p, v1, sub(v1, v2)) {
-            EdgeHit::Hits => {
-                trace.walkable = edge_walkable;
-                return;
-            }
-            EdgeHit::MayHitV0 => {
-                vert = Some(v1);
-                walkable &= edge_walkable;
-            }
-            EdgeHit::MayHitV1 => {
-                vert = Some(v2);
-                walkable &= edge_walkable;
-            }
-            EdgeHit::Miss => {}
-        }
-    }
-    if let Some(v) = vert {
+    if let Some(v) = corner {
         sphere_through_vertex(tw, trace, p, v, walkable);
     }
 }
 
 /// `CM_TraceSphereThroughEdge`: the sphere from `p` along the sweep
 /// against the edge from `v` along `-edge`.
-fn sphere_through_edge(tw: &TraceWork, trace: &mut Trace, p: [f32; 3], v: [f32; 3], edge: [f32; 3]) -> EdgeHit {
+fn sphere_through_edge(tw: &TraceWork, hit: &mut Trace, p: [f32; 3], v: [f32; 3], edge: [f32; 3]) -> EdgeSweep {
     let sd = sub(p, v);
     let perp = cross(edge, tw.delta);
-    let r = tw.radius + SURFACE_CLIP_EPSILON;
+    let r = tw.radius + SURFACE_CLIP_SLACK;
     let s = dot(perp, sd);
     let perp_sq = dot(perp, perp);
     let disc = r * r * perp_sq - s * s;
     if !(0.0 < disc) {
-        return EdgeHit::Miss;
+        return EdgeSweep::Clear;
     }
     let edge_sq = dot(edge, edge);
-    let inv = 1.0 / perp_sq;
-    let half = libm::sqrtf(edge_sq * disc) * inv;
+    let stow_kind = 1.0 / perp_sq;
+    let half = libm::sqrtf(edge_sq * disc) * stow_kind;
     let t = dot(cross(sd, edge), perp);
-    if !(0.0 <= inv * t + half) {
-        return EdgeHit::Miss;
+    if !(0.0 <= stow_kind * t + half) {
+        return EdgeSweep::Clear;
     }
-    let enter = inv * t - half;
-    if !(enter < trace.fraction) {
-        return EdgeHit::Miss;
+    let enter = stow_kind * t - half;
+    if !(enter < hit.fraction) {
+        return EdgeSweep::Clear;
     }
-    if enter >= 0.0 {
-        let hp = add(scale(tw.delta, enter), sd);
-        let proj = -dot(edge, hp);
-        if !(0.0 < proj) {
-            return EdgeHit::MayHitV0;
-        }
-        if edge_sq <= proj {
-            return EdgeHit::MayHitV1;
-        }
-        let n = add(scale(edge, proj / edge_sq), hp);
-        trace.normal = scale(n, 1.0 / r);
-        trace.fraction = enter;
-        EdgeHit::Hits
-    } else {
-        let proj = -dot(edge, sd);
-        if !(0.0 < proj) {
-            return EdgeHit::MayHitV0;
-        }
-        if edge_sq <= proj {
-            return EdgeHit::MayHitV1;
-        }
-        let n = add(scale(edge, proj / edge_sq), sd);
-        if 0.0 <= dot(tw.delta, n) {
-            return EdgeHit::Miss;
-        }
-        trace.normal = normalize_to(n).0;
-        trace.fraction = 0.0;
-        trace.startsolid = !((tw.radius * tw.radius * perp_sq - s * s) * edge_sq <= t * t);
-        EdgeHit::Hits
+    // Ahead of the start the contact is where the sphere meets the edge;
+    // already touching, it is the start itself.
+    let ahead = enter >= 0.0;
+    let contact = if ahead { add(scale(tw.delta, enter), sd) } else { sd };
+    let proj = -dot(edge, contact);
+    if !(0.0 < proj) {
+        return EdgeSweep::PastEnd(0);
     }
+    if edge_sq <= proj {
+        return EdgeSweep::PastEnd(1);
+    }
+    let n = add(scale(edge, proj / edge_sq), contact);
+    if ahead {
+        strike(hit, scale(n, 1.0 / r), enter);
+        return EdgeSweep::Struck;
+    }
+    if 0.0 <= dot(tw.delta, n) {
+        return EdgeSweep::Clear;
+    }
+    strike(hit, unit_and_length(n).unit, 0.0);
+    hit.starts_inside = !((tw.radius * tw.radius * perp_sq - s * s) * edge_sq <= t * t);
+    EdgeSweep::Struck
 }
 
 /// `CM_TraceSphereThroughVertex`.
-fn sphere_through_vertex(tw: &TraceWork, trace: &mut Trace, p: [f32; 3], vert: [f32; 3], walkable: bool) {
+fn sphere_through_vertex(tw: &TraceWork, hit: &mut Trace, p: [f32; 3], vert: [f32; 3], walkable: bool) {
     let sd = sub(p, vert);
     let b = dot(tw.delta, sd);
     if !(b < 0.0) {
         return;
     }
     let c0 = dot(sd, sd);
-    let r = tw.radius + SURFACE_CLIP_EPSILON;
+    let r = tw.radius + SURFACE_CLIP_SLACK;
     let c = c0 - r * r;
-    if 0.0 < c {
-        let a = tw.delta_len_sq;
-        let disc = b * b - a * c;
-        if !(b * b * 0.001 <= disc) {
-            return;
-        }
-        let frac = (-libm::sqrtf(disc) - b) / a;
-        if frac < trace.fraction {
-            let n = scale(add(scale(tw.delta, frac), sd), 1.0 / r);
-            // One Newton step back towards unit length.
-            trace.normal = scale(n, (3.0 - dot(n, n)) * 0.5);
-            trace.walkable = walkable;
-            trace.fraction = frac;
-        }
-    } else {
-        trace.normal = scale(sd, 1.0 / libm::sqrtf(c0));
-        trace.walkable = walkable;
-        trace.fraction = 0.0;
-        if c0 < tw.radius * tw.radius {
-            trace.startsolid = true;
-        }
+    if !(0.0 < c) {
+        // Already within reach of the corner.
+        strike(hit, scale(sd, 1.0 / libm::sqrtf(c0)), 0.0);
+        hit.walkable = walkable;
+        hit.starts_inside |= c0 < tw.radius * tw.radius;
+        return;
     }
+    let a = tw.delta_len_sq;
+    let disc = b * b - a * c;
+    if !(b * b * 0.001 <= disc) {
+        return;
+    }
+    let frac = (-libm::sqrtf(disc) - b) / a;
+    if !(frac < hit.fraction) {
+        return;
+    }
+    let n = scale(add(scale(tw.delta, frac), sd), 1.0 / r);
+    // One Newton step back towards unit length.
+    strike(hit, scale(n, (3.0 - dot(n, n)) * 0.5), frac);
+    hit.walkable = walkable;
 }
 
 /// `CM_MeshTestInLeaf`: is the box inside a leaf's terrain?
@@ -351,19 +323,19 @@ pub(crate) fn mesh_test_in_leaf(
     check: &mut CheckCount<'_>,
     tw: &TraceWork,
     leaf: &Leaf,
-    trace: &mut Trace,
+    hit: &mut Trace,
 ) {
     let first = leaf.first_coll_aabb as usize;
-    for i in 0..leaf.coll_aabb_count as usize {
+    for i in 0..leaf.collision_box_total as usize {
         let index = first + i;
         let material = &map.materials[map.aabb_trees[index].material_index as usize];
-        if material.content_flags & tw.contents == 0 {
+        if material.pack_presence_bits & tw.contents == 0 {
             continue;
         }
-        position_test_in_aabb_tree_r(map, check, tw, index, trace);
-        if trace.allsolid {
-            trace.sflags = material.surface_flags;
-            trace.cflags = material.content_flags;
+        position_test_in_aabb_tree_r(map, check, tw, index, hit);
+        if hit.fully_embedded {
+            hit.sflags = material.surface_flags;
+            hit.cflags = material.pack_presence_bits;
             return;
         }
     }
@@ -375,52 +347,56 @@ fn position_test_in_aabb_tree_r(
     check: &mut CheckCount<'_>,
     tw: &TraceWork,
     index: usize,
-    trace: &mut Trace,
+    hit: &mut Trace,
 ) {
     let node = &map.aabb_trees[index];
     if !node_touched(tw, node) {
         return;
     }
-    if node.child_count == 0 {
-        let p = node.u as usize;
-        if !check.first_look(p) {
-            return;
-        }
-        let part = &map.partitions[p];
-        for t in 0..part.tri_count as usize {
-            position_test_capsule_in_triangle(tw, map.tri_verts(part.first_tri as usize + t), trace);
-            if trace.startsolid {
-                return;
+    let kids = node_children(node);
+    if !kids.is_empty() {
+        // Children in order, until one finds the box solid.
+        for child in kids {
+            position_test_in_aabb_tree_r(map, check, tw, child, hit);
+            if hit.starts_inside {
+                break;
             }
         }
         return;
     }
-    for c in 0..node.child_count as usize {
-        position_test_in_aabb_tree_r(map, check, tw, node.u as usize + c, trace);
-        if trace.startsolid {
-            return;
+    // A leaf node: its partition's triangles, once a test.
+    let partition = node.u as usize;
+    if check.first_look(partition) {
+        let part = &map.partitions[partition];
+        let first = part.leading_triangle as usize;
+        for tri in first..first + part.tri_tally as usize {
+            position_test_capsule_in_triangle(tw, map.tri_verts(tri), hit);
+            if hit.starts_inside {
+                break;
+            }
         }
     }
 }
 
 /// `CM_PositionTestCapsuleInTriangle`.
-fn position_test_capsule_in_triangle(tw: &TraceWork, [v0, v1, v2]: [[f32; 3]; 3], trace: &mut Trace) {
-    let start = tw.extents.start;
-    let radius_sq = tw.radius * tw.radius;
+fn position_test_capsule_in_triangle(tw: &TraceWork, [v0, v1, v2]: [[f32; 3]; 3], tr_out: &mut Trace) {
+    let start = tw.extents.from;
+    let reach_squared = tw.radius * tw.radius;
     let hit = if tw.offset_z == 0.0 {
         let pt = closest_point_on_tri(start, v0, sub(v1, v0), sub(v2, v0));
         let d = sub(pt, start);
-        dot(d, d) < radius_sq
+        dot(d, d) < reach_squared
     } else {
         let oz = tw.offset_z;
         let a = [start[0], start[1], start[2] + oz];
         let b = [start[0], start[1], start[2] - oz];
-        does_capsule_intersect_triangle(a, b, radius_sq, [v0, v1, v2])
+        does_capsule_intersect_triangle(a, b, reach_squared, [v0, v1, v2])
     };
     if hit {
-        trace.fraction = 0.0;
-        trace.allsolid = true;
-        trace.startsolid = true;
+        // Embedded: solid from the start, and all the way.
+        tr_out.fraction = 0.0;
+        tr_out.starts_inside = true;
+        tr_out.fully_embedded = true;
     }
 }
 
@@ -472,9 +448,9 @@ pub fn closest_point_on_tri(p: [f32; 3], b: [f32; 3], e0: [f32; 3], e1: [f32; 3]
         }
     } else if s >= 0.0 {
         if t >= 0.0 {
-            let inv = 1.0 / det;
-            s *= inv;
-            t *= inv;
+            let stow_kind = 1.0 / det;
+            s *= stow_kind;
+            t *= stow_kind;
             Then::Done
         } else {
             Then::EdgeE0
@@ -482,12 +458,10 @@ pub fn closest_point_on_tri(p: [f32; 3], b: [f32; 3], e0: [f32; 3], e1: [f32; 3]
     } else if t < 0.0 {
         s = 0.0;
         t = 0.0;
-        if d < 0.0 {
-            Then::EdgeE0
-        } else if 0.0 <= e {
-            Then::Done
-        } else {
-            Then::EdgeE1
+        match (d < 0.0, 0.0 <= e) {
+            (true, _) => Then::EdgeE0,
+            (false, true) => Then::Done,
+            (false, false) => Then::EdgeE1,
         }
     } else {
         Then::EdgeE1
@@ -531,9 +505,9 @@ pub fn closest_point_on_tri(p: [f32; 3], b: [f32; 3], e0: [f32; 3], e1: [f32; 3]
 }
 
 /// `DoesCapsuleIntersectTriangle`: does the capsule whose sphere centres
-/// run from `a` to `b` (radius squared `radius_sq`) touch the triangle?
+/// run from `a` to `b` (radius squared `reach_squared`) touch the triangle?
 #[must_use]
-pub fn does_capsule_intersect_triangle(a: [f32; 3], b: [f32; 3], radius_sq: f32, [v0, v1, v2]: [[f32; 3]; 3]) -> bool {
+pub fn does_capsule_intersect_triangle(a: [f32; 3], b: [f32; 3], reach_squared: f32, [v0, v1, v2]: [[f32; 3]; 3]) -> bool {
     let e1 = sub(v1, v0);
     let e2 = sub(v2, v0);
     let n = cross(e1, e2);
@@ -559,7 +533,7 @@ pub fn does_capsule_intersect_triangle(a: [f32; 3], b: [f32; 3], radius_sq: f32,
             return true;
         }
     }
-    let reach = f64::from(dot(n, n) * radius_sq);
+    let reach = f64::from(dot(n, n) * reach_squared);
     let near_a = da * da < reach;
     let near_b = db * db < reach;
     if da * db >= 0.0 && !near_a && !near_b {
@@ -572,9 +546,9 @@ pub fn does_capsule_intersect_triangle(a: [f32; 3], b: [f32; 3], radius_sq: f32,
         return true;
     }
     let seg = sub(b, a);
-    !(segment_distance_sq(v0, e1, a, seg) >= radius_sq
-        && segment_distance_sq(v0, e2, a, seg) >= radius_sq
-        && segment_distance_sq(v1, sub(v2, v1), a, seg) >= radius_sq)
+    !(segment_distance_sq(v0, e1, a, seg) >= reach_squared
+        && segment_distance_sq(v0, e2, a, seg) >= reach_squared
+        && segment_distance_sq(v1, sub(v2, v1), a, seg) >= reach_squared)
 }
 
 /// `CM_DistanceSquaredBetweenSegments`: the squared distance between the
@@ -597,20 +571,18 @@ pub fn segment_distance_sq(p1: [f32; 3], d1: [f32; 3], p2: [f32; 3], d2: [f32; 3
         } else {
             let b = dot(d1, d2);
             let denom = a * e - b * b;
-            let mut s = if denom != 0.0 {
+            let s = if denom != 0.0 {
                 ((b * f - c * e) / denom).clamp(0.0, 1.0)
             } else {
                 0.0
             };
-            let mut t = (b * s + f) / e;
-            if t < 0.0 {
-                t = 0.0;
-                s = (-c / a).clamp(0.0, 1.0);
-            } else if t > 1.0 {
-                t = 1.0;
-                s = ((b - c) / a).clamp(0.0, 1.0);
+            // A `t` off the second segment is pinned to its nearer end and
+            // `s` found again from there.
+            match (b * s + f) / e {
+                below if below < 0.0 => ((-c / a).clamp(0.0, 1.0), 0.0),
+                above if above > 1.0 => (((b - c) / a).clamp(0.0, 1.0), 1.0),
+                inside => (s, inside),
             }
-            (s, t)
         }
     };
     let d = sub(add(p1, scale(d1, s)), add(p2, scale(d2, t)));

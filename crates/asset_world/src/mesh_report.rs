@@ -4,7 +4,7 @@ use std::fmt;
 
 /// The size of a built world mesh.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct WorldMeshStats {
+pub struct LevelMeshMetrics {
     pub vertices: usize,
     pub triangles: usize,
     pub surfaces: usize,
@@ -16,44 +16,44 @@ pub struct WorldMeshStats {
 
 /// Which of the world's bounds tables a box came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BoundsTable {
+pub enum BoxSource {
     /// A node of one cell's surface tree.
-    AabbNode { cell: usize },
+    TreeNode { cell: usize },
     Surface,
     /// An entry of the static model instance list.
-    SmodelInst,
+    PropInstance,
 }
 
-impl fmt::Display for BoundsTable {
+impl fmt::Display for BoxSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AabbNode { cell } => write!(f, "cell {cell} surface tree node"),
+            Self::TreeNode { cell } => write!(f, "cell {cell} surface tree node"),
             Self::Surface => f.write_str("surface bounds"),
-            Self::SmodelInst => f.write_str("static model instance bounds"),
+            Self::PropInstance => f.write_str("static model instance bounds"),
         }
     }
 }
 
 /// Why a world mesh could not be built.
 #[derive(Debug)]
-pub enum WorldMeshError {
+pub enum LevelMeshFault {
     /// The zone has no world geometry to draw.
-    NoGeometry,
+    EmptyWorld,
     /// A box was stored as (mins, maxs) where (mid, half) was expected, which
     /// shows up as a negative half-size.
-    NegativeBoundsHalf {
-        table: BoundsTable,
+    InsideOutBox {
+        table: BoxSource,
         index: usize,
         axis: usize,
         half: f32,
     },
 }
 
-impl fmt::Display for WorldMeshError {
+impl fmt::Display for LevelMeshFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoGeometry => f.write_str("the zone has no world geometry"),
-            Self::NegativeBoundsHalf {
+            Self::EmptyWorld => f.write_str("the zone has no world geometry"),
+            Self::InsideOutBox {
                 table,
                 index,
                 axis,
@@ -67,7 +67,7 @@ impl fmt::Display for WorldMeshError {
     }
 }
 
-impl std::error::Error for WorldMeshError {}
+impl std::error::Error for LevelMeshFault {}
 
 #[cfg(test)]
 mod tests {
@@ -75,8 +75,8 @@ mod tests {
 
     #[test]
     fn a_negative_half_names_the_table_and_the_box() {
-        let error = WorldMeshError::NegativeBoundsHalf {
-            table: BoundsTable::AabbNode { cell: 3 },
+        let error = LevelMeshFault::InsideOutBox {
+            table: BoxSource::TreeNode { cell: 3 },
             index: 7,
             axis: 1,
             half: -2.5,
@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn a_world_without_geometry_says_so() {
         assert_eq!(
-            WorldMeshError::NoGeometry.to_string(),
+            LevelMeshFault::EmptyWorld.to_string(),
             "the zone has no world geometry"
         );
     }

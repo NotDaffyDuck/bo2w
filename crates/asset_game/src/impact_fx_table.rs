@@ -2,10 +2,10 @@
 //! surface the bullet can land on.
 
 use fx_t6::runtime::{
-    FX_IMPACT_FLESH_COUNT, FX_IMPACT_NONFLESH_COUNT, FX_SURF_TYPE_FLESH, impact_table_row,
+    BODY_HIT_KIND_TOTAL, SOLID_HIT_KIND_TOTAL, MATERIAL_KIND_BODY, impact_table_row,
 };
 
-use crate::{AssetNamespace, FxName};
+use crate::{AssetCategoryScope, FxName};
 
 /// The kind of hit that the armour-piercing rounds of the Zombies guns
 /// register as.
@@ -20,40 +20,48 @@ const LARGE_BULLET_HIT: i32 = 2;
 
 /// One row of the table: the effect to play on each surface.
 #[derive(Clone, Debug, Default)]
-pub struct OwnedFxImpactEntry {
+pub struct SelfContainedImpactFxRecord {
     /// By surface type; the 32nd is the riot shield.
-    pub nonflesh: [String; FX_IMPACT_NONFLESH_COUNT],
+    pub hard_hit: [String; SOLID_HIT_KIND_TOTAL],
     /// By flesh slot.
-    pub flesh: [String; FX_IMPACT_FLESH_COUNT],
+    pub body_hit: [String; BODY_HIT_KIND_TOTAL],
 }
 
-impl OwnedFxImpactEntry {
+impl SelfContainedImpactFxRecord {
     /// The effect for a non-flesh `surf_type`, if the row has such a surface.
     /// An empty name means the surface plays nothing.
     pub fn nonflesh_name(&self, surf_type: usize) -> Option<&str> {
-        self.nonflesh.get(surf_type).map(String::as_str)
+        self.hard_hit.get(surf_type).map(String::as_str)
+    }
+
+    /// The cell for a surface: by flesh slot when the surface is flesh.
+    fn cell(&self, surface_kind: usize, body_material_slot: Option<usize>) -> Option<&str> {
+        if surface_kind != MATERIAL_KIND_BODY {
+            return self.nonflesh_name(surface_kind);
+        }
+        self.body_hit.get(body_material_slot?).map(String::as_str)
     }
 }
 
 /// A map's impact effect table with every cell already named.
 #[derive(Clone, Debug, Default)]
-pub struct OwnedFxImpactTable {
+pub struct SelfContainedImpactFxTable {
     /// Set for tables built from Black Ops II's own data.
     pub t6: bool,
     pub name: String,
-    pub entries: Vec<OwnedFxImpactEntry>,
+    pub entries: Vec<SelfContainedImpactFxRecord>,
 }
 
-impl OwnedFxImpactTable {
+impl SelfContainedImpactFxTable {
     /// Builds the table from the zone's impact table, padding any row's flesh
     /// cells that are missing.
     pub fn from_t6(table: &asset_t6::ImpactTableRef) -> Self {
         let entries = table
             .rows
             .iter()
-            .map(|(nonflesh, flesh)| OwnedFxImpactEntry {
-                nonflesh: nonflesh.clone(),
-                flesh: std::array::from_fn(|slot| flesh.get(slot).cloned().unwrap_or_default()),
+            .map(|(nonflesh, flesh)| SelfContainedImpactFxRecord {
+                hard_hit: nonflesh.clone(),
+                body_hit: std::array::from_fn(|slot| flesh.get(slot).cloned().unwrap_or_default()),
             })
             .collect();
         Self {
@@ -63,40 +71,35 @@ impl OwnedFxImpactTable {
         }
     }
 
-    pub fn row_count(&self) -> usize {
+    pub fn line_total(&self) -> usize {
         self.entries.len()
     }
 
     /// The namespace the table's effect names belong to.
-    pub fn namespace(&self) -> AssetNamespace {
-        AssetNamespace::T6
+    pub fn namespace(&self) -> AssetCategoryScope {
+        AssetCategoryScope::T6
     }
 
     /// The effect to play for `row` landing on `surf_type`. A flesh surface
-    /// also needs the `flesh_slot`. Empty cells play nothing.
-    pub fn effect_name(
+    /// also needs the `body_material_slot`. Empty cells play nothing.
+    pub fn effect_label(
         &self,
         row: usize,
-        surf_type: usize,
-        flesh_slot: Option<usize>,
+        surf_kind: usize,
+        body_material_slot: Option<usize>,
     ) -> Option<FxName<'_>> {
-        let entry = self.entries.get(row)?;
-        let name = if surf_type == FX_SURF_TYPE_FLESH {
-            entry.flesh.get(flesh_slot?)?.as_str()
-        } else {
-            entry.nonflesh_name(surf_type)?
-        };
-        (!name.is_empty()).then(|| FxName::new(self.namespace(), name))
+        let name = self.entries.get(row)?.cell(surf_kind, body_material_slot)?;
+        Some(FxName::new(self.namespace(), name)).filter(|_| !name.is_empty())
     }
 
     /// The row to read for a kind of hit, on the way in or (with `exit`) out.
-    pub fn impact_row(&self, impact_type: i32, exit: bool) -> Option<usize> {
-        let kind = if self.t6 && impact_type == ARMOUR_PIERCING_HIT {
+    pub fn hit_fx_row(&self, impact_kind_id: i32, outbound: bool) -> Option<usize> {
+        let kind = if self.t6 && impact_kind_id == ARMOUR_PIERCING_HIT {
             LARGE_BULLET_HIT
         } else {
-            impact_type
+            impact_kind_id
         };
-        impact_table_row(kind, exit)
+        impact_table_row(kind, outbound)
     }
 }
 
@@ -104,8 +107,8 @@ impl OwnedFxImpactTable {
 mod tests {
     use super::*;
 
-    fn table_with(nonflesh: [String; FX_IMPACT_NONFLESH_COUNT]) -> OwnedFxImpactTable {
-        OwnedFxImpactTable::from_t6(&asset_t6::ImpactTableRef {
+    fn table_with(nonflesh: [String; SOLID_HIT_KIND_TOTAL]) -> SelfContainedImpactFxTable {
+        SelfContainedImpactFxTable::from_t6(&asset_t6::ImpactTableRef {
             name: "table".into(),
             rows: vec![(nonflesh, Default::default())],
         })
@@ -113,29 +116,39 @@ mod tests {
 
     #[test]
     fn the_riot_shield_surface_is_named_and_the_next_one_is_not() {
-        let mut nonflesh: [String; FX_IMPACT_NONFLESH_COUNT] = Default::default();
+        let mut nonflesh: [String; SOLID_HIT_KIND_TOTAL] = Default::default();
         nonflesh[2] = "brick".into();
         nonflesh[31] = "shield".into();
         let table = table_with(nonflesh);
-        assert_eq!(table.effect_name(0, 2, None).map(|n| n.name), Some("brick"));
-        assert_eq!(table.effect_name(0, 31, None).map(|n| n.name), Some("shield"));
-        assert!(table.effect_name(0, 32, None).is_none());
-        assert!(table.effect_name(0, 5, None).is_none());
-        assert!(table.effect_name(1, 2, None).is_none());
+        assert_eq!(table.effect_label(0, 2, None).map(|n| n.name), Some("brick"));
+        assert_eq!(table.effect_label(0, 31, None).map(|n| n.name), Some("shield"));
+        assert!(table.effect_label(0, 32, None).is_none());
+        assert!(table.effect_label(0, 5, None).is_none());
+        assert!(table.effect_label(1, 2, None).is_none());
+    }
+
+    #[test]
+    fn a_flesh_surface_is_read_by_slot_and_needs_one() {
+        let mut table = table_with(Default::default());
+        table.entries[0].body_hit[1] = "blood".into();
+        assert_eq!(table.effect_label(0, MATERIAL_KIND_BODY, Some(1)).map(|n| n.name), Some("blood"));
+        assert!(table.effect_label(0, MATERIAL_KIND_BODY, Some(0)).is_none());
+        assert!(table.effect_label(0, MATERIAL_KIND_BODY, None).is_none());
+        assert!(table.effect_label(0, MATERIAL_KIND_BODY, Some(BODY_HIT_KIND_TOTAL)).is_none());
     }
 
     #[test]
     fn armour_piercing_hits_read_the_large_bullet_rows() {
         let table = table_with(Default::default());
-        assert_eq!(table.impact_row(3, false), Some(3));
-        assert_eq!(table.impact_row(3, true), Some(4));
-        assert_eq!(table.impact_row(2, true), Some(4));
-        assert_eq!(table.impact_row(15, false), Some(20));
+        assert_eq!(table.hit_fx_row(3, false), Some(3));
+        assert_eq!(table.hit_fx_row(3, true), Some(4));
+        assert_eq!(table.hit_fx_row(2, true), Some(4));
+        assert_eq!(table.hit_fx_row(15, false), Some(20));
     }
 
     #[test]
     fn a_table_not_from_black_ops_ii_keeps_the_armour_piercing_row() {
-        let table = OwnedFxImpactTable::default();
-        assert_eq!(table.impact_row(3, false), impact_table_row(3, false));
+        let table = SelfContainedImpactFxTable::default();
+        assert_eq!(table.hit_fx_row(3, false), impact_table_row(3, false));
     }
 }

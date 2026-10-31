@@ -2,40 +2,40 @@
 //!
 //! The low bits hold the number; bit 0x400 flips every time an anim is (re)started so the
 //! client restarts it even when the number is the same. BO2 only touches these while
-//! `pm_type < PM_DEAD`.
+//! `movement_mode < PM_DEAD`.
 
-pub const IDLE: i32 = 0;
+pub const REST: i32 = 0;
 pub const FORCE_IDLE: i32 = 1;
 pub const ATTACK: i32 = 2;
 pub const ATTACK_LEFT: i32 = 3;
 pub const ATTACK_LASTSHOT: i32 = 4;
 pub const ATTACK_LASTSHOT_LEFT: i32 = 5;
-pub const RECHAMBER: i32 = 6;
+pub const BOLT_CYCLE: i32 = 6;
 pub const ADS_ATTACK: i32 = 7;
 pub const ADS_ATTACK_LASTSHOT: i32 = 8;
-pub const ADS_RECHAMBER: i32 = 9;
+pub const ADS_BOLT_CYCLE: i32 = 9;
 pub const MELEE_ATTACK: i32 = 10;
 pub const MELEE_ATTACK_EMPTY: i32 = 11;
 pub const MELEE_CHARGE: i32 = 12;
 pub const MELEE_CHARGE_EMPTY: i32 = 13;
-pub const DROP: i32 = 14;
+pub const PUT_AWAY: i32 = 14;
 pub const RAISE: i32 = 15;
-pub const FIRST_RAISE: i32 = 16;
+pub const FIRST_TAKE_OUT: i32 = 16;
 pub const RELOAD: i32 = 17;
-pub const RELOAD_EMPTY: i32 = 18;
-pub const RELOAD_START: i32 = 19;
-pub const RELOAD_END: i32 = 20;
+pub const RELOAD_DRY: i32 = 18;
+pub const RELOAD_BEGIN: i32 = 19;
+pub const RELOAD_FINISH: i32 = 20;
 pub const RELOAD_QUICK: i32 = 21;
 pub const RELOAD_QUICK_EMPTY: i32 = 22;
 pub const ALTSWITCHFROM: i32 = 23;
 pub const ALTSWITCHTO: i32 = 24;
-pub const QUICK_DROP: i32 = 25;
-pub const QUICK_RAISE: i32 = 26;
-pub const EMPTY_DROP: i32 = 27;
-pub const EMPTY_RAISE: i32 = 28;
-pub const SPRINT_IN: i32 = 29;
-pub const SPRINT_LOOP: i32 = 30;
-pub const SPRINT_OUT: i32 = 31;
+pub const FAST_PUT_AWAY: i32 = 25;
+pub const FAST_TAKE_OUT: i32 = 26;
+pub const EMPTY_PUT_AWAY: i32 = 27;
+pub const EMPTY_TAKE_OUT: i32 = 28;
+pub const SPRINT_ENTER: i32 = 29;
+pub const SPRINT_HOLD: i32 = 30;
+pub const SPRINT_EXIT: i32 = 31;
 pub const SPRINT_EMPTY_IN: i32 = 32;
 pub const SPRINT_EMPTY_LOOP: i32 = 33;
 pub const SPRINT_EMPTY_OUT: i32 = 34;
@@ -45,10 +45,10 @@ pub const LOWREADY_OUT: i32 = 37;
 pub const CONT_FIRE_IN: i32 = 38;
 pub const CONT_FIRE_LOOP: i32 = 39;
 pub const CONT_FIRE_OUT: i32 = 40;
-pub const HOLD_FIRE: i32 = 41;
-pub const DETONATE: i32 = 42;
-pub const NIGHTVISION_WEAR: i32 = 43;
-pub const NIGHTVISION_REMOVE: i32 = 44;
+pub const FIRE_HELD: i32 = 41;
+pub const TRIGGER_DETONATOR: i32 = 42;
+pub const NVG_ON: i32 = 43;
+pub const NVG_OFF: i32 = 44;
 pub const DEPLOYING: i32 = 45;
 pub const BREAKING_DOWN: i32 = 46;
 pub const DTP_IN: i32 = 47;
@@ -126,7 +126,7 @@ mod tests {
     fn toggle_flips() {
         let a = super::start(0, super::RAISE);
         assert_eq!(a, 0x400 | 15);
-        let b = super::start(a, super::IDLE);
+        let b = super::start(a, super::REST);
         assert_eq!(b, 0);
         assert_eq!(super::name(a), "RAISE");
         assert_eq!(super::name(super::CRAWL_EMPTY_OUT), "CRAWL_EMPTY_OUT");

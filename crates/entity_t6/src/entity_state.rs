@@ -7,7 +7,7 @@
 
 use playerstate_t6::{RenderOptions, Weapon};
 
-use crate::trajectory::Trajectory;
+use crate::flight::Trajectory;
 
 fn rd_i32(b: &[u8], o: usize) -> i32 {
     i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
@@ -92,8 +92,8 @@ impl LerpUnion {
 /// BO2's `LerpEntityStatePlayer`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LerpPlayer {
-    pub leanf: f32,
-    pub movement_dir: i32,
+    pub tilt_sideways: f32,
+    pub move_heading: i32,
     pub move_type: i32,
     pub primary_weapon: Weapon,
     pub stowed_weapon: Weapon,
@@ -112,8 +112,8 @@ pub struct LerpPlayer {
 impl LerpPlayer {
     fn read(b: &[u8; 36]) -> Self {
         Self {
-            leanf: rd_f32(b, 0),
-            movement_dir: rd_i32(b, 4),
+            tilt_sideways: rd_f32(b, 0),
+            move_heading: rd_i32(b, 4),
             move_type: rd_i32(b, 8),
             primary_weapon: Weapon(rd_i32(b, 12) as u32),
             stowed_weapon: Weapon(rd_i32(b, 16) as u32),
@@ -131,8 +131,8 @@ impl LerpPlayer {
     }
 
     fn write(&self, b: &mut [u8; 36]) {
-        wr_f32(b, 0, self.leanf);
-        wr_i32(b, 4, self.movement_dir);
+        wr_f32(b, 0, self.tilt_sideways);
+        wr_i32(b, 4, self.move_heading);
         wr_i32(b, 8, self.move_type);
         wr_i32(b, 12, self.primary_weapon.0 as i32);
         wr_i32(b, 16, self.stowed_weapon.0 as i32);
@@ -152,9 +152,9 @@ impl LerpPlayer {
 /// BO2's `LerpEntityStateMissile`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LerpMissile {
-    pub launch_time: i32,
+    pub spawn_moment: i32,
     pub parent_client_num: i32,
-    pub fuse_time: i32,
+    pub detonation_delay: i32,
     pub forced_dud: i32,
     pub auto_detonate_time: f32,
 }
@@ -162,18 +162,18 @@ pub struct LerpMissile {
 impl LerpMissile {
     fn read(b: &[u8; 36]) -> Self {
         Self {
-            launch_time: rd_i32(b, 0),
+            spawn_moment: rd_i32(b, 0),
             parent_client_num: rd_i32(b, 4),
-            fuse_time: rd_i32(b, 8),
+            detonation_delay: rd_i32(b, 8),
             forced_dud: rd_i32(b, 12),
             auto_detonate_time: rd_f32(b, 16),
         }
     }
 
     fn write(&self, b: &mut [u8; 36]) {
-        wr_i32(b, 0, self.launch_time);
+        wr_i32(b, 0, self.spawn_moment);
         wr_i32(b, 4, self.parent_client_num);
-        wr_i32(b, 8, self.fuse_time);
+        wr_i32(b, 8, self.detonation_delay);
         wr_i32(b, 12, self.forced_dud);
         wr_f32(b, 16, self.auto_detonate_time);
     }
@@ -190,7 +190,7 @@ pub struct LerpScriptMover {
     pub attached_ent_time: i32,
     pub exploder_index: i16,
     pub scale: u16,
-    pub flags: u8,
+    pub mover_bits: u8,
     pub ai_type: u16,
 }
 
@@ -205,7 +205,7 @@ impl LerpScriptMover {
             attached_ent_time: rd_i32(b, 20),
             exploder_index: rd_i16(b, 24),
             scale: rd_i16(b, 26) as u16,
-            flags: b[28],
+            mover_bits: b[28],
             ai_type: rd_i16(b, 30) as u16,
         }
     }
@@ -221,7 +221,7 @@ impl LerpScriptMover {
         wr_i32(b, 20, self.attached_ent_time);
         wr_i16(b, 24, self.exploder_index);
         wr_i16(b, 26, self.scale as i16);
-        b[28] = self.flags;
+        b[28] = self.mover_bits;
         wr_i16(b, 30, self.ai_type as i16);
     }
 }
@@ -257,10 +257,10 @@ pub struct Un2(pub [u8; 16]);
 /// BO2's `playerAnimState_t` (players and corpses).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerAnimState {
-    pub legs_anim: i32,
-    pub torso_anim: i32,
-    pub torso_pitch: f32,
-    pub waist_pitch: f32,
+    pub legs_clip: i32,
+    pub torso_clip: i32,
+    pub chest_tilt: f32,
+    pub hip_tilt: f32,
 }
 
 /// BO2's `actorAnimState_t`.
@@ -312,19 +312,19 @@ impl Un2 {
     pub fn player_anim(&self) -> PlayerAnimState {
         let b = &self.0;
         PlayerAnimState {
-            legs_anim: rd_i32(b, 0),
-            torso_anim: rd_i32(b, 4),
-            torso_pitch: rd_f32(b, 8),
-            waist_pitch: rd_f32(b, 12),
+            legs_clip: rd_i32(b, 0),
+            torso_clip: rd_i32(b, 4),
+            chest_tilt: rd_f32(b, 8),
+            hip_tilt: rd_f32(b, 12),
         }
     }
 
     pub fn set_player_anim(&mut self, a: &PlayerAnimState) {
         let b = &mut self.0;
-        wr_i32(b, 0, a.legs_anim);
-        wr_i32(b, 4, a.torso_anim);
-        wr_f32(b, 8, a.torso_pitch);
-        wr_f32(b, 12, a.waist_pitch);
+        wr_i32(b, 0, a.legs_clip);
+        wr_i32(b, 4, a.torso_clip);
+        wr_f32(b, 8, a.chest_tilt);
+        wr_f32(b, 12, a.hip_tilt);
     }
 
     #[must_use]
@@ -422,15 +422,15 @@ impl Un2 {
 pub struct ClientLinkInfo {
     pub parent_ent: i16,
     pub tag_index: u8,
-    pub flags: u8,
+    pub link_bits: u8,
 }
 
 /// BO2's `entityState_s`, in BO2's field order.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct EntityState {
-    pub number: i32,
+pub struct EntitySnapshot {
+    pub slot_index: i32,
     pub lerp: LerpEntityState,
-    pub time2: i32,
+    pub aux_time: i32,
     pub loop_sound_id: u32,
     pub solid: i32,
     pub render_options: RenderOptions,
@@ -438,28 +438,28 @@ pub struct EntityState {
     /// BO2's `un3` union: `hintString`, `vehicleXModel`, `secondBcAlias` or
     /// `soundTag`, by entity type.
     pub un3: u32,
-    pub part_bits: [u32; 5],
+    pub hidden_parts: [u32; 5],
     pub client_link_info: ClientLinkInfo,
     pub client_mask: [i32; 1],
     /// The event ring: four slots, indexed by `event_sequence & 3`.
     pub events: [u8; 4],
     pub event_parms: [u32; 4],
-    pub event_parm: u32,
+    pub parm_value: u32,
     /// [`crate::entity_type::et`].
     pub e_type: i16,
     pub ground_entity_num: i16,
     /// BO2's `index` union: `brushmodel`, `xmodel` or `primaryLight`
     /// (signed), or `bone` (unsigned).
     pub index: i16,
-    pub other_entity_num: i16,
-    pub attacker_entity_num: i16,
+    pub partner_num: i16,
+    pub hitter_num: i16,
     pub enemy_model: i16,
     pub weapon: Weapon,
     pub last_stand_prev_weapon: Weapon,
     pub targetname: u16,
     pub loop_sound_fade: i16,
     pub event_sequence: i16,
-    pub surf_type: u8,
+    pub surface_kind: u8,
     pub client_num: u8,
     pub i_head_icon: u8,
     pub weapon_model: u8,
@@ -471,7 +471,7 @@ pub struct EntityState {
 /// BO2's event ring size in `entityState_s::events`.
 pub const MAX_EVENTS_PER_ENTITY: usize = 4;
 
-impl EntityState {
+impl EntitySnapshot {
     #[must_use]
     pub const fn bone(&self) -> u16 {
         self.index as u16
@@ -485,8 +485,8 @@ mod tests {
     #[test]
     fn player_view_round_trips_in_bo2_layout() {
         let p = LerpPlayer {
-            leanf: -0.5,
-            movement_dir: 45,
+            tilt_sideways: -0.5,
+            move_heading: 45,
             move_type: playerstate_t6::flags::MOVE_TYPE_SLIDE,
             primary_weapon: Weapon::new(12, 1, 2, 3),
             stowed_weapon: Weapon::new(7, 0, 0, 0),
@@ -515,9 +515,9 @@ mod tests {
     fn missile_and_mover_share_the_same_words() {
         let mut u = LerpUnion::default();
         u.set_missile(&LerpMissile {
-            launch_time: 5000,
+            spawn_moment: 5000,
             parent_client_num: 3,
-            fuse_time: 2500,
+            detonation_delay: 2500,
             forced_dud: 0,
             auto_detonate_time: 1.5,
         });
@@ -531,7 +531,7 @@ mod tests {
             attached_ent_time: 9000,
             exploder_index: -2,
             scale: 128,
-            flags: 9,
+            mover_bits: 9,
             ai_type: 300,
         };
         u.set_script_mover(&m);
@@ -544,10 +544,10 @@ mod tests {
     fn un2_views() {
         let mut un2 = Un2::default();
         let a = PlayerAnimState {
-            legs_anim: 100,
-            torso_anim: 200,
-            torso_pitch: 10.0,
-            waist_pitch: -5.0,
+            legs_clip: 100,
+            torso_clip: 200,
+            chest_tilt: 10.0,
+            hip_tilt: -5.0,
         };
         un2.set_player_anim(&a);
         assert_eq!(un2.player_anim(), a);

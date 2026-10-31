@@ -2,47 +2,47 @@
 //! items, missiles and script models, and the draw plans they publish for the
 //! renderer.
 
-mod draw_build;
 mod guest_gravgun;
+mod plan_fill;
 mod plugin;
 
-pub mod anim;
-pub mod draw;
-pub mod gaps;
+pub mod motion;
+pub mod strokes;
+pub mod holes;
 pub mod geometry;
 pub mod guest_weapons;
-pub mod lighting;
+pub mod illum;
 pub mod occupancy;
 
-pub use anim::*;
-pub use draw::*;
-pub use draw_build::*;
-pub use lighting_t6::viewmodel_lighting_origin;
-pub use plugin::RenderAnimPlugin;
+pub use motion::*;
+pub use strokes::*;
+pub use plan_fill::*;
+pub use lighting_t6::held_view_light_point;
+pub use plugin::BodyAnimationPlugin;
 
-pub use anim::dobj_pose::{
-    HostDObjPoseFrame, HostDObjPoseRefuse, PosedPlayer, PosedPlayerFrame, PosedPlayerHead,
+pub use motion::puppet_pose::{
+    HostSkeletonFrame, HostPoseDecline, AnimatedBody, AnimatedBodyFrame, AnimatedHeadMode,
 };
-pub use anim::fpv_host::{
-    FpvBoltTargets, FpvGenerateArgs, FpvHeldLife, FpvHeldSettled, FpvPoseKind, FpvPoseProduct,
-    FpvPoseRefuse, FpvPosedFrame, FpvPresentCursor, PendingFpvNotetracks, PendingFpvSpawn,
-    PendingFpvSpawnRequest, generate_fpv_pose,
+pub use motion::gun_host::{
+    AttachTagGoals, GunPoseInputs, HoldLifeStamp, HoldSettledLife, ViewmodelPoseVariety, GunPoseOutput,
+    GunPoseDecline, GunPoseSnapshot, FpvShownCursor, QueuedGunNotes, WaitingFpvSpawn,
+    QueuedGunSpawn, generate_fpv_posture,
 };
-pub use anim::fpv_prepared::{
-    FpvPreparationCensus, FpvRigSet, FpvWeaponSlot, FpvWeaponTable, FpvWeaponView, PreparedFpv,
-    prepare_fpv_compositions,
+pub use motion::fpv_prepared::{
+    FpvHandsOverride, FpvPreparationCensus, FpvRigSet, FpvWeaponSlot, FpvWeaponTable,
+    FpvWeaponView, PreparedFpv, prepare_fpv_compositions,
 };
-pub use anim::model_materials::{PreparedModelMaterials, prepare_model_materials};
-pub use anim::viewmodel_controller::{
-    AdvanceResult, EventResult, ViewmodelController, ViewmodelEvent, WeaponState,
+pub use motion::model_materials::{PreparedModelMaterials, prepare_model_materials};
+pub use motion::gun_rig_ctl::{
+    StepOutcome, EventReaction, FirstPersonGunAnimator, GunAnimEvent, GunPhase,
 };
-pub use lighting::{
-    attach_bone, base_trans, fpv_dobj_lighting_box_half, fpv_dobj_radius, radius_lighting_box_half,
-    script_model_lighting_box_half,
+pub use illum::{
+    attach_bone, base_trans, viewmodel_light_extent, gun_model_reach, radius_lighting_box_half,
+    model_light_offset, script_prop_light_extent,
 };
 pub use occupancy::{
-    DynEntCellBits, DynEntPhysClip, DynEntPhysWorld, FpvGeometrySet, FpvPlacementRoot,
-    FpvPlacementSet, GunOffset, LocalSpawnArmed, PendingViewHurt, RemoteFxBolts, RemotePlayer,
-    RenderFocus, ScriptModelDrawSet, ScriptModelSkinSet, SessionViewmodel, occupy_fpv_scene,
-    spawn_pending_fpv, stamp_fpv_placement_matrix, sync_camera_from_presented, tick_fpv_viewmodel,
+    DebrisRoomBits, PropPhysicsShape, DebrisPhysLevel, FpvGeometrySet, GunMountAnchor,
+    GunMountStage, GunOffset, OwnSpawnPrimed, QueuedHurtFlinch, OtherBodyEffectTags, OtherPlayerBody,
+    DrawFocus, ScriptPropDrawStage, ScriptPropSkinStage, ActiveGunMeshes, populate_gun_scene,
+    spawn_viewmodel, stamp_matrix, sync_camera_from_shown, tick_viewmodel,
 };

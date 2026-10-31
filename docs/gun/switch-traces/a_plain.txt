@@ -1,0 +1,42 @@
+# A. Plain swap AN-94 -> MP7, then quick AN-94 -> pistol and back (SWITCH.md 8A). 50 ms ticks.
+# Real numbers: AN-94 drop 400 raise 600; MP7 raise 500; pistol quick 250/250; AN-94 quick drop 250.
+# Spawn as BO2 does: empty hands, class guns given, the primary comes up with its first raise (AN-94 1600 ms),
+# which marks every held gun as raised before. 50 ms ticks: 1 press tick + 32.
+msec 50
+give an94_mp
+give mp7_mp
+give fiveseven_mp
+select an94_mp
+run 33
+expect state READY
+expect anim IDLE
+select mp7_mp
+run 1                 # press tick: drop starts (400)
+expect state DROPPING
+expect anim DROP
+run 7
+expect state DROPPING
+run 1                 # 400 ms: MP7 comes up
+expect state RAISING
+expect weapon mp7_mp
+run 9
+expect state RAISING
+run 1                 # 900 ms: ready
+expect state READY
+select an94_mp
+run 20
+expect state READY
+expect weapon an94_mp
+select fiveseven_mp
+run 1                 # quick drop (250)
+expect state DROPPING_QUICK
+expect anim QUICK_DROP
+run 4
+expect state DROPPING_QUICK
+run 1                 # 250 ms: pistol quick raise (250)
+expect anim QUICK_RAISE
+expect weapon fiveseven_mp
+run 4
+expect state RAISING
+run 1                 # 500 ms: ready
+expect state READY

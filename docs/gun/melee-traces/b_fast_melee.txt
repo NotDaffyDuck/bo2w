@@ -1,0 +1,11 @@
+# B: as A with fast melee recovery (perk flag 19): only the quick raise halves (400 -> 200 ms).
+msec 50
+spawn an94_mp
+perk 19
+hold melee
+run 1
+release melee
+run 16
+expect state MELEE_END
+run 4
+expect state READY

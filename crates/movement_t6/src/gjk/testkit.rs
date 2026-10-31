@@ -3,15 +3,22 @@
 
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicU64, Ordering};
-use crate::bridge::{CollisionBackend, GroundTraceInput};
-use trace_t6::{ENTITYNUM_WORLD, Trace};
+use core::sync::atomic::AtomicU64;
+use crate::bridge::{SolidProbe, SweepAsk};
+use trace_t6::ENTITYNUM_WORLD;
+use trace_t6::Trace;
 
 use super::hull::player_hull;
-use super::{Bo2Collision, Geom, IDENTITY, Shape, add};
+use super::Bo2Collision;
+use super::Geom;
+use super::IDENTITY;
+use super::Shape;
+use super::add;
+use crate::stance::BOX_HALF_WIDTH;
+use core::sync::atomic::Ordering;
 
-pub(crate) const MINS: [f32; 3] = [-15.0, -15.0, 0.0];
-pub(crate) const MAXS: [f32; 3] = [15.0, 15.0, 70.0];
+pub(crate) const MINS: [f32; 3] = [-BOX_HALF_WIDTH, -BOX_HALF_WIDTH, 0.0];
+pub(crate) const MAXS: [f32; 3] = [BOX_HALF_WIDTH, BOX_HALF_WIDTH, 70.0];
 pub(crate) const MASK: u32 = 1;
 
 pub(crate) struct World {
@@ -25,13 +32,13 @@ impl World {
     }
 }
 
-impl CollisionBackend for World {
-    fn trace(&self, _input: GroundTraceInput) -> Trace {
+impl SolidProbe for World {
+    fn trace(&self, _input: SweepAsk) -> Trace {
         unreachable!("mode 1 only")
     }
 
-    fn touch_entity(&self, trace: &Trace, _end_pos: [f32; 3]) {
-        let entity = trace_t6::trace_get_entity_hit_id(&trace);
+    fn brush_against(&self, hit: &Trace, _end_pos: [f32; 3]) {
+        let entity = trace_t6::trace_get_entity_hit_id(&hit);
         self.touched.borrow_mut().push(i32::from(entity));
     }
 }
@@ -41,11 +48,11 @@ impl Bo2Collision for World {
         true
     }
 
-    fn gjk_query<'a>(&'a self, mins: [f32; 3], maxs: [f32; 3], mask: u32, out: &mut Vec<Geom<'a>>) {
+    fn gjk_query<'a>(&'a self, box_lo: [f32; 3], box_hi: [f32; 3], mask: u32, out: &mut Vec<Geom<'a>>) {
         out.extend(
             self.shapes
                 .iter()
-                .filter(|g| g.contents & mask != 0 && (0..3).all(|a| g.mins[a] <= maxs[a] && mins[a] <= g.maxs[a]))
+                .filter(|g| g.contents & mask != 0 && (0..3).all(|a| g.lo_corner[a] <= box_hi[a] && box_lo[a] <= g.hi_corner[a]))
                 .copied(),
         );
     }
@@ -54,8 +61,8 @@ impl Bo2Collision for World {
 /// A new key for each shape (tests that check a key set their own, below
 /// 1000).
 fn next_key() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1000);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    static MINT_COUNTER: AtomicU64 = AtomicU64::new(1000);
+    MINT_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A box brush between `lo` and `hi`, world contents and flags 7.
@@ -65,12 +72,12 @@ pub(crate) fn block(lo: [f32; 3], hi: [f32; 3]) -> Geom<'static> {
     Geom {
         shape: Shape::Box { center, half, brush: true },
         axis: IDENTITY,
-        origin: [0.0; 3],
-        mins: lo,
-        maxs: hi,
+        origin: Default::default(),
+        lo_corner: lo,
+        hi_corner: hi,
         contents: MASK,
-        surface_flags: 7,
-        hit_id: ENTITYNUM_WORLD,
+        surf_bits: 7,
+        struck_entity_num: ENTITYNUM_WORLD,
         sentient: false,
         no_push_out: false,
         key: next_key(),
@@ -90,11 +97,11 @@ pub(crate) fn other_player(origin: [f32; 3], num: u16) -> Geom<'static> {
         shape: Shape::Player { hull },
         axis: IDENTITY,
         origin,
-        mins: add(origin, lo),
-        maxs: add(origin, hi),
+        lo_corner: add(origin, lo),
+        hi_corner: add(origin, hi),
         contents: MASK,
-        surface_flags: 0,
-        hit_id: num,
+        surf_bits: 0_u32,
+        struck_entity_num: num,
         sentient: true,
         no_push_out: true,
         key: next_key(),

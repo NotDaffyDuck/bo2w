@@ -1,4 +1,4 @@
-//! Firing + rechamber, by BO2's rules (docs/gun/FIRE.md has the full timing spec).
+//! Firing + rechamber, by BO2's rules (docs/gun/TRIGGER_SLOT.md has the full timing spec).
 //!
 //! One hand of one player. `tick` runs the parts of BO2's weapon tick that this file owns, in BO2's order:
 //! spin, pending pull, timers, continuous fire, rechamber, then the fire check. States owned by other files
@@ -6,6 +6,9 @@
 //! as `Event::StartReload` for the reload code to pick up.
 
 use crate::state;
+
+/// How long the gun waits each frame while the trigger is still held down.
+const TRIGGER_WAIT_MS: i32 = 1;
 
 /// BO2's fire types (`weapFireType_t`).
 pub mod fire_type {
@@ -22,14 +25,14 @@ pub mod fire_type {
 }
 
 /// BO2's player weapon anim numbers used by firing (`weapAnim`, low bits; 0x400 is the restart toggle).
-pub mod anim {
-    pub const IDLE: i32 = 0;
+pub mod clip_ids {
+    pub const REST: i32 = 0;
     pub const ATTACK: i32 = 2;
     pub const ATTACK_LASTSHOT: i32 = 4;
-    pub const RECHAMBER: i32 = 6;
+    pub const BOLT_CYCLE: i32 = 6;
     pub const ADS_ATTACK: i32 = 7;
     pub const ADS_ATTACK_LASTSHOT: i32 = 8;
-    pub const ADS_RECHAMBER: i32 = 9;
+    pub const ADS_BOLT_CYCLE: i32 = 9;
     pub const CONT_FIRE_IN: i32 = 38;
     pub const CONT_FIRE_LOOP: i32 = 39;
     pub const CONT_FIRE_OUT: i32 = 40;
@@ -49,14 +52,14 @@ pub const MAX_INTRO_SHOTS: i32 = 250;
 /// The firing numbers of one weapon (from its weapon file, attachments already applied to `fire_time`).
 #[derive(Clone, Debug, Default)]
 pub struct FireDef {
-    pub fire_type: i32,
+    pub trigger_mode: i32,
     pub fire_time: i32,
     pub fire_delay: i32,
     pub last_fire_time: i32,
     pub intro_fire_time: i32,
     pub intro_fire_length: i32,
     pub burst_delay: i32,
-    pub bolt_action: bool,
+    pub manual_cycle: bool,
     pub shots_before_rechamber: i32,
     pub rechamber_time: i32,
     pub rechamber_bolt_time: i32,
@@ -65,13 +68,13 @@ pub struct FireDef {
     pub cont_fire_out_time: i32,
     pub spin_up_time: i32,
     pub spin_down_time: i32,
-    pub clip_size: i32,
+    pub magazine_capacity: i32,
     pub unlimited_ammo: bool,
     /// Weapon flag that turns off the wait for a trigger release.
     pub no_trigger_wait: bool,
     /// Refuses the automatic reload while fully aimed.
     pub no_ads_auto_reload: bool,
-    pub ads_fire_only: bool,
+    pub fire_only_when_scoped: bool,
     /// Time to aim in fully, in ms (after the aim-in scale).
     pub ads_in_time: i32,
 }
@@ -79,16 +82,16 @@ pub struct FireDef {
 /// One hand's firing state (the player-state fields BO2 keeps for it).
 #[derive(Clone, Debug, Default)]
 pub struct Hand {
-    pub state: i32,
-    pub weapon_time: i32,
-    pub weapon_delay: i32,
-    pub shot_count: i32,
+    pub phase: i32,
+    pub timer_ms: i32,
+    pub weapon_ready_wait: i32,
+    pub rounds_fired: i32,
     pub intro_shots_fired: i32,
     pub shots_from_chamber: i32,
     pub needs_rechamber: bool,
     pub pending_pull: bool,
-    pub clip: i32,
-    pub stock: i32,
+    pub mag_rounds: i32,
+    pub spare_rounds: i32,
     /// Player anim number with the 0x400 toggle bit.
     pub anim: i32,
     /// Minigun spin, 0..1.
@@ -100,9 +103,9 @@ pub struct Hand {
 /// This tick's input for the hand.
 #[derive(Clone, Debug, Default)]
 pub struct Input {
-    pub msec: i32,
+    pub frame_ms: i32,
     pub fire: bool,
-    pub fire_last: bool,
+    pub final_round_fired: bool,
     pub ads: bool,
     /// Aim blend, 0 = hip, 1 = fully aimed.
     pub pos_frac: f32,
@@ -130,70 +133,70 @@ pub enum Event {
 }
 
 fn start_anim(h: &mut Hand, a: i32) {
-    h.anim = (!h.anim & anim::TOGGLE) | a;
+    h.anim = (!h.anim & clip_ids::TOGGLE) | a;
 }
 
 /// Back to the idle anim unless it is already playing.
 fn continue_anim(h: &mut Hand) {
-    if h.anim & !anim::TOGGLE != anim::IDLE {
-        start_anim(h, anim::IDLE);
+    if h.anim & !clip_ids::TOGGLE != clip_ids::REST {
+        start_anim(h, clip_ids::REST);
     }
 }
 
 fn idle(h: &mut Hand) {
-    h.weapon_time = 0;
-    h.weapon_delay = 0;
-    h.state = state::READY;
-    start_anim(h, anim::IDLE);
+    h.timer_ms = Default::default();
+    h.weapon_ready_wait = 0;
+    h.phase = state::READY;
+    start_anim(h, clip_ids::REST);
 }
 
 fn uses_burst(def: &FireDef) -> bool {
-    (fire_type::BURST2..=fire_type::BURST5).contains(&def.fire_type) || def.fire_type == fire_type::CHARGESHOT
+    (fire_type::BURST2..=fire_type::BURST5).contains(&def.trigger_mode) || def.trigger_mode == fire_type::CHARGESHOT
 }
 
 /// Has this pull fired all the shots its fire type allows?
 pub fn shot_limit_reached(def: &FireDef, h: &Hand) -> bool {
-    match def.fire_type {
-        fire_type::SINGLESHOT | fire_type::CHARGESHOT => h.shot_count >= 1,
-        fire_type::BURST2..=fire_type::BURST5 => h.shot_count >= def.fire_type,
-        fire_type::STACKED => h.shot_count >= def.clip_size,
+    match def.trigger_mode {
+        fire_type::SINGLESHOT | fire_type::CHARGESHOT => h.rounds_fired >= 1,
+        fire_type::BURST2..=fire_type::BURST5 => h.rounds_fired >= def.trigger_mode,
+        fire_type::STACKED => h.rounds_fired >= def.magazine_capacity,
         _ => false,
     }
 }
 
 /// A burst has started and still owes shots (it keeps firing with the trigger up).
 pub fn burst_in_progress(def: &FireDef, h: &Hand) -> bool {
-    !matches!(def.fire_type, fire_type::FULLAUTO | fire_type::MINIGUN | fire_type::JETGUN)
-        && h.shot_count != 0
+    !matches!(def.trigger_mode, fire_type::FULLAUTO | fire_type::MINIGUN | fire_type::JETGUN)
+        && h.rounds_fired != 0
         && !shot_limit_reached(def, h)
 }
 
 fn waiting_for_trigger_release(def: &FireDef, h: &Hand, inp: &Input) -> bool {
-    let offhand = (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&h.state);
-    let crawl = (state::CRAWL_IN..=state::CRAWL_LEFT).contains(&h.state);
+    let offhand = (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&h.phase);
+    let crawl = (state::CRAWL_IN..=state::CRAWL_LEFT).contains(&h.phase);
     !offhand
         && !crawl
         && !def.no_trigger_wait
         && !h.pending_pull
         && shot_limit_reached(def, h)
         && inp.fire
-        && (h.clip > 0 || def.unlimited_ammo)
+        && (h.mag_rounds > 0 || def.unlimited_ammo)
 }
 
 fn is_last_shot(def: &FireDef, h: &Hand) -> bool {
-    let below = match def.fire_type {
-        fire_type::BURST2..=fire_type::BURST5 => def.fire_type + 1,
+    let below = match def.trigger_mode {
+        fire_type::BURST2..=fire_type::BURST5 => def.trigger_mode + 1,
         _ => 2,
     };
-    h.clip < below
+    h.mag_rounds < below
 }
 
 fn rechamber_blocks_fire(def: &FireDef, h: &Hand) -> bool {
-    def.bolt_action && h.needs_rechamber
+    def.manual_cycle && h.needs_rechamber
 }
 
 fn update_spin(def: &FireDef, h: &mut Hand, inp: &Input) {
-    if def.fire_type != fire_type::MINIGUN {
+    if def.trigger_mode != fire_type::MINIGUN {
         return;
     }
     let rate = if inp.fire || inp.ads {
@@ -203,14 +206,14 @@ fn update_spin(def: &FireDef, h: &mut Hand, inp: &Input) {
         h.spinning = false;
         -1.0 / def.spin_down_time.max(1) as f32
     };
-    h.spin = (h.spin + inp.msec as f32 * rate).clamp(0.0, 1.0);
+    h.spin = (h.spin + inp.frame_ms as f32 * rate).clamp(0.0, 1.0);
 }
 
 fn update_pending_pull(def: &FireDef, h: &mut Hand, inp: &Input) {
-    if def.fire_type != fire_type::FULLAUTO
-        && def.fire_type != fire_type::SINGLESHOT
+    if def.trigger_mode != fire_type::FULLAUTO
+        && def.trigger_mode != fire_type::SINGLESHOT
         && inp.fire
-        && !inp.fire_last
+        && !inp.final_round_fired
     {
         h.pending_pull = true;
     }
@@ -219,36 +222,36 @@ fn update_pending_pull(def: &FireDef, h: &mut Hand, inp: &Input) {
 /// This tick's timer step in ms, perk-scaled the way BO2 scales firing and rechamber states.
 pub fn step_ms(h: &Hand, inp: &Input) -> i32 {
     let fire_states = matches!(
-        h.state,
+        h.phase,
         state::FIRING | state::RECHAMBER_START | state::RECHAMBERING | state::CONT_FIRE_LOOP
     );
     if inp.rate_of_fire && fire_states {
-        (inp.msec as f64 / RATE_OF_FIRE_MULT as f64 + 9.313226e-10).round() as i32
+        (inp.frame_ms as f64 / RATE_OF_FIRE_MULT as f64 + 9.313226e-10).round() as i32
     } else {
-        inp.msec
+        inp.frame_ms
     }
 }
 
 /// Counts the timers down. Returns true on the tick the weapon delay runs out (the held shot is released).
 fn adjust_times(def: &FireDef, h: &mut Hand, inp: &Input) -> bool {
     let step = step_ms(h, inp);
-    if h.weapon_time != 0 {
-        h.weapon_time -= step;
-        if def.fire_type == fire_type::STACKED && burst_in_progress(def, h) {
-            h.weapon_time = 0;
-        } else if h.weapon_time > 0 {
+    if h.timer_ms != 0 {
+        h.timer_ms -= step;
+        if def.trigger_mode == fire_type::STACKED && burst_in_progress(def, h) {
+            h.timer_ms = Default::default();
+        } else if h.timer_ms > 0 {
             return count_delay(h, step);
         }
-        if matches!(h.state, state::FIRING | state::CONT_FIRE_LOOP) && uses_burst(def) && !burst_in_progress(def, h) {
+        if matches!(h.phase, state::FIRING | state::CONT_FIRE_LOOP) && uses_burst(def) && !burst_in_progress(def, h) {
             // Burst over: the burst wait starts and nothing else runs this tick.
-            h.weapon_time = if def.burst_delay == 0 { 1 } else { def.burst_delay };
+            h.timer_ms = if def.burst_delay == 0 { 1 } else { def.burst_delay };
             continue_anim(h);
-            h.state = state::READY;
+            h.phase = state::READY;
             return false;
         }
         if waiting_for_trigger_release(def, h, inp) {
-            h.weapon_time = 1;
-            match h.state {
+            h.timer_ms = TRIGGER_WAIT_MS;
+            match h.phase {
                 state::RECHAMBERING => finish_rechamber(h),
                 state::FIRING
                 | state::RECHAMBER_START
@@ -257,29 +260,29 @@ fn adjust_times(def: &FireDef, h: &mut Hand, inp: &Input) -> bool {
                 | state::MELEE_FIRE
                 | state::MELEE_END => {
                     continue_anim(h);
-                    h.state = state::READY;
+                    h.phase = state::READY;
                 }
                 s if state::is_reload_family(s) => {
-                    h.weapon_time = 0;
-                    h.shot_count = 0;
+                    h.timer_ms = Default::default();
+                    h.rounds_fired = 0;
                 }
                 _ => {}
             }
         } else {
             if (!inp.fire || h.pending_pull) && !burst_in_progress(def, h) {
-                h.shot_count = 0;
+                h.rounds_fired = 0;
             }
-            h.weapon_time = 0;
+            h.timer_ms = Default::default();
         }
     }
     count_delay(h, step)
 }
 
 fn count_delay(h: &mut Hand, step: i32) -> bool {
-    if h.weapon_delay != 0 {
-        h.weapon_delay -= step;
-        if h.weapon_delay < 1 {
-            h.weapon_delay = 0;
+    if h.weapon_ready_wait != 0 {
+        h.weapon_ready_wait -= step;
+        if h.weapon_ready_wait < 1 {
+            h.weapon_ready_wait = 0;
             return true;
         }
     }
@@ -289,16 +292,16 @@ fn count_delay(h: &mut Hand, step: i32) -> bool {
 fn should_be_firing(def: &FireDef, h: &mut Hand, inp: &Input, released: bool) -> bool {
     let held = inp.fire;
     let owed = released || burst_in_progress(def, h);
-    let fire = if def.fire_type == fire_type::MINIGUN {
+    let fire = if def.trigger_mode == fire_type::MINIGUN {
         held && h.spin >= 1.0
     } else {
         !rechamber_blocks_fire(def, h) && (held || owed)
     };
-    if !fire && !released && h.state == state::FIRING {
+    if !fire && !released && h.phase == state::FIRING {
         if !inp.mantling {
             continue_anim(h);
         }
-        h.state = state::READY;
+        h.phase = state::READY;
     }
     fire
 }
@@ -307,7 +310,7 @@ fn check_continuous_fire(def: &FireDef, h: &mut Hand, inp: &Input, released: boo
     if !def.continuous_fire {
         return;
     }
-    let s = h.state;
+    let s = h.phase;
     let fire_or_melee = matches!(
         s,
         state::FIRING | state::RECHAMBER_START | state::RECHAMBERING | state::MELEE_INIT | state::MELEE_FIRE | state::MELEE_END
@@ -324,46 +327,46 @@ fn check_continuous_fire(def: &FireDef, h: &mut Hand, inp: &Input, released: boo
     let mut probe = h.clone();
     let firing = should_be_firing(def, &mut probe, inp, released);
     if inp.overheated || !firing {
-        if matches!(h.state, state::CONT_FIRE_IN | state::CONT_FIRE_LOOP) {
-            h.state = state::CONT_FIRE_OUT;
-            h.weapon_time = def.cont_fire_out_time;
-            start_anim(h, anim::CONT_FIRE_OUT);
+        if matches!(h.phase, state::CONT_FIRE_IN | state::CONT_FIRE_LOOP) {
+            h.phase = state::CONT_FIRE_OUT;
+            h.timer_ms = def.cont_fire_out_time;
+            start_anim(h, clip_ids::CONT_FIRE_OUT);
         }
-    } else if !(state::CONT_FIRE_IN..=state::CONT_FIRE_OUT).contains(&h.state) {
-        h.state = state::CONT_FIRE_IN;
-        h.weapon_time = def.cont_fire_in_time;
-        h.weapon_delay = 0;
-        start_anim(h, anim::CONT_FIRE_IN);
+    } else if !(state::CONT_FIRE_IN..=state::CONT_FIRE_OUT).contains(&h.phase) {
+        h.phase = state::CONT_FIRE_IN;
+        h.timer_ms = def.cont_fire_in_time;
+        h.weapon_ready_wait = 0;
+        start_anim(h, clip_ids::CONT_FIRE_IN);
     }
 }
 
 fn finish_rechamber(h: &mut Hand) {
-    start_anim(h, anim::IDLE);
+    start_anim(h, clip_ids::REST);
     h.needs_rechamber = false;
-    h.state = state::READY;
+    h.phase = state::READY;
     h.shots_from_chamber = 0;
 }
 
 /// Bolt-action rechamber. Returns true when the tick must stop here.
 fn check_rechamber(def: &FireDef, h: &mut Hand, inp: &Input, released: bool, ev: &mut Vec<Event>) -> bool {
-    let s = h.state;
+    let s = h.phase;
     if (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&s)
         || (state::DTP_IN..=state::DTP_OUT).contains(&s)
         || (state::RIOTSHIELD_PREPARE..=state::RIOTSHIELD_END).contains(&s)
-        || !def.bolt_action
+        || !def.manual_cycle
         || !h.needs_rechamber
     {
         return false;
     }
-    if h.state == state::RECHAMBER_START && released {
-        h.state = state::RECHAMBERING;
+    if h.phase == state::RECHAMBER_START && released {
+        h.phase = state::RECHAMBERING;
         ev.push(Event::Bolt);
-        if h.weapon_time != 0 {
+        if h.timer_ms != 0 {
             return true;
         }
-    } else if h.weapon_time != 0 {
+    } else if h.timer_ms != 0 {
         let busy = matches!(
-            h.state,
+            h.phase,
             state::FIRING
                 | state::RECHAMBER_START
                 | state::RECHAMBERING
@@ -372,23 +375,23 @@ fn check_rechamber(def: &FireDef, h: &mut Hand, inp: &Input, released: bool, ev:
                 | state::MELEE_FIRE
                 | state::MELEE_END
         );
-        if busy || h.weapon_delay != 0 {
+        if busy || h.weapon_ready_wait != 0 {
             return false;
         }
     }
-    if h.state == state::RECHAMBERING {
+    if h.phase == state::RECHAMBERING {
         finish_rechamber(h);
         return false;
     }
-    if h.state == state::READY || (state::CRAWL_IN..=state::CRAWL_OUT).contains(&h.state) {
-        start_anim(h, if inp.pos_frac <= 0.75 { anim::RECHAMBER } else { anim::ADS_RECHAMBER });
-        h.state = state::RECHAMBER_START;
-        h.weapon_time = def.rechamber_time;
+    if h.phase == state::READY || (state::CRAWL_IN..=state::CRAWL_OUT).contains(&h.phase) {
+        start_anim(h, if inp.pos_frac <= 0.75 { clip_ids::BOLT_CYCLE } else { clip_ids::ADS_BOLT_CYCLE });
+        h.phase = state::RECHAMBER_START;
+        h.timer_ms = def.rechamber_time;
         if def.shots_before_rechamber != 0 {
             h.shots_from_chamber = 0;
         }
         let bolt = def.rechamber_bolt_time;
-        h.weapon_delay = if bolt != 0 && bolt < def.rechamber_time { bolt } else { 1 };
+        h.weapon_ready_wait = if bolt != 0 && bolt < def.rechamber_time { bolt } else { 1 };
         ev.push(Event::Rechamber);
     }
     false
@@ -396,11 +399,11 @@ fn check_rechamber(def: &FireDef, h: &mut Hand, inp: &Input, released: bool, ev:
 
 /// Enough rounds in the clip? If not: reload or dry-fire click, and the click lockout.
 fn check_firing_ammo(def: &FireDef, h: &mut Hand, inp: &Input, ev: &mut Vec<Event>) -> bool {
-    if h.clip >= 1 {
+    if h.mag_rounds >= 1 {
         return true;
     }
     if !(def.no_ads_auto_reload && inp.pos_frac >= 1.0) {
-        if h.stock >= 1 {
+        if h.spare_rounds >= 1 {
             ev.push(Event::StartReload);
             return false;
         }
@@ -409,56 +412,56 @@ fn check_firing_ammo(def: &FireDef, h: &mut Hand, inp: &Input, ev: &mut Vec<Even
     if !inp.mantling {
         h.needs_rechamber = false;
         continue_anim(h);
-        h.weapon_time += DRY_FIRE_MS;
+        h.timer_ms += DRY_FIRE_MS;
     }
     false
 }
 
 fn start_firing(def: &FireDef, h: &mut Hand, inp: &Input) {
-    if h.state != state::FIRING {
+    if h.phase != state::FIRING {
         h.intro_shots_fired = 0;
     }
-    h.weapon_time = if is_last_shot(def, h) && def.last_fire_time != 0 {
+    h.timer_ms = if is_last_shot(def, h) && def.last_fire_time != 0 {
         def.last_fire_time
     } else if def.intro_fire_length != 0 && h.intro_shots_fired < def.intro_fire_length {
         def.intro_fire_time
     } else {
         def.fire_time
     };
-    if def.bolt_action && def.shots_before_rechamber == 0 {
+    if def.manual_cycle && def.shots_before_rechamber == 0 {
         h.needs_rechamber = true;
     }
-    if h.state != state::FIRING && h.state != state::CONT_FIRE_LOOP {
-        h.weapon_delay = def.fire_delay;
+    if h.phase != state::FIRING && h.phase != state::CONT_FIRE_LOOP {
+        h.weapon_ready_wait = def.fire_delay;
     }
-    if def.ads_fire_only && def.fire_type != fire_type::MINIGUN {
+    if def.fire_only_when_scoped && def.trigger_mode != fire_type::MINIGUN {
         let left = ((1.0 - inp.pos_frac) * def.ads_in_time as f32) as i32;
-        h.weapon_delay = h.weapon_delay.max(left);
+        h.weapon_ready_wait = h.weapon_ready_wait.max(left);
     }
-    if !(state::CONT_FIRE_IN..=state::CONT_FIRE_OUT).contains(&h.state) {
-        h.state = state::FIRING;
+    if !(state::CONT_FIRE_IN..=state::CONT_FIRE_OUT).contains(&h.phase) {
+        h.phase = state::FIRING;
     }
-    if def.bolt_action && def.shots_before_rechamber > 0 {
+    if def.manual_cycle && def.shots_before_rechamber > 0 {
         h.shots_from_chamber += 1;
         if h.shots_from_chamber >= def.shots_before_rechamber {
             h.needs_rechamber = true;
         }
     }
-    if h.weapon_delay == 0 && def.fire_type != fire_type::FULLAUTO {
-        h.shot_count = (h.shot_count + 1).min(MAX_SHOT_COUNT);
+    if h.weapon_ready_wait == 0 && def.trigger_mode != fire_type::FULLAUTO {
+        h.rounds_fired = (h.rounds_fired + 1).min(MAX_SHOT_COUNT);
     }
 }
 
 fn set_fire_anim(h: &mut Hand, inp: &Input) {
-    if h.anim & !anim::TOGGLE == anim::MANTLE {
+    if h.anim & !clip_ids::TOGGLE == clip_ids::MANTLE {
         return;
     }
-    let empty = h.clip == 0;
+    let empty = h.mag_rounds == 0;
     let a = match (inp.pos_frac <= 0.75, empty) {
-        (true, false) => anim::ATTACK,
-        (true, true) => anim::ATTACK_LASTSHOT,
-        (false, false) => anim::ADS_ATTACK,
-        (false, true) => anim::ADS_ATTACK_LASTSHOT,
+        (true, false) => clip_ids::ATTACK,
+        (true, true) => clip_ids::ATTACK_LASTSHOT,
+        (false, false) => clip_ids::ADS_ATTACK,
+        (false, true) => clip_ids::ADS_ATTACK_LASTSHOT,
     };
     start_anim(h, a);
 }
@@ -471,19 +474,19 @@ fn fire_weapon(def: &FireDef, h: &mut Hand, inp: &Input, ev: &mut Vec<Event>) {
         return;
     }
     start_firing(def, h, inp);
-    if h.weapon_delay != 0 {
+    if h.weapon_ready_wait != 0 {
         return;
     }
     h.pending_pull = false;
     if !def.unlimited_ammo {
-        h.clip -= 1;
+        h.mag_rounds -= 1;
     }
     h.intro_shots_fired = (h.intro_shots_fired + 1).min(MAX_INTRO_SHOTS);
-    if !(state::CONT_FIRE_IN..=state::CONT_FIRE_OUT).contains(&h.state) {
+    if !(state::CONT_FIRE_IN..=state::CONT_FIRE_OUT).contains(&h.phase) {
         set_fire_anim(h, inp);
     }
-    ev.push(Event::Fire { shot: h.shot_count, emptied: h.clip == 0 });
-    if h.clip == 0 && h.stock == 0 && !def.unlimited_ammo {
+    ev.push(Event::Fire { shot: h.rounds_fired, emptied: h.mag_rounds == 0 });
+    if h.mag_rounds == 0 && h.spare_rounds == 0 && !def.unlimited_ammo {
         ev.push(Event::AutoSwitch);
     }
 }
@@ -499,15 +502,15 @@ pub fn tick(def: &FireDef, h: &mut Hand, inp: &Input, ev: &mut Vec<Event>) {
     if check_rechamber(def, h, inp, released, ev) {
         return;
     }
-    if (h.weapon_time != 0 || h.weapon_delay != 0) && !released {
+    if (h.timer_ms != 0 || h.weapon_ready_wait != 0) && !released {
         return;
     }
-    match h.state {
+    match h.phase {
         state::CONT_FIRE_IN => {
-            h.state = state::CONT_FIRE_LOOP;
-            h.weapon_time = 0;
-            h.weapon_delay = 0;
-            start_anim(h, anim::CONT_FIRE_LOOP);
+            h.phase = state::CONT_FIRE_LOOP;
+            h.timer_ms = Default::default();
+            h.weapon_ready_wait = 0;
+            start_anim(h, clip_ids::CONT_FIRE_LOOP);
         }
         state::CONT_FIRE_OUT => {
             idle(h);
@@ -533,7 +536,7 @@ mod tests {
         let mut t = 0;
         while t < ms {
             let f = fire(t);
-            let inp = Input { msec: frame, fire: f, fire_last: last, ..base.clone() };
+            let inp = Input { frame_ms: frame, fire: f, final_round_fired: last, ..base.clone() };
             let mut ev = Vec::new();
             tick(def, h, &inp, &mut ev);
             for e in ev {
@@ -548,11 +551,18 @@ mod tests {
     }
 
     fn gun(fire_type: i32, fire_time: i32) -> FireDef {
-        FireDef { fire_type, fire_time, clip_size: 30, ..Default::default() }
+        let mut def = FireDef::default();
+        def.trigger_mode = fire_type;
+        def.fire_time = fire_time;
+        def.magazine_capacity = 30;
+        def
     }
 
     fn loaded(clip: i32) -> Hand {
-        Hand { clip, stock: 90, ..Default::default() }
+        let mut hand = Hand::default();
+        hand.mag_rounds = clip;
+        hand.spare_rounds = 90;
+        hand
     }
 
     #[test]
@@ -597,7 +607,7 @@ mod tests {
         let mut h = loaded(30);
         let shots = run(&def, &mut h, 1, 1000, |t| t < 10, Input::default());
         assert_eq!(shots, vec![0, 60, 120]);
-        assert_eq!(h.shot_count, 0);
+        assert_eq!(h.rounds_fired, 0);
     }
 
     #[test]
@@ -625,11 +635,14 @@ mod tests {
         let mut def = gun(fire_type::FULLAUTO, 100);
         def.last_fire_time = 300;
         let mut h = loaded(2);
-        h.stock = 0;
+        h.spare_rounds = 0;
         let mut ev_all = Vec::new();
         let mut last = false;
         for t in 0..1000 {
-            let inp = Input { msec: 1, fire: true, fire_last: last, ..Default::default() };
+            let mut inp = Input::default();
+            inp.frame_ms = 1;
+            inp.fire = true;
+            inp.final_round_fired = last;
             let mut ev = Vec::new();
             tick(&def, &mut h, &inp, &mut ev);
             for e in ev {
@@ -648,12 +661,12 @@ mod tests {
     #[test]
     fn bolt_action_rechambers_and_blocks_fire() {
         let def = FireDef {
-            fire_type: fire_type::SINGLESHOT,
+            trigger_mode: fire_type::SINGLESHOT,
             fire_time: 100,
-            bolt_action: true,
+            manual_cycle: true,
             rechamber_time: 1000,
             rechamber_bolt_time: 600,
-            clip_size: 5,
+            magazine_capacity: 5,
             ..Default::default()
         };
         let mut h = loaded(5);
@@ -661,7 +674,10 @@ mod tests {
         let mut last = false;
         for t in 0..1500 {
             let f = true;
-            let inp = Input { msec: 1, fire: f, fire_last: last, ..Default::default() };
+            let mut inp = Input::default();
+            inp.frame_ms = 1;
+            inp.fire = f;
+            inp.final_round_fired = last;
             let mut ev = Vec::new();
             tick(&def, &mut h, &inp, &mut ev);
             for e in ev {
@@ -675,7 +691,7 @@ mod tests {
         assert_eq!(log[2], (700, Event::Bolt));
         // Rechamber done at 1100; trigger still held from the first shot -> no second shot.
         assert_eq!(log.len(), 3);
-        assert_eq!(h.state, state::READY);
+        assert_eq!(h.phase, state::READY);
         assert!(!h.needs_rechamber);
     }
 
@@ -683,12 +699,14 @@ mod tests {
     fn rate_of_fire_scales_fire_time() {
         let def = gun(fire_type::FULLAUTO, 100);
         let mut h = loaded(30);
-        let base = Input { rate_of_fire: true, ..Default::default() };
+        let mut base = Input::default();
+        base.rate_of_fire = true;
         // 10 ms frames: step rounds 13.3 to 13, so a 100 ms fire time ends after 8 frames.
         let shots = run(&def, &mut h, 10, 400, |_| true, base);
         assert_eq!(shots, vec![0, 80, 160, 240, 320]);
         let mut h = loaded(30);
-        let base = Input { rate_of_fire: true, ..Default::default() };
+        let mut base = Input::default();
+        base.rate_of_fire = true;
         let shots = run(&def, &mut h, 1, 300, |_| true, base);
         // 1 ms frames: step rounds 1.33 to 1, so the perk only shows on longer frames (as in BO2).
         assert_eq!(shots, vec![0, 100, 200]);
@@ -707,11 +725,11 @@ mod tests {
     #[test]
     fn minigun_spins_up_before_firing() {
         let def = FireDef {
-            fire_type: fire_type::MINIGUN,
+            trigger_mode: fire_type::MINIGUN,
             fire_time: 50,
             spin_up_time: 500,
             spin_down_time: 1000,
-            clip_size: 100,
+            magazine_capacity: 100,
             ..Default::default()
         };
         let mut h = loaded(100);
@@ -724,19 +742,19 @@ mod tests {
     #[test]
     fn continuous_fire_in_loop_out() {
         let def = FireDef {
-            fire_type: fire_type::FULLAUTO,
+            trigger_mode: fire_type::FULLAUTO,
             fire_time: 100,
             continuous_fire: true,
             cont_fire_in_time: 300,
             cont_fire_out_time: 200,
-            clip_size: 100,
+            magazine_capacity: 100,
             ..Default::default()
         };
         let mut h = loaded(100);
         let shots = run(&def, &mut h, 1, 600, |t| t < 500, Input::default());
         assert_eq!(shots, vec![300, 400]);
-        assert_eq!(h.state, state::CONT_FIRE_OUT);
+        assert_eq!(h.phase, state::CONT_FIRE_OUT);
         run(&def, &mut h, 1, 300, |_| false, Input::default());
-        assert_eq!(h.state, state::READY);
+        assert_eq!(h.phase, state::READY);
     }
 }

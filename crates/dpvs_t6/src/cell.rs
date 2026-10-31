@@ -1,134 +1,129 @@
+//! The map's cells and portals, and the small BSP that says which cell a
+//! point is in.
+
 use core::ops::Range;
 
-/// GfxCell: its bounds and its run of portals (each leads out of this cell).
+/// One cell: its bounds and the run of portals leading out of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Cell {
-    pub mins: [f32; 3],
-    pub maxs: [f32; 3],
+    pub lo: [f32; 3],
+    pub hi: [f32; 3],
     pub portal_start: u32,
-    pub portal_count: u32,
+    pub portal_opening_total: u32,
 }
 
-/// GfxPortal: the DpvsPlane it lies in, the cell it leads into, its winding and the two axes
-/// its hull points are kept in.
+/// One portal: the plane it lies in, the cell it opens into, its run of
+/// winding points and the two axes its hull points are expressed in.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Portal {
     pub plane: [f32; 4],
     pub cell: u16,
-    pub vert_start: u32,
-    pub vert_count: u32,
-    pub hull_axis: [[f32; 3]; 2],
+    pub vertex_first: u32,
+    pub vertex_tally: u32,
+    pub hull_axes_dir: [[f32; 3]; 2],
 }
 
-/// A BO2 map's cells, portals and the GfxWorldDpvsPlanes BSP that finds a point's cell.
-/// `planes` are cplane_s as `[normal, dist]`; `nodes` is the u16 node array.
+/// A map's cells and portals plus the point-to-cell BSP (`planes` as
+/// `[normal, dist]`, `nodes` as the packed node codes).
 #[derive(Clone, Copy, Debug)]
 pub struct DpvsWorld<'a> {
     pub cells: &'a [Cell],
     pub portals: &'a [Portal],
-    pub verts: &'a [[f32; 3]],
+    pub vertex_points: &'a [[f32; 3]],
     pub planes: &'a [[f32; 4]],
     pub nodes: &'a [u16],
 }
 
+/// `start .. start + len`, both ends clamped to `total`.
+fn clamped_run(start: u32, len: u32, total: usize) -> Range<usize> {
+    let first = total.min(start as usize);
+    first..total.min(first + len as usize)
+}
+
 impl DpvsWorld<'_> {
+    /// Indices of the portals leading out of `cell` (empty for an unknown cell).
     #[must_use]
     pub fn cell_portals(&self, cell: usize) -> Range<usize> {
-        let Some(c) = self.cells.get(cell) else {
-            return 0..0;
-        };
-        let start = (c.portal_start as usize).min(self.portals.len());
-        let end = (start + c.portal_count as usize).min(self.portals.len());
-        start..end
+        match self.cells.get(cell) {
+            Some(c) => clamped_run(c.portal_start, c.portal_opening_total, self.portals.len()),
+            None => 0..0,
+        }
     }
 
+    /// The winding points of `portal` (empty for an unknown portal).
     #[must_use]
-    pub fn portal_verts(&self, portal: usize) -> &[[f32; 3]] {
-        let Some(p) = self.portals.get(portal) else {
-            return &[];
-        };
-        let start = (p.vert_start as usize).min(self.verts.len());
-        let end = (start + p.vert_count as usize).min(self.verts.len());
-        &self.verts[start..end]
+    pub fn portal_vertices(&self, portal: usize) -> &[[f32; 3]] {
+        match self.portals.get(portal) {
+            Some(p) => &self.vertex_points[clamped_run(p.vertex_first, p.vertex_tally, self.vertex_points.len())],
+            None => &[],
+        }
     }
 
-    /// R_CellForPoint over this world's planes and nodes.
+    /// The cell `spot` is in, by this world's BSP.
     #[must_use]
-    pub fn cell_for_point(&self, p: [f32; 3]) -> Option<usize> {
-        cell_for_point(self.planes, self.nodes, self.cells.len(), p)
+    pub fn cell_holding(&self, spot: [f32; 3]) -> Option<usize> {
+        cell_holding(self.planes, self.nodes, self.cells.len(), spot)
     }
 }
 
-/// cplane_s: normal, dist and type (0..2 for a plane along that axis, 3 otherwise).
+/// A splitting plane: normal, distance and axis kind (0..2 along that axis, 3 otherwise).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct CPlane {
+pub struct PlaneEquation {
     pub normal: [f32; 3],
-    pub dist: f32,
+    pub offset: f32,
     pub r#type: u8,
 }
 
-/// GfxWorldDpvsPlanes: the planes and u16 nodes of the BSP that finds a point's cell and
-/// files scene ents into cells.
+/// The point-to-cell BSP on its own, which also files scene entities into cells.
 #[derive(Clone, Copy, Debug)]
-pub struct DpvsPlanes<'a> {
-    pub planes: &'a [CPlane],
+pub struct VisibilityCellPlanes<'a> {
+    pub planes: &'a [PlaneEquation],
     pub nodes: &'a [u16],
-    pub cell_count: u32,
+    pub leaf_cells: u32,
 }
 
-impl DpvsPlanes<'_> {
-    /// R_CellForPoint, as [`cell_for_point`].
+impl VisibilityCellPlanes<'_> {
+    /// The cell `probe` is in; see [`cell_for_point`].
     #[must_use]
-    pub fn cell_for_point(&self, p: [f32; 3]) -> Option<usize> {
-        let cell_count = self.cell_count as usize;
-        if self.nodes.is_empty() || cell_count == 0 {
-            return None;
-        }
-        let mut i = 0usize;
-        for _ in 0..self.nodes.len() {
-            let value = usize::from(*self.nodes.get(i)?);
-            if value <= cell_count {
-                return value.checked_sub(1).filter(|&c| c < cell_count);
-            }
-            let plane = self.planes.get(value - (cell_count + 1))?;
-            let n = plane.normal;
-            let d = n[0] * p[0] + n[1] * p[1] + n[2] * p[2] - plane.dist;
-            i += if d > 0.0 {
-                2
-            } else {
-                usize::from(*self.nodes.get(i + 1)?)
-            };
-        }
-        None
+    pub fn cell_holding(&self, probe: [f32; 3]) -> Option<usize> {
+        descend(self.nodes, self.leaf_cells as usize, |slot| {
+            let split = self.planes.get(slot)?;
+            let [nx, ny, nz] = split.normal;
+            Some(nx * probe[0] + ny * probe[1] + nz * probe[2] - split.offset)
+        })
     }
 }
 
-/// R_CellForPoint over a GfxWorldDpvsPlanes BSP alone (`planes` as `[normal, dist]`): a node
-/// value at or below `cell_count` is leaf `value - 1`, a larger one is plane
-/// `value - (cell_count + 1)` followed by the offset of its back child. In front
-/// (distance > 0) goes to the next node.
+/// The cell `at_p` is in, by the BSP `planes` (`[normal, dist]`) and `nodes`.
+///
+/// Node codes: `1..=cell_count` is the leaf for cell `code - 1` (0 is
+/// outside every cell); a larger code is plane `code - cell_count - 1`, and
+/// the node after it holds how far ahead its back child is. Strictly in front
+/// of the plane continues two nodes on.
 #[must_use]
-pub fn cell_for_point(
-    planes: &[[f32; 4]],
-    nodes: &[u16],
-    cell_count: usize,
-    p: [f32; 3],
-) -> Option<usize> {
-    if nodes.is_empty() || cell_count == 0 {
+pub fn cell_holding(planes: &[[f32; 4]], nodes: &[u16], cells_total: usize, at_p: [f32; 3]) -> Option<usize> {
+    descend(nodes, cells_total, |node_ix| {
+        let [nx, ny, nz, dist] = *planes.get(node_ix)?;
+        Some(nx * at_p[0] + ny * at_p[1] + nz * at_p[2] - dist)
+    })
+}
+
+/// Walks the node codes from the root; `distance(plane)` is the point's
+/// signed distance from a splitting plane. None for a broken tree.
+fn descend(nodes: &[u16], n_cells: usize, dist_fn: impl Fn(usize) -> Option<f32>) -> Option<usize> {
+    if n_cells == 0 || nodes.is_empty() {
         return None;
     }
-    let mut i = 0usize;
-    for _ in 0..nodes.len() {
-        let value = usize::from(*nodes.get(i)?);
-        if value <= cell_count {
-            return value.checked_sub(1).filter(|&c| c < cell_count);
-        }
-        let plane = planes.get(value - (cell_count + 1))?;
-        let d = plane[0] * p[0] + plane[1] * p[1] + plane[2] * p[2] - plane[3];
-        i += if d > 0.0 {
-            2
-        } else {
-            usize::from(*nodes.get(i + 1)?)
+    let mut cur = 0usize;
+    // A sound tree reaches a leaf in fewer steps than it has nodes.
+    for _ in nodes {
+        let code = usize::from(*nodes.get(cur)?);
+        let Some(plane) = code.checked_sub(n_cells + 1) else {
+            return code.checked_sub(1);
+        };
+        cur += match dist_fn(plane)? > 0.0 {
+            true => 2,
+            false => usize::from(*nodes.get(cur + 1)?),
         };
     }
     None
@@ -147,11 +142,11 @@ mod tests {
         let world = DpvsWorld {
             cells: &cells,
             portals: &[],
-            verts: &[],
+            vertex_points: &[],
             planes: &planes,
             nodes: &nodes,
         };
-        assert_eq!(world.cell_for_point([5.0, 0.0, 0.0]), Some(0));
-        assert_eq!(world.cell_for_point([-5.0, 0.0, 0.0]), Some(1));
+        assert_eq!(world.cell_holding([5.0, 0.0, 0.0]), Some(0));
+        assert_eq!(world.cell_holding([-5.0, 0.0, 0.0]), Some(1));
     }
 }

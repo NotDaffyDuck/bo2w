@@ -2,12 +2,12 @@
 
 /// One bit per surface, set when that surface casts the sun's shadow.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SurfaceCastsSunShadow {
+pub struct FaceBlocksSunlight {
     bits: Vec<u32>,
     surfaces: usize,
 }
 
-impl SurfaceCastsSunShadow {
+impl FaceBlocksSunlight {
     /// A set for `surfaces` surfaces, none of them casting.
     pub fn with_len(surfaces: usize) -> Self {
         Self {
@@ -38,7 +38,7 @@ impl SurfaceCastsSunShadow {
     }
 
     /// The bits as 32-bit words: surface `n` is bit `n % 32` of word `n / 32`.
-    pub fn words(&self) -> &[u32] {
+    pub fn bit_words(&self) -> &[u32] {
         &self.bits
     }
 }
@@ -49,22 +49,22 @@ mod tests {
 
     #[test]
     fn bits_land_in_the_word_that_holds_them() {
-        let mut casters = SurfaceCastsSunShadow::with_len(70);
+        let mut casters = FaceBlocksSunlight::with_len(70);
         casters.set(0);
         casters.set(33);
         casters.set(69);
-        assert_eq!(casters.words(), [1, 2, 1 << 5]);
+        assert_eq!(casters.bit_words(), [1, 2, 1 << 5]);
         assert!(casters.get(33) && !casters.get(34));
     }
 
     #[test]
     fn surfaces_past_the_end_are_ignored() {
-        let mut casters = SurfaceCastsSunShadow::with_len(3);
+        let mut casters = FaceBlocksSunlight::with_len(3);
         casters.set(3);
         casters.set(1000);
         assert!(!casters.get(3) && !casters.get(1000));
-        assert_eq!(casters.words(), [0]);
+        assert_eq!(casters.bit_words(), [0]);
         assert_eq!(casters.len(), 3);
-        assert!(SurfaceCastsSunShadow::default().is_empty());
+        assert!(FaceBlocksSunlight::default().is_empty());
     }
 }

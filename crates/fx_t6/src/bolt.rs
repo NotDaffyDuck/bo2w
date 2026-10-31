@@ -1,7 +1,7 @@
 //! The packed bolt / sort-order word on each BO2 effect.
 //!
 //! Bolted form: sort order 8 bits, type 2, dobj handle 11, temporal 1,
-//! bone index 9. Dynent form: sort order 8, type 2, dynent id 21.
+//! bone index 9. Dynent form: sort order 8, type 2, debris_bit id 21.
 // BO2 unknown: the facts give the fields and widths but not their bit order.
 // Packed here in the listed order from bit 0 (see facts/QUESTIONS.md).
 
@@ -11,7 +11,7 @@ pub const FX_BOLT_TYPE_BITS: u32 = 2;
 pub const FX_BOLT_DOBJ_SHIFT: u32 = 10;
 pub const FX_BOLT_DOBJ_BITS: u32 = 11;
 pub const FX_BOLT_TEMPORAL_SHIFT: u32 = 21;
-pub const FX_BOLT_BONE_SHIFT: u32 = 22;
+pub const ATTACH_JOINT_BIT_OFFSET: u32 = 22;
 pub const FX_BOLT_BONE_BITS: u32 = 9;
 pub const FX_BOLT_DYNENT_SHIFT: u32 = 10;
 pub const FX_BOLT_DYNENT_BITS: u32 = 21;
@@ -76,8 +76,8 @@ pub fn bolt_type(word: u32) -> FxBoltType {
     FxBoltType::from_bits(word >> FX_BOLT_TYPE_SHIFT)
 }
 
-pub fn pack_bolt(sort_order: u8, bolt: FxBolt) -> u32 {
-    let sort = u32::from(sort_order);
+pub fn pack_bolt(paint_rank: u8, bolt: FxBolt) -> u32 {
+    let sort = u32::from(paint_rank);
     let ty = |t: FxBoltType| (t as u32) << FX_BOLT_TYPE_SHIFT;
     match bolt {
         FxBolt::None => sort | ty(FxBoltType::None),
@@ -89,7 +89,7 @@ pub fn pack_bolt(sort_order: u8, bolt: FxBolt) -> u32 {
             sort | ty(FxBoltType::Bolted)
                 | ((dobj & mask(FX_BOLT_DOBJ_BITS)) << FX_BOLT_DOBJ_SHIFT)
                 | (u32::from(temporal) << FX_BOLT_TEMPORAL_SHIFT)
-                | ((bone & mask(FX_BOLT_BONE_BITS)) << FX_BOLT_BONE_SHIFT)
+                | ((bone & mask(FX_BOLT_BONE_BITS)) << ATTACH_JOINT_BIT_OFFSET)
         }
         FxBolt::Dynent { id } => {
             sort | ty(FxBoltType::Dynent)
@@ -107,7 +107,7 @@ pub fn unpack_bolt(word: u32) -> FxBolt {
         FxBoltType::Bolted => FxBolt::Bolted {
             dobj: (word >> FX_BOLT_DOBJ_SHIFT) & mask(FX_BOLT_DOBJ_BITS),
             temporal: (word >> FX_BOLT_TEMPORAL_SHIFT) & 1 != 0,
-            bone: (word >> FX_BOLT_BONE_SHIFT) & mask(FX_BOLT_BONE_BITS),
+            bone: (word >> ATTACH_JOINT_BIT_OFFSET) & mask(FX_BOLT_BONE_BITS),
         },
         FxBoltType::Dynent => FxBolt::Dynent {
             id: (word >> FX_BOLT_DYNENT_SHIFT) & mask(FX_BOLT_DYNENT_BITS),
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn widths_fill_31_bits() {
-        assert_eq!(FX_BOLT_BONE_SHIFT + FX_BOLT_BONE_BITS, 31);
+        assert_eq!(ATTACH_JOINT_BIT_OFFSET + FX_BOLT_BONE_BITS, 31);
         assert_eq!(FX_BOLT_DYNENT_SHIFT + FX_BOLT_DYNENT_BITS, 31);
         assert_eq!(FX_BOLT_DOBJ_NONE, mask(FX_BOLT_DOBJ_BITS));
         assert_eq!(FX_BOLT_BONE_NONE, mask(FX_BOLT_BONE_BITS));

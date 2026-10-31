@@ -1,135 +1,157 @@
-//! The anim side of a DObj: which part each of a clip's tracks drives, and
-//! `DObjCalcAnim`'s blend of the playing anims into a local pose.
+//! How a DObj plays animation: which of its parts each track of a clip moves,
+//! and the blend of every playing anim into one local pose (BO2's
+//! `DObjCalcAnim`).
 
-use dobj_t6::{DObj, LocalPose, PartBits, PartPose};
+use std::collections::HashMap;
+
+use dobj_t6::{AnimMat, PosedSkeleton, IGNORED_PART, LocalPose, PartSet, PartPose};
 use glam::Mat4;
 
-use crate::AnimClip;
+use crate::SkeletalClip;
 
-pub struct AnimInstance<'a> {
-    pub clip: &'a AnimClip,
+/// One anim that is currently playing on a DObj.
+pub struct ClipPlayback<'a> {
+    pub clip: &'a SkeletalClip,
     pub tracks: &'a [Option<usize>],
     pub time: f32,
     pub weight: f32,
-    pub parts: Option<&'a PartBits>,
+    pub parts: Option<&'a PartSet>,
 }
 
-pub trait DObjAnim {
-    fn tracks_for(&self, clip: &AnimClip) -> Vec<Option<usize>>;
-
-    fn calc_anim(&self, anims: &[AnimInstance<'_>], requested: &PartBits) -> LocalPose;
-
-    /// BO2's `DObjCalcAnim` blend (facts/xanim-dobj-t6.md 1 and 3): each
-    /// anim adds its samples into a [`dobj_t6::AnimMat`] per bone (rotations
-    /// flipped toward the sum, translation over its own weight total); part
-    /// 159 is never written by anim data; a bone no anim drove gets its
-    /// base pose (identity for root bones) and no translation.
-    fn calc_anim_masked(
-        &self,
-        anims: &[AnimInstance<'_>],
-        requested: &PartBits,
-    ) -> (LocalPose, Vec<bool>);
-
-    fn pose(&self, anims: &[AnimInstance<'_>], requested: &PartBits, placement: Mat4)
-    -> Vec<Mat4>;
-
-    fn pose_with_controller(
-        &self,
-        anims: &[AnimInstance<'_>],
-        requested: &PartBits,
-        placement: Mat4,
-        controller: impl FnOnce(&DObj, &PartBits, &mut LocalPose),
-    ) -> Vec<Mat4>;
+impl ClipPlayback<'_> {
+    /// The part a track of this anim may drive, when the anim is allowed to
+    /// touch it: not the ignored part, asked for by the caller, and inside this
+    /// anim's own part filter if it has one.
+    fn drivable_part(&self, lane: usize, wanted: &PartSet) -> Option<usize> {
+        let part = (*self.tracks.get(lane)?)?;
+        let allowed = part != IGNORED_PART
+            && wanted.get(part)
+            && self.parts.is_none_or(|filter| filter.get(part));
+        allowed.then_some(part)
+    }
 }
 
-impl DObjAnim for DObj {
-    fn tracks_for(&self, clip: &AnimClip) -> Vec<Option<usize>> {
-        let mut first_by_name = std::collections::HashMap::with_capacity(self.bones.len());
-        for (index, bone) in self.bones.iter().enumerate() {
-            first_by_name.entry(bone.name.as_str()).or_insert(index);
+/// The running sum of every playing anim, per part of a DObj.
+struct Blend {
+    sums: Vec<AnimMat>,
+    driven: Vec<bool>,
+}
+
+impl Blend {
+    fn new(part_count: usize) -> Self {
+        Blend {
+            sums: vec![AnimMat::ZERO; part_count],
+            driven: vec![false; part_count],
         }
-        clip.tracks
-            .iter()
-            .map(|track| first_by_name.get(track.name.as_str()).copied())
-            .collect()
     }
 
-    fn calc_anim(&self, anims: &[AnimInstance<'_>], requested: &PartBits) -> LocalPose {
-        self.calc_anim_masked(anims, requested).0
-    }
-
-    fn calc_anim_masked(
-        &self,
-        anims: &[AnimInstance<'_>],
-        requested: &PartBits,
-    ) -> (LocalPose, Vec<bool>) {
-        let mut mats = vec![dobj_t6::AnimMat::ZERO; self.bones.len()];
-        let mut controlled = vec![false; self.bones.len()];
-
-        for anim in anims {
-            if anim.weight <= 0.0 {
+    /// Adds every sample of one playing anim into the parts its tracks drive.
+    fn accumulate(&mut self, play: &ClipPlayback, want: &PartSet) {
+        let weight = play.weight;
+        let drives = (0..play.tracks.len())
+            .filter_map(|track| Some((track, play.drivable_part(track, want)?)));
+        for (track, part) in drives {
+            let Some(sample) = play.clip.lane_at(track, play.time) else {
                 continue;
+            };
+            self.driven[part] = true;
+            let sum = &mut self.sums[part];
+            match sample.rotation {
+                Some(rotation) => sum.blend_rotation(rotation, weight),
+                None => sum.blend_identity(weight),
             }
-            for (track, bone) in anim.tracks.iter().enumerate() {
-                let Some(bone) = *bone else { continue };
-                if bone == dobj_t6::IGNORED_PART || !requested.get(bone) {
-                    continue;
-                }
-                if let Some(parts) = anim.parts
-                    && !parts.get(bone)
-                {
-                    continue;
-                }
-                let Some(sample) = anim.clip.sample_track(track, anim.time) else {
-                    continue;
-                };
-                controlled[bone] = true;
-                let mat = &mut mats[bone];
-                match sample.rotation {
-                    Some(q) => mat.add_quat(q, anim.weight),
-                    None => mat.add_identity(anim.weight),
-                }
-                if let Some(t) = sample.translation {
-                    mat.add_trans(t, anim.weight);
-                }
+            if let Some(translation) = sample.move_track {
+                sum.blend_translation(translation, weight);
             }
         }
+    }
 
-        let locals = (0..self.bones.len())
-            .map(|bone| {
-                if controlled[bone] {
-                    let (rotation, translation) = mats[bone].finish();
-                    PartPose {
-                        rotation,
-                        translation,
-                    }
-                } else {
-                    PartPose::at_rest(self.bones[bone].bind_rotation.to_array())
+    /// One pose per part: the blend where an anim drove it, else `rest_of`.
+    fn finish(self, rest_of: impl Fn(usize) -> PartPose) -> (LocalPose, Vec<bool>) {
+        let Blend { sums, driven } = self;
+        let poses = sums
+            .iter()
+            .zip(&driven)
+            .enumerate()
+            .map(|(part, (sum, &was_driven))| {
+                if !was_driven {
+                    return rest_of(part);
+                }
+                let (rotation, shift) = sum.finish();
+                PartPose {
+                    rotation,
+                    translation: shift,
                 }
             })
             .collect();
-        (LocalPose::new(locals), controlled)
+        (LocalPose::new(poses), driven)
+    }
+}
+
+pub trait DObjAnim {
+    fn tracks_for(&self, clip: &SkeletalClip) -> Vec<Option<usize>>;
+
+    /// Blends the playing anims the way BO2's `DObjCalcAnim` does
+    /// (facts/xanim-dobj-t6.md 1 and 3). Every anim adds its samples into an
+    /// [`dobj_t6::AnimMat`] per part: rotations are flipped toward the running
+    /// sum and a translation is divided by its own weight total. Part 159 is
+    /// never written by anim data. A part that no anim drove takes its base
+    /// pose (identity for root parts) and gets no translation. The second
+    /// result says which parts were driven.
+    fn calc_anim_masked(&self, active: &[ClipPlayback], want_set: &PartSet) -> (LocalPose, Vec<bool>);
+
+    fn calc_anim(&self, playing: &[ClipPlayback], wanted: &PartSet) -> LocalPose;
+
+    fn pose_using_aim(
+        &self,
+        playing: &[ClipPlayback],
+        wanted: &PartSet,
+        world_xf: Mat4,
+        steer: impl FnOnce(&PosedSkeleton, &PartSet, &mut LocalPose),
+    ) -> Vec<Mat4>;
+
+    fn pose(&self, playing: &[ClipPlayback], wanted: &PartSet, to_world: Mat4) -> Vec<Mat4>;
+}
+
+impl DObjAnim for PosedSkeleton {
+    fn tracks_for(&self, clip: &SkeletalClip) -> Vec<Option<usize>> {
+        let mut by_name: HashMap<&str, usize> = HashMap::with_capacity(self.bones.len());
+        for (index, bone) in self.bones.iter().enumerate().rev() {
+            by_name.insert(bone.name.as_str(), index);
+        }
+        let find = |name: &str| by_name.get(name).copied();
+        clip.tracks
+            .iter()
+            .map(|track| find(track.name.as_str()))
+            .collect()
     }
 
-    fn pose(
-        &self,
-        anims: &[AnimInstance<'_>],
-        requested: &PartBits,
-        placement: Mat4,
-    ) -> Vec<Mat4> {
-        self.pose_with_controller(anims, requested, placement, |_, _, _| {})
+    fn calc_anim_masked(&self, active_set: &[ClipPlayback], wish_set: &PartSet) -> (LocalPose, Vec<bool>) {
+        let mut blend = Blend::new(self.bones.len());
+        for instance in active_set.iter().filter(|a| a.weight > 0.0) {
+            blend.accumulate(instance, wish_set);
+        }
+        blend.finish(|part| PartPose::at_rest(self.bones[part].rest_orientation.to_array()))
     }
 
-    fn pose_with_controller(
+    fn calc_anim(&self, playing: &[ClipPlayback], wanted: &PartSet) -> LocalPose {
+        self.calc_anim_masked(playing, wanted).0
+    }
+
+    fn pose_using_aim(
         &self,
-        anims: &[AnimInstance<'_>],
-        requested: &PartBits,
-        placement: Mat4,
-        controller: impl FnOnce(&DObj, &PartBits, &mut LocalPose),
+        playing: &[ClipPlayback],
+        wanted: &PartSet,
+        root_xf: Mat4,
+        pose_hook: impl FnOnce(&PosedSkeleton, &PartSet, &mut LocalPose),
     ) -> Vec<Mat4> {
-        let mut locals = self.calc_anim(anims, requested);
-        controller(self, requested, &mut locals);
-        self.apply_duplicates(&mut locals);
-        self.compose(&locals, placement)
+        let mut local = self.calc_anim(playing, wanted);
+        pose_hook(self, wanted, &mut local);
+        self.copy_mirrored_parts(&mut local);
+        self.world_pose(&local, root_xf)
+    }
+
+    fn pose(&self, playing: &[ClipPlayback], wanted: &PartSet, into_world: Mat4) -> Vec<Mat4> {
+        self.pose_using_aim(playing, wanted, into_world, |_, _, _| {})
     }
 }

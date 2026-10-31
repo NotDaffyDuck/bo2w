@@ -6,31 +6,47 @@
 //! they also strictly increase: an id made in the same millisecond as the
 //! last one (or after the clock stepped back) is the last one plus one.
 
-use std::sync::{Mutex, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
 
-const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+/// Crockford's base32 digits: 0-9, then A-Z less I, L, O and U.
+const CROCKFORD: [u8; 32] = crockford_digits();
 const ID_LEN: usize = 26;
 const RANDOM_BITS: u32 = 80;
 const MAX_MILLIS: u64 = (1 << 48) - 1;
 const MAX_RANDOM: u128 = (1 << RANDOM_BITS) - 1;
 
-#[derive(Debug)]
-pub enum UlidError {
-    ClockBeforeEpoch,
-    Random(String),
+const fn crockford_digits() -> [u8; 32] {
+    let mut table = [0u8; 32];
+    let mut filled = 0;
+    let mut code = b'0';
+    while filled < table.len() {
+        let gap = code > b'9' && code < b'A';
+        let banned = matches!(code, b'I' | b'L' | b'O' | b'U');
+        if !gap && !banned {
+            table[filled] = code;
+            filled += 1;
+        }
+        code += 1;
+    }
+    table
 }
 
-impl core::fmt::Display for UlidError {
+#[derive(Debug)]
+pub enum SortableIdFault {
+    ClockPrecedesOrigin,
+    Entropy(String),
+}
+
+impl core::fmt::Display for SortableIdFault {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            UlidError::ClockBeforeEpoch => f.write_str("system clock is before UNIX epoch"),
-            UlidError::Random(why) => write!(f, "CSPRNG failed: {why}"),
+            SortableIdFault::ClockPrecedesOrigin => f.write_str("system clock is before UNIX epoch"),
+            SortableIdFault::Entropy(why) => write!(f, "CSPRNG failed: {why}"),
         }
     }
 }
 
-impl std::error::Error for UlidError {}
+impl std::error::Error for SortableIdFault {}
 
 /// The two halves of an id before they are written out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,39 +77,35 @@ impl Parts {
         let mut bits = (u128::from(self.millis) << RANDOM_BITS) | self.random;
         let mut text = [b'0'; ID_LEN];
         for slot in text.iter_mut().rev() {
-            *slot = ALPHABET[(bits & 0x1f) as usize];
+            *slot = CROCKFORD[(bits & 0x1f) as usize];
             bits >>= 5;
         }
         text.iter().map(|&byte| char::from(byte)).collect()
     }
 }
 
-/// The id after `newest` at clock reading `now`. Randomness is asked for only
-/// when the clock has moved past `newest`.
+/// The id after `previous` at clock reading `now`. Randomness is asked for
+/// only when the clock has moved past `previous`.
 fn next_parts(
-    newest: Option<Parts>,
+    previous: Option<Parts>,
     now: u64,
-    fresh_random: impl FnOnce() -> Result<u128, UlidError>,
-) -> Result<Parts, UlidError> {
-    match newest {
-        Some(last) if now <= last.millis => Ok(last.successor()),
-        _ => Ok(Parts {
-            millis: now.min(MAX_MILLIS),
-            random: fresh_random()?,
-        }),
+    fresh_random: impl FnOnce() -> Result<u128, SortableIdFault>,
+) -> Result<Parts, SortableIdFault> {
+    if let Some(last) = previous.filter(|last| now <= last.millis) {
+        return Ok(last.successor());
     }
+    let random = fresh_random()?;
+    Ok(Parts { millis: now.min(MAX_MILLIS), random })
 }
 
-fn unix_millis() -> Result<u64, UlidError> {
-    let since_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| UlidError::ClockBeforeEpoch)?;
+fn unix_millis() -> Result<u64, SortableIdFault> {
+    let since_epoch = std::time::UNIX_EPOCH.elapsed().map_err(|_| SortableIdFault::ClockPrecedesOrigin)?;
     Ok(u64::try_from(since_epoch.as_millis()).unwrap_or(MAX_MILLIS))
 }
 
-fn random_80_bits() -> Result<u128, UlidError> {
+fn random_80_bits() -> Result<u128, SortableIdFault> {
     let mut bytes = [0u8; 10];
-    getrandom::fill(&mut bytes).map_err(|why| UlidError::Random(why.to_string()))?;
+    getrandom::fill(&mut bytes).map_err(|why| SortableIdFault::Entropy(why.to_string()))?;
     Ok(bytes
         .iter()
         .fold(0u128, |bits, &byte| (bits << 8) | u128::from(byte)))
@@ -103,9 +115,9 @@ fn random_80_bits() -> Result<u128, UlidError> {
 static NEWEST: Mutex<Option<Parts>> = Mutex::new(None);
 
 /// A new id, later than every id this process made before.
-pub fn new_ulid() -> Result<String, UlidError> {
+pub fn fresh_sortable_id() -> Result<String, SortableIdFault> {
     let now = unix_millis()?;
-    let mut newest = NEWEST.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut newest = NEWEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let next = next_parts(*newest, now, random_80_bits)?;
     *newest = Some(next);
     Ok(next.write())
@@ -115,8 +127,8 @@ pub fn new_ulid() -> Result<String, UlidError> {
 mod tests {
     use super::*;
 
-    fn refuse_randomness() -> Result<u128, UlidError> {
-        Err(UlidError::Random("not asked for".to_owned()))
+    fn refuse_randomness() -> Result<u128, SortableIdFault> {
+        Err(SortableIdFault::Entropy("not asked for".to_owned()))
     }
 
     #[test]
@@ -163,11 +175,11 @@ mod tests {
 
     #[test]
     fn the_alphabet_has_32_distinct_characters_and_no_confusable_letters() {
-        let mut seen = std::collections::BTreeSet::new();
-        seen.extend(ALPHABET.iter().copied());
-        assert_eq!(seen.len(), 32);
+        let mut handed_out = std::collections::BTreeSet::new();
+        handed_out.extend(CROCKFORD.iter().copied());
+        assert_eq!(handed_out.len(), 32);
         for banned in *b"ILOU" {
-            assert!(!seen.contains(&banned));
+            assert!(!handed_out.contains(&banned));
         }
     }
 
@@ -266,18 +278,18 @@ mod tests {
     #[test]
     fn the_clock_error_says_so() {
         assert_eq!(
-            UlidError::ClockBeforeEpoch.to_string(),
+            SortableIdFault::ClockPrecedesOrigin.to_string(),
             "system clock is before UNIX epoch"
         );
     }
 
     #[test]
     fn real_ids_are_26_crockford_characters_and_strictly_increase() {
-        let mut previous = new_ulid().unwrap();
+        let mut previous = fresh_sortable_id().unwrap();
         for _ in 0..2_000 {
-            let id = new_ulid().unwrap();
+            let id = fresh_sortable_id().unwrap();
             assert_eq!(id.len(), 26);
-            assert!(id.bytes().all(|byte| ALPHABET.contains(&byte)), "{id}");
+            assert!(id.bytes().all(|byte| CROCKFORD.contains(&byte)), "{id}");
             assert!(id > previous, "{id} should follow {previous}");
             previous = id;
         }

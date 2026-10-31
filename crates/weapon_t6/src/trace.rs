@@ -19,7 +19,7 @@
 //! | `input pad\|mouse\|keyboard` | the last input device (dual wield: which trigger fires which gun) |
 //! | `zombies on\|off` | Zombies session rules |
 //! | `pmtype N` / `pmflags HEX` | movement values the tick reads |
-//! | `stick F R` | forwardmove / rightmove (-127..127) |
+//! | `stick F R` | thrust_ahead / thrust_lateral (-127..127) |
 //! | `water N` | waterlevel |
 //! | `jumptime N` | jump time (below 0 = a landed dive sliding) |
 //! | `slidenext` | a slide starts on the next tick |
@@ -40,17 +40,17 @@ use crate::env::T6Env;
 use crate::facts::{FactsTable, T6WeaponFacts};
 use crate::player::T6WeaponPs;
 use crate::pm::FrameOut;
-use crate::{anim, events, state, tick};
+use {crate::anim, crate::events, crate::state, crate::tick};
 
 /// What a script run printed and how many `expect` lines failed.
 #[derive(Clone, Debug, Default)]
 pub struct TraceResult {
-    pub lines: Vec<String>,
+    pub log_rows: Vec<String>,
     pub failures: usize,
 }
 
 /// The player, input and world one script drives.
-pub struct Runner<'f> {
+pub struct ScenarioDriver<'f> {
     pub ps: T6WeaponPs,
     pub env: T6Env,
     pub cmd: T6Cmd,
@@ -66,19 +66,19 @@ pub struct Runner<'f> {
 
 fn button_bit(name: &str) -> Option<u32> {
     Some(match name.to_ascii_lowercase().as_str() {
-        "attack" | "fire" => button::ATTACK,
-        "ads" => button::ADS,
-        "melee" => button::MELEE,
-        "reload" => button::RELOAD,
-        "use" => button::USE,
-        "use_reload" => button::USE_RELOAD,
+        "attack" | "fire" => button::FIRE_BIT,
+        "ads" => button::AIM_BIT,
+        "melee" => button::CLOSE_COMBAT,
+        "reload" => button::REFILL_BIT,
+        "use" => button::INTERACT_KEY,
+        "use_reload" => button::INTERACT_RELOAD_KEY,
         "sprint" => button::SPRINT,
-        "frag" => button::FRAG,
-        "smoke" => button::SMOKE,
-        "prone" => button::PRONE,
-        "crouch" => button::CROUCH,
-        "jump" => button::JUMP,
-        "breath" => button::BREATH,
+        "frag" => button::SAMPLE_FRAG_ASSET,
+        "smoke" => button::OBSCURANT,
+        "prone" => button::LYING_FLAT,
+        "crouch" => button::DUCK_BUTTON_BIT,
+        "jump" => button::LEAP,
+        "breath" => button::STEADY_AIM_HOLD_BIT,
         "offhand_switch" => button::OFFHAND_SWITCH,
         "toggle_ads" => button::TOGGLE_ADS,
         "change_zoom" => button::CHANGE_ZOOM,
@@ -86,21 +86,21 @@ fn button_bit(name: &str) -> Option<u32> {
     })
 }
 
-impl<'f> Runner<'f> {
+impl<'f> ScenarioDriver<'f> {
     pub fn new(facts: &'f FactsTable) -> Self {
         Self {
             ps: T6WeaponPs::default(),
             env: T6Env {
                 is_server: true,
                 view_height_settled: true,
-                on_ground: true,
+                grounded_now: true,
                 plant_spot_ok: true,
                 tac_insert_allowed: true,
-                other_flags: crate::env::of::WEAPON_USABLE,
+                secondary_state_bits: crate::env::of::WEAPON_USABLE,
                 ..T6Env::default()
             },
             cmd: T6Cmd {
-                msec: 50,
+                frame_ms: 50,
                 ..T6Cmd::default()
             },
             facts,
@@ -111,19 +111,20 @@ impl<'f> Runner<'f> {
         }
     }
 
-    fn weapon_id(&self, name: &str) -> Result<u32, String> {
+    fn gun_catalog_no(&self, name: &str) -> Result<u32, String> {
         if name.eq_ignore_ascii_case("none") {
             return Ok(0);
         }
-        self.facts
+        let &Self { facts, .. } = self;
+        facts
             .find(name)
             .ok_or_else(|| format!("no weapon named {name}"))
     }
 
     /// One tick, traced.
     pub fn step(&mut self) {
-        self.now += self.cmd.msec;
-        self.cmd.server_time = self.now;
+        self.now += self.cmd.frame_ms;
+        self.cmd.authority_clock_ms = self.now;
         let mut out = tick::pre_weapon(&mut self.ps, &self.cmd, &mut self.env, self.facts);
         // The movement code's sprint update runs after the ADS flag, before the weapon.
         let mut pm = crate::pm::Pm {
@@ -139,8 +140,8 @@ impl<'f> Runner<'f> {
         out.append(main);
         self.last_events = out.events.iter().map(|e| e.id).collect();
         // Next tick's previous command (BO2 oldcmd).
-        self.cmd.old_buttons = self.cmd.buttons;
-        self.out.lines.push(frame_line(self.facts, self.now, &self.ps, &out));
+        self.cmd.last_tick_buttons = self.cmd.buttons;
+        self.out.log_rows.push(frame_line(self.facts, self.now, &self.ps, &out));
     }
 
     fn expect(&mut self, n: usize, words: &[&str]) -> Result<(), String> {
@@ -158,7 +159,7 @@ impl<'f> Runner<'f> {
             return Ok(());
         }
         if what == "clip" || what == "stock" {
-            let w = self.weapon_id(want)?;
+            let w = self.gun_catalog_no(want)?;
             let n_want = words.get(3).copied().ok_or("missing argument")?;
             let got = if what == "clip" {
                 self.ps.ammo_in_clip(self.facts, w)
@@ -170,9 +171,9 @@ impl<'f> Runner<'f> {
             return Ok(());
         }
         let got = match what {
-            "state" => state::name(self.ps.weaponstate).to_owned(),
+            "state" => state::name(self.ps.gun_phase).to_owned(),
             "left" => state::name(self.ps.weaponstate_left).to_owned(),
-            "anim" => anim::name(self.ps.weap_anim).to_owned(),
+            "anim" => anim::name(self.ps.gun_clip).to_owned(),
             "leftanim" => anim::name(self.ps.weap_anim_left).to_owned(),
             "weapon" if self.ps.weapon == 0 => "none".to_owned(),
             "weapon" => self.facts.name(self.ps.weapon).to_owned(),
@@ -185,11 +186,11 @@ impl<'f> Runner<'f> {
 
     fn check(&mut self, n: usize, what: &str, pass: bool, got: &str, want: &str) {
         if pass {
-            self.out.lines.push(format!("ok   line {n}: {what} {want}"));
+            self.out.log_rows.push(format!("ok   line {n}: {what} {want}"));
         } else {
             self.out.failures += 1;
             self.out
-                .lines
+                .log_rows
                 .push(format!("FAIL line {n}: {what} is {got}, want {want}"));
         }
     }
@@ -209,39 +210,40 @@ impl<'f> Runner<'f> {
             i64::from_str_radix(s, radix).map_err(|e| format!("{s}: {e}"))
         };
         match words[0] {
-            "msec" => self.cmd.msec = num(1)? as i32,
+            "msec" => self.cmd.frame_ms = num(1)? as i32,
             "server" => self.env.is_server = arg(1)? == "on",
             "spawn" => {
-                let w = self.weapon_id(arg(1)?)?;
+                let w = self.gun_catalog_no(arg(1)?)?;
                 self.give(w);
                 self.ps.weapon = w;
                 self.cmd.weapon = w;
-                self.ps.weaponstate = state::READY;
+                self.ps.gun_phase = state::READY;
                 self.ps.weaponstate_left = state::READY;
                 // A spawned player's first raise has marked every gun held.
-                self.ps.set_ever_had_all(true);
+                self.ps.mark_all_owned(true);
             }
             "give" => {
-                let w = self.weapon_id(arg(1)?)?;
+                let w = self.gun_catalog_no(arg(1)?)?;
                 self.give(w);
             }
             "take" => {
-                let w = self.weapon_id(arg(1)?)?;
+                let w = self.gun_catalog_no(arg(1)?)?;
                 self.ps.take(w);
             }
             "select" => {
                 // The client fills the alt-mode memory with the selection (CL_SetWeapon).
-                let w = self.weapon_id(arg(1)?)?;
+                let w = self.gun_catalog_no(arg(1)?)?;
                 self.cmd.weapon = w;
+                let &mut Self { facts, .. } = self;
                 self.cmd.last_weapon_alt_mode_switch =
-                    crate::switch::ClientSwitch::cmd_alt_memory(&self.ps, self.facts, w);
+                    crate::switch::ClientSwitch::cmd_alt_memory(&self.ps, facts, w);
             }
             "clip" => {
-                let w = self.weapon_id(arg(1)?)?;
+                let w = self.gun_catalog_no(arg(1)?)?;
                 self.ps.set_ammo_in_clip(self.facts, w, num(2)? as i32);
             }
             "stock" => {
-                let w = self.weapon_id(arg(1)?)?;
+                let w = self.gun_catalog_no(arg(1)?)?;
                 self.ps.set_ammo_not_in_clip(self.facts, w, num(2)? as i32);
             }
             "hold" | "release" => {
@@ -274,20 +276,20 @@ impl<'f> Runner<'f> {
                 }
             }
             "zombies" => self.env.zombies = arg(1)? == "on",
-            "pmtype" => self.env.pm_type = num(1)? as i32,
-            "pmflags" => self.env.pm_flags = num(1)? as u32,
+            "pmtype" => self.env.movement_mode = num(1)? as i32,
+            "pmflags" => self.env.movement_state_bits = num(1)? as u32,
             "stick" => {
-                self.cmd.forwardmove = num(1)?.clamp(-127, 127) as i8;
-                self.cmd.rightmove = num(2)?.clamp(-127, 127) as i8;
+                self.cmd.thrust_ahead = num(1)?.clamp(-127, 127) as i8;
+                self.cmd.thrust_lateral = num(2)?.clamp(-127, 127) as i8;
             }
             "water" => self.env.waterlevel = num(1)? as i32,
-            "jumptime" => self.env.jump_time = num(1)? as i32,
+            "jumptime" => self.env.hop_start_ms = num(1)? as i32,
             // The slide starts on the next tick.
-            "slidenext" => self.env.slide_time = self.now + self.cmd.msec,
+            "slidenext" => self.env.slide_time = self.now + self.cmd.frame_ms,
             // The last dive ended at the current time.
             "dtpend" => self.env.last_dtp_end = self.now,
             "blocked" => self.env.riotshield_blocked = num(1)? != 0,
-            "ground" => self.env.on_ground = num(1)? != 0,
+            "ground" => self.env.grounded_now = num(1)? != 0,
             "plantok" => self.env.plant_spot_ok = num(1)? != 0,
             "tacok" => self.env.tac_insert_allowed = num(1)? != 0,
             "console" => self.env.is_console = num(1)? != 0,
@@ -296,10 +298,10 @@ impl<'f> Runner<'f> {
                 // lunge ENT DIST, or lunge none
                 if arg(1)? == "none" {
                     self.cmd.melee_charge_ent = None;
-                    self.cmd.melee_charge_dist = 0;
+                    self.cmd.lunge_reach = 0;
                 } else {
                     self.cmd.melee_charge_ent = Some(num(1)? as u16);
-                    self.cmd.melee_charge_dist = num(2)? as u8;
+                    self.cmd.lunge_reach = num(2)? as u8;
                 }
             }
             "run" => {
@@ -309,14 +311,14 @@ impl<'f> Runner<'f> {
             }
             "expect" => self.expect(n, words)?,
             "everhad" => {
-                let w = self.weapon_id(arg(1)?)?;
+                let w = self.gun_catalog_no(arg(1)?)?;
                 self.ps.set_ever_had(w, num(2)? != 0);
             }
             "offhand" => {
-                let w = self.weapon_id(arg(2)?)?;
+                let w = self.gun_catalog_no(arg(2)?)?;
                 match arg(1)? {
-                    "primary" => self.ps.offhand_primary = w,
-                    "secondary" => self.ps.offhand_secondary = w,
+                    "primary" => self.ps.secondary_gear_main = w,
+                    "secondary" => self.ps.secondary_gear_alt = w,
                     o => return Err(format!("offhand primary|secondary, not {o}")),
                 }
             }
@@ -327,12 +329,12 @@ impl<'f> Runner<'f> {
 
     fn give(&mut self, w: u32) {
         // BO2: a melee-inventory weapon becomes the melee weapon (the game's bridge does the same).
-        if self.facts.get(w).core.inventory_type == crate::facts::inventory::MELEE {
+        if self.facts.get(w).core.carry_slot_kind == crate::facts::inventory::CLOSE_COMBAT {
             self.ps.melee_weapon = w;
             return;
         }
         if self.ps.give(w) {
-            let clip = self.facts.get(w).core.clip_size;
+            let clip = self.facts.get(w).core.magazine_capacity;
             self.ps.set_ammo_in_clip(self.facts, w, clip);
         }
     }
@@ -341,12 +343,12 @@ impl<'f> Runner<'f> {
     pub fn run_script(mut self, script: &str) -> Result<TraceResult, String> {
         for (i, raw) in script.lines().enumerate() {
             let n = i + 1;
-            let text = raw.split('#').next().unwrap_or("").trim();
-            if text.is_empty() {
+            let cmd = raw.split('#').next().unwrap_or("").trim();
+            if cmd.is_empty() {
                 continue;
             }
-            self.out.lines.push(format!("> {text}"));
-            let words: Vec<&str> = text.split_whitespace().collect();
+            self.out.log_rows.push(format!("> {cmd}"));
+            let words: Vec<&str> = cmd.split_whitespace().collect();
             self.command(n, &words)
                 .map_err(|e| format!("line {n}: {e}"))?;
         }
@@ -360,7 +362,7 @@ pub fn demo_facts() -> FactsTable {
     let mut t = FactsTable::new();
     for (i, name) in [(1u32, "demo_smg"), (2, "demo_pistol")] {
         let mut f = T6WeaponFacts::default();
-        f.core.clip_size = 30;
+        f.core.magazine_capacity = 30;
         f.switch.raise = 500;
         f.switch.drop = 400;
         f.switch.first_raise = 1000;
@@ -379,21 +381,21 @@ pub fn demo_facts() -> FactsTable {
 /// One trace line for one tick: the right hand, the left hand, ADS columns, then what the tick
 /// produced. The game writes the same line (BO2MP_GUN_TRACE) so a game trace and a runner trace
 /// compare line by line.
-pub fn frame_line(facts: &FactsTable, now: i32, ps: &T6WeaponPs, out: &FrameOut) -> String {
+pub fn frame_line(facts: &FactsTable, now: i32, player: &T6WeaponPs, out: &FrameOut) -> String {
     let mut line = format!(
         "{:>6} {:<14} R {:<20} t{:>5} d{:>5} {:<16} | L {:<12} t{:>5} d{:>5} {:<10}",
         now,
-        facts.name(ps.weapon),
-        state::name(ps.weaponstate),
-        ps.weapon_time,
-        ps.weapon_delay,
-        anim::name(ps.weap_anim),
-        state::name(ps.weaponstate_left),
-        ps.weapon_time_left,
-        ps.weapon_delay_left,
-        anim::name(ps.weap_anim_left),
+        facts.name(player.weapon),
+        state::name(player.gun_phase),
+        player.gun_timer_ms,
+        player.weapon_ready_wait,
+        anim::name(player.gun_clip),
+        state::name(player.weaponstate_left),
+        player.weapon_time_left,
+        player.weapon_delay_left,
+        anim::name(player.weap_anim_left),
     );
-    let ads = crate::pm::ads::trace_columns(ps);
+    let ads = crate::pm::ads::trace_columns(player);
     if !ads.is_empty() {
         line.push_str(" | ads ");
         line.push_str(&ads);
@@ -407,7 +409,7 @@ pub fn frame_line(facts: &FactsTable, now: i32, ps: &T6WeaponPs, out: &FrameOut)
 
 #[cfg(test)]
 mod tests {
-    use super::{Runner, demo_facts};
+    use crate::trace::{ScenarioDriver, demo_facts};
 
     #[test]
     fn switch_drops_raises_then_idles() {
@@ -430,8 +432,8 @@ mod tests {
             expect state RAISING
             expect anim RAISE
         ";
-        let r = Runner::new(&facts).run_script(script).expect("script runs");
-        let text = r.lines.join("\n");
+        let r = ScenarioDriver::new(&facts).run_script(script).expect("script runs");
+        let text = r.log_rows.join("\n");
         assert_eq!(r.failures, 0, "{text}");
         assert!(text.contains("RAISING"), "{text}");
     }
@@ -450,12 +452,12 @@ mod tests {
             run 1
             expect state READY
         ";
-        let r = Runner::new(&facts).run_script(script).expect("script runs");
+        let r = ScenarioDriver::new(&facts).run_script(script).expect("script runs");
         assert_eq!(
             r.failures,
             0,
             "{}",
-            r.lines.join(
+            r.log_rows.join(
                 "
 "
             )
@@ -465,18 +467,18 @@ mod tests {
     #[test]
     fn old_buttons_follow_the_last_tick() {
         let facts = demo_facts();
-        let mut runner = Runner::new(&facts);
-        runner.cmd.buttons = crate::cmd::button::ATTACK;
-        assert!(runner.cmd.pressed(crate::cmd::button::ATTACK));
+        let mut runner = ScenarioDriver::new(&facts);
+        runner.cmd.buttons = crate::cmd::button::FIRE_BIT;
+        assert!(runner.cmd.went_down(crate::cmd::button::FIRE_BIT));
         runner.step();
-        assert!(!runner.cmd.pressed(crate::cmd::button::ATTACK));
-        assert!(runner.cmd.was_held(crate::cmd::button::ATTACK));
+        assert!(!runner.cmd.went_down(crate::cmd::button::FIRE_BIT));
+        assert!(runner.cmd.was_held(crate::cmd::button::FIRE_BIT));
     }
 
     #[test]
     fn bad_command_names_the_line() {
         let facts = demo_facts();
-        let e = Runner::new(&facts)
+        let e = ScenarioDriver::new(&facts)
             .run_script("msec 50\nwiggle")
             .unwrap_err();
         assert!(e.starts_with("line 2:"), "{e}");

@@ -3,7 +3,7 @@
 package.name = "bots"
 package.version = "0.1.0"
 package.edition = { workspace = true }
-package.license = { workspace = true }
+package.publish = { workspace = true }
 package.description = "Console bot commands and the host plumbing for BO2's script bots."
 lints = { workspace = true }
 dependencies.bevy = { workspace = true }

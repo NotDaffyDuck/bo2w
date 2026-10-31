@@ -1,27 +1,26 @@
 //! `visionSetNaked` and `visionReset`: blend the screen's film look to a
 //! vision preset the map loaded, or back to the map's own.
 
-use bevy::prelude::*;
+use bevy::{ecs::message::MessageReader, ecs::system::Res, ecs::system::ResMut};
 use net::FrameClock;
-use render_frontend::{
-    assemble::drawsurf::film_vision_view::FilmVisionView,
-    prepare::scene::{view_parms::PreparedSceneView, world::WorldScene},
-};
+use render_frontend::assemble::draw_items::screen_grade_view::GradeEye;
+use render_frontend::prepare::scene::eye_parms::StagedStageEye;
+use render_frontend::prepare::scene::world::LevelStage;
 
-use crate::feature_dispatch::ConsoleEcho;
-use crate::{CommandSpec, ConsoleCommand, ConsoleRegistry};
+use crate::tool_cmds::PromptReplyWriter;
+use crate::OrderBlueprint;
+use crate::TypedOrder;
+use crate::OrderCatalog;
 
-const USAGE: &str = "usage: visionSetNaked <preset> [seconds] | visionReset [seconds]";
+const HELP_BANNER: &str = "usage: visionSetNaked <preset> [seconds] | visionReset [seconds]";
 const DEFAULT_SECONDS: f64 = 1.0;
 
-pub(crate) fn register(registry: &mut ConsoleRegistry) {
-    registry.register(
-        CommandSpec::new("visionSetNaked")
-            .usage("visionSetNaked <preset> [seconds] — apply a loaded vision preset"),
-    );
-    registry.register(
-        CommandSpec::new("visionReset").usage("visionReset [seconds] — restore the map vision"),
-    );
+pub(crate) fn enlist(book: &mut OrderCatalog) {
+    let naked = OrderBlueprint::new("visionSetNaked")
+        .help_line("visionSetNaked <preset> [seconds] — apply a loaded vision preset");
+    let reset = OrderBlueprint::new("visionReset").help_line("visionReset [seconds] — restore the map vision");
+    book.enlist(naked);
+    book.enlist(reset);
 }
 
 /// What was asked for: a named preset (or the map's own, with no name) and
@@ -36,14 +35,14 @@ impl<'a> Blend<'a> {
         let (preset, rest) = match (command, args) {
             ("visionReset", rest) => (None, rest),
             ("visionSetNaked", [name, rest @ ..]) => (Some(name.as_str()), rest),
-            _ => return Err(USAGE.into()),
+            _ => return Err(HELP_BANNER.into()),
         };
         let seconds = match rest {
             [] => DEFAULT_SECONDS,
             [text] => text
                 .parse()
                 .map_err(|_| "vision: invalid transition duration".to_owned())?,
-            _ => return Err(USAGE.into()),
+            _ => return Err(HELP_BANNER.into()),
         };
         if !seconds.is_finite() || seconds < 0.0 || seconds * 1000.0 > f64::from(i32::MAX) {
             return Err("vision: duration must be finite, nonnegative and fit milliseconds".into());
@@ -59,26 +58,26 @@ impl<'a> Blend<'a> {
 /// How the map stores a preset: `vision/<name>.vision`, lower case, with the
 /// folder and the extension optional in what is typed.
 fn preset_key(typed: &str) -> String {
-    let typed = typed.replace('\\', "/").to_ascii_lowercase();
+    let typed = typed.to_ascii_lowercase().replace('\\', "/");
     let stem = typed.strip_prefix("vision/").unwrap_or(&typed);
     let stem = stem.strip_suffix(".vision").unwrap_or(stem);
     format!("vision/{stem}.vision")
 }
 
 fn apply(
-    command: &ConsoleCommand,
-    scene: &WorldScene,
-    view: &PreparedSceneView,
+    command: &TypedOrder,
+    scene: &LevelStage,
+    view: &StagedStageEye,
     time: i32,
-    film: &mut FilmVisionView,
+    film: &mut GradeEye,
 ) -> Result<String, String> {
-    if !view.ready {
+    if !view.primed {
         return Err("vision: no ready world view".into());
     }
-    let blend = Blend::parse(&command.name, &command.args)?;
+    let blend = Blend::parse(&command.name, &command.words)?;
     let preset = match blend.preset {
         None => {
-            if scene.film_vision.is_none() {
+            if scene.colour_grade.is_none() {
                 return Err("vision: map preset is unavailable".into());
             }
             None
@@ -92,75 +91,75 @@ fn apply(
             }
         }
     };
-    film.select(scene.film_vision, preset, time, blend.millis());
+    film.select(scene.colour_grade, preset, time, blend.millis());
     let shown = blend.preset.unwrap_or("map");
     Ok(format!("vision: {shown} transition={}s", blend.seconds))
 }
 
 pub(crate) fn route_vision_commands(
-    mut commands: MessageReader<ConsoleCommand>,
-    mut echo: ConsoleEcho,
-    scene: Res<WorldScene>,
-    view: Res<PreparedSceneView>,
+    mut commands: MessageReader<TypedOrder>,
+    mut echo: PromptReplyWriter,
+    scene: Res<LevelStage>,
+    view: Res<StagedStageEye>,
     clock: Res<FrameClock>,
-    mut film: ResMut<FilmVisionView>,
+    mut film: ResMut<GradeEye>,
 ) {
     for command in commands
         .read()
         .filter(|command| matches!(command.name.as_str(), "visionSetNaked" | "visionReset"))
     {
-        let said = apply(command, &scene, &view, clock.time(), &mut film).unwrap_or_else(|why| why);
+        let now = clock.time();
+        let said = apply(command, &scene, &view, now, &mut film).unwrap_or_else(|why| why);
         echo.write(said);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use asset_world::{FilmVision, FilmVisionParseError};
+    use bevy::app::App;
+    use asset_world::{ScreenGradeLook, GradeVisionDecodeFault};
 
-    use super::*;
-    use crate::feature_dispatch::testing::{console_app, feed, said};
+    use crate::vision::*;
+    use crate::tool_cmds::testing::{console_app, feed, said};
+    use bevy::app::Update;
 
-    fn night() -> FilmVision {
-        FilmVision {
-            enable: true,
-            contrast: 1.4,
-            ..FilmVision::default()
-        }
+    fn night() -> ScreenGradeLook {
+        let mut look = ScreenGradeLook::default();
+        look.enable = true;
+        look.contrast = 1.4;
+        look
     }
 
-    fn map_look() -> FilmVision {
-        FilmVision {
-            enable: true,
-            brightness: 0.1,
-            ..FilmVision::default()
-        }
+    fn map_look() -> ScreenGradeLook {
+        let mut look = ScreenGradeLook::default();
+        look.enable = true;
+        look.brightness = 0.1;
+        look
     }
 
     /// An app whose world view is ready and whose map has a look and the
     /// presets given.
-    fn app_with(presets: &[(&str, Result<FilmVision, FilmVisionParseError>)]) -> App {
+    fn app_with(presets: &[(&str, Result<ScreenGradeLook, GradeVisionDecodeFault>)]) -> App {
         let mut app = console_app();
-        let mut scene = WorldScene {
-            film_vision: Some(map_look()),
-            ..WorldScene::default()
+        let mut scene = LevelStage {
+            colour_grade: Some(map_look()),
+            ..LevelStage::default()
         };
         for (key, preset) in presets {
             scene.film_visions.insert((*key).to_owned(), *preset);
         }
+        let mut eye = StagedStageEye::default();
+        eye.primed |= true;
         app.insert_resource(scene)
             .init_resource::<FrameClock>()
-            .init_resource::<FilmVisionView>()
-            .insert_resource(PreparedSceneView {
-                ready: true,
-                ..PreparedSceneView::default()
-            })
+            .init_resource::<GradeEye>()
+            .insert_resource(eye)
             .add_systems(Update, route_vision_commands);
         app
     }
 
-    fn film(app: &App) -> FilmVisionView {
-        *app.world().resource::<FilmVisionView>()
+    fn film(app: &App) -> GradeEye {
+        *app.world().resource::<GradeEye>()
     }
 
     #[test]
@@ -175,11 +174,8 @@ mod tests {
             let mut app = app_with(&[("vision/night.vision", Ok(night()))]);
             let before = film(&app);
             feed(&mut app, &format!("visionSetNaked {typed}"));
-            assert_eq!(
-                said(&app),
-                [format!("vision: {typed} transition=1s")],
-                "{typed}"
-            );
+            let expected = [format!("vision: {typed} transition=1s")];
+            assert_eq!(said(&app), expected, "{typed}");
             assert_ne!(film(&app), before, "{typed} selected nothing");
         }
     }
@@ -204,36 +200,32 @@ mod tests {
         assert_ne!(film(&app), before);
 
         let mut bare = app_with(&[]);
-        bare.world_mut().resource_mut::<WorldScene>().film_vision = None;
+        bare.world_mut().resource_mut::<LevelStage>().colour_grade = None;
         feed(&mut bare, "visionReset");
         assert_eq!(said(&bare), ["vision: map preset is unavailable"]);
-        assert_eq!(film(&bare), FilmVisionView::default());
+        assert_eq!(film(&bare), GradeEye::default());
     }
 
     #[test]
     fn a_preset_that_is_missing_or_broken_changes_nothing() {
-        let mut app = app_with(&[("vision/bad.vision", Err(FilmVisionParseError::Decode))]);
+        let mut app = app_with(&[("vision/bad.vision", Err(GradeVisionDecodeFault::Decode))]);
         feed(&mut app, "visionSetNaked nowhere; visionSetNaked bad");
-        assert_eq!(
-            said(&app),
-            [
-                "vision: preset vision/nowhere.vision is not loaded",
-                "vision: vision/bad.vision: Decode",
-            ]
-        );
-        assert_eq!(film(&app), FilmVisionView::default());
+        let expected = [
+            "vision: preset vision/nowhere.vision is not loaded",
+            "vision: vision/bad.vision: Decode",
+        ];
+        assert_eq!(said(&app), expected);
+        assert_eq!(film(&app), GradeEye::default());
     }
 
     #[test]
     fn without_a_ready_world_view_nothing_is_tried() {
         let mut app = app_with(&[("vision/night.vision", Ok(night()))]);
-        app.world_mut().resource_mut::<PreparedSceneView>().ready = false;
+        app.world_mut().resource_mut::<StagedStageEye>().primed = false;
         feed(&mut app, "visionSetNaked night; visionReset");
-        assert_eq!(
-            said(&app),
-            ["vision: no ready world view", "vision: no ready world view"]
-        );
-        assert_eq!(film(&app), FilmVisionView::default());
+        let expected = ["vision: no ready world view", "vision: no ready world view"];
+        assert_eq!(said(&app), expected);
+        assert_eq!(film(&app), GradeEye::default());
     }
 
     #[test]
@@ -256,18 +248,15 @@ mod tests {
                 "visionReset 3000000",
                 "vision: duration must be finite, nonnegative and fit milliseconds",
             ),
-            ("visionSetNaked", USAGE),
-            ("visionSetNaked night 1 2", USAGE),
-            ("visionReset 1 2", USAGE),
+            ("visionSetNaked", HELP_BANNER),
+            ("visionSetNaked night 1 2", HELP_BANNER),
+            ("visionReset 1 2", HELP_BANNER),
         ] {
             feed(&mut app, line);
-            assert_eq!(
-                said(&app).last().map(String::as_str),
-                Some(said_so),
-                "{line}"
-            );
+            let expected = Some(said_so);
+            assert_eq!(said(&app).last().map(String::as_str), expected, "{line}");
         }
-        assert_eq!(film(&app), FilmVisionView::default());
+        assert_eq!(film(&app), GradeEye::default());
     }
 
     #[test]
@@ -286,11 +275,11 @@ mod tests {
 
     #[test]
     fn both_commands_are_registered_with_a_usage_line() {
-        let mut registry = ConsoleRegistry::default();
-        register(&mut registry);
-        let lines = registry.help_lines();
+        let mut book = OrderCatalog::default();
+        enlist(&mut book);
+        let lines = book.usage_listing();
         for name in ["visionSetNaked", "visionReset"] {
-            assert!(registry.resolve(name).is_some(), "{name}");
+            assert!(book.look_up(name).is_some(), "{name}");
             assert!(lines.iter().any(|line| line.starts_with(name)), "{name}");
         }
     }

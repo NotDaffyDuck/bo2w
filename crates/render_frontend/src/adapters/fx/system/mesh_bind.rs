@@ -3,157 +3,161 @@
 //! take it at all. A mesh that cannot be bound is skipped and, for the
 //! causes the journal tracks, counted.
 
-use asset_game::{FxDefinitions, OwnedFxVisual, lookup_fx_color_image};
+use asset_game::{FxDefinitions, SelfContainedEffectLook, find_tint_picture};
 use bevy::prelude::*;
-use render_fx::{FxJournalCursor, FxWorldColorImages};
+use render_fx::{EffectJournalCursor, EffectLevelColorImages, JournalCount};
 
-use crate::assemble::drawsurf::{
-    MaterialGeneration, RuntimeMaterial, RuntimeMaterialCatalog, TechType,
-    material_runtime::resolve_material_technique,
+use crate::{
+    MaterialEpoch, LiveMaterial, LiveMaterialLedger, MethodType,
+    material_live::select_material_technique,
 };
 
 /// Why a code mesh is left out this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FxPresentSkip {
+pub(crate) enum EffectPresentSkip {
     /// No colour image, and the emissive technique does not sample one.
-    NoColorMap,
+    MissingColorMap,
     /// The material is not in the sorted catalog.
     NoOrdinal,
     /// The material draws in another camera region than the emissive one.
-    NotEmissive,
+    NoGlow,
 }
 
-pub(crate) enum FxCodeMeshBind {
+pub(crate) enum EffectEngineMeshBind {
     Ready {
-        color: Option<Handle<Image>>,
-        sort_key: u8,
-        ordinal: u32,
+        tint: Option<Handle<Image>>,
+        order_key: u8,
+        ord_no: u32,
     },
-    Skip(FxPresentSkip),
+    Skip(EffectPresentSkip),
 }
 
 /// Bumps the journal counter behind `cause`; a missing colour map is not
 /// tracked.
-pub(crate) fn count_fx_present_skip(cursor: &mut FxJournalCursor, cause: FxPresentSkip) {
-    let counter = match cause {
-        FxPresentSkip::NoOrdinal => &mut cursor.skipped_no_ordinal,
-        FxPresentSkip::NotEmissive => &mut cursor.skipped_not_emissive,
-        FxPresentSkip::NoColorMap => return,
-    };
-    *counter = counter.saturating_add(1);
+pub(crate) fn tally_fx_present_skip(cursor: &mut EffectJournalCursor, why: EffectPresentSkip) {
+    match why {
+        EffectPresentSkip::NoOrdinal => cursor.bump(JournalCount::MeshNoOrdinal),
+        EffectPresentSkip::NoGlow => cursor.bump(JournalCount::MeshNotEmissive),
+        EffectPresentSkip::MissingColorMap => {}
+    }
 }
 
 /// The first visual of an effect element that names a material asset.
 pub(crate) fn spark_elem_asset_id(
     catalog: &FxDefinitions,
-    catalog_index: u16,
-    def_index: u8,
+    ledger_index: u16,
+    definition_slot: u8,
 ) -> Option<usize> {
-    let effect = render_fx::present::catalog_lookup(catalog, catalog_index)?;
-    let elem = effect.elems.get(usize::from(def_index))?;
-    elem.visuals.iter().find_map(OwnedFxVisual::bound_index)
+    let seat = usize::from(definition_slot);
+    render_fx::effect_play::recipe_lookup(catalog, ledger_index)?
+        .elems
+        .get(seat)
+        .and_then(|elem| elem.visuals.iter().find_map(SelfContainedEffectLook::extent_position))
 }
 
 /// Binds a code mesh by the material name its effect element carries.
 pub(crate) fn code_mesh_bind(
-    material_name: &str,
-    color_images: &FxWorldColorImages,
-    runtime: &MaterialGeneration,
-) -> FxCodeMeshBind {
-    let catalog = &runtime.catalog;
-    let bind_name = asset_game::material_bind_name(material_name);
-    let Some((material, ordinal)) = find_by_name(catalog, bind_name) else {
-        return FxCodeMeshBind::Skip(FxPresentSkip::NoOrdinal);
-    };
-    let color = lookup_fx_color_image(&color_images.colors, material_name).cloned();
-    let table_key = color_images
-        .keys
-        .get(material_name)
-        .or_else(|| color_images.keys.get(bind_name))
-        .map(|&(key, _)| key);
-    bind_material(catalog, material, ordinal, color, table_key)
+    surface_title: &str,
+    colour_targets: &EffectLevelColorImages,
+    runtime: &MaterialEpoch,
+) -> EffectEngineMeshBind {
+    let bind_name = asset_game::material_bind_name(surface_title);
+    let named = &colour_targets.by_name;
+    let table_key = [surface_title, bind_name]
+        .into_iter()
+        .find_map(|name| named.sort_keys.get(name).copied());
+    match find_by_name(&runtime.catalog, bind_name) {
+        None => EffectEngineMeshBind::Skip(EffectPresentSkip::NoOrdinal),
+        Some((material, ordinal)) => {
+            let color = find_tint_picture(&named.colors, surface_title).cloned();
+            bind_material(&runtime.catalog, material, ordinal, color, table_key)
+        }
+    }
 }
 
 /// Binds a code mesh by the material's asset id (tracer beams, sparks).
 pub(crate) fn code_mesh_bind_asset(
-    asset_id: usize,
-    color_images: &FxWorldColorImages,
-    runtime: &MaterialGeneration,
-) -> FxCodeMeshBind {
+    asset_no: usize,
+    colour_targets: &EffectLevelColorImages,
+    runtime: &MaterialEpoch,
+) -> EffectEngineMeshBind {
     let catalog = &runtime.catalog;
-    let Some(material) = catalog.derived(assets::MaterialIndex::from_order(asset_id)) else {
-        return FxCodeMeshBind::Skip(FxPresentSkip::NoOrdinal);
+    let found = catalog
+        .derived(assets::SurfaceMaterialId::from_sequence(asset_no))
+        .zip(catalog.ranked_materials.rank_for_asset_id(asset_no));
+    let Some((derived, ord)) = found else {
+        return EffectEngineMeshBind::Skip(EffectPresentSkip::NoOrdinal);
     };
-    let Some(ordinal) = catalog.sorted_materials.ordinal_for_asset_id(asset_id) else {
-        return FxCodeMeshBind::Skip(FxPresentSkip::NoOrdinal);
-    };
-    let color = color_images.colors_by_asset.get(&asset_id).cloned();
-    let table_key = color_images
-        .keys_by_asset
-        .get(&asset_id)
-        .map(|&(key, _)| key);
-    bind_material(catalog, material, ordinal.get(), color, table_key)
+    let images = &colour_targets.by_asset;
+    bind_material(
+        catalog,
+        derived,
+        ord.get(),
+        images.colors.get(&asset_no).cloned(),
+        images.sort_keys.get(&asset_no).copied(),
+    )
 }
 
 /// Binds a mark surface's material: the sort key baked into the material
 /// and its ordinal in the sorted catalog.
 pub(crate) fn mark_mesh_bind(
-    material_name: &str,
-    runtime: &MaterialGeneration,
+    surface_title: &str,
+    runtime: &MaterialEpoch,
 ) -> Option<(u8, u32)> {
-    let bind_name = asset_game::material_bind_name(material_name);
-    let (material, ordinal) = find_by_name(&runtime.catalog, bind_name)?;
-    Some((choose_sort_key(None, material.baked_draw_surf), ordinal))
+    let bind_name = asset_game::material_bind_name(surface_title);
+    find_by_name(&runtime.catalog, bind_name)
+        .map(|(material, ordinal)| (choose_sort_key(None, material.baked_facet_draw), ordinal))
 }
 
 fn find_by_name<'a>(
-    catalog: &'a RuntimeMaterialCatalog,
+    catalog: &'a LiveMaterialLedger,
     name: &str,
-) -> Option<(&'a RuntimeMaterial, u32)> {
-    let material = catalog.material_for_name(name)?;
-    let ordinal = catalog
-        .sorted_materials
-        .ordinal_for_asset_id(usize::from(material.asset_id.0))?;
-    Some((material, ordinal.get()))
+) -> Option<(&'a LiveMaterial, u32)> {
+    let material = catalog.material_by_name(name)?;
+    let ord = catalog
+        .ranked_materials
+        .rank_for_asset_id(usize::from(material.asset_id.0))?;
+    Some((material, ord.get()))
 }
 
 /// The part both entry points share: refuse what the emissive pass cannot
 /// draw, otherwise pick the sort key.
 fn bind_material(
-    catalog: &RuntimeMaterialCatalog,
-    material: &RuntimeMaterial,
-    ordinal: u32,
-    color: Option<Handle<Image>>,
+    catalog: &LiveMaterialLedger,
+    material: &LiveMaterial,
+    ord: u32,
+    rgba: Option<Handle<Image>>,
     table_key: Option<u8>,
-) -> FxCodeMeshBind {
-    let technique_has_texture = || emissive_technique_flagged(catalog, material, ordinal);
-    if let Some(cause) = refusal(
-        color.is_some(),
-        technique_has_texture,
-        material.camera_region == render_material::CAMERA_REGION_EMISSIVE,
-    ) {
-        return FxCodeMeshBind::Skip(cause);
-    }
-    FxCodeMeshBind::Ready {
-        color,
-        sort_key: choose_sort_key(table_key, material.baked_draw_surf),
-        ordinal,
+) -> EffectEngineMeshBind {
+    let in_emissive_region = material.camera_zone == render_material::VIEW_STAGE_SELF_LIT;
+    let refused = refusal(
+        rgba.is_some(),
+        || emissive_technique_flagged(catalog, material, ord),
+        in_emissive_region,
+    );
+    match refused {
+        Some(cause) => EffectEngineMeshBind::Skip(cause),
+        None => EffectEngineMeshBind::Ready {
+            order_key: choose_sort_key(table_key, material.baked_facet_draw),
+            tint: rgba,
+            ord_no: ord,
+        },
     }
 }
 
 /// Whether the material's emissive technique carries the "samples a colour
 /// map" flag. Only asked when no colour image was found.
 fn emissive_technique_flagged(
-    catalog: &RuntimeMaterialCatalog,
-    material: &RuntimeMaterial,
-    ordinal: u32,
+    catalog: &LiveMaterialLedger,
+    material: &LiveMaterial,
+    ord: u32,
 ) -> bool {
-    let Some(packed) = material.baked_draw_surf else {
-        return false;
-    };
-    let key = render_material::MaterialDrawKey::new(packed, ordinal);
-    resolve_material_technique(catalog, key, TechType(lighting_t6::TECHNIQUE_EMISSIVE))
-        .is_ok_and(|(_, technique)| technique.flags & 1 != 0)
+    material.baked_facet_draw.is_some_and(|packed| {
+        let key = render_material::SurfaceSortKeyPair::new(packed, ord);
+        let emissive = MethodType(lighting_t6::TECHNIQUE_EMISSIVE);
+        select_material_technique(catalog, key, emissive)
+            .is_ok_and(|pair| pair.1.flags & 1 != 0)
+    })
 }
 
 /// The skip decision, apart from the catalog so it can be tested: a mesh
@@ -163,11 +167,11 @@ fn refusal(
     has_color: bool,
     technique_has_texture: impl FnOnce() -> bool,
     in_emissive_region: bool,
-) -> Option<FxPresentSkip> {
+) -> Option<EffectPresentSkip> {
     if !has_color && !technique_has_texture() {
-        Some(FxPresentSkip::NoColorMap)
+        Some(EffectPresentSkip::MissingColorMap)
     } else if !in_emissive_region {
-        Some(FxPresentSkip::NotEmissive)
+        Some(EffectPresentSkip::NoGlow)
     } else {
         None
     }
@@ -175,11 +179,11 @@ fn refusal(
 
 /// The colour table's key when it has one, otherwise the key baked into
 /// the material's draw surface, otherwise 0.
-fn choose_sort_key(table_key: Option<u8>, baked_draw_surf: Option<u64>) -> u8 {
+fn choose_sort_key(table_key: Option<u8>, baked_facet_draw: Option<u64>) -> u8 {
     table_key
         .or_else(|| {
-            baked_draw_surf
-                .map(|packed| dpvs_t6::GfxDrawSurf::from_packed(packed).primary_sort_key())
+            baked_facet_draw
+                .map(|packed| dpvs_t6::SortedDraw::unpack_from_bits(packed).leading_sort_bucket())
         })
         .unwrap_or(0)
 }
@@ -205,20 +209,20 @@ mod tests {
 
     #[test]
     fn no_image_and_no_texture_flag_is_no_colour_map() {
-        assert_eq!(refusal(false, || false, true), Some(FxPresentSkip::NoColorMap));
+        assert_eq!(refusal(false, || false, true), Some(EffectPresentSkip::MissingColorMap));
         // The missing map is reported even when the region is wrong as well.
-        assert_eq!(refusal(false, || false, false), Some(FxPresentSkip::NoColorMap));
+        assert_eq!(refusal(false, || false, false), Some(EffectPresentSkip::MissingColorMap));
     }
 
     #[test]
     fn a_technique_texture_stands_in_for_the_image() {
         assert_eq!(refusal(false, || true, true), None);
-        assert_eq!(refusal(false, || true, false), Some(FxPresentSkip::NotEmissive));
+        assert_eq!(refusal(false, || true, false), Some(EffectPresentSkip::NoGlow));
     }
 
     #[test]
     fn the_wrong_region_is_not_emissive() {
-        assert_eq!(refusal(true, || true, false), Some(FxPresentSkip::NotEmissive));
+        assert_eq!(refusal(true, || true, false), Some(EffectPresentSkip::NoGlow));
     }
 
     #[test]
@@ -232,12 +236,18 @@ mod tests {
 
     #[test]
     fn only_tracked_causes_are_counted() {
-        let mut cursor = FxJournalCursor::default();
-        count_fx_present_skip(&mut cursor, FxPresentSkip::NoColorMap);
-        assert_eq!((cursor.skipped_no_ordinal, cursor.skipped_not_emissive), (0, 0));
-        count_fx_present_skip(&mut cursor, FxPresentSkip::NoOrdinal);
-        count_fx_present_skip(&mut cursor, FxPresentSkip::NoOrdinal);
-        count_fx_present_skip(&mut cursor, FxPresentSkip::NotEmissive);
-        assert_eq!((cursor.skipped_no_ordinal, cursor.skipped_not_emissive), (2, 1));
+        let mut cursor = EffectJournalCursor::default();
+        tally_fx_present_skip(&mut cursor, EffectPresentSkip::MissingColorMap);
+        let counted = |cursor: &EffectJournalCursor| {
+            (
+                cursor.tally_of(JournalCount::MeshNoOrdinal),
+                cursor.tally_of(JournalCount::MeshNotEmissive),
+            )
+        };
+        assert_eq!(counted(&cursor), (0, 0));
+        tally_fx_present_skip(&mut cursor, EffectPresentSkip::NoOrdinal);
+        tally_fx_present_skip(&mut cursor, EffectPresentSkip::NoOrdinal);
+        tally_fx_present_skip(&mut cursor, EffectPresentSkip::NoGlow);
+        assert_eq!(counted(&cursor), (2, 1));
     }
 }

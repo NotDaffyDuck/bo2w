@@ -6,7 +6,8 @@
 //! its own flags, and only its sloped faces as planes (`sides`). The sweep
 //! tries the box faces first, then the sloped ones.
 
-use crate::{SURFACE_CLIP_EPSILON, Trace, TraceWork};
+use crate::capsule::{SURFACE_CLIP_SLACK, TraceWork};
+use crate::result::TraceResult;
 
 /// A brush's box faces: low x, y, z, then high x, y, z.
 pub const AXIAL_SIDES: usize = 6;
@@ -15,7 +16,7 @@ pub const AXIAL_SIDES: usize = 6;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Plane {
     pub normal: [f32; 3],
-    pub dist: f32,
+    pub plane_offset: f32,
 }
 
 /// BO2's `cbrushside_t`: a sloped face and its flags.
@@ -30,176 +31,175 @@ pub struct BrushSide {
 /// faces, each per axis.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Brush<'a> {
-    pub mins: [f32; 3],
-    pub maxs: [f32; 3],
+    pub lower: [f32; 3],
+    pub upper: [f32; 3],
     pub contents: u32,
     pub sides: &'a [BrushSide],
     pub axial_cflags: [[u32; 3]; 2],
     pub axial_sflags: [[u32; 3]; 2],
 }
 
-/// The face a sweep hit first.
+/// The face a sweep hit first: its outward normal and its surface flags.
 #[derive(Clone, Copy)]
 struct Lead {
-    normal: [f32; 3],
+    looks: [f32; 3],
     sflags: u32,
 }
 
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+impl Plane {
+    /// Signed height of `at` over this face once it is pushed out by the
+    /// capsule's size.
+    fn height_above(&self, tw: &TraceWork, at: [f32; 3]) -> f32 {
+        let pushed_out = (self.normal[2] * tw.offset_z).abs() + self.plane_offset + tw.radius;
+        self.normal[0] * at[0] + self.normal[1] * at[1] + self.normal[2] * at[2] - pushed_out
+    }
 }
 
-/// How far a sloped face sits out from its plane for this capsule.
-fn side_dist(tw: &TraceWork, plane: &Plane) -> f32 {
-    (plane.normal[2] * tw.offset_z).abs() + plane.dist + tw.radius
+/// True when a sweep that starts `d1` out from a face (`d1 > 0`) ends no
+/// nearer to it than the clip lip, so it can never touch the brush.
+fn never_reaches(d1: f32, d2: f32) -> bool {
+    let lip = if d1 > SURFACE_CLIP_SLACK { SURFACE_CLIP_SLACK } else { d1 };
+    d2 >= lip
+}
+
+/// The part of the sweep that lies inside every face looked at so far.
+/// A face that leaves nothing of it makes the sweep miss (`None`).
+struct Window {
+    enter: f32,
+    leave: f32,
+    never_out: bool,
+    lead: Option<Lead>,
+}
+
+impl Window {
+    /// A box face. `scale` is the inverse sweep length on the face's axis,
+    /// signed by which way the face points.
+    fn box_face(&mut self, d1: f32, d2: f32, scale: f32, face: Lead) -> Option<()> {
+        if d1 > 0.0 {
+            if never_reaches(d1, d2) {
+                return None;
+            }
+            let at = (d1 - SURFACE_CLIP_SLACK) * scale;
+            if self.leave <= at {
+                return None;
+            }
+            self.never_out &= !(d2 > 0.0);
+            if self.enter < at {
+                self.enter = at;
+                self.lead = Some(face);
+            } else {
+                self.lead.get_or_insert(face);
+            }
+            return Some(());
+        }
+        if d2 > 0.0 {
+            let at = d1 * scale;
+            if at <= self.enter {
+                return None;
+            }
+            self.never_out = false;
+            if at < self.leave {
+                self.leave = at;
+            }
+        }
+        Some(())
+    }
+
+    /// A sloped face.
+    fn sloped_face(&mut self, d1: f32, d2: f32, face: Lead) -> Option<()> {
+        let span = d1 - d2;
+        if d1 > 0.0 {
+            if never_reaches(d1, d2) {
+                return None;
+            }
+            self.never_out &= !(d2 > 0.0);
+            let reach = d1 - SURFACE_CLIP_SLACK;
+            if reach <= span * self.enter {
+                self.lead.get_or_insert(face);
+                return Some(());
+            }
+            self.enter = reach / span;
+            self.lead = Some(face);
+            if self.leave <= self.enter {
+                return None;
+            }
+            return Some(());
+        }
+        if d2 > 0.0 {
+            if span * self.leave < d1 {
+                self.leave = d1 / span;
+                if self.leave <= self.enter {
+                    return None;
+                }
+            }
+            self.never_out = false;
+        }
+        Some(())
+    }
+}
+
+/// Clip the sweep against every face of `brush`: box faces low then high,
+/// x to z, then the sloped ones. `None` when the sweep misses the brush.
+fn clip(tw: &TraceWork, brush: &Brush<'_>, limit: f32) -> Option<Window> {
+    let start = tw.extents.from;
+    let end = tw.extents.to;
+    let mut window = Window { enter: 0.0, leave: limit, never_out: true, lead: None };
+
+    for slot in 0..AXIAL_SIDES {
+        let (high, axis) = (slot / 3, slot % 3);
+        let (bound, sign) = if high == 0 { (brush.lower[axis], -1.0_f32) } else { (brush.upper[axis], 1.0_f32) };
+        let pad = tw.radius_offset[axis];
+        let d1 = sign * (start[axis] - bound) - pad;
+        let d2 = sign * (end[axis] - bound) - pad;
+        let mut facing = [0.0_f32; 3];
+        facing[axis] = sign;
+        let face = Lead { looks: facing, sflags: brush.axial_sflags[high][axis] };
+        window.box_face(d1, d2, sign * tw.extents.inv_delta[axis], face)?;
+    }
+
+    for side in brush.sides {
+        let face = Lead { looks: side.plane.normal, sflags: side.sflags };
+        window.sloped_face(side.plane.height_above(tw, start), side.plane.height_above(tw, end), face)?;
+    }
+    Some(window)
 }
 
 /// `CM_TraceThroughBrush`: sweep the capsule through one brush. A hit that
 /// is closer than `trace.fraction` replaces it.
 ///
-/// A trace that starts inside the brush gets `startsolid` (and `allsolid` if
+/// A trace that starts inside the brush gets `startsolid` (and `fully_embedded` if
 /// it never gets out), with the flags of the brush's top face.
-pub fn trace_through_brush(tw: &TraceWork, brush: &Brush<'_>, trace: &mut Trace) {
-    let start = tw.extents.start;
-    let end = tw.extents.end;
-    let mut enter_frac = 0.0_f32;
-    let mut leave_frac = trace.fraction;
-    let mut all_inside = true;
-    let mut lead: Option<Lead> = None;
-
-    for (face, (bound, sign)) in [(brush.mins, -1.0_f32), (brush.maxs, 1.0_f32)]
-        .into_iter()
-        .enumerate()
-    {
-        for axis in 0..3 {
-            let d1 = (start[axis] - bound[axis]) * sign - tw.radius_offset[axis];
-            let d2 = (end[axis] - bound[axis]) * sign - tw.radius_offset[axis];
-            if d1 <= 0.0 {
-                if d2 > 0.0 {
-                    let f = tw.extents.inv_delta[axis] * d1 * sign;
-                    if f <= enter_frac {
-                        return;
-                    }
-                    all_inside = false;
-                    if f < leave_frac {
-                        leave_frac = f;
-                    }
-                }
-                continue;
-            }
-            let front = if d1 > SURFACE_CLIP_EPSILON {
-                SURFACE_CLIP_EPSILON
-            } else {
-                d1
-            };
-            if front <= d2 {
-                return;
-            }
-            let f = (d1 - SURFACE_CLIP_EPSILON) * tw.extents.inv_delta[axis] * sign;
-            if leave_frac <= f {
-                return;
-            }
-            if d2 > 0.0 {
-                all_inside = false;
-            }
-            if enter_frac < f || lead.is_none() {
-                if enter_frac < f {
-                    enter_frac = f;
-                }
-                let mut normal = [0.0; 3];
-                normal[axis] = sign;
-                lead = Some(Lead {
-                    normal,
-                    sflags: brush.axial_sflags[face][axis],
-                });
-            }
+pub fn trace_through_brush(tw: &TraceWork, brush: &Brush<'_>, trace: &mut TraceResult) {
+    let Some(window) = clip(tw, brush, trace.fraction) else {
+        return;
+    };
+    let Some(lead) = window.lead else {
+        trace.starts_inside = true;
+        if window.never_out {
+            trace.fully_embedded = true;
+            trace.fraction = 0.0;
         }
-    }
-
-    for side in brush.sides {
-        let dist = side_dist(tw, &side.plane);
-        let d1 = dot(side.plane.normal, start) - dist;
-        let d2 = dot(side.plane.normal, end) - dist;
-        if d1 <= 0.0 {
-            if d2 > 0.0 {
-                let delta = d1 - d2;
-                if delta * leave_frac < d1 {
-                    leave_frac = d1 / delta;
-                    if leave_frac <= enter_frac {
-                        return;
-                    }
-                }
-                all_inside = false;
-            }
-            continue;
-        }
-        let front = if d1 > SURFACE_CLIP_EPSILON {
-            SURFACE_CLIP_EPSILON
-        } else {
-            d1
-        };
-        if front <= d2 {
-            return;
-        }
-        if d2 > 0.0 {
-            all_inside = false;
-        }
-        let delta = d1 - d2;
-        if d1 - SURFACE_CLIP_EPSILON <= delta * enter_frac {
-            if lead.is_none() {
-                lead = Some(Lead {
-                    normal: side.plane.normal,
-                    sflags: side.sflags,
-                });
-            }
-        } else {
-            enter_frac = (d1 - SURFACE_CLIP_EPSILON) / delta;
-            lead = Some(Lead {
-                normal: side.plane.normal,
-                sflags: side.sflags,
-            });
-            if leave_frac <= enter_frac {
-                return;
-            }
-        }
-    }
-
+        trace.sflags = brush.axial_sflags[1][2];
+        trace.cflags = brush.axial_cflags[1][2];
+        return;
+    };
+    trace.fraction = window.enter;
+    trace.normal = lead.looks;
+    trace.sflags = lead.sflags;
     trace.cflags = brush.contents;
-    match lead {
-        None => {
-            trace.startsolid = true;
-            if all_inside {
-                trace.allsolid = true;
-                trace.fraction = 0.0;
-            }
-            trace.sflags = brush.axial_sflags[1][2];
-            trace.cflags = brush.axial_cflags[1][2];
-        }
-        Some(lead) => {
-            trace.fraction = enter_frac;
-            trace.normal = lead.normal;
-            trace.sflags = lead.sflags;
-            trace.walkable = false;
-        }
-    }
+    trace.walkable = false;
 }
 
 /// `CM_TestBoxInBrush`: is the capsule, standing still, inside this brush?
 /// If so the trace is all solid.
-pub fn test_box_in_brush(tw: &TraceWork, brush: &Brush<'_>, trace: &mut Trace) {
-    for axis in 0..3 {
-        if !(tw.bounds[0][axis] < brush.maxs[axis] && brush.mins[axis] < tw.bounds[1][axis]) {
-            return;
-        }
+pub fn test_box_in_brush(tw: &TraceWork, brush: &Brush<'_>, trace: &mut TraceResult) {
+    let overlaps = (0..3).all(|a| tw.bounds[0][a] < brush.upper[a] && brush.lower[a] < tw.bounds[1][a]);
+    let start = tw.extents.from;
+    if !overlaps || brush.sides.iter().any(|side| side.plane.height_above(tw, start) > 0.0) {
+        return;
     }
-    let start = tw.extents.start;
-    for side in brush.sides {
-        if dot(side.plane.normal, start) - side_dist(tw, &side.plane) > 0.0 {
-            return;
-        }
-    }
-    trace.startsolid = true;
-    trace.allsolid = true;
+    trace.starts_inside = true;
+    trace.fully_embedded = true;
     trace.fraction = 0.0;
     trace.sflags = 0;
     trace.cflags = brush.contents;
@@ -212,10 +212,10 @@ mod tests {
 
     const SOLID: u32 = 1;
 
-    fn cube<'a>(mins: [f32; 3], maxs: [f32; 3], sides: &'a [BrushSide]) -> Brush<'a> {
+    fn cube<'a>(lo: [f32; 3], hi: [f32; 3], sides: &'a [BrushSide]) -> Brush<'a> {
         Brush {
-            mins,
-            maxs,
+            lower: lo,
+            upper: hi,
             contents: SOLID,
             sides,
             axial_cflags: [[SOLID; 3]; 2],
@@ -223,10 +223,10 @@ mod tests {
         }
     }
 
-    fn sweep(brush: &Brush<'_>, start: [f32; 3], end: [f32; 3], mins: [f32; 3], maxs: [f32; 3]) -> Trace {
-        let mut t = Trace::new();
-        trace_brushes([brush], start, end, mins, maxs, SOLID, &mut t);
-        t
+    fn sweep(brush: &Brush<'_>, from: [f32; 3], till: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> TraceResult {
+        let mut found = TraceResult::new();
+        trace_brushes([brush], from, till, lo, hi, SOLID, &mut found);
+        found
     }
 
     #[test]
@@ -237,14 +237,14 @@ mod tests {
         assert_eq!(t.normal, [-1.0, 0.0, 0.0]);
         assert_eq!(t.sflags, 0x10);
         assert_eq!(t.cflags, SOLID);
-        assert!(!t.startsolid);
+        assert!(!t.starts_inside);
     }
 
     #[test]
     fn player_lands_on_a_floor() {
         let b = cube([-256.0, -256.0, -64.0], [256.0, 256.0, 0.0], &[]);
         let t = sweep(&b, [0.0, 0.0, 40.0], [0.0, 0.0, -40.0], [-15.0, -15.0, 0.0], [15.0, 15.0, 70.0]);
-        assert!((t.end_pos([0.0, 0.0, 40.0], [0.0, 0.0, -40.0])[2] - 0.125).abs() < 1e-4);
+        assert!((t.finish_location([0.0, 0.0, 40.0], [0.0, 0.0, -40.0])[2] - 0.125).abs() < 1e-4);
         assert_eq!(t.normal, [0.0, 0.0, 1.0]);
         assert_eq!(t.sflags, 0x60);
     }
@@ -253,7 +253,7 @@ mod tests {
     fn starting_inside_takes_the_top_face_flags() {
         let b = cube([-64.0; 3], [64.0; 3], &[]);
         let t = sweep(&b, [0.0; 3], [8.0, 0.0, 0.0], [0.0; 3], [0.0; 3]);
-        assert!(t.startsolid && t.allsolid);
+        assert!(t.starts_inside && t.fully_embedded);
         assert_eq!(t.fraction, 0.0);
         assert_eq!(t.sflags, 0x60);
     }
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn a_miss_keeps_the_old_flags() {
         let b = cube([64.0; 3], [128.0; 3], &[]);
-        let mut t = Trace::new();
+        let mut t = TraceResult::new();
         t.sflags = 0x1234;
         trace_brushes([&b], [0.0; 3], [-8.0, 0.0, 0.0], [0.0; 3], [0.0; 3], SOLID, &mut t);
         assert_eq!(t.fraction, 1.0);
@@ -272,9 +272,9 @@ mod tests {
     fn position_test_inside_and_outside() {
         let b = cube([-64.0; 3], [64.0; 3], &[]);
         let inside = sweep(&b, [60.0, 0.0, 0.0], [60.0, 0.0, 0.0], [-15.0, -15.0, 0.0], [15.0, 15.0, 70.0]);
-        assert!(inside.allsolid && inside.startsolid && inside.fraction == 0.0);
+        assert!(inside.fully_embedded && inside.starts_inside && inside.fraction == 0.0);
         let outside = sweep(&b, [80.0, 0.0, 0.0], [80.0, 0.0, 0.0], [-15.0, -15.0, 0.0], [15.0, 15.0, 70.0]);
-        assert!(!outside.startsolid && outside.fraction == 1.0);
+        assert!(!outside.starts_inside && outside.fraction == 1.0);
     }
 
     #[test]
@@ -284,7 +284,7 @@ mod tests {
         let ramp = [BrushSide {
             plane: Plane {
                 normal: [n, 0.0, n],
-                dist: 32.0 * n,
+                plane_offset: 32.0 * n,
             },
             cflags: SOLID,
             sflags: 0x77,
@@ -293,7 +293,7 @@ mod tests {
         let t = sweep(&b, [0.0, 0.0, 128.0], [0.0, 0.0, -128.0], [0.0; 3], [0.0; 3]);
         assert_eq!(t.normal, [n, 0.0, n]);
         assert_eq!(t.sflags, 0x77);
-        let z = t.end_pos([0.0, 0.0, 128.0], [0.0, 0.0, -128.0])[2];
+        let z = t.finish_location([0.0, 0.0, 128.0], [0.0, 0.0, -128.0])[2];
         assert!((z - (32.0 + 0.125 / n)).abs() < 1e-3, "{z}");
     }
 }

@@ -6,21 +6,25 @@
 //! ledge, or the ordinary dive, ladder, knife charge, walk or air move.
 
 use crate::bridge::{
-    AdsIntentContext, CheckLadderContext, CollisionBackend, GroundTraceInput, LadderAttachBackend,
-    LadderTraceHit, MantleCapsuleTrace,
-    MantleRootDelta,
-    MantleXAnimLength, MoveBounds, PRONE_LERP_MS, Pml, PmoveResult, PmoveSingleContext,
-    SprintResult, StanceChange, calc_melee_charge_time,
+    ScopeWishArgs, RungGrabArgs, SolidProbe, SweepAsk, RungGripSource,
+    RungProbeContact, ClimbPillSweep,
+    ClimbBoneOffsetSource,
+    ClimbClipDuration, HullExtents, PRONE_LERP_MS, TickLocals, MotionTickOutcome, OneTickMotionArgs,
+    DashVerdict, PostureShift, calc_melee_charge_time,
     drop_timers, mantle, melee_charge_move, ufo, update_ads_frac,
     update_ads_intent,
 };
 use playerstate_t6::game::{
-    ENTITYNUM_NONE, PM_TYPE_DEAD, PM_TYPE_DEAD_LINKED, PM_TYPE_INTERMISSION, PM_TYPE_LAST_STAND,
-    PM_TYPE_NORMAL_LINKED, PlayerState, UserCmd, pm_flags,
+    MOVE_MODE_WALK_ATTACHED, AvatarState, InputCommand, movement_state_bits,
 };
+use playerstate_t6::game::NO_ENTITY_SLOT;
+use playerstate_t6::game::MOVE_KIND_DEAD;
+use playerstate_t6::game::MOVE_KIND_DEAD_TETHERED;
+use playerstate_t6::game::MOVE_MODE_INTERLUDE;
+use playerstate_t6::game::MOVE_MODE_DOWNED;
 
 use crate::dive;
-use crate::feel::EF_TURRET;
+use playerstate_t6::game::entity_flag_bits::TURRET_MASK;
 use crate::gjk::{Bo2Collision, PenetrationChecks};
 use crate::stance::DuckContext;
 
@@ -57,7 +61,7 @@ pub struct BodyAnims {
 }
 
 impl BodyAnims {
-    fn add(&mut self, other: BodyAnims) {
+    fn merge(&mut self, other: BodyAnims) {
         self.jump |= other.jump;
         self.land |= other.land;
     }
@@ -66,394 +70,404 @@ impl BodyAnims {
 /// Black Ops II's Pmove: a late command catches up at most 150 ms, in moves
 /// of at most 66 ms. It takes the player, command and context and gives
 /// back the result (the last move's). It moves as the server does.
-pub fn pmove<C: Bo2Collision, L: MantleXAnimLength, R: MantleRootDelta>(
-    ps: &mut PlayerState,
-    cmd: &mut UserCmd,
-    context: PmoveSingleContext,
-    collision: &C,
-    lengths: &L,
-    root: &R,
-) -> PmoveResult {
-    pmove_with_body(ps, cmd, context, collision, lengths, root, true).0
+pub fn pmove<C: Bo2Collision, L: ClimbClipDuration, R: ClimbBoneOffsetSource>(
+    avatar: &mut AvatarState,
+    ucmd: &mut InputCommand,
+    setup: OneTickMotionArgs,
+    solids: &C,
+    anim_len: &L,
+    delta_src: &R,
+) -> MotionTickOutcome {
+    pmove_with_body(avatar, ucmd, setup, solids, anim_len, delta_src, true).0
 }
 
 /// `pmove`, also giving the legs' jump and land animations any of its moves
 /// started, and the slope pitch they averaged. `server` is BO2's server move
 /// (not a client's prediction): only it sends the slide sound events.
-pub fn pmove_with_body<C: Bo2Collision, L: MantleXAnimLength, R: MantleRootDelta>(
-    ps: &mut PlayerState,
-    cmd: &mut UserCmd,
-    mut context: PmoveSingleContext,
-    collision: &C,
-    lengths: &L,
-    root: &R,
+pub fn pmove_with_body<C: Bo2Collision, L: ClimbClipDuration, R: ClimbBoneOffsetSource>(
+    avatar: &mut AvatarState,
+    ucmd: &mut InputCommand,
+    mut setup: OneTickMotionArgs,
+    solids: &C,
+    anim_len: &L,
+    delta_src: &R,
     server: bool,
-) -> (PmoveResult, BodyAnims) {
+) -> (MotionTickOutcome, BodyAnims) {
     let mut body = BodyAnims::default();
     // BO2 clears the pitch history with the rest of pmove_t for each command.
     let mut pitch = crate::slope::PitchHistory::default();
-    let server_time = cmd.server_time;
+    let authority_clock_ms = ucmd.authority_clock_ms;
     // The platform the player rides carries them first, over the whole
     // command (before the catch-up below).
-    crate::mover::pre_step(ps, cmd, collision);
-    if server_time.wrapping_sub(ps.command_time) > CATCH_UP_MSEC {
-        ps.command_time = server_time.wrapping_sub(CATCH_UP_MSEC);
+    crate::mover::pre_step(avatar, ucmd, solids);
+    if authority_clock_ms.wrapping_sub(avatar.last_cmd_ms) > CATCH_UP_MSEC {
+        avatar.last_cmd_ms = authority_clock_ms.wrapping_sub(CATCH_UP_MSEC);
     }
     loop {
-        let step = server_time.wrapping_sub(ps.command_time).min(STEP_MSEC);
-        cmd.server_time = ps.command_time.wrapping_add(step);
-        let result = pmove_single(ps, cmd, context, collision, lengths, root, &mut body, &mut pitch, server);
-        if cmd.server_time == server_time {
+        let step = authority_clock_ms.wrapping_sub(avatar.last_cmd_ms).min(STEP_MSEC);
+        ucmd.authority_clock_ms = avatar.last_cmd_ms.wrapping_add(step);
+        let outcome = pmove_single(avatar, ucmd, setup, solids, anim_len, delta_src, &mut body, &mut pitch, server);
+        if ucmd.authority_clock_ms == authority_clock_ms {
             body.average_pitch = pitch.average();
-            return (result, body);
+            return (outcome, body);
         }
         // The next move's last command is this one.
-        context.old_buttons = cmd.buttons;
-        context.walk.old_buttons = cmd.buttons;
-        context.old_move = [cmd.forwardmove, cmd.rightmove];
+        setup.last_tick_buttons = ucmd.buttons;
+        setup.walk.last_tick_buttons = ucmd.buttons;
+        setup.old_move = [ucmd.thrust_ahead, ucmd.thrust_lateral];
     }
 }
 
 /// One move of Black Ops II movement (PmoveSingle).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn pmove_single<C: Bo2Collision, L: MantleXAnimLength, R: MantleRootDelta>(
-    ps: &mut PlayerState,
-    cmd: &mut UserCmd,
-    context: PmoveSingleContext,
-    collision: &C,
-    lengths: &L,
-    root: &R,
+fn pmove_single<C: Bo2Collision, L: ClimbClipDuration, R: ClimbBoneOffsetSource>(
+    avatar: &mut AvatarState,
+    ucmd: &mut InputCommand,
+    setup: OneTickMotionArgs,
+    solids: &C,
+    anim_len: &L,
+    delta_src: &R,
     body: &mut BodyAnims,
     pitch: &mut crate::slope::PitchHistory,
     server: bool,
-) -> PmoveResult {
-    let mut context = bo2_context(context);
-    let feel = context.walk.feel;
+) -> MotionTickOutcome {
+    let mut frame_ctx = bo2_context(setup);
+    let feel = frame_ctx.walk.feel;
     // The crouch and stand-up checks (BO2's is_not_penetrating).
-    let penetration = PenetrationChecks(collision);
+    let penetration = PenetrationChecks(solids);
 
     // A knife charge runs straight ahead whatever the keys say.
-    if ps.pm_flags & pm_flags::MELEE_CHARGE != 0 {
-        cmd.forwardmove = 127;
-        cmd.rightmove = 0;
+    if avatar.movement_state_bits & movement_state_bits::MELEE_CHARGE != 0 {
+        set_keys(ucmd, 127, 0);
     }
     // A dead body passes through players unless its link says otherwise.
-    if ps.pm_type >= PM_TYPE_DEAD && ps.link_flags & LINK_KEEPS_BODY_CONTENTS == 0 {
-        context.bounds.tracemask &= !crate::stance::BO2_GETUP_IGNORES;
+    if avatar.movement_mode >= MOVE_KIND_DEAD && avatar.attach_bits & LINK_KEEPS_BODY_CONTENTS == 0 {
+        frame_ctx.bounds.collide_filter &= !crate::stance::BO2_GETUP_IGNORES;
     }
 
-    let msec = cmd.server_time.wrapping_sub(ps.command_time).clamp(MIN_MSEC, MAX_MSEC);
+    let msec = ucmd.authority_clock_ms.wrapping_sub(avatar.last_cmd_ms).clamp(MIN_MSEC, MAX_MSEC);
     // The water level is worked out again after the view; until then it is
     // dry (BO2 reads the lying-down aim before it).
-    ps.waterlevel = 0;
+    avatar.waterlevel = 0;
     // Lying down and aiming holds still (decided before anything moves).
     crate::feel::prone_aim(
-        ps,
-        cmd,
-        context.old_move,
-        crate::stance::sniper_scope_raised(ps, context.ads_intent),
+        avatar,
+        ucmd,
+        frame_ctx.old_move,
+        crate::stance::sniper_scope_raised(avatar, frame_ctx.ads_intent),
     );
     // The dead do not walk.
-    if ps.pm_type >= PM_TYPE_DEAD {
-        cmd.forwardmove = 0;
-        cmd.rightmove = 0;
+    if avatar.movement_mode >= MOVE_KIND_DEAD {
+        set_keys(ucmd, 0, 0);
     }
-    ps.command_time = cmd.server_time;
+    avatar.last_cmd_ms = ucmd.authority_clock_ms;
 
-    let mut pml = Pml {
-        forward: [0.0; 3],
-        right: [0.0; 3],
-        up: [0.0; 3],
-        frametime: (msec as f32) * 0.001_f32,
-        msec,
+    let mut tick_vars = TickLocals {
+        fwd_axis: ORIGIN_VEC,
+        right_axis: ORIGIN_VEC,
+        up_axis: ORIGIN_VEC,
+        step_millis_elapsed: (msec as f32) * 0.001_f32,
+        frame_ms: msec,
         walking: 0,
-        ground_plane: 0,
-        almost_ground_plane: 0,
-        ground_trace: [0; 11],
-        previous_origin: ps.origin,
-        previous_velocity: ps.velocity,
-        holdrand: holdrand(ps.viewangles[1], cmd.server_time),
+        standing_on_floor: 0, near_floor_contact: 0,
+        floor_probe: [0; 11],
+        prior_tick_position: avatar.origin, prior_tick_speed_vec: avatar.velocity,
+        frame_seed: holdrand(avatar.look_angles[1], ucmd.authority_clock_ms),
     };
 
-    let old_yaw = ps.viewangles[1];
-    crate::view::update_view_angles(ps, cmd, context.view_angles);
+    let old_yaw = avatar.look_angles[1];
+    crate::view::update_view_angles(avatar, ucmd, frame_ctx.look_rotation);
     // Lying down, the view is held to the body's turn.
-    crate::prone_turn::bo2_prone_view(ps, cmd, msec, collision, feel.zombies, old_yaw);
-    crate::water::set_water_level(ps, collision);
+    crate::prone_turn::bo2_prone_view(avatar, ucmd, msec, solids, feel.zombies, old_yaw);
+    crate::water::set_water_level(avatar, solids);
     // A dive into water is over once it stops rising (BO2's Dtp_CanMove,
     // dtp_new_trajectory on).
-    if dive::active(ps) && ps.waterlevel > 0 && ps.velocity[2] <= 0.0 {
-        dive::interrupt(ps, cmd.server_time);
+    if dive::active(avatar) && avatar.waterlevel > 0 && avatar.velocity[2] <= 0.0 {
+        dive::interrupt(avatar, ucmd.authority_clock_ms);
     }
-    let (forward, right, up) = game_math::angle_vectors(ps.viewangles);
-    pml.forward = forward;
-    pml.right = right;
-    pml.up = up;
+    (tick_vars.fwd_axis, tick_vars.right_axis, tick_vars.up_axis) = game_math::euler_basis(avatar.look_angles);
 
     // Noclip and UFO (the mod menu's fly mode): no ground, no ladder, no
     // stance, mantle or dive.
-    if ufo::active(ps) {
-        ps.ground_entity_num = ENTITYNUM_NONE;
-        ladder_to_fall(ps);
-        drop_timers(ps, &pml);
-        ufo::fly(ps, cmd, &pml);
-        return result(pml, context.bounds, None, false, 0.0);
+    if ufo::active(avatar) {
+        avatar.standing_on = NO_ENTITY_SLOT;
+        ladder_to_fall(avatar);
+        drop_timers(avatar, &tick_vars);
+        ufo::fly(avatar, ucmd, &tick_vars);
+        return result(tick_vars, frame_ctx.bounds, None, false, 0.0);
     }
 
-    mantle::clear_hint(ps);
+    mantle::clear_hint(avatar);
 
     // A dive to prone starts from a sprint, so it is decided before the
     // sprint and stance updates see the prone press; while it lasts it owns
     // sprint, stance and movement. After its slide the player lies still a
     // moment, and a slide that has stopped is over before the stance update.
     if feel.dive {
-        if dive::pausing(ps, cmd.server_time) {
-            cmd.forwardmove = 0;
-            cmd.rightmove = 0;
+        if dive::pausing(avatar, ucmd.authority_clock_ms) {
+            set_keys(ucmd, 0, 0);
         }
-        dive::end_stopped_slide(ps, cmd.server_time);
+        dive::end_stopped_slide(avatar, ucmd.authority_clock_ms);
     }
-    let dive_stance = dive::owns_stance(ps, cmd.server_time);
+    let dive_stance = dive::owns_stance(avatar, ucmd.authority_clock_ms);
     let dive_start =
-        feel.dive && !context.weapon_blocks_prone && dive::wants(ps, cmd, context.old_buttons);
-    let diving = dive_start || dive::active(ps);
+        feel.dive && !frame_ctx.gun_forbids_lying && dive::wants(avatar, ucmd, frame_ctx.last_tick_buttons);
+    let diving = dive_start || dive::active(avatar);
 
     // The gun can aim through a dive (asked for, 10-09).
-    let ads_cmd = dive::ads_cmd(ps, cmd, diving);
-    let _ads = update_ads_intent(ps, &ads_cmd, context.old_buttons, context.ads_intent);
-    let mut sprint = context.sprint;
-    sprint.weapon_max_sprint_time =
-        crate::feel::stamin_up_sprint_time(ps, sprint.weapon_max_sprint_time, feel);
-    if ps.pm_flags & (pm_flags::PRONE | pm_flags::CROUCH) != 0 {
-        sprint.stand_up_clear = !penetration
-            .trace(GroundTraceInput {
-                start: ps.origin,
-                end: ps.origin,
-                mins: context.bounds.mins,
-                maxs: context.bounds.maxs,
-                tracemask: context.bounds.tracemask & !0x0200_0000,
+    let ads_cmd = dive::ads_cmd(avatar, ucmd, diving);
+    let _ads = update_ads_intent(avatar, &ads_cmd, frame_ctx.last_tick_buttons, frame_ctx.ads_intent);
+    let mut sprint = frame_ctx.sprint;
+    sprint.gun_dash_cap_secs =
+        crate::feel::stamin_up_sprint_time(avatar, sprint.gun_dash_cap_secs, feel);
+    if avatar.movement_state_bits & (movement_state_bits::LYING_FLAT | movement_state_bits::DUCK_BUTTON_BIT) != 0 {
+        sprint.rise_space_free = !penetration
+            .trace(SweepAsk {
+                start: avatar.origin,
+                end: avatar.origin,
+                lo_corner: frame_ctx.bounds.lo_corner,
+                hi_corner: frame_ctx.bounds.hi_corner,
+                collide_filter: frame_ctx.bounds.collide_filter & !crate::stance::BO2_GETUP_IGNORES,
             })
-            .allsolid;
+            .fully_embedded;
     }
     let sprint_change = if diving {
-        SprintResult::Unchanged
+        DashVerdict::Unchanged
     } else {
         // Sprint in any direction (feel.omni); a held prone key does not end
         // the sprint while getting up from a dive.
-        let sprint_cmd = crate::feel::omni_sprint_cmd(&dive::stance_cmd(ps, cmd), feel);
-        crate::sprint::update(ps, &sprint_cmd, sprint, context.weapon_blocks_prone)
+        let sprint_cmd = crate::feel::omni_sprint_cmd(&dive::stance_cmd(avatar, ucmd), feel);
+        crate::sprint::update(avatar, &sprint_cmd, sprint, frame_ctx.gun_forbids_lying)
     };
 
     // The end-of-match screen: aim and sprint settle, nothing moves.
-    if ps.pm_type == PM_TYPE_INTERMISSION {
-        ladder_to_fall(ps);
-        update_ads_frac(ps, pml.msec, context.ads_frac);
-        return result(pml, context.bounds, None, false, 0.0);
+    if avatar.movement_mode == MOVE_MODE_INTERLUDE {
+        ladder_to_fall(avatar);
+        update_ads_frac(avatar, tick_vars.frame_ms, frame_ctx.ads_frac);
+        return result(tick_vars, frame_ctx.bounds, None, false, 0.0);
     }
 
-    crate::feel::update_walking_flag(ps, cmd);
+    crate::feel::update_walking_flag(avatar, ucmd);
 
-    let duck = duck_pass(ps, cmd, &ads_cmd, collision, &context, dive_stance, diving, pml.frametime);
+    let duck = duck_pass(avatar, ucmd, &ads_cmd, solids, &frame_ctx, dive_stance, diving, tick_vars.step_millis_elapsed);
     let mut stance_event = duck.anim;
     let mut reset_torso =
-        duck.change != StanceChange::Unchanged || sprint_change == SprintResult::Started;
+        duck.change != PostureShift::Unchanged || sprint_change == DashVerdict::Started;
     let mut bounds = duck.bounds;
-    update_ads_frac(ps, pml.msec, context.ads_frac);
+    update_ads_frac(avatar, tick_vars.frame_ms, frame_ctx.ads_frac);
 
     // Linked to something (a vehicle, a script's link, a linked body): the
     // link owns the origin, so the player is held still.
-    if ps.pm_type == PM_TYPE_NORMAL_LINKED || ps.pm_type == PM_TYPE_DEAD_LINKED {
-        hold_still(ps, &mut pml);
-        drop_timers(ps, &pml);
-        footsteps(ps, &pml, cmd, &context, pitch);
+    if avatar.movement_mode == MOVE_MODE_WALK_ATTACHED || avatar.movement_mode == MOVE_KIND_DEAD_TETHERED {
+        hold_still(avatar, &mut tick_vars);
+        drop_timers(avatar, &tick_vars);
+        footsteps(avatar, &tick_vars, ucmd, &frame_ctx, pitch);
         // A dive is cut short by a link.
-        if ps.pm_type == PM_TYPE_NORMAL_LINKED && dive::active(ps) {
-            dive::interrupt(ps, cmd.server_time);
+        if avatar.movement_mode == MOVE_MODE_WALK_ATTACHED && dive::active(avatar) {
+            dive::interrupt(avatar, ucmd.authority_clock_ms);
         }
-        return result(pml, bounds, stance_event, reset_torso, 0.0);
+        return result(tick_vars, bounds, stance_event, reset_torso, 0.0);
     }
 
     // Going down leaves any ladder and any turret.
-    if ps.pm_type == PM_TYPE_LAST_STAND {
-        ladder_to_fall(ps);
-        ps.e_flags &= !EF_TURRET;
+    if avatar.movement_mode == MOVE_MODE_DOWNED {
+        ladder_to_fall(avatar);
+        avatar.e_flags &= !TURRET_MASK;
     }
 
     // On a turret the gun does the moving.
-    if ps.e_flags & EF_TURRET != 0 {
-        hold_still(ps, &mut pml);
-        drop_timers(ps, &pml);
-        footsteps(ps, &pml, cmd, &context, pitch);
-        return result(pml, bounds, stance_event, reset_torso, 0.0);
+    if avatar.e_flags & TURRET_MASK != 0 {
+        hold_still(avatar, &mut tick_vars);
+        drop_timers(avatar, &tick_vars);
+        footsteps(avatar, &tick_vars, ucmd, &frame_ctx, pitch);
+        return result(tick_vars, bounds, stance_event, reset_torso, 0.0);
     }
 
     let mut climb_started = false;
-    if ps.pm_flags & pm_flags::MANTLE == 0 {
+    if avatar.movement_state_bits & movement_state_bits::MANTLE == 0 {
         // A climb's own path owns the ledge; the ground's solid fix-up during
         // it would push the player back off.
-        body.add(crate::ground::ground_trace(ps, &mut pml, bounds, collision, feel, cmd.server_time, server));
-        let mut tracer = CollisionMantleTrace { collision };
+        body.merge(crate::ground::floor_probe(avatar, &mut tick_vars, bounds, solids, feel, ucmd.authority_clock_ms, server));
+        let mut tracer = WorldMantleSweep { solids };
         let check = crate::mantle::CheckContext {
-            buttons: cmd.buttons,
-            facing_xy: [pml.forward[0], pml.forward[1]],
-            tracemask: bounds.tracemask,
+            held_buttons: ucmd.buttons,
+            heading_planar: level_heading(&tick_vars),
+            collide_filter: bounds.collide_filter,
             mp: !feel.zombies,
         };
-        climb_started =
-            !diving && crate::mantle::check(ps, &check, &mut tracer, lengths, root);
+        // bo2zm: a roof hatch over the player comes before any ledge.
+        let hatch = !diving
+            && feel.zombies
+            && crate::mantle::hatch_check(avatar, ucmd.buttons, tick_vars.fwd_axis, tick_vars.up_axis, &mut tracer, anim_len, delta_src);
+        climb_started = match hatch {
+            true => avatar.movement_state_bits & movement_state_bits::MANTLE != 0,
+            false => !diving && crate::mantle::check(avatar, &check, &mut tracer, anim_len, delta_src),
+        };
         if climb_started {
-            mantle::mark_bo2_weapon(ps, feel, lengths);
+            mantle::mark_bo2_weapon(avatar, feel, anim_len);
         }
     }
 
-    if ps.pm_flags & pm_flags::MANTLE != 0 {
-        ladder_to_fall(ps);
-        ps.ground_entity_num = ENTITYNUM_NONE;
-        pml.walking = 0;
-        pml.ground_plane = 0;
+    if avatar.movement_state_bits & movement_state_bits::MANTLE != 0 {
+        ladder_to_fall(avatar);
+        lift_off(avatar, &mut tick_vars);
         if climb_started {
             // BO2 runs the aim, sprint, walking and stance updates again on
             // the frame a climb starts, now off the ground: the aim lets go
             // (no aiming while climbing) and the view's height steps again.
             update_ads_intent(
-                ps,
+                avatar,
                 &ads_cmd,
-                context.old_buttons,
-                AdsIntentContext { ads_allowed: false, ..context.ads_intent },
+                frame_ctx.last_tick_buttons,
+                ScopeWishArgs { sights_permitted: false, ..frame_ctx.ads_intent },
             );
-            let sprint_cmd = crate::feel::omni_sprint_cmd(&dive::stance_cmd(ps, cmd), feel);
-            crate::sprint::update(ps, &sprint_cmd, sprint, context.weapon_blocks_prone);
-            crate::feel::update_walking_flag(ps, cmd);
+            let sprint_cmd = crate::feel::omni_sprint_cmd(&dive::stance_cmd(avatar, ucmd), feel);
+            crate::sprint::update(avatar, &sprint_cmd, sprint, frame_ctx.gun_forbids_lying);
+            crate::feel::update_walking_flag(avatar, ucmd);
             let again =
-                duck_pass(ps, cmd, &ads_cmd, collision, &context, dive_stance, diving, pml.frametime);
+                duck_pass(avatar, ucmd, &ads_cmd, solids, &frame_ctx, dive_stance, diving, tick_vars.step_millis_elapsed);
             bounds = again.bounds;
             stance_event = again.anim.or(stance_event);
-            reset_torso |= again.change != StanceChange::Unchanged;
+            reset_torso |= again.change != PostureShift::Unchanged;
         }
-        body.jump |= crate::mantle::advance(ps, pml.msec, cmd.server_time, !feel.zombies, lengths, root);
-        return result(pml, bounds, stance_event, reset_torso, 0.0);
+        body.jump |= crate::mantle::tick_climb(avatar, tick_vars.frame_ms, ucmd.authority_clock_ms, !feel.zombies, anim_len, delta_src);
+        return result(tick_vars, bounds, stance_event, reset_torso, 0.0);
     }
 
     // The body's slope pitches follow this frame's ground.
-    crate::prone_turn::bo2_prone_pitch(ps, &pml, collision, feel.zombies);
-    drop_timers(ps, &pml);
-    if ps.pm_type >= PM_TYPE_LAST_STAND {
-        crate::dead::dead_move(ps, &pml);
+    crate::prone_turn::bo2_prone_pitch(avatar, &tick_vars, solids, feel.zombies);
+    drop_timers(avatar, &tick_vars);
+    if avatar.movement_mode >= MOVE_MODE_DOWNED {
+        crate::dead::dead_move(avatar, &tick_vars);
     }
 
     if !diving {
-        let mut ladder = CollisionLadderBackend {
-            collision,
+        let mut ladder = WorldLadderProbe {
+            solids,
             bounds,
             last_entity: None,
         };
-        let check = CheckLadderContext {
-            server_time: cmd.server_time,
-            walking: pml.walking != 0,
-            forward_xy: [pml.forward[0], pml.forward[1]],
-            forwardmove: cmd.forwardmove,
+        let check = RungGrabArgs {
+            authority_clock_ms: ucmd.authority_clock_ms,
+            on_foot: tick_vars.walking != 0,
+            ahead_planar: level_heading(&tick_vars),
+            thrust_ahead: ucmd.thrust_ahead,
         };
-        body.jump |= crate::ladder::check_ladder_move(ps, &mut pml, check, &mut ladder);
+        body.jump |= crate::ladder::check_ladder_move(avatar, &mut tick_vars, check, &mut ladder);
     }
 
     let view_change = if diving {
         if dive_start {
-            dive::start(ps, &mut pml, cmd, context.walk.jump.jump_height);
+            dive::start(avatar, &mut tick_vars, ucmd, frame_ctx.walk.jump.leap_height);
         }
-        dive::advance(ps, &pml, cmd, bounds, collision, context.walk.jump.jump_height, context.air)
-    } else if ps.pm_flags & pm_flags::LADDER != 0 {
-        crate::ladder::ladder_move(ps, &mut pml, cmd, context.walk, bounds, collision, body)
-    } else if let Some(lunge) = context.walk.lunge {
+        dive::advance(avatar, &tick_vars, ucmd, bounds, solids, frame_ctx.walk.jump.leap_height, frame_ctx.air)
+    } else if avatar.movement_state_bits & movement_state_bits::LADDER != 0 {
+        crate::ladder::ladder_move(avatar, &mut tick_vars, ucmd, frame_ctx.walk, bounds, solids, body)
+    } else if let Some(lunge) = frame_ctx.walk.lunge {
         // bo2mp's knife lunge (BO2's COD4-style charge) launches here, then
         // the walk or air move runs it with the lunge's own friction.
-        crate::bridge::bo2_lunge_update(ps, &pml, lunge);
-        if ps.waterlevel >= crate::water::SWIM_LEVEL {
-            crate::water::swim_move(ps, &mut pml, cmd, context.air, bounds, collision, feel.zombies, Some(lunge))
-        } else if pml.walking == 0 {
-            crate::air::air_move(ps, &pml, cmd, context.air, bounds, collision, feel.zombies, Some(lunge))
+        crate::bridge::bo2_lunge_update(avatar, &tick_vars, lunge);
+        let swimming = avatar.waterlevel >= crate::water::SWIM_LEVEL;
+        let airborne = tick_vars.walking == 0;
+        if swimming {
+            crate::water::swim_move(avatar, &mut tick_vars, ucmd, frame_ctx.air, bounds, solids, feel.zombies, Some(lunge))
+        } else if airborne {
+            crate::air::air_move(avatar, &tick_vars, ucmd, frame_ctx.air, bounds, solids, feel.zombies, Some(lunge))
         } else {
-            crate::walk::walk_move(ps, &mut pml, cmd, context.walk, bounds, collision, body)
+            crate::walk::walk_move(avatar, &mut tick_vars, ucmd, frame_ctx.walk, bounds, solids, body)
         }
     } else {
-        calc_melee_charge_time(ps, context.melee_charge, context.player_melee_range);
-        if ps.pm_flags & pm_flags::MELEE_CHARGE != 0 {
-            melee_charge_move(
-                ps,
-                &pml,
-                bounds.mins,
-                bounds.maxs,
-                bounds.tracemask,
-                collision,
-                feel.zombies,
-            )
-        } else if ps.waterlevel >= crate::water::SWIM_LEVEL {
-            crate::water::swim_move(ps, &mut pml, cmd, context.air, bounds, collision, feel.zombies, None)
-        } else if pml.walking == 0 {
-            crate::air::air_move(ps, &pml, cmd, context.air, bounds, collision, feel.zombies, None)
+        calc_melee_charge_time(avatar, frame_ctx.melee_charge, frame_ctx.knife_reach);
+        if avatar.movement_state_bits & movement_state_bits::MELEE_CHARGE != 0 {
+            let HullExtents { lo_corner: lo, hi_corner: hi, collide_filter: mask } = bounds;
+            melee_charge_move(avatar, &tick_vars, lo, hi, mask, solids, feel.zombies)
+        } else if avatar.waterlevel >= crate::water::SWIM_LEVEL {
+            crate::water::swim_move(avatar, &mut tick_vars, ucmd, frame_ctx.air, bounds, solids, feel.zombies, None)
+        } else if 0 == tick_vars.walking {
+            crate::air::air_move(avatar, &tick_vars, ucmd, frame_ctx.air, bounds, solids, feel.zombies, None)
         } else {
-            crate::walk::walk_move(ps, &mut pml, cmd, context.walk, bounds, collision, body)
+            crate::walk::walk_move(avatar, &mut tick_vars, ucmd, frame_ctx.walk, bounds, solids, body)
         }
     };
 
-    body.add(crate::ground::ground_trace(ps, &mut pml, bounds, collision, feel, cmd.server_time, server));
-    footsteps(ps, &pml, cmd, &context, pitch);
+    body.merge(crate::ground::floor_probe(avatar, &mut tick_vars, bounds, solids, feel, ucmd.authority_clock_ms, server));
+    footsteps(avatar, &tick_vars, ucmd, &frame_ctx, pitch);
     // BO2 runs the gun between the two; ours runs after the move.
-    crate::foliage::foliage_sounds(ps, cmd.server_time, bounds, collision);
-    crate::snap::end_tick_velocity(ps, &pml);
-    result(pml, bounds, stance_event, reset_torso, view_change)
+    crate::foliage::foliage_sounds(avatar, ucmd.authority_clock_ms, bounds, solids);
+    crate::snap::end_tick_velocity(avatar, &tick_vars);
+    result(tick_vars, bounds, stance_event, reset_torso, view_change)
 }
 
 /// BO2's random seed for the frame: the view's yaw in whole degrees plus the
 /// frame's time, stepped four times.
-pub fn holdrand(view_yaw: f32, server_time: i32) -> i32 {
-    let mut value = (view_yaw as i32).wrapping_add(server_time) as u32;
-    for _ in 0..4 {
-        value = value.wrapping_mul(HOLDRAND_MUL).wrapping_add(HOLDRAND_ADD);
-    }
-    value as i32
+pub fn holdrand(look_heading: f32, authority_clock_ms: i32) -> i32 {
+    let seed = (look_heading as i32).wrapping_add(authority_clock_ms) as u32;
+    let stepped = (0..4).fold(seed, |acc, _| {
+        acc.wrapping_mul(HOLDRAND_MUL).wrapping_add(HOLDRAND_ADD)
+    });
+    stepped as i32
 }
 
 /// This crate is always Black Ops II, whatever rules it is handed.
-fn bo2_context(mut context: PmoveSingleContext) -> PmoveSingleContext {
-    if context.walk.cmd_scale.prone_lerp_ms == 0 {
-        context.walk.cmd_scale.prone_lerp_ms = PRONE_LERP_MS;
+fn bo2_context(mut ctx: OneTickMotionArgs) -> OneTickMotionArgs {
+    let scale = &mut ctx.walk.cmd_scale;
+    if scale.prone_lerp_ms == 0 {
+        scale.prone_lerp_ms = PRONE_LERP_MS;
     }
-    context
+    ctx
 }
 
 /// Leaving a ladder any way but the ground lets the player fall off it.
-fn ladder_to_fall(ps: &mut PlayerState) {
-    if ps.pm_flags & pm_flags::LADDER != 0 {
-        ps.pm_flags = (ps.pm_flags & !pm_flags::LADDER) | pm_flags::LADDER_FALL;
+fn ladder_to_fall(avatar: &mut AvatarState) {
+    let on_ladder = avatar.movement_state_bits & movement_state_bits::LADDER != 0;
+    if on_ladder {
+        avatar.movement_state_bits = (avatar.movement_state_bits & !movement_state_bits::LADDER) | movement_state_bits::LADDER_FALL;
     }
 }
 
 /// Linked or on a turret: off any ladder, off the ground, not moving.
-fn hold_still(ps: &mut PlayerState, pml: &mut Pml) {
-    ladder_to_fall(ps);
-    ps.ground_entity_num = ENTITYNUM_NONE;
-    pml.walking = 0;
-    pml.ground_plane = 0;
-    pml.almost_ground_plane = 0;
-    ps.velocity = [0.0; 3];
+fn hold_still(avatar: &mut AvatarState, tick_vars: &mut TickLocals) {
+    ladder_to_fall(avatar);
+    lift_off(avatar, tick_vars);
+    tick_vars.near_floor_contact = 0;
+    avatar.velocity = ORIGIN_VEC;
 }
+
+/// Detaches the player from the ground for this frame.
+fn lift_off(avatar: &mut AvatarState, tick_vars: &mut TickLocals) {
+    tick_vars.standing_on_floor = 0;
+    tick_vars.walking = 0;
+    avatar.standing_on = NO_ENTITY_SLOT;
+}
+
+fn set_keys(ucmd: &mut InputCommand, ahead: i8, side: i8) {
+    ucmd.thrust_lateral = side;
+    ucmd.thrust_ahead = ahead;
+}
+
+fn level_heading(tick_vars: &TickLocals) -> [f32; 2] {
+    let [x, y, _] = tick_vars.fwd_axis;
+    [x, y]
+}
+
+const ORIGIN_VEC: [f32; 3] = [0.0; 3];
 
 /// PM_Footsteps (footstep.rs): the walk rhythm and its footstep.
 fn footsteps(
-    ps: &mut PlayerState,
-    pml: &Pml,
-    cmd: &UserCmd,
-    context: &PmoveSingleContext,
+    avatar: &mut AvatarState,
+    tick_vars: &TickLocals,
+    ucmd: &InputCommand,
+    frame_ctx: &OneTickMotionArgs,
     pitch: &mut crate::slope::PitchHistory,
 ) {
-    crate::footstep::footsteps(ps, pml, cmd, context.walk.cmd_scale, context.walk.feel, pitch);
+    crate::gait_cycle::footsteps(avatar, tick_vars, ucmd, frame_ctx.walk.cmd_scale, frame_ctx.walk.feel, pitch);
 }
 
 /// What one stance pass leaves.
 struct DuckPass {
-    bounds: MoveBounds,
+    bounds: HullExtents,
     anim: Option<u8>,
-    change: StanceChange,
+    change: PostureShift,
 }
 
 /// BO2's PM_CheckDuck: the stance keys, the 1.8 s prone lock, the view's
@@ -461,119 +475,108 @@ struct DuckPass {
 /// frame a climb starts.
 #[allow(clippy::too_many_arguments)]
 fn duck_pass<C: Bo2Collision>(
-    ps: &mut PlayerState,
-    cmd: &mut UserCmd,
-    ads_cmd: &UserCmd,
-    collision: &C,
-    context: &PmoveSingleContext,
+    avatar: &mut AvatarState,
+    ucmd: &mut InputCommand,
+    ads_cmd: &InputCommand,
+    solids: &C,
+    frame_ctx: &OneTickMotionArgs,
     dive_stance: bool,
     diving: bool,
-    frametime: f32,
+    step_millis_elapsed: f32,
 ) -> DuckPass {
-    let feel = context.walk.feel;
-    let previous_stance = ps.pm_flags & (pm_flags::PRONE | pm_flags::CROUCH);
+    let feel = frame_ctx.walk.feel;
+    let previous_stance = avatar.movement_state_bits & (movement_state_bits::LYING_FLAT | movement_state_bits::DUCK_BUTTON_BIT);
     // From the frame after a dive's take-off to the end of its still moment
     // the view drops to prone; a get-up pressed meanwhile is kept.
     let dive_prone = if dive_stance {
-        dive::queue_getup(ps, cmd, context.old_buttons);
-        dive::force_prone(ps);
+        dive::queue_getup(avatar, ucmd, frame_ctx.last_tick_buttons);
+        dive::force_prone(avatar);
         true
     } else {
-        !diving && dive::holds_prone(ps, cmd, context.old_buttons)
+        !diving && dive::holds_prone(avatar, ucmd, frame_ctx.last_tick_buttons)
     };
     // A held prone key does not drop the player back down while they get up
     // from a dive. Buttons the stance update clears stay cleared in the real
     // command.
-    let mut stance_cmd = dive::stance_cmd(ps, cmd);
-    let held_back = cmd.buttons & !stance_cmd.buttons;
+    let mut stance_cmd = dive::stance_cmd(avatar, ucmd);
+    let held_back = ucmd.buttons & !stance_cmd.buttons;
     let duck = crate::stance::check_duck(
-        ps,
+        avatar,
         &mut stance_cmd,
-        collision,
+        solids,
         DuckContext {
-            bounds: context.bounds,
-            weapon_blocks_prone: context.weapon_blocks_prone,
+            body: frame_ctx.bounds,
+            prone_barred: frame_ctx.gun_forbids_lying,
             zombies: feel.zombies,
             dive_owns: diving || dive_prone,
         },
     );
-    cmd.buttons &= stance_cmd.buttons | held_back;
+    ucmd.buttons &= stance_cmd.buttons | held_back;
     let stance_event = duck.anim;
     let stance_change = duck.change;
     // Dropping to prone locks the stance for 1.8 s (a dive's landing and last
     // stand do not).
-    if stance_change == StanceChange::EnteredProne
-        && ps.pm_type != PM_TYPE_LAST_STAND
-        && ps.pm_time == 0
-        && !dive::any(ps)
+    if stance_change == PostureShift::WentFlat
+        && avatar.movement_mode != MOVE_MODE_DOWNED
+        && avatar.move_timer == 0
+        && !dive::any(avatar)
     {
-        ps.pm_flags |= pm_flags::JUMPING;
-        ps.pm_time = 1800;
+        avatar.movement_state_bits |= movement_state_bits::JUMPING;
+        avatar.move_timer = 1800;
     }
-    dive::finish_getup(ps, cmd);
+    dive::finish_getup(avatar, ucmd);
     let mut bounds =
-        crate::stance::finish_duck(ps, duck.tail, context.bounds, cmd.server_time, frametime);
-    if dive::active(ps) {
+        crate::stance::finish_duck(avatar, duck.tail, frame_ctx.bounds, ucmd.authority_clock_ms, step_millis_elapsed);
+    if dive::active(avatar) {
         // Through a dive the body shrinks as the view drops.
-        bounds.maxs[2] = dive::hull_height(ps);
+        bounds.hi_corner[2] = dive::hull_height(avatar);
     }
     // A dive's push does not drop the aim on lying down.
     crate::stance::bo2_lie_down(
-        ps,
+        avatar,
         ads_cmd,
-        collision,
+        solids,
         bounds,
-        previous_stance & pm_flags::PRONE != 0,
+        previous_stance & movement_state_bits::LYING_FLAT != 0,
     );
     DuckPass { bounds, anim: stance_event, change: stance_change }
 }
 
 fn result(
-    pml: Pml,
-    bounds: MoveBounds,
+    tick_vars: TickLocals,
+    bounds: HullExtents,
     stance_event: Option<u8>,
     reset_torso: bool,
     view_change: f32,
-) -> PmoveResult {
-    PmoveResult {
-        pml,
-        bounds,
-        stance_event,
-        reset_torso,
-        view_change,
-    }
+) -> MotionTickOutcome {
+    MotionTickOutcome { pml: tick_vars, bounds, stance_event, reset_torso, view_change }
 }
 
 /// The mantle's capsule sweeps run through the world's collision.
-struct CollisionMantleTrace<'a, C: CollisionBackend> {
-    collision: &'a C,
+struct WorldMantleSweep<'a, C: SolidProbe> {
+    solids: &'a C,
 }
 
-impl<C: CollisionBackend> MantleCapsuleTrace for CollisionMantleTrace<'_, C> {
+impl<C: SolidProbe> ClimbPillSweep for WorldMantleSweep<'_, C> {
     fn trace(
         &mut self,
-        start: [f32; 3],
+        from_pt: [f32; 3],
         end: [f32; 3],
-        mins: [f32; 3],
-        maxs: [f32; 3],
-        contentmask: u32,
+        box_lo: [f32; 3],
+        box_hi: [f32; 3],
+        solid_filter: u32,
     ) -> trace_t6::Trace {
-        self.collision.trace(GroundTraceInput {
-            start,
-            end,
-            mins,
-            maxs,
-            tracemask: contentmask,
-        })
+        let query = SweepAsk { start: from_pt, end, lo_corner: box_lo, hi_corner: box_hi, collide_filter: solid_filter };
+        self.solids.trace(query)
     }
 }
 
 /// The ladder probe: a slimmer box from knee height, swept toward the
 /// ladder. It remembers which entity it last hit, for a ladder on a moving
 /// thing.
-struct CollisionLadderBackend<'a, C: CollisionBackend> {
-    collision: &'a C,
-    bounds: MoveBounds,
+struct WorldLadderProbe<'a, C: SolidProbe> {
+    solids: &'a C,
+    bounds: HullExtents,
     last_entity: Option<i32>,
 }
 
@@ -581,44 +584,35 @@ struct CollisionLadderBackend<'a, C: CollisionBackend> {
 const LADDER_PROBE_INSET: f32 = 6.0;
 const LADDER_PROBE_FLOOR: f32 = 8.0;
 
-impl<C: CollisionBackend> LadderAttachBackend for CollisionLadderBackend<'_, C> {
-    fn ladder_trace(&mut self, origin: [f32; 3], dir: [f32; 3], dist: f32) -> Option<LadderTraceHit> {
-        let end = [
-            origin[0] + dir[0] * dist,
-            origin[1] + dir[1] * dist,
-            origin[2] + dir[2] * dist,
-        ];
-        let mut mins = self.bounds.mins;
-        let mut maxs = self.bounds.maxs;
-        mins[0] += LADDER_PROBE_INSET;
-        mins[1] += LADDER_PROBE_INSET;
-        mins[2] = LADDER_PROBE_FLOOR;
-        maxs[0] -= LADDER_PROBE_INSET;
-        maxs[1] -= LADDER_PROBE_INSET;
-        if maxs[2] < LADDER_PROBE_FLOOR {
-            maxs[2] = mins[2];
-        }
-        let hit = self.collision.trace(GroundTraceInput {
-            start: origin,
-            end,
-            mins,
-            maxs,
-            tracemask: self.bounds.tracemask,
+impl<C: SolidProbe> RungGripSource for WorldLadderProbe<'_, C> {
+    fn rung_probe(&mut self, at: [f32; 3], heading: [f32; 3], dist: f32) -> Option<RungProbeContact> {
+        let reach_to = core::array::from_fn(|i| at[i] + heading[i] * dist);
+        let [lo_x, lo_y, _] = self.bounds.lo_corner;
+        let [hi_x, hi_y, hi_z] = self.bounds.hi_corner;
+        let probe_lo = [lo_x + LADDER_PROBE_INSET, lo_y + LADDER_PROBE_INSET, LADDER_PROBE_FLOOR];
+        let probe_hi_z = if hi_z < LADDER_PROBE_FLOOR { probe_lo[2] } else { hi_z };
+        let probe_hi = [hi_x - LADDER_PROBE_INSET, hi_y - LADDER_PROBE_INSET, probe_hi_z];
+        let strike = self.solids.trace(SweepAsk {
+            start: at,
+            end: reach_to,
+            lo_corner: probe_lo,
+            hi_corner: probe_hi,
+            collide_filter: self.bounds.collide_filter,
         });
-        self.last_entity = (hit.hit_type == trace_t6::TraceHitType::Entity)
-            .then(|| i32::from(trace_t6::trace_get_entity_hit_id(&hit)));
-        if hit.fraction >= 1.0 {
+        self.last_entity = (strike.impact_category == trace_t6::TraceHitType::Entity)
+            .then(|| i32::from(trace_t6::trace_get_entity_hit_id(&strike)));
+        if strike.fraction >= 1.0 {
             return None;
         }
-        Some(LadderTraceHit {
-            fraction: hit.fraction,
-            normal: hit.normal,
-            surface_flags: hit.sflags,
+        Some(RungProbeContact {
+            travelled: strike.fraction,
+            facing: strike.normal,
+            surf_bits: strike.sflags,
         })
     }
 }
 
-impl<C: CollisionBackend> crate::ladder::LadderHitEntity for CollisionLadderBackend<'_, C> {
+impl<C: SolidProbe> crate::ladder::LadderHitEntity for WorldLadderProbe<'_, C> {
     fn last_hit_entity(&self) -> Option<i32> {
         self.last_entity
     }
@@ -628,10 +622,13 @@ impl<C: CollisionBackend> crate::ladder::LadderHitEntity for CollisionLadderBack
 mod tests {
     use super::*;
     use crate::bridge::{
-        AdsFracContext, AdsIntentContext, AirMoveContext, Bo2Feel, CmdScaleWalkContext,
-        FlatMantleAnimLength, JumpLaunchContext, MeleeChargeWeaponDelays, SprintContext,
-        ViewAngleClamp, WalkMoveContext, ZeroMantleRootDelta, view_height,
+        ScopeBlendArgs, ScopeWishArgs, AirborneStepArgs, Bo2Feel, StrideScaleArgs,
+        FixedClimbClipDuration, LeapKickoffArgs, LungeGunTimings, DashArgs,
     };
+    use crate::bridge::LookRotationLimit;
+    use crate::bridge::FootedStepArgs;
+    use crate::bridge::StillClimbOffset;
+    use crate::bridge::eye_level;
     use playerstate_t6::game::buttons;
     use trace_t6::Trace;
 
@@ -640,141 +637,117 @@ mod tests {
 
     impl Bo2Collision for Floor {}
 
-    impl CollisionBackend for Floor {
-        fn trace(&self, input: GroundTraceInput) -> Trace {
-            let start = input.start[2] + input.mins[2];
-            let end = input.end[2] + input.mins[2];
-            let mut hit = Trace {
-                fraction: 1.0,
-                ..Trace::default()
-            };
+    impl SolidProbe for Floor {
+        fn trace(&self, input: SweepAsk) -> Trace {
+            let start = input.start[2] + input.lo_corner[2];
+            let end = input.end[2] + input.lo_corner[2];
+            let mut strike = Trace::new();
             if start < 0.0 {
-                hit.startsolid = true;
-                hit.allsolid = end < 0.0;
-                hit.fraction = 0.0;
-                hit.normal = [0.0, 0.0, 1.0];
-                return hit;
+                strike.starts_inside = true;
+                strike.fully_embedded = end < 0.0;
+                strike.fraction = 0.0_f32;
+                strike.normal = [0.0, 0.0, 1.0];
+                return strike;
             }
             if end < 0.0 {
                 let fraction = start / (start - end);
-                hit.fraction = fraction;
-                hit.normal = [0.0, 0.0, 1.0];
-                hit.walkable = true;
-                hit.hit_type = trace_t6::TraceHitType::Entity;
-                hit.hit_id = trace_t6::ENTITYNUM_WORLD;
+                strike.fraction = fraction;
+                strike.normal = [0.0, 0.0, 1.0];
+                strike.walkable = true;
+                strike.impact_category = trace_t6::TraceHitType::Entity;
+                strike.struck_entity_num = trace_t6::ENTITYNUM_WORLD;
             }
-            hit
+            strike
         }
     }
 
-    /// The sim's move settings, handed MW2's rules (the frame turns BO2's on).
-    fn context() -> PmoveSingleContext {
+    /// Move settings as the sim hands them over, with MW2's rules (the frame
+    /// switches BO2's on).
+    fn frame_ctx() -> OneTickMotionArgs {
         let feel = Bo2Feel::BO2_MP;
-        let air = AirMoveContext {
-            player_spectate_speed_scale: 1.0,
-            shellshock_gravity_scale: 1.0,
-            shellshock_gravity_bias: 0.0,
+        let (off, on) = (false, true);
+        let air = AirborneStepArgs {
+            observer_pace_ratio: 1.0,
+            concussed_fall_ratio: 1.0,
+            concussed_fall_offset: 0.0,
         };
-        PmoveSingleContext {
-            walk: WalkMoveContext {
-                cmd_scale: CmdScaleWalkContext {
-                    player_back_speed_scale: 0.7,
-                    player_strafe_speed_scale: 0.8,
-                    player_sprint_speed_scale: 1.5,
-                    player_last_stand_crawl_speed_scale: 0.15,
-                    weapon_move_speed_scale: 1.0,
-                    weapon_ads_move_speed_scale: 1.0,
-                    shellshock_movement_scale: 1.0,
-                    prone_lerp_ms: 0,
-                },
-                weapon_move_scale: 1.0,
-                old_buttons: 0,
-                jump: JumpLaunchContext {
-                    jump_height: 39.0,
-                    dive: false,
-                    crouch_jump_scale: 1.0,
-                    jump_ladder_push_vel: 128.0,
-                },
-                air,
-                feel,
-                lunge: None,
-            },
+        let cmd_scale = StrideScaleArgs {
+            retreat_pace_ratio: 0.7, sidestep_pace_ratio: 0.8,
+            dash_pace_ratio: 1.5, downed_crawl_pace_ratio: 0.15,
+            gun_stride_ratio: 1.0, scoped_carry_pace: 1.0,
+            shellshock_movement_scale: 1.0, prone_lerp_ms: 0,
+        };
+        let jump = LeapKickoffArgs {
+            leap_height: 39.0_f32, dive: off, squat_leap_ratio: 1.0, rung_kickoff_speed: 128.0,
+        };
+        let walk = FootedStepArgs {
+            cmd_scale, gun_carry_pace: 1.0, last_tick_buttons: 0, jump, air, feel, lunge: None,
+        };
+        let sprint = DashArgs {
+            gun_dash_cap_secs: 4000, endless_dash: off, dash_least_secs: 1.0,
+            dash_warmup_secs: 0.0, dash_thrust_floor: 105, rise_space_free: on,
+            dash_refill_hold_secs: 0.0,
+        };
+        let rate = 1.0 / 200.0;
+        OneTickMotionArgs {
+            walk,
             air,
-            bounds: MoveBounds {
-                mins: [-15.0, -15.0, 0.0],
-                maxs: [15.0, 15.0, 70.0],
-                tracemask: 0x0281_0011,
+            bounds: HullExtents {
+                collide_filter: 0x0281_0011, hi_corner: [15.0_f32, 15.0, 70.0], lo_corner: [-15.0_f32, -15.0, 0.0],
             },
-            view_angles: ViewAngleClamp {
-                pitch_up: 85.0,
-                pitch_down: 85.0,
-                unclamped_pitch_bit: false,
+            look_rotation: LookRotationLimit { tilt_upper_limit: 85.0, tilt_lower_limit: 85.0, free_tilt_flag: off },
+            sprint,
+            ads_intent: ScopeWishArgs { sights_permitted: on, scoped_weapon: off, dash_keeps_scope: off },
+            ads_frac: ScopeBlendArgs {
+                scoped_aiming: off,
+                scope_raise_speed: rate,
+                scope_lower_speed: rate,
+                rack_bolt_when_scoped: on,
+                fire_only_when_scoped: off,
+                ..ScopeBlendArgs::default()
             },
-            sprint: SprintContext {
-                weapon_max_sprint_time: 4000,
-                sprint_forever: false,
-                min_sprint_time_seconds: 1.0,
-                sprint_delay_seconds: 0.0,
-                sprint_forward_minimum: 105,
-                stand_up_clear: true,
-                sprint_recharge_pause_seconds: 0.0,
-            },
-            ads_intent: AdsIntentContext {
-                ads_allowed: true,
-                weapon_def_scope: false,
-                sprint_hold_ads: false,
-            },
-            ads_frac: AdsFracContext {
-                aim_down_sight: false,
-                ads_in_rate: 1.0 / 200.0,
-                ads_out_rate: 1.0 / 200.0,
-                rechamber_while_ads: true,
-                ads_fire_only: false,
-                ..AdsFracContext::default()
-            },
-            melee_charge: MeleeChargeWeaponDelays {
-                melee_delay_ms: 0,
-                melee_charge_delay_ms: 0,
-            },
-            player_melee_range: crate::bridge::MELEE_CHARGE_PLAYER_MELEE_RANGE_DEFAULT,
-            old_buttons: 0,
+            melee_charge: LungeGunTimings { strike_wait_millis: 0, lunge_windup_wait_millis: 0 },
+            knife_reach: crate::bridge::MELEE_CHARGE_PLAYER_MELEE_RANGE_DEFAULT,
+            last_tick_buttons: 0,
             old_move: [0, 0],
-            weapon_blocks_prone: false,
+            gun_forbids_lying: off,
         }
     }
 
     /// A player standing on the floor at time 1000.
-    fn player() -> PlayerState {
-        let mut ps = PlayerState::ZERO;
-        ps.gravity = 800;
-        ps.speed = 190;
-        ps.move_speed_scale_multiplier = 1.0;
-        ps.ground_entity_num = 1022;
-        ps.view_height_target = 60;
-        ps.view_height_current = 60.0;
-        ps.command_time = 1000;
-        ps
+    fn player() -> AvatarState {
+        let mut avatar = AvatarState::ZERO;
+        avatar.gravity = 800_i32;
+        avatar.speed = 190;
+        avatar.run_speed_modifier = 1.0;
+        avatar.standing_on = 1022;
+        (avatar.eye_height_goal, avatar.eye_height_now) = (60, 60.0);
+        avatar.last_cmd_ms = 1000;
+        avatar
     }
 
     /// Runs one 50 ms frame with these keys; returns the command as the
     /// frame left it.
-    fn frame(ps: &mut PlayerState, forward: i8, right: i8) -> UserCmd {
-        let mut cmd = UserCmd {
-            server_time: ps.command_time + 50,
-            forwardmove: forward,
-            rightmove: right,
-            ..UserCmd::default()
+    fn frame(avatar: &mut AvatarState, ahead: i8, side: i8) -> InputCommand {
+        let mut ucmd = InputCommand {
+            authority_clock_ms: avatar.last_cmd_ms + 50,
+            thrust_ahead: ahead,
+            thrust_lateral: side,
+            ..InputCommand::default()
         };
         pmove(
-            ps,
-            &mut cmd,
-            context(),
+            avatar,
+            &mut ucmd,
+            frame_ctx(),
             &Floor,
-            &FlatMantleAnimLength::default(),
-            &ZeroMantleRootDelta,
+            &FixedClimbClipDuration::default(),
+            &StillClimbOffset,
         );
-        cmd
+        ucmd
     }
+
+    /// Frames run in the longer tests.
+    const FRAMES: usize = 20;
 
     #[test]
     fn holdrand_uses_whole_degrees_of_yaw() {
@@ -787,171 +760,171 @@ mod tests {
 
     #[test]
     fn walking_forward_reaches_the_walk_speed_on_the_floor() {
-        let mut ps = player();
-        for _ in 0..20 {
-            frame(&mut ps, 127, 0);
+        let mut avatar = player();
+        for _ in 0..FRAMES {
+            frame(&mut avatar, 127, 0);
         }
-        assert!(ps.origin[0] > 100.0, "{:?}", ps.origin);
-        assert!(ps.origin[2].abs() < 0.5, "{:?}", ps.origin);
-        assert_ne!(ps.ground_entity_num, ENTITYNUM_NONE);
-        assert!((ps.velocity[0] - 190.0).abs() < 2.0, "{:?}", ps.velocity);
+        assert!(avatar.origin[0] > 100.0, "{:?}", avatar.origin);
+        assert!(avatar.origin[2].abs() < 0.5, "{:?}", avatar.origin);
+        assert_ne!(avatar.standing_on, NO_ENTITY_SLOT);
+        assert!((avatar.velocity[0] - 190.0).abs() < 2.0, "{:?}", avatar.velocity);
     }
 
     #[test]
     fn a_late_command_catches_up_only_150_ms() {
-        let mut ps = player();
-        for _ in 0..20 {
-            frame(&mut ps, 127, 0);
+        let mut avatar = player();
+        for _ in 0..FRAMES {
+            frame(&mut avatar, 127, 0);
         }
-        let speed = ps.velocity[0];
-        let from = ps.origin[0];
-        let mut cmd = UserCmd {
-            server_time: ps.command_time + 500,
-            forwardmove: 127,
-            ..UserCmd::default()
+        let speed = avatar.velocity[0];
+        let from = avatar.origin[0];
+        let mut ucmd = InputCommand {
+            authority_clock_ms: avatar.last_cmd_ms + 500,
+            thrust_ahead: 127,
+            ..InputCommand::default()
         };
-        let late = cmd.server_time;
+        let late = ucmd.authority_clock_ms;
         pmove(
-            &mut ps,
-            &mut cmd,
-            context(),
+            &mut avatar,
+            &mut ucmd,
+            frame_ctx(),
             &Floor,
-            &FlatMantleAnimLength::default(),
-            &ZeroMantleRootDelta,
+            &FixedClimbClipDuration::default(),
+            &StillClimbOffset,
         );
-        assert_eq!((ps.command_time, cmd.server_time), (late, late));
-        let moved = ps.origin[0] - from;
+        assert_eq!((avatar.last_cmd_ms, ucmd.authority_clock_ms), (late, late));
+        let moved = avatar.origin[0] - from;
         assert!((moved - speed * 0.150).abs() < 1.0, "{moved} at {speed}");
     }
 
     #[test]
     fn a_knife_charge_runs_straight_ahead() {
-        let mut ps = player();
-        ps.pm_flags = pm_flags::MELEE_CHARGE;
-        let cmd = frame(&mut ps, 0, -50);
-        assert_eq!((cmd.forwardmove, cmd.rightmove), (127, 0));
+        let mut avatar = player();
+        avatar.movement_state_bits = movement_state_bits::MELEE_CHARGE;
+        let ucmd = frame(&mut avatar, 0, -50);
+        assert_eq!((ucmd.thrust_ahead, ucmd.thrust_lateral), (127, 0));
     }
 
     #[test]
     fn the_dead_do_not_walk() {
-        let mut ps = player();
-        ps.pm_type = PM_TYPE_DEAD;
-        let cmd = frame(&mut ps, 127, 127);
-        assert_eq!((cmd.forwardmove, cmd.rightmove), (0, 0));
-        assert!(ps.velocity[0].abs() < 1e-3, "{:?}", ps.velocity);
+        let mut avatar = player();
+        avatar.movement_mode = MOVE_KIND_DEAD;
+        let ucmd = frame(&mut avatar, 127, 127);
+        assert_eq!((ucmd.thrust_ahead, ucmd.thrust_lateral), (0, 0));
+        assert!(avatar.velocity[0].abs() < 1e-3, "{:?}", avatar.velocity);
     }
 
     #[test]
     fn a_dead_body_slides_to_a_stop() {
-        let mut ps = player();
-        ps.pm_type = PM_TYPE_DEAD;
-        ps.velocity = [100.0, 0.0, 0.0];
-        frame(&mut ps, 0, 0);
+        let mut avatar = player();
+        avatar.movement_mode = MOVE_KIND_DEAD;
+        avatar.velocity = [100.0, 0.0, 0.0];
+        frame(&mut avatar, 0, 0);
         // Dead drag 100 -> 80. BO2's ladder check then takes the dead off
         // the ground, so the frame runs the air move: no ground grip.
-        assert_eq!(ps.velocity, [80.0, 0.0, 0.0]);
-        frame(&mut ps, 0, 0);
+        assert_eq!(avatar.velocity, [80.0, 0.0, 0.0]);
+        frame(&mut avatar, 0, 0);
         // The frame's ground trace put the body back down, so the drag
         // runs again next frame.
-        assert_eq!(ps.velocity, [60.0, 0.0, 0.0]);
+        assert_eq!(avatar.velocity, [60.0, 0.0, 0.0]);
     }
 
     #[test]
     fn a_linked_player_is_held_still_off_any_ladder() {
-        let mut ps = player();
-        ps.pm_type = PM_TYPE_NORMAL_LINKED;
-        ps.pm_flags = pm_flags::LADDER;
-        ps.velocity = [100.0, 0.0, 50.0];
-        frame(&mut ps, 127, 0);
-        assert_eq!(ps.velocity, [0.0; 3]);
-        assert_eq!(ps.origin, [0.0; 3]);
-        assert_eq!(ps.ground_entity_num, ENTITYNUM_NONE);
-        assert_eq!(ps.pm_flags & (pm_flags::LADDER | pm_flags::LADDER_FALL), pm_flags::LADDER_FALL);
+        let mut avatar = player();
+        avatar.movement_mode = MOVE_MODE_WALK_ATTACHED;
+        avatar.movement_state_bits = movement_state_bits::LADDER;
+        avatar.velocity = [100.0, 0.0, 50.0];
+        frame(&mut avatar, 127, 0);
+        assert_eq!(avatar.velocity, [0.0; 3]);
+        assert_eq!(avatar.origin, [0.0; 3]);
+        assert_eq!(avatar.standing_on, NO_ENTITY_SLOT);
+        assert_eq!(avatar.movement_state_bits & (movement_state_bits::LADDER | movement_state_bits::LADDER_FALL), movement_state_bits::LADDER_FALL);
     }
 
     #[test]
     fn a_turret_holds_the_player_still() {
-        let mut ps = player();
-        ps.e_flags = 0x400;
-        ps.velocity = [100.0, 0.0, 0.0];
-        frame(&mut ps, 127, 0);
-        assert_eq!(ps.velocity, [0.0; 3]);
-        assert_eq!(ps.origin, [0.0; 3]);
+        let mut avatar = player();
+        avatar.e_flags = playerstate_t6::game::entity_flag_bits::TURRET_STAND;
+        avatar.velocity = [100.0, 0.0, 0.0];
+        frame(&mut avatar, 127, 0);
+        assert_eq!(avatar.velocity, [0.0; 3]);
+        assert_eq!(avatar.origin, [0.0; 3]);
     }
 
     #[test]
     fn going_down_leaves_the_turret() {
-        let mut ps = player();
-        ps.pm_type = PM_TYPE_LAST_STAND;
-        ps.e_flags = 0x400;
-        frame(&mut ps, 0, 0);
-        assert_eq!(ps.e_flags & EF_TURRET, 0);
+        let mut avatar = player();
+        avatar.movement_mode = MOVE_MODE_DOWNED;
+        avatar.e_flags = playerstate_t6::game::entity_flag_bits::TURRET_STAND;
+        frame(&mut avatar, 0, 0);
+        assert_eq!(avatar.e_flags & TURRET_MASK, 0);
     }
 
     #[test]
     fn the_end_of_match_screen_moves_nobody() {
-        let mut ps = player();
-        ps.pm_type = PM_TYPE_INTERMISSION;
-        ps.velocity = [100.0, 0.0, 0.0];
-        frame(&mut ps, 127, 0);
-        assert_eq!(ps.origin, [0.0; 3]);
+        let mut avatar = player();
+        avatar.movement_mode = MOVE_MODE_INTERLUDE;
+        avatar.velocity = [100.0, 0.0, 0.0];
+        frame(&mut avatar, 127, 0);
+        assert_eq!(avatar.origin, [0.0; 3]);
     }
 
     #[test]
     fn the_rules_are_always_bo2() {
-        let context = bo2_context(context());
-        assert_eq!(context.walk.cmd_scale.prone_lerp_ms, PRONE_LERP_MS);
+        let frame_ctx = bo2_context(frame_ctx());
+        assert_eq!(frame_ctx.walk.cmd_scale.prone_lerp_ms, PRONE_LERP_MS);
     }
 
     /// Runs one 50 ms frame holding these keys.
-    fn hold(ps: &mut PlayerState, keys: u32) -> PmoveResult {
-        let mut cmd = UserCmd {
-            server_time: ps.command_time + 50,
+    fn hold(avatar: &mut AvatarState, keys: u32) -> MotionTickOutcome {
+        let mut ucmd = InputCommand {
+            authority_clock_ms: avatar.last_cmd_ms + 50,
             buttons: keys,
-            ..UserCmd::default()
+            ..InputCommand::default()
         };
         pmove(
-            ps,
-            &mut cmd,
-            context(),
+            avatar,
+            &mut ucmd,
+            frame_ctx(),
             &Floor,
-            &FlatMantleAnimLength::default(),
-            &ZeroMantleRootDelta,
+            &FixedClimbClipDuration::default(),
+            &StillClimbOffset,
         )
     }
 
     #[test]
     fn lying_down_and_getting_up_go_by_crouch() {
-        let mut ps = player();
+        let mut avatar = player();
         let mut locked = false;
-        let mut last = hold(&mut ps, buttons::PRONE);
+        let mut last = hold(&mut avatar, buttons::LYING_FLAT);
         // Down to crouch height first (200 ms), then prone (600 ms).
-        assert_eq!(ps.view_height_target, view_height::CROUCH);
-        assert_eq!(last.bounds.maxs[2], 50.0);
-        for _ in 0..20 {
-            let was = ps.view_height_target;
-            last = hold(&mut ps, buttons::PRONE);
-            if was != view_height::PRONE && ps.view_height_target == view_height::PRONE {
+        assert_eq!(avatar.eye_height_goal, eye_level::DUCK_BUTTON_BIT);
+        assert_eq!(last.bounds.hi_corner[2], 50.0);
+        for _ in 0..FRAMES {
+            let was = avatar.eye_height_goal;
+            last = hold(&mut avatar, buttons::LYING_FLAT);
+            if was != eye_level::LYING_FLAT && avatar.eye_height_goal == eye_level::LYING_FLAT {
                 // Lying down holds the stance for 1.8 s.
-                locked = ps.pm_flags & pm_flags::JUMPING != 0 && ps.pm_time > 1700;
+                locked = avatar.movement_state_bits & movement_state_bits::JUMPING != 0 && avatar.move_timer > 1700;
             }
         }
         assert!(locked);
-        assert_eq!(ps.view_height_current, 11.0);
-        assert_eq!(ps.pm_flags & pm_flags::PRONE, pm_flags::PRONE);
-        assert_eq!(last.bounds.maxs[2], 30.0);
+        assert_eq!(avatar.eye_height_now, 11.0);
+        assert_eq!(avatar.movement_state_bits & movement_state_bits::LYING_FLAT, movement_state_bits::LYING_FLAT);
+        assert_eq!(last.bounds.hi_corner[2], 30.0);
 
         // Letting go: the get-up animation once, then up by way of crouch.
-        let first = hold(&mut ps, 0);
+        let first = hold(&mut avatar, 0);
         assert_eq!(first.stance_event, Some(16));
         assert!(first.reset_torso);
-        assert_eq!(ps.view_height_target, view_height::CROUCH);
-        for _ in 0..20 {
-            last = hold(&mut ps, 0);
+        assert_eq!(avatar.eye_height_goal, eye_level::DUCK_BUTTON_BIT);
+        for _ in 0..FRAMES {
+            last = hold(&mut avatar, 0);
             assert_eq!(last.stance_event, None);
         }
-        assert_eq!(ps.view_height_current, 60.0);
-        assert_eq!(ps.pm_flags & (pm_flags::PRONE | pm_flags::CROUCH), 0);
-        assert_eq!(last.bounds.maxs[2], 70.0);
+        assert_eq!(avatar.eye_height_now, 60.0);
+        assert_eq!(avatar.movement_state_bits & (movement_state_bits::LYING_FLAT | movement_state_bits::DUCK_BUTTON_BIT), 0);
+        assert_eq!(last.bounds.hi_corner[2], 70.0);
     }
 }

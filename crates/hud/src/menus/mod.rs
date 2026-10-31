@@ -2,8 +2,9 @@
 //! own UI (`ui::lui_hud`, published as `frame::LuiMenus`).
 
 use bevy::prelude::*;
-use frame::{AppScreen, LuiMenus};
-use net::{LocalPresentClient, PresentedSnapshot};
+use frame::ShellScreen;
+use frame::LuiMenus;
+use net::{HostViewClient, ShownWorldFrame};
 
 #[derive(Resource, Default)]
 pub struct ScriptMenus {
@@ -20,21 +21,21 @@ impl ScriptMenus {
 /// menu only counts in the front end, or in a match once the local client
 /// appears in the presented snapshot.
 pub(crate) fn track_lui_menus(
-    screen: Res<AppScreen>,
-    presented: Res<PresentedSnapshot>,
-    local: Res<LocalPresentClient>,
+    app_screen: Res<ShellScreen>,
+    presented: Res<ShownWorldFrame>,
+    local: Res<HostViewClient>,
     lui: Option<Res<LuiMenus>>,
     mut menus: ResMut<ScriptMenus>,
-    hud_input: Option<ResMut<frame::HudInputView>>,
+    hud_input: Option<ResMut<frame::OverlayControlSnapshot>>,
 ) {
     let local_in_snapshot = || {
-        presented
-            .snapshot()
+        let shown = presented.snapshot();
+        shown
             .is_some_and(|snap| snap.meta.for_client(local.0).is_some())
     };
-    let menus_apply = match *screen {
-        AppScreen::MainMenu => true,
-        AppScreen::InGame | AppScreen::ClassSelect => local_in_snapshot(),
+    let menus_apply = match *app_screen {
+        ShellScreen::MainMenu => true,
+        ShellScreen::InGame | ShellScreen::KitPicker => local_in_snapshot(),
         _ => false,
     };
     let open = menus_apply && lui.is_some_and(|lui| lui.open);

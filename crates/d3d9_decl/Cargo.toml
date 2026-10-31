@@ -2,7 +2,7 @@
 name = "d3d9_decl"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
+publish.workspace = true
 description = "D3D9 vertex declaration element types and usage semantics."
 
 [lints]

@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 
-use bevy::prelude::{Message, Resource};
+use bevy::{ecs::message::Message, ecs::resource::Resource};
 
 /// The state of the party, for the menu to show.
 #[derive(Resource, Debug, Default)]
 pub struct UiPartyState {
-    pub active: bool,
+    pub in_party: bool,
     pub in_lobby: bool,
     pub is_host: bool,
 }
@@ -20,9 +20,8 @@ pub struct UiMenuDvars {
 
 impl UiMenuDvars {
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.values
-            .get(&name.to_ascii_lowercase())
-            .map(String::as_str)
+        let key = name.to_ascii_lowercase();
+        self.values.get(&key).map(String::as_str)
     }
 
     pub fn set(&mut self, name: &str, value: impl Into<String>) {
@@ -63,6 +62,16 @@ pub struct WorldDim(pub f32);
 /// How many open menus dim the world.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MenuDims(pub u32);
+
+/// bo2zm: the full-screen filter a Black Ops II script turns on (its
+/// visionset manager's overlay; Mob's Afterlife is `zm_afterlife_filter`,
+/// drawn with `generic_filter_afterlife_alcatraz`): the filter's material
+/// and how far it has faded in (0..1).
+#[derive(Resource, Clone, Default, Debug, PartialEq)]
+pub struct ScriptScreenFilter {
+    pub material: Option<String>,
+    pub amount: f32,
+}
 
 /// A solo game is paused.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -106,13 +115,8 @@ mod tests {
 
     #[test]
     fn menus_start_inactive_and_the_world_untouched() {
-        assert_eq!(
-            LuiMenus::default(),
-            LuiMenus {
-                active: false,
-                open: false
-            }
-        );
+        let menus = LuiMenus::default();
+        assert!(!menus.active && !menus.open);
         assert_eq!(WorldBlur::default(), WorldBlur(0.0));
         assert_eq!(WorldDim::default(), WorldDim(0.0));
         assert_eq!(MenuDims::default(), MenuDims(0));
@@ -122,7 +126,7 @@ mod tests {
     #[test]
     fn no_party_and_no_rules_by_default() {
         let party = UiPartyState::default();
-        assert!(!party.active && !party.in_lobby && !party.is_host);
+        assert!(!party.in_party && !party.in_lobby && !party.is_host);
         assert!(HostMatchRules::default().0.is_empty());
     }
 }

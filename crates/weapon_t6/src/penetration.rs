@@ -3,153 +3,149 @@
 
 use crate::surface::SURFACE_TYPE_COUNT;
 
-pub const PENETRATE_TYPE_COUNT: usize = 4;
-
+/// Penetrate types: none, then the three sizes `bullet_penetration_mp` names.
+pub const PIERCE_CLASS_TOTAL: usize = 4;
 /// Surfaces a depth table holds: BO2's `penetrationDepthTable` is 4 types by 32 surfaces.
 pub const PEN_TABLE_SURF_COUNT: usize = SURFACE_TYPE_COUNT;
 
-pub const SURF_NOPENETRATE: u32 = 0x100;
+/// Surface and contents bits, and the flesh surface type.
+pub const FACE_BLOCKS_BULLETS: u32 = 0x100;
+pub const BRUSH_IS_PANE: u32 = 0x10;
+pub const FACE_KIND_BODY: u32 = 7;
 
-pub const CONTENTS_GLASS: u32 = 0x10;
+/// How many surfaces a bullet may pass, normally and with extended penetration.
+pub const PIERCE_PASS_LIMIT: usize = 5;
+pub const PIERCE_LONG_PASS_LIMIT: usize = 12;
 
-pub const SURF_TYPE_FLESH: u32 = 7;
+/// How far past a face the forward and reverse traces restart. The reverse trace also ends this far short of the
+/// entry point (bo2mp Bullet_FirePenetrate).
+pub const STEP_FORECAST_NUDGE: f32 = 0.135;
+pub const STEP_BACKCAST_NUDGE: f32 = 0.01;
+/// A bullet this close to grazing a world face does not advance through it.
+pub const STEP_ON_COSINE_FLOOR: f32 = 0.125;
 
-pub const MAX_PENETRATE_STEPS: usize = 5;
-
-pub const MAX_EXTENDED_STEPS: usize = 12;
-
-pub const ADVANCE_TRACE_FWD: f32 = 0.135;
-
-pub const ADVANCE_TRACE_REV: f32 = 0.01;
-
-/// TODO(fact): how far past the exit the reverse trace starts, kept from the older code
-/// (BO2's own reverse offset is ADVANCE_TRACE_REV).
-pub const REV_END_EPS: f32 = 2.0;
-
-pub const ADVANCE_DOT_MIN: f32 = 0.125;
-
-pub const RIFLE_COLLATERAL_SCALE: f32 = 0.5;
+/// What a rifle bullet keeps for the next victim.
+pub const RIFLE_PASS_THROUGH_FACTOR: f32 = 0.5;
 
 /// `perk_bulletPenetrationMultiplier`'s registered default (2.0, weapon-hits-pen-t6.md 3.8):
 /// how much deeper a bullet goes with the bullet penetration perk, times the table's depth.
 pub const PERK_BULLET_PENETRATION_MULTIPLIER_DEFAULT: f32 = 2.0;
 
-pub const PEN_THICKNESS_FLOOR: f32 = 1.0;
+/// The thinnest a passed surface counts as.
+pub const PIERCE_DEPTH_MINIMUM: f32 = 1.0;
 
+/// The penetration side of one weapon's bullet.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BulletPenFacts {
-    pub penetrate_type: i32,
-
-    pub penetrate_multiplier: f32,
-
-    pub rifle_bullet: bool,
-
+pub struct PierceCapability {
+    pub wall_pierce_class: i32,
+    pub wall_pierce_scale: f32,
+    pub long_gun_round: bool,
     /// bo2mp: bBulletImpactExplode (exploding bullets never penetrate).
     pub impact_explode: bool,
 }
 
-impl Default for BulletPenFacts {
-    fn default() -> Self {
-        Self {
-            penetrate_type: 0,
-            penetrate_multiplier: 1.0,
-            rifle_bullet: false,
-            impact_explode: false,
-        }
-    }
-}
+impl PierceCapability {
+    /// A bullet that goes through nothing, at the plain depth.
+    const SOLID: Self = Self {
+        wall_pierce_class: 0,
+        wall_pierce_scale: 1.0,
+        long_gun_round: false,
+        impact_explode: false,
+    };
 
-impl BulletPenFacts {
     /// bo2mp: BO2 penetrates with a penetrate type and no exploding bullets; it never
     /// reads bullet_penetrationEnabled.
     pub const fn pen_gate(self) -> bool {
-        self.penetrate_type != 0 && !self.impact_explode
+        !self.impact_explode && self.wall_pierce_class != 0
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PenetrationDepthTable {
-    depths: [[f32; PEN_TABLE_SURF_COUNT]; PENETRATE_TYPE_COUNT],
-}
-
-impl Default for PenetrationDepthTable {
+impl Default for PierceCapability {
     fn default() -> Self {
-        Self::empty()
+        Self::SOLID
     }
 }
 
-impl PenetrationDepthTable {
+/// How deep each penetrate type goes into each surface type.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BulletPierceDepthChart {
+    by_class: [[f32; PEN_TABLE_SURF_COUNT]; PIERCE_CLASS_TOTAL],
+}
+
+impl BulletPierceDepthChart {
+    /// Every depth zero.
     pub const fn empty() -> Self {
-        Self {
-            depths: [[0.0; PEN_TABLE_SURF_COUNT]; PENETRATE_TYPE_COUNT],
+        Self { by_class: [[0f32; PEN_TABLE_SURF_COUNT]; PIERCE_CLASS_TOTAL] }
+    }
+
+    /// Sets one cell; a cell off the table is ignored.
+    pub fn put_depth(&mut self, wall_pierce_class: usize, surf_kind: usize, on: f32) {
+        let cell = self.by_class.get_mut(wall_pierce_class).and_then(|row| row.get_mut(surf_kind));
+        if let Some(cell) = cell {
+            *cell = on;
         }
     }
 
-    pub const fn from_depths(depths: [[f32; PEN_TABLE_SURF_COUNT]; PENETRATE_TYPE_COUNT]) -> Self {
-        Self { depths }
-    }
-
-    pub fn set_depth(&mut self, penetrate_type: usize, surface_type: usize, value: f32) {
-        if penetrate_type < PENETRATE_TYPE_COUNT && surface_type < PEN_TABLE_SURF_COUNT {
-            self.depths[penetrate_type][surface_type] = value;
-        }
-    }
-
-    pub fn depth(self, penetrate_type: i32, surface_type: u32) -> f32 {
-        let pt = penetrate_type as usize;
-        let st = surface_type as usize;
-        if pt == 0 || pt >= PENETRATE_TYPE_COUNT || st >= PEN_TABLE_SURF_COUNT || st == 0 {
+    /// The depth for a penetrate type into a surface type; 0 for type or surface 0, or
+    /// either off the table.
+    pub fn depth(self, wall_pierce_class: i32, surf_kind: u32) -> f32 {
+        let (row, col) = (wall_pierce_class as usize, surf_kind as usize);
+        if row == 0 || col == 0 {
             return 0.0;
         }
-        self.depths[pt][st]
+        self.by_class.get(row).and_then(|r| r.get(col)).copied().unwrap_or(0.0)
     }
 }
 
-pub fn depth_surface_type(surface_flags: u32, last_surface_type: u32) -> u32 {
-    if surface_flags & SURF_NOPENETRATE != 0 {
-        return 0;
+impl Default for BulletPierceDepthChart {
+    fn default() -> Self {
+        BulletPierceDepthChart::empty()
     }
-    // bo2mp: BO2's surface type is 6 bits.
-    let mut surf = (surface_flags >> 20) & 0x3f;
-    if surf == 0 && last_surface_type != 0 {
-        surf = last_surface_type;
-    }
-    surf
 }
 
+/// The surface type a hit's depth is read for: none on a no-penetrate face, else the
+/// face's own (6 bits in BO2), falling back to the last one when the face has none.
+pub fn pierce_face_kind(surface_flags: u32, prev_surf: u32) -> u32 {
+    let own = (surface_flags >> 20) & 0x3f;
+    match (surface_flags & FACE_BLOCKS_BULLETS != 0, own) {
+        (true, _) => 0,
+        (false, 0) if prev_surf != 0 => prev_surf,
+        (false, own) => own,
+    }
+}
+
+/// Where the trace goes on from after a hit: `dist` further along `dir` past a world
+/// face, measured square to the face; `None` when the bullet meets the face too
+/// glancingly. Entities, or no distance, start at the hit itself.
 pub fn advance_trace(
-    hit_pos: [f32; 3],
-    normal: [f32; 3],
+    impact_point: [f32; 3],
+    surface_normal: [f32; 3],
     dir: [f32; 3],
-    hit_is_world: bool,
+    struck_world: bool,
     dist: f32,
 ) -> Option<[f32; 3]> {
-    if hit_is_world && dist > 0.0 {
-        let dot = -(normal[0] * dir[0] + normal[1] * dir[1] + normal[2] * dir[2]);
-        if dot < ADVANCE_DOT_MIN {
-            return None;
+    let through_world = struck_world && dist > 0.0;
+    if !through_world {
+        return Some(impact_point);
+    }
+    let into_face = -(surface_normal[0] * dir[0] + surface_normal[1] * dir[1] + surface_normal[2] * dir[2]);
+    match into_face < STEP_ON_COSINE_FLOOR {
+        true => None,
+        false => {
+            let along = dist / into_face;
+            Some(core::array::from_fn(|i| impact_point[i] + along * dir[i]))
         }
-        let offset = dist / dot;
-        Some(vec3_mad(hit_pos, offset, dir))
-    } else {
-        Some(hit_pos)
     }
 }
 
-fn vec3_mad(a: [f32; 3], s: f32, b: [f32; 3]) -> [f32; 3] {
-    [a[0] + s * b[0], a[1] + s * b[1], a[2] + s * b[2]]
-}
+/// The size prefixes of `bullet_penetration_mp` keys, by penetrate type from 1.
+const PEN_SIZES: [&str; 3] = ["small", "medium", "large"];
 
 /// A `bullet_penetration_mp` key ("small_<surface>", "medium_..", "large_..") as
 /// (penetrate type, surface) against a surface list (BO2: `T6_SURFACE_TYPE_NAMES`).
 pub fn split_pen_key_in(key: &str, surface_names: &[&str]) -> Option<(usize, usize)> {
-    let (prefix, surf_name) = key.split_once('_')?;
-    let ptype = match prefix {
-        "small" => 1usize,
-        "medium" => 2,
-        "large" => 3,
-        _ => return None,
-    };
-    let surf = surface_names.iter().position(|&n| n == surf_name)?;
-    Some((ptype, surf))
+    let (size, surface) = key.split_once('_')?;
+    let pierce_class = 1 + PEN_SIZES.iter().position(|s| *s == size)?;
+    let surf = surface_names.iter().position(|name| *name == surface)?;
+    Some((pierce_class, surf))
 }

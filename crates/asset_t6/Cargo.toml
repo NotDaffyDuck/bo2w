@@ -1,14 +1,12 @@
-[package]
-name = "asset_t6"
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-description = "bo2zm: Black Ops II zone captures and image packs, turned into engine data."
+# Black Ops II zone captures and image packs, read into engine data.
+package.name = "asset_t6"
+package.version = "0.1.0"
+package.edition.workspace = true
+package.publish.workspace = true
+package.description = "bo2zm: Black Ops II zone captures and image packs, turned into engine data."
 
-[dependencies]
-asset_transport.workspace = true
-fastfile_t6.workspace = true
-ipak_t6.workspace = true
+lints.workspace = true
 
-[lints]
-workspace = true
+dependencies.asset_transport.workspace = true
+dependencies.fastfile_t6.workspace = true
+dependencies.ipak_t6.workspace = true

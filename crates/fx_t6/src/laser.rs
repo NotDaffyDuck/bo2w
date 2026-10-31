@@ -4,12 +4,12 @@
 //! TODO(fact): the laser builder's argument roles are [read, inferred]; a
 //! laser-sight shot pair settles them.
 
-use crate::beam::{FxBeamKind, FxBeamTess, beam_color_key};
-use crate::post_light::FxPostLight;
+use crate::beam::{FxBeamKind, EffectBeamStitch, beam_color_key};
+use crate::late_lighting::AfterglowSprite;
 use crate::runtime::vec3_distance;
 
 /// The attach point on the gun (item 9).
-pub const FX_LASER_TAG: &str = "tag_laser";
+pub const AIM_BEAM_JOINT: &str = "tag_laser";
 
 /// CG_LaserAdd holds this many entities a frame (item 10); MW2 held 48.
 pub const FX_LASER_ADD_CAP: usize = 96;
@@ -43,13 +43,13 @@ pub struct FxLaserDvars {
     /// TODO(fact): its default is not found; on, as MW2's was.
     pub light: bool,
     pub range: f32,
-    pub range_player: f32,
+    pub viewer_reach: f32,
     pub light_range_player: f32,
     pub radius: f32,
     pub light_radius: f32,
     pub light_begin_offset: f32,
     pub light_end_offset: f32,
-    pub end_offset: f32,
+    pub finish_shift: f32,
     pub light_body_tweak: f32,
     pub flare_pct: f32,
     pub fade_ads: bool,
@@ -58,15 +58,15 @@ pub struct FxLaserDvars {
 impl Default for FxLaserDvars {
     fn default() -> Self {
         Self {
-            light: true,
+            light: !false,
             range: 1500.0,
-            range_player: 2000.0,
+            viewer_reach: 2000.0,
             light_range_player: 2000.0,
             radius: 0.35,
             light_radius: 0.45,
             light_begin_offset: 10.0,
             light_end_offset: -1.0,
-            end_offset: -2.0,
+            finish_shift: -2.0,
             light_body_tweak: 15.0,
             flare_pct: 0.25,
             fade_ads: true,
@@ -77,18 +77,17 @@ impl Default for FxLaserDvars {
 impl FxLaserDvars {
     /// The local player's own laser reaches further (item 2).
     #[must_use]
-    pub const fn range_for(&self, local_player: bool) -> f32 {
-        if local_player {
-            self.range_player
-        } else {
-            self.range
+    pub const fn range_for(&self, is_own_player: bool) -> f32 {
+        match is_own_player {
+            true => self.viewer_reach,
+            false => self.range,
         }
     }
 
     /// The light's own, longer trace when the beam hit nothing (item 8).
     #[must_use]
-    pub fn light_retrace_range(&self, local_player: bool, hit: FxLaserHit) -> Option<f32> {
-        (local_player && hit.fraction >= 1.0 && self.light_range_player > self.range_player)
+    pub fn light_retrace_range(&self, is_own_player: bool, hit: FxLaserHit) -> Option<f32> {
+        (is_own_player && hit.fraction >= 1.0 && self.light_range_player > self.viewer_reach)
             .then_some(self.light_range_player)
     }
 }
@@ -97,15 +96,15 @@ impl FxLaserDvars {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FxLaserHit {
     pub fraction: f32,
-    pub surface_flags: u32,
-    pub startsolid: bool,
+    pub face_bits: u32,
+    pub began_inside: bool,
 }
 
 impl FxLaserHit {
     pub const MISS: Self = Self {
-        fraction: 1.0,
-        surface_flags: 0,
-        startsolid: false,
+        fraction: 1.0_f32,
+        face_bits: 0_u32,
+        began_inside: !true,
     };
 }
 
@@ -113,20 +112,20 @@ impl FxLaserHit {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FxLaserAim {
     pub origin: [f32; 3],
-    pub dir: [f32; 3],
+    pub heading: [f32; 3],
     pub range: f32,
     /// The local player's own gun, drawn first person (item 6).
     pub viewmodel: bool,
     /// The owner's weapon position fraction, 1 at full ADS (item 5).
-    pub weapon_pos_frac: f32,
+    pub gun_raise_share: f32,
 }
 
 /// The beam and light one laser draws this frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FxLaserSight {
-    pub beam: FxBeamTess,
+    pub beam: EffectBeamStitch,
     pub material: &'static str,
-    pub light: Option<FxPostLight>,
+    pub light: Option<AfterglowSprite>,
 }
 
 /// How much the far end widens: 1 + flare x distance x 0.01 (item 1).
@@ -139,12 +138,11 @@ pub fn laser_flare(flare_pct: f32, view_dist: f32) -> f32 {
 /// The sight fades out as the gun comes up to ADS (item 5).
 #[inline]
 #[must_use]
-pub fn laser_alpha(fade_ads: bool, weapon_pos_frac: f32) -> f32 {
-    if fade_ads {
-        1.0 - weapon_pos_frac.clamp(0.0, 1.0)
-    } else {
-        1.0
+pub fn laser_alpha(fade_ads: bool, gun_raise_share: f32) -> f32 {
+    if !fade_ads {
+        return 1.0;
     }
+    1.0 - gun_raise_share.clamp(0.0, 1.0)
 }
 
 /// A cached trace is redone only on every 4th frame per entity (item 2).
@@ -158,17 +156,17 @@ pub const fn laser_trace_due(frame: u32, entity: u32) -> bool {
 #[inline]
 #[must_use]
 pub fn laser_light_span(begin: f32, end: f32) -> (f32, f32) {
-    if end - begin < FX_LASER_LIGHT_MIN_SPAN {
-        let mid = (begin + end) * 0.5;
-        (mid - FX_LASER_LIGHT_SPAN_PAD, mid + FX_LASER_LIGHT_SPAN_PAD)
-    } else {
-        (begin, end)
+    match (begin + end) * 0.5 {
+        mid if end - begin < FX_LASER_LIGHT_MIN_SPAN => {
+            (mid - FX_LASER_LIGHT_SPAN_PAD, mid + FX_LASER_LIGHT_SPAN_PAD)
+        }
+        _ => (begin, end),
     }
 }
 
 #[inline]
-fn point_on_ray(origin: [f32; 3], dir: [f32; 3], t: f32) -> [f32; 3] {
-    core::array::from_fn(|i| origin[i] + dir[i] * t)
+fn point_on_ray(origin: [f32; 3], heading: [f32; 3], k: f32) -> [f32; 3] {
+    core::array::from_fn(|i| origin[i] + heading[i] * k)
 }
 
 /// The beam and light for one laser (items 1, 3-8, 11). `light_hit` is the
@@ -182,62 +180,64 @@ pub fn laser_sight(
     light_hit: Option<(f32, FxLaserHit)>,
     view: [f32; 3],
 ) -> Option<FxLaserSight> {
-    if hit.startsolid {
-        return None;
-    }
-    let hit_dist = hit.fraction * aim.range;
-    let end = point_on_ray(aim.origin, aim.dir, hit_dist - dvars.end_offset);
-    let flare = laser_flare(dvars.flare_pct, vec3_distance(end, view));
-
-    let a = laser_alpha(dvars.fade_ads, aim.weapon_pos_frac);
-    let begin_color = beam_color_key([a; 4]);
-    let end_color = beam_color_key([a, a, a, (1.0 - hit.fraction) * a * a]);
-    let beam = FxBeamTess {
-        kind: FxBeamKind::Laser {
-            end_radius: dvars.radius * flare,
-        },
-        depth_hack: aim.viewmodel,
-        draw_surf_override: if aim.viewmodel {
-            FX_LASER_VIEWMODEL_DRAW_SURF_OVERRIDE
-        } else {
-            0
-        },
-        begin: aim.origin,
-        end,
-        colors: [begin_color, end_color, [0; 4], [0; 4], [0; 4]],
-        radius: dvars.radius,
-        segment_count: 1,
-    };
-    let material = if aim.viewmodel {
-        FX_LASER_VIEWMODEL_MATERIAL
-    } else {
-        FX_LASER_MATERIAL
-    };
-
-    // TODO(fact): the light also needs "the light enum ON"; which state that
-    // enum reads is not named, so every drawn laser counts as on.
-    let light = dvars.light.then(|| {
-        let (light_dist, light_flags) = match light_hit {
-            Some((range, h)) => (h.fraction * range, h.surface_flags),
-            None => (hit_dist, hit.surface_flags),
+    (!hit.began_inside).then(|| {
+        let hit_dist = hit.fraction * aim.range;
+        let end = point_on_ray(aim.origin, aim.heading, hit_dist - dvars.finish_shift);
+        let flare = laser_flare(dvars.flare_pct, vec3_distance(end, view));
+        let a = laser_alpha(dvars.fade_ads, aim.gun_raise_share);
+        let begin_color = beam_color_key([a; 4]);
+        let ease_off = (1.0 - hit.fraction) * a * a;
+        let (mat_name, draw_surf_override) = match aim.viewmodel {
+            true => (
+                FX_LASER_VIEWMODEL_MATERIAL,
+                FX_LASER_VIEWMODEL_DRAW_SURF_OVERRIDE,
+            ),
+            false => (FX_LASER_MATERIAL, 0),
         };
-        let mut end_t = light_dist - dvars.light_end_offset;
-        if light_flags & FX_LASER_LIGHT_BODY_SURF != 0 {
-            end_t += dvars.light_body_tweak;
+        let beam = EffectBeamStitch {
+            kind: FxBeamKind::Laser {
+                finish_reach: dvars.radius * flare,
+            },
+            near_layer_draw: aim.viewmodel,
+            draw_surf_override,
+            begin: aim.origin,
+            end,
+            colors: [
+                begin_color,
+                beam_color_key([a, a, a, ease_off]),
+                [0; 4],
+                [0; 4],
+                [0; 4],
+            ],
+            radius: dvars.radius,
+            piece_tally: 1,
+        };
+        let light = dvars.light.then(|| {
+            let (light_dist, light_flags) = light_hit
+                .map(|(range, h)| (h.fraction * range, h.face_bits))
+                .unwrap_or((hit_dist, hit.face_bits));
+            let body_extra = if light_flags & FX_LASER_LIGHT_BODY_SURF != 0 {
+                dvars.light_body_tweak
+            } else {
+                0.0
+            };
+            let (from, to) = laser_light_span(
+                dvars.light_begin_offset,
+                light_dist - dvars.light_end_offset + body_extra,
+            );
+            AfterglowSprite {
+                begin: point_on_ray(aim.origin, aim.heading, from),
+                end: point_on_ray(aim.origin, aim.heading, to),
+                radius: dvars.light_radius * flare,
+                tint_word: u32::from_le_bytes(begin_color),
+                surface_title: FX_LASER_LIGHT_MATERIAL,
+            }
+        });
+        FxLaserSight {
+            beam,
+            material: mat_name,
+            light,
         }
-        let (begin_t, end_t) = laser_light_span(dvars.light_begin_offset, end_t);
-        FxPostLight {
-            begin: point_on_ray(aim.origin, aim.dir, begin_t),
-            end: point_on_ray(aim.origin, aim.dir, end_t),
-            radius: dvars.light_radius * flare,
-            color_packed: u32::from_le_bytes(begin_color),
-            material_name: FX_LASER_LIGHT_MATERIAL,
-        }
-    });
-    Some(FxLaserSight {
-        beam,
-        material,
-        light,
     })
 }
 
@@ -264,7 +264,12 @@ impl FxLaserTraceCache {
         entity: u32,
         trace: impl FnOnce() -> FxLaserHit,
     ) -> FxLaserHit {
-        if let Some(slot) = self.slots.iter_mut().flatten().find(|s| s.entity == entity) {
+        let known = self
+            .slots
+            .iter()
+            .position(|s| s.is_some_and(|s| s.entity == entity));
+        if let Some(at) = known {
+            let slot = self.slots[at].as_mut().expect("position found it");
             if laser_trace_due(frame, entity) {
                 slot.hit = trace();
             }
@@ -272,15 +277,11 @@ impl FxLaserTraceCache {
             return slot.hit;
         }
         let hit = trace();
-        let slot = self
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                (0..FX_LASER_TRACE_CACHE_SLOTS)
-                    .max_by_key(|&i| self.slots[i].map_or(u32::MAX, |s| frame.wrapping_sub(s.used)))
-                    .unwrap_or(0)
-            });
+        // A free slot first, otherwise the one idle the longest.
+        let age = |i: usize| self.slots[i].map_or(u32::MAX, |s| frame.wrapping_sub(s.used));
+        let free = self.slots.iter().position(|held| held.is_none());
+        let stalest = || (0..FX_LASER_TRACE_CACHE_SLOTS).max_by_key(|&i| age(i)).unwrap_or(0);
+        let slot = free.unwrap_or_else(stalest);
         self.slots[slot] = Some(CachedTrace {
             entity,
             hit,
@@ -294,21 +295,21 @@ impl FxLaserTraceCache {
 mod tests {
     use super::*;
 
-    fn aim(viewmodel: bool, weapon_pos_frac: f32) -> FxLaserAim {
+    fn aim(viewmodel: bool, gun_raise_share: f32) -> FxLaserAim {
         FxLaserAim {
-            origin: [0.0; 3],
-            dir: [1.0, 0.0, 0.0],
+            origin: Default::default(),
+            heading: [1.0, 0.0, 0.0],
             range: 2000.0,
             viewmodel,
-            weapon_pos_frac,
+            gun_raise_share,
         }
     }
 
-    fn hit(fraction: f32, surface_flags: u32) -> FxLaserHit {
+    fn hit(fraction: f32, flag_bits: u32) -> FxLaserHit {
         FxLaserHit {
             fraction,
-            surface_flags,
-            startsolid: false,
+            face_bits: flag_bits,
+            began_inside: !true,
         }
     }
 
@@ -319,7 +320,7 @@ mod tests {
         assert_eq!(s.beam.end, [1002.0, 0.0, 0.0]);
         assert_eq!(s.beam.radius, 0.35);
         let want = 0.35 * (1.0 + 0.25 * 1002.0 * 0.01);
-        assert!((s.beam.end_radius() - want).abs() < 1e-5);
+        assert!((s.beam.finish_reach() - want).abs() < 1e-5);
         assert_eq!(s.material, FX_LASER_MATERIAL);
         assert_eq!(s.beam.draw_surf_override(), 0x18);
     }
@@ -330,17 +331,17 @@ mod tests {
         let hip = laser_sight(&d, aim(true, 0.0), hit(0.5, 0), None, [0.0; 3]).unwrap();
         assert_eq!(hip.beam.colors[0], [255; 4]);
         assert_eq!(hip.beam.colors[1], [255, 255, 255, 128]);
-        assert_eq!(hip.light.unwrap().color_packed, u32::MAX);
+        assert_eq!(hip.light.unwrap().tint_word, u32::MAX);
         let ads = laser_sight(&d, aim(true, 1.0), hit(0.5, 0), None, [0.0; 3]).unwrap();
         assert_eq!(ads.beam.colors[0], [0; 4]);
-        assert_eq!(ads.light.unwrap().color_packed, 0);
+        assert_eq!(ads.light.unwrap().tint_word, 0);
     }
 
     #[test]
     fn the_first_person_beam_takes_the_viewmodel_material_and_depth_hack() {
         let d = FxLaserDvars::default();
         let s = laser_sight(&d, aim(true, 0.0), hit(1.0, 0), None, [0.0; 3]).unwrap();
-        assert!(s.beam.depth_hack);
+        assert!(s.beam.near_layer_draw);
         assert_eq!(s.beam.draw_surf_override(), 0xf);
         assert_eq!(s.material, FX_LASER_VIEWMODEL_MATERIAL);
     }
@@ -351,7 +352,7 @@ mod tests {
         let s = laser_sight(&d, aim(false, 0.0), hit(0.05, 0), None, [0.0; 3]).unwrap();
         let light = s.light.unwrap();
         assert_eq!((light.begin[0], light.end[0]), (10.0, 101.0));
-        assert!((light.radius - 0.45 * s.beam.end_radius() / 0.35).abs() < 1e-5);
+        assert!((light.radius - 0.45 * s.beam.finish_reach() / 0.35).abs() < 1e-5);
         let body = laser_sight(&d, aim(false, 0.0), hit(0.05, 0x8000), None, [0.0; 3]).unwrap();
         assert_eq!(body.light.unwrap().end[0], 116.0);
         let close = laser_sight(&d, aim(false, 0.0), hit(0.005, 0), None, [0.0; 3]).unwrap();
@@ -365,7 +366,7 @@ mod tests {
     fn nothing_draws_from_inside_solid_and_the_light_has_its_own_gate() {
         let mut d = FxLaserDvars::default();
         let solid = FxLaserHit {
-            startsolid: true,
+            began_inside: true,
             ..FxLaserHit::MISS
         };
         assert!(laser_sight(&d, aim(false, 0.0), solid, None, [0.0; 3]).is_none());

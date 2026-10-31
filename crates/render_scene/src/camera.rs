@@ -4,55 +4,50 @@ use bevy::prelude::*;
 
 /// Where the game says the view is: an origin and pitch/yaw/roll in degrees.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WorldCameraPose {
+pub struct WorldEyePlacement {
     pub origin: [f32; 3],
-    pub angles: [f32; 3],
+    pub turn: [f32; 3],
 }
 
 /// Marks the camera that renders the player's view.
 #[derive(Component)]
-pub struct FpvLens;
+pub struct FirstPersonLens;
 
 /// A free camera the player flies by hand.
 #[derive(Component)]
-pub struct FlyCamera {
-    pub yaw: f32,
-    pub pitch: f32,
-    pub speed: f32,
+pub struct FreeRoamCamera {
+    pub turn_deg: f32,
+    pub tilt: f32,
+    pub pace: f32,
 }
 
 /// Whether the simulation drives the camera, and whether the fly camera holds still meanwhile.
 #[derive(Resource, Clone, Copy, Debug, Default)]
-pub struct SimCamera {
+pub struct GameplayCamera {
     pub enabled: bool,
-    pub freeze_fly: bool,
+    pub hold_free_camera: bool,
 }
 
 /// The camera transform for a game view. The game looks along +X with +Z up and
 /// roll leaning the view; the transform looks along its own -Z with +Y up, so the
 /// rotation takes the game's right, up and negated forward as its columns.
-pub fn transform_from_iw_view(view: WorldCameraPose) -> Transform {
-    let [pitch, yaw, roll] = view.angles.map(f32::to_radians);
-    let (sin_p, cos_p) = pitch.sin_cos();
-    let (sin_y, cos_y) = yaw.sin_cos();
-    let (sin_r, cos_r) = roll.sin_cos();
+pub fn transform_from_game_view(view: WorldEyePlacement) -> Transform {
+    let WorldEyePlacement { origin: at, turn } = view;
+    let [(sin_p, cos_p), (sin_y, cos_y), (sin_r, cos_r)] = turn.map(|deg| deg.to_radians().sin_cos());
 
-    let forward = Vec3::new(cos_p * cos_y, cos_p * sin_y, -sin_p);
-    let right = Vec3::new(
+    let ahead = Vec3::new(cos_p * cos_y, cos_p * sin_y, -sin_p);
+    let side = Vec3::new(
         cos_r * sin_y - sin_r * sin_p * cos_y,
         -cos_r * cos_y - sin_r * sin_p * sin_y,
         -sin_r * cos_p,
     );
-    let up = Vec3::new(
+    let overhead = Vec3::new(
         cos_r * sin_p * cos_y + sin_r * sin_y,
         cos_r * sin_p * sin_y - sin_r * cos_y,
         cos_r * cos_p,
     );
-    Transform {
-        translation: Vec3::from_array(view.origin),
-        rotation: Quat::from_mat3(&Mat3::from_cols(right, up, -forward)),
-        ..default()
-    }
+    let facing = Mat3::from_cols(side, overhead, -ahead);
+    Transform::from_translation(Vec3::from(at)).with_rotation(Quat::from_mat3(&facing))
 }
 
 #[cfg(test)]
@@ -60,7 +55,7 @@ mod tests {
     use super::*;
 
     fn facing(angles: [f32; 3]) -> Transform {
-        transform_from_iw_view(WorldCameraPose { origin: [1.0, 2.0, 3.0], angles })
+        transform_from_game_view(WorldEyePlacement { origin: [1.0, 2.0, 3.0], turn: angles })
     }
 
     fn close(a: Vec3, b: Vec3) -> bool {

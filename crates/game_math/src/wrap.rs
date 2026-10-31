@@ -11,8 +11,8 @@ const SETTLED: f32 = 0.001;
 const SNAP_WINDOW_SQ: f32 = f32::from_bits(0x3586_37be);
 
 /// `angle` wrapped into [0, 360).
-pub fn angle_normalize_360(angle: f32) -> f32 {
-    let turns = angle * TURN_PER_DEGREE;
+pub fn wrap_degrees(raw: f32) -> f32 {
+    let turns = raw * TURN_PER_DEGREE;
     let degrees = (turns - libm::floorf(turns)) * DEGREES_PER_TURN;
     // Rounding can land exactly on 360; that is 0.
     let over = degrees - DEGREES_PER_TURN;
@@ -20,38 +20,38 @@ pub fn angle_normalize_360(angle: f32) -> f32 {
 }
 
 /// `from - to` taken the short way round, in [-180, 180).
-pub fn angle_subtract(from: f32, to: f32) -> f32 {
+pub fn degree_gap(from: f32, to: f32) -> f32 {
     let turns = (from - to) * TURN_PER_DEGREE;
     (turns - libm::floorf(turns + 0.5)) * DEGREES_PER_TURN
 }
 
-/// One easing step from `current` toward `target`: the remaining gap shrinks by `rate * frame` of itself. Stays put
+/// One easing step from `start_val` toward `goal`: the remaining gap shrinks by `rate * ticks` of itself. Stays put
 /// when already within [`SETTLED`], or when the step would overshoot.
-pub fn track(current: f32, target: f32, rate: f32, frame: f32) -> f32 {
-    let gap = current - target;
-    let step = gap * rate * frame;
+pub fn ease_toward(start_val: f32, goal: f32, rate: f32, ticks: f32) -> f32 {
+    let gap = start_val - goal;
+    let step = gap * rate * ticks;
     if gap.abs() <= SETTLED || gap.abs() < step.abs() {
-        current
+        start_val
     } else {
-        target + step
+        step + goal
     }
 }
 
-/// [`track`] for an angle: `current` is first brought within half a turn of `target`, and the result wrapped.
-pub fn track_angle(current: f32, target: f32, rate: f32, frame: f32) -> f32 {
-    let mut near = current;
-    while near - target > 180.0 {
+/// [`track`] for an angle: `start_val` is first brought within half a turn of `goal`, and the result wrapped.
+pub fn ease_angle_toward(start_val: f32, goal: f32, rate: f32, ticks: f32) -> f32 {
+    let mut near = start_val;
+    while near - goal > 180.0 {
         near -= DEGREES_PER_TURN;
     }
-    while near - target < -180.0 {
+    while near - goal < -180.0 {
         near += DEGREES_PER_TURN;
     }
-    angle_subtract(track(near, target, rate, frame), 0.0)
+    degree_gap(ease_toward(near, goal, rate, ticks), 0.0)
 }
 
 /// Each angle that is within a hair of a whole degree becomes that whole degree.
-pub fn snap_angles(angles: [f32; 3]) -> [f32; 3] {
-    angles.map(|angle| {
+pub fn round_degrees(triple: [f32; 3]) -> [f32; 3] {
+    triple.map(|angle| {
         // Adding zero first makes -0 round to +0, as BO2's rounding does.
         let whole = libm::roundf(angle + 0.0);
         let off = whole - angle;
@@ -65,22 +65,22 @@ mod tests {
 
     #[test]
     fn wrapping_keeps_one_turn() {
-        assert_eq!(angle_normalize_360(-90.0), 270.0);
-        assert_eq!(angle_normalize_360(720.0), 0.0);
-        assert!((angle_subtract(350.0, 10.0) + 20.0).abs() < 1e-4);
-        assert!((angle_subtract(10.0, 350.0) - 20.0).abs() < 1e-4);
+        assert_eq!(wrap_degrees(-90.0), 270.0);
+        assert_eq!(wrap_degrees(720.0), 0.0);
+        assert!((degree_gap(350.0, 10.0) + 20.0).abs() < 1e-4);
+        assert!((degree_gap(10.0, 350.0) - 20.0).abs() < 1e-4);
     }
 
     #[test]
     fn easing_stops_when_close_or_overshooting() {
-        assert_eq!(track(10.0, 10.0005, 1.0, 1.0), 10.0);
-        assert_eq!(track(10.0, 0.0, 0.5, 1.0), 5.0);
-        assert_eq!(track(10.0, 0.0, 3.0, 1.0), 10.0);
-        assert_eq!(track_angle(350.0, 10.0, 0.5, 1.0), 0.0);
+        assert_eq!(ease_toward(10.0, 10.0005, 1.0, 1.0), 10.0);
+        assert_eq!(ease_toward(10.0, 0.0, 0.5, 1.0), 5.0);
+        assert_eq!(ease_toward(10.0, 0.0, 3.0, 1.0), 10.0);
+        assert_eq!(ease_angle_toward(350.0, 10.0, 0.5, 1.0), 0.0);
     }
 
     #[test]
     fn near_whole_angles_snap() {
-        assert_eq!(snap_angles([89.9999, 12.3, -0.0]), [90.0, 12.3, 0.0]);
+        assert_eq!(round_degrees([89.9999, 12.3, -0.0]), [90.0, 12.3, 0.0]);
     }
 }

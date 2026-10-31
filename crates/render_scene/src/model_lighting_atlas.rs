@@ -3,63 +3,66 @@
 
 use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
-use bevy::render::render_resource::{
-    Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
-};
-use lighting_t6::{
-    MODEL_LIGHTING_ATLAS_DEPTH, MODEL_LIGHTING_ATLAS_WIDTH, MODEL_LIGHTING_TILE_BYTES,
-    ModelLightingAtlasDims, ModelLightingTileIndex, model_lighting_write_tile_to_atlas,
-};
+use bevy::render::render_resource;
+use lighting_t6::ILLUM_TILE_LEN;
+use lighting_t6::MODEL_LIGHT_ATLAS_LAYERS;
+use lighting_t6::MODEL_LIGHT_ATLAS_TEXELS_ACROSS;
+use lighting_t6::ModelIllumAtlasDims;
+use lighting_t6::IllumTileNo;
+use lighting_t6::blit_illum_tile;
 
 #[derive(Resource)]
-pub struct WorldModelLightingAtlas {
+pub struct LevelModelIllumAtlas {
     pub image: Handle<Image>,
-    pub dims: ModelLightingAtlasDims,
+    pub dims: ModelIllumAtlasDims,
 }
 
-impl WorldModelLightingAtlas {
-    pub fn new(images: &mut Assets<Image>, dims: ModelLightingAtlasDims) -> Self {
-        Self { image: images.add(model_lighting_atlas_image(dims)), dims }
+impl LevelModelIllumAtlas {
+    pub fn new(store: &mut Assets<Image>, dims: ModelIllumAtlasDims) -> Self {
+        let image = store.add(model_lighting_atlas_image(dims));
+        Self { image, dims }
     }
 }
 
-/// An empty atlas: `MODEL_LIGHTING_ATLAS_WIDTH` x `dims.image_height` texels,
-/// `MODEL_LIGHTING_ATLAS_DEPTH` layers deep, four bytes a texel.
-pub fn model_lighting_atlas_image(dims: ModelLightingAtlasDims) -> Image {
-    let size = Extent3d {
-        width: MODEL_LIGHTING_ATLAS_WIDTH,
-        height: dims.image_height,
-        depth_or_array_layers: MODEL_LIGHTING_ATLAS_DEPTH,
+/// An empty atlas: `MODEL_LIGHT_ATLAS_TEXELS_ACROSS` x `dims.image_height` texels,
+/// `MODEL_LIGHT_ATLAS_LAYERS` layers deep, four bytes a texel.
+pub fn model_lighting_atlas_image(dims: ModelIllumAtlasDims) -> Image {
+    let rows = dims.rows_tall;
+    let extent = render_resource::Extent3d {
+        width: MODEL_LIGHT_ATLAS_TEXELS_ACROSS,
+        height: rows,
+        depth_or_array_layers: MODEL_LIGHT_ATLAS_LAYERS,
     };
-    let byte_len = size.width as usize * size.height as usize * size.depth_or_array_layers as usize * 4;
-    let mut image = Image::new(
-        size,
-        TextureDimension::D3,
+    let byte_len = extent.width as usize * extent.height as usize * extent.depth_or_array_layers as usize * 4;
+    let mut blank = Image::new(
+        extent,
+        render_resource::TextureDimension::D3,
         vec![0; byte_len],
-        TextureFormat::Rgba8Unorm,
+        render_resource::TextureFormat::Rgba8Unorm,
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
-    image.texture_view_descriptor = Some(TextureViewDescriptor {
-        dimension: Some(TextureViewDimension::D3),
+    blank.texture_view_descriptor = Some(render_resource::TextureViewDescriptor {
+        dimension: Some(render_resource::TextureViewDimension::D3),
         ..default()
     });
-    image
+    blank
 }
 
 /// Copies a tile into the CPU side of the atlas. `false` when the image is not
 /// an atlas of these dimensions, has no CPU data, or the tile is out of range.
-pub fn model_lighting_atlas_write_tile(
-    atlas: &mut Image,
-    dims: ModelLightingAtlasDims,
-    entry: ModelLightingTileIndex,
-    tile: &[u8; MODEL_LIGHTING_TILE_BYTES],
+pub fn light_atlas_store_tile(
+    target: &mut Image,
+    dims: ModelIllumAtlasDims,
+    entry: IllumTileNo,
+    tile: &[u8; ILLUM_TILE_LEN],
 ) -> bool {
-    let size = atlas.texture_descriptor.size;
-    let is_atlas = size.width == MODEL_LIGHTING_ATLAS_WIDTH
-        && size.height == dims.image_height
-        && size.depth_or_array_layers == MODEL_LIGHTING_ATLAS_DEPTH;
-    match atlas.data.as_mut() {
-        Some(data) if is_atlas => model_lighting_write_tile_to_atlas(data, dims.image_height, entry, tile),
+    let rows = dims.rows_tall;
+    let size = target.texture_descriptor.size;
+    let is_atlas = size.width == MODEL_LIGHT_ATLAS_TEXELS_ACROSS
+        && size.height == rows
+        && size.depth_or_array_layers == MODEL_LIGHT_ATLAS_LAYERS;
+    match target.data.as_mut() {
+        Some(data) if is_atlas => blit_illum_tile(data, rows, entry, tile),
         _ => false,
     }
 }
@@ -73,15 +76,15 @@ pub struct ModelLightingAtlasTileWrites {
 pub struct ModelLightingAtlasTileWrite {
     pub image: AssetId<Image>,
     pub origin: (u32, u32),
-    pub texels: [u8; MODEL_LIGHTING_TILE_BYTES],
+    pub texels: [u8; ILLUM_TILE_LEN],
 }
 
 impl ModelLightingAtlasTileWrites {
     pub fn push(
         &mut self,
         image: AssetId<Image>,
-        entry: ModelLightingTileIndex,
-        tile: &[u8; MODEL_LIGHTING_TILE_BYTES],
+        entry: IllumTileNo,
+        tile: &[u8; ILLUM_TILE_LEN],
     ) {
         self.tiles.push(ModelLightingAtlasTileWrite {
             image,
@@ -95,10 +98,10 @@ impl ModelLightingAtlasTileWrites {
 mod tests {
     use super::*;
 
-    const DIMS: ModelLightingAtlasDims = ModelLightingAtlasDims {
-        xmodel_entry_limit: 1,
-        smodel_entry_limit: 1,
-        image_height: 8,
+    const DIMS: ModelIllumAtlasDims = ModelIllumAtlasDims {
+        figure_entry_limit: 1,
+        prop_entry_limit: 1,
+        rows_tall: 8,
     };
 
     #[test]
@@ -107,9 +110,9 @@ mod tests {
         let size = image.texture_descriptor.size;
         assert_eq!(
             (size.width, size.height, size.depth_or_array_layers),
-            (MODEL_LIGHTING_ATLAS_WIDTH, 8, MODEL_LIGHTING_ATLAS_DEPTH)
+            (MODEL_LIGHT_ATLAS_TEXELS_ACROSS, 8, MODEL_LIGHT_ATLAS_LAYERS)
         );
-        assert_eq!(image.texture_descriptor.dimension, TextureDimension::D3);
+        assert_eq!(image.texture_descriptor.dimension, render_resource::TextureDimension::D3);
         let data = image.data.expect("cpu data");
         assert_eq!(data.len(), (size.width * size.height * size.depth_or_array_layers * 4) as usize);
         assert!(data.iter().all(|&b| b == 0));
@@ -117,32 +120,32 @@ mod tests {
 
     #[test]
     fn writing_a_tile_to_a_differently_sized_image_is_refused() {
-        let mut other = model_lighting_atlas_image(ModelLightingAtlasDims { image_height: 16, ..DIMS });
-        let tile = [1; MODEL_LIGHTING_TILE_BYTES];
-        assert!(!model_lighting_atlas_write_tile(&mut other, DIMS, ModelLightingTileIndex { raw: 0 }, &tile));
+        let mut other = model_lighting_atlas_image(ModelIllumAtlasDims { rows_tall: 16, ..DIMS });
+        let tile = [1; ILLUM_TILE_LEN];
+        assert!(!light_atlas_store_tile(&mut other, DIMS, IllumTileNo { raw: 0 }, &tile));
     }
 
     #[test]
     fn writing_a_tile_to_an_image_with_no_cpu_data_is_refused() {
-        let mut atlas = model_lighting_atlas_image(DIMS);
-        atlas.data = None;
-        let tile = [1; MODEL_LIGHTING_TILE_BYTES];
-        assert!(!model_lighting_atlas_write_tile(&mut atlas, DIMS, ModelLightingTileIndex { raw: 0 }, &tile));
+        let mut target = model_lighting_atlas_image(DIMS);
+        target.data = None;
+        let tile = [1; ILLUM_TILE_LEN];
+        assert!(!light_atlas_store_tile(&mut target, DIMS, IllumTileNo { raw: 0 }, &tile));
     }
 
     #[test]
     fn a_tile_that_fits_lands_in_the_atlas_data() {
-        let mut atlas = model_lighting_atlas_image(DIMS);
-        let tile = [0xAB; MODEL_LIGHTING_TILE_BYTES];
-        assert!(model_lighting_atlas_write_tile(&mut atlas, DIMS, ModelLightingTileIndex { raw: 0 }, &tile));
-        assert!(atlas.data.expect("cpu data").contains(&0xAB));
+        let mut target = model_lighting_atlas_image(DIMS);
+        let tile = [0xAB; ILLUM_TILE_LEN];
+        assert!(light_atlas_store_tile(&mut target, DIMS, IllumTileNo { raw: 0 }, &tile));
+        assert!(target.data.expect("cpu data").contains(&0xAB));
     }
 
     #[test]
     fn queued_writes_keep_the_tile_texels_and_the_entry_origin() {
         let mut writes = ModelLightingAtlasTileWrites::default();
-        let entry = ModelLightingTileIndex { raw: 3 };
-        writes.push(AssetId::default(), entry, &[7; MODEL_LIGHTING_TILE_BYTES]);
+        let entry = IllumTileNo { raw: 3 };
+        writes.push(AssetId::default(), entry, &[7; ILLUM_TILE_LEN]);
         assert_eq!(writes.tiles.len(), 1);
         assert_eq!(writes.tiles[0].origin, entry.texel_origin());
         assert!(writes.tiles[0].texels.iter().all(|&b| b == 7));

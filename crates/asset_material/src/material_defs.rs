@@ -3,11 +3,11 @@
 use bevy::prelude::Resource;
 
 use crate::{
-    AssetNamespace, AssetRef, AssetRefCensus, AuthoredImage, AuthoredMaterial, AuthoredShader,
-    AuthoredVertexDecl, ColorMapTransform, MaterialCullFace, MaterialDrawMode,
-    MaterialIndex, MaterialKey, MaterialPass, TS_2D, TS_COLOR_MAP, TechniqueSetFacts, TechsetKey,
-    TechsetResolve, ZoneOwner, alpha_test_cutoff_from_state_bits, color_pass_agreement,
-    cull_face_from_state_bits, material_constant_name,
+    AssetCategoryScope, AssetPointer, AssetPointerTally, HandBuiltTexture, DesignerMaterial, HandBuiltShader,
+    VertexDeclRow, TintMapRemap, FaceCullingMode, ShaderDrawStyle,
+    SurfaceMaterialId, MaterialKey, DrawPass, TS_2D, SEMANTIC_COLOR, RecipeBundleSummary, RecipeBundleId,
+    RecipeBundleLookup, ZoneCustodian, cutout_level_of, judge_color_passes,
+    face_culling_of, surface_parameter_label,
 };
 
 /// What a build finished with: every name resolved and every row final. The
@@ -15,194 +15,185 @@ use crate::{
 /// linking where the importer stopped.
 #[derive(Clone, Debug, Default)]
 pub struct MaterialDefinitions {
-    pub materials: Vec<AuthoredMaterial>,
-    pub images: Vec<AuthoredImage>,
-    pub shaders: Vec<AuthoredShader>,
-    pub vertex_decls: Vec<AuthoredVertexDecl>,
-    /// Arguments a pass fed that no loader could place. Always zero: the one
-    /// loader that counted them is gone.
-    pub leftover_t5_arg_n: u32,
+    pub materials: Vec<DesignerMaterial>,
+    pub images: Vec<HandBuiltTexture>,
+    pub shaders: Vec<HandBuiltShader>,
+    pub vertex_decls: Vec<VertexDeclRow>,
 }
 
 /// How many of each kind of name a population holds, real against reference.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AssetRefDumpCensus {
-    pub materials: AssetRefCensus,
-    pub images: AssetRefCensus,
-    pub shaders: AssetRefCensus,
-    pub decls: AssetRefCensus,
+pub struct AssetPointerDumpTally {
+    pub materials: AssetPointerTally,
+    pub images: AssetPointerTally,
+    pub shaders: AssetPointerTally,
+    pub decls: AssetPointerTally,
 }
 
-impl AssetRefDumpCensus {
-    pub fn from_catalog(catalog: &MaterialDefinitions) -> Self {
-        fn census<'a>(names: impl Iterator<Item = &'a AssetRef>) -> AssetRefCensus {
-            let mut census = AssetRefCensus::default();
-            names.for_each(|name| census.push(name));
-            census
+impl AssetPointerDumpTally {
+    pub fn build_from_index(catalog: &MaterialDefinitions) -> Self {
+        fn tally<'a>(refs: impl IntoIterator<Item = &'a AssetPointer>) -> AssetPointerTally {
+            refs.into_iter().fold(AssetPointerTally::default(), |mut acc, one| {
+                acc.push(one);
+                acc
+            })
         }
+        let materials = tally(catalog.materials.iter().map(|row| &row.name));
+        let images = tally(catalog.images.iter().map(|row| &row.name));
+        let shaders = tally(catalog.shaders.iter().map(|row| &row.name));
+        let decls = tally(catalog.vertex_decls.iter().map(|row| &row.name));
         Self {
-            materials: census(catalog.materials.iter().map(|m| &m.name)),
-            images: census(catalog.images.iter().map(|i| &i.name)),
-            shaders: census(catalog.shaders.iter().map(|s| &s.name)),
-            decls: census(catalog.vertex_decls.iter().map(|d| &d.name)),
+            materials,
+            images,
+            shaders,
+            decls,
         }
     }
 }
 
 /// The name a row is looked up by, or `None` when it names nothing.
 fn lookup_name(name: &str) -> Option<&str> {
-    let bare = AssetRef::bare_name(name);
-    (!bare.is_empty()).then_some(bare)
+    match AssetPointer::bare_name(name) {
+        "" => None,
+        trimmed => Some(trimmed),
+    }
 }
 
 impl MaterialDefinitions {
-    pub fn zone_of(&self, index: usize) -> ZoneOwner {
-        self.materials.get(index).map(|m| m.zone).unwrap_or_default()
+    pub fn owning_zone(&self, index: usize) -> ZoneCustodian {
+        match self.materials.get(index) {
+            Some(row) => row.zone,
+            None => ZoneCustodian::default(),
+        }
     }
 
-    pub fn material_index_by_key(&self, key: &MaterialKey) -> Option<MaterialIndex> {
+    pub fn material_index_by_key(&self, key: &MaterialKey) -> Option<SurfaceMaterialId> {
         self.material_index_by_ns(key.namespace, &key.name)
     }
 
-    pub fn material_index_by_ns(&self, namespace: AssetNamespace, name: &str) -> Option<MaterialIndex> {
-        let name = lookup_name(name)?;
-        self.materials
-            .iter()
-            .position(|m| m.namespace == namespace && m.name.is_real() && m.name.as_str() == name)
-            .map(MaterialIndex::from_order)
+    pub fn material_index_by_ns(&self, namespace: AssetCategoryScope, wanted_name: &str) -> Option<SurfaceMaterialId> {
+        let wanted = lookup_name(wanted_name)?;
+        let slot = self.materials.iter().position(|row| {
+            row.name.is_genuine() && row.namespace == namespace && row.name.as_str() == wanted
+        })?;
+        Some(SurfaceMaterialId::from_sequence(slot))
     }
 
-    pub fn image_index_by_key(&self, namespace: AssetNamespace, name: &str) -> Option<usize> {
-        let name = lookup_name(name)?;
-        self.images
-            .iter()
-            .position(|i| i.namespace == namespace && i.name.is_real() && i.name.as_str() == name)
+    pub fn image_index_by_key(&self, namespace: AssetCategoryScope, wanted_name: &str) -> Option<usize> {
+        let wanted = lookup_name(wanted_name)?;
+        self.images.iter().position(|row| {
+            row.name.is_genuine() && row.namespace == namespace && row.name.as_str() == wanted
+        })
     }
 
     /// What the material's colour passes all decode to, when they agree.
     fn agreed_over<T: PartialEq>(
-        material: &AuthoredMaterial,
-        decode: impl Fn([u32; 2]) -> T,
+        mat: &DesignerMaterial,
+        read_bits: impl Fn([u32; 2]) -> T,
     ) -> Option<T> {
-        color_pass_agreement(
-            material.state_bits_entry.as_ref(),
-            &material.state_bits,
-            material.route.map(|route| route.technique_slots),
-            decode,
-        )
-        .agreed()
+        let slots = mat.route.map(|r| r.technique_mask);
+        let table = mat.raster_bits.as_slice();
+        let verdict = judge_color_passes(mat.raster_slot.as_ref(), table, slots, read_bits);
+        verdict.consensus_reached()
     }
 
-    fn agreed_draw_mode(material: &AuthoredMaterial) -> Option<MaterialDrawMode> {
-        Self::agreed_over(material, MaterialDrawMode::from_state_bits)
+    fn agreed_draw_mode(material: &DesignerMaterial) -> Option<ShaderDrawStyle> {
+        Self::agreed_over(material, ShaderDrawStyle::from_state_bits)
     }
 
-    pub fn agreed_alpha_test_cutoff(&self, material: &AuthoredMaterial) -> Option<Option<f32>> {
-        Self::agreed_over(material, alpha_test_cutoff_from_state_bits)
+    pub fn shared_alpha_cutoff(&self, material: &DesignerMaterial) -> Option<Option<f32>> {
+        Self::agreed_over(material, cutout_level_of)
     }
 
-    pub fn cull_face(&self, material: &AuthoredMaterial) -> Option<MaterialCullFace> {
-        Self::agreed_over(material, cull_face_from_state_bits)
+    pub fn face_culling(&self, material: &DesignerMaterial) -> Option<FaceCullingMode> {
+        Self::agreed_over(material, face_culling_of)
     }
 
-    fn pass_of(material: &AuthoredMaterial) -> Option<MaterialPass> {
-        material.route.map(|route| route.pass)
+    fn pass_of(material: &DesignerMaterial) -> Option<DrawPass> {
+        let route = material.route?;
+        Some(route.draw_pass)
     }
 
-    pub fn is_sky(&self, material: &AuthoredMaterial) -> bool {
-        matches!(Self::pass_of(material), Some(MaterialPass::Sky(_)))
-    }
-
-    pub fn is_shadowcaster(&self, material: &AuthoredMaterial) -> bool {
-        matches!(Self::pass_of(material), Some(MaterialPass::ShadowOnly))
+    pub fn casts_shadow_only(&self, material: &DesignerMaterial) -> bool {
+        Self::pass_of(material) == Some(DrawPass::DepthShadow)
     }
 
     /// `None` while the material has no route to say.
-    pub fn is_unlit(&self, material: &AuthoredMaterial) -> Option<bool> {
-        Some(matches!(
-            Self::pass_of(material)?,
-            MaterialPass::Unlit | MaterialPass::Sky(_)
-        ))
+    pub fn draws_flat(&self, material: &DesignerMaterial) -> Option<bool> {
+        let pass = Self::pass_of(material)?;
+        Some(pass == DrawPass::Unlit)
     }
 
-    pub fn constant(material: &AuthoredMaterial, name: &str) -> Option<[f32; 4]> {
-        material
-            .constants
-            .iter()
-            .find(|c| material_constant_name(&c.name) == name)
-            .map(|c| c.literal)
+    pub fn constant(material: &DesignerMaterial, param_name: &str) -> Option<[f32; 4]> {
+        for entry in &material.constants {
+            if surface_parameter_label(&entry.name) == param_name {
+                return Some(entry.literal);
+            }
+        }
+        None
     }
 
     /// The four rows the animated-material shader reads: uv animation, then the
     /// falloff parameters, begin colour and end colour when the material has
     /// all three.
-    pub fn material_animation(material: &AuthoredMaterial) -> [[f32; 4]; 4] {
-        let uv_anim = Self::constant(material, "uvAnimParms").unwrap_or_default();
-        let falloff = (
-            Self::constant(material, "falloffParms"),
-            Self::constant(material, "falloffBegin"),
-            Self::constant(material, "falloffEndCo"),
-        );
-        match falloff {
-            (Some(parms), Some(begin), Some(end)) => {
-                [uv_anim, parms, [begin[0], begin[1], begin[2], 1.0], end]
-            }
-            _ => [uv_anim, [0.0; 4], [0.0; 4], [0.0; 4]],
-        }
+    pub fn material_animation(material: &DesignerMaterial) -> [[f32; 4]; 4] {
+        let scroll = Self::constant(material, "uvAnimParms").unwrap_or_default();
+        let parms = Self::constant(material, "falloffParms");
+        let begin = Self::constant(material, "falloffBegin");
+        let end = Self::constant(material, "falloffEndCo");
+        let (Some(falloff), Some(open_at), Some(end)) = (parms, begin, end) else {
+            return [scroll, [0.0; 4], [0.0; 4], [0.0; 4]];
+        };
+        let begin_opaque = [open_at[0], open_at[1], open_at[2], 1.0];
+        [scroll, falloff, begin_opaque, end]
     }
 
-    pub fn color_map_transform(&self, material: &AuthoredMaterial) -> ColorMapTransform {
-        match Self::agreed_draw_mode(material) {
-            Some(MaterialDrawMode::Blend | MaterialDrawMode::Additive | MaterialDrawMode::Screen) => {
-                ColorMapTransform::Unknown
-            }
-            Some(_) => ColorMapTransform::Square,
-            None => match Self::pass_of(material) {
-                Some(MaterialPass::Lit | MaterialPass::Unlit | MaterialPass::Sky(_)) => {
-                    ColorMapTransform::Square
-                }
-                Some(MaterialPass::ShadowOnly) | None => ColorMapTransform::Unknown,
-            },
+    pub fn tint_map_remap(&self, material: &DesignerMaterial) -> TintMapRemap {
+        let by_pass = || match Self::pass_of(material) {
+            Some(DrawPass::DepthShadow) | None => TintMapRemap::Unknown,
+            Some(DrawPass::Lit | DrawPass::Unlit) => TintMapRemap::Square,
+        };
+        let Some(mode) = Self::agreed_draw_mode(material) else {
+            return by_pass();
+        };
+        if matches!(
+            mode,
+            ShaderDrawStyle::Blend | ShaderDrawStyle::Additive | ShaderDrawStyle::Screen
+        ) {
+            TintMapRemap::Unknown
+        } else {
+            TintMapRemap::Square
         }
     }
 
     /// The name of the image a HUD material draws: its 2D texture, else its
     /// colour map.
-    pub fn hud_image_name(&self, material: &AuthoredMaterial) -> Option<&str> {
-        let image_named_for = |semantic: u8| {
-            let texture = material
-                .textures
-                .iter()
-                .find(|t| t.semantic == semantic && t.image.is_some())?;
-            let name = self.images.get(texture.image?)?.name.as_str();
-            (!name.is_empty()).then_some(name)
+    pub fn overlay_picture_name(&self, material: &DesignerMaterial) -> Option<&str> {
+        let name_for_semantic = |wanted: u8| -> Option<&str> {
+            let mut candidates = material.textures.iter();
+            let binding = candidates.find(|b| b.image.is_some() && b.semantic == wanted)?;
+            let row = binding.image?;
+            let image_name = self.images.get(row)?.name.as_str();
+            if image_name.is_empty() { None } else { Some(image_name) }
         };
-        image_named_for(TS_2D).or_else(|| image_named_for(TS_COLOR_MAP))
+        name_for_semantic(TS_2D).or_else(|| name_for_semantic(SEMANTIC_COLOR))
     }
 
     /// Technique sets a population holds; none do, see `technique_graph`.
-    pub fn technique_set_facts(&self) -> &[TechniqueSetFacts] {
+    pub fn method_set_facts(&self) -> &[RecipeBundleSummary] {
         &[]
     }
 
-    pub fn resolve_technique_set(&self, _key: TechsetKey<'_>) -> TechsetResolve<'_> {
-        TechsetResolve::Missing
-    }
-
-    pub fn leftover_t5_arg_top(&self) -> Option<String> {
-        None
-    }
-
-    pub fn leftover_t5_arg_ranked(&self, _rank: usize) -> Option<String> {
-        None
-    }
-
-    pub fn leftover_t5_arg_dest(&self, _dest: u16) -> Option<String> {
-        None
+    pub fn resolve_method_set(&self, _key: RecipeBundleId<'_>) -> RecipeBundleLookup<'_> {
+        RecipeBundleLookup::Missing
     }
 }
 
 /// A technique-set name with its `x0`/`x1` feature tokens taken out.
-pub fn t5_feature_token_stripped(name: &str) -> String {
-    name.replace("x0", "").replace("x1", "")
+pub fn without_t5_feature_tag(name: &str) -> String {
+    let mut out = name.to_owned();
+    for token in ["x0", "x1"] {
+        out = out.replace(token, "");
+    }
+    out
 }

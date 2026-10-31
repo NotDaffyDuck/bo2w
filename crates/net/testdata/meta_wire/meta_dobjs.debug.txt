@@ -1,19 +1,27 @@
-SnapshotMetaSectionBytes {
-    match_header: 21,
-    events: 11,
-    aliases: 41,
-    entity_dobjs: 326,
-    corpses: 9,
-    entities: 2,
-    script_movers: 2,
-    entity_kernel: 16,
-    item_tables: 4,
-    area_entities: 1,
-    objectives: 31,
-    world_objects: 11,
+MetaSectionSizes {
+    header_len: 21,
+    event_len: 11,
+    alias_len: 41,
+    dobj_len: 333,
+    corpse_len: 9,
+    entity_len: 2,
+    mover_len: 2,
+    kernel_len: 16,
+    item_len: 4,
+    area_len: 1,
+    objective_len: 31,
+    world_len: 11,
 }
-SnapshotMeta {
-    objectives: ObjectiveMatch {
+TickLedgerNotes {
+    phase: Warmup,
+    kind: FreeForAll,
+    prematch: Waiting {
+        spent_ms: 0,
+    },
+    match_clock_ms: 0,
+    score_limit: 0,
+    time_limit_ms: 0,
+    objectives: MatchBoard {
         scores: [
             0,
             0,
@@ -33,14 +41,6 @@ SnapshotMeta {
         missile_vision: None,
         pain_vision: None,
     },
-    phase: Warmup,
-    match_elapsed_ms: 0,
-    prematch: Waiting {
-        elapsed_ms: 0,
-    },
-    score_limit: 0,
-    time_limit_ms: 0,
-    kind: FreeForAll,
     clients: [],
     journal: [],
     entity_events: [],
@@ -50,74 +50,84 @@ SnapshotMeta {
     effect_names: [],
     hud_materials: [],
     hud_strings: [],
-    rng: RngDebugMeta {
+    rng: DiceTrace {
         root_seed: 0,
         scheme: 0,
         spawn_draws: 0,
         combat_draws: 0,
         bot_draws: 0,
     },
-    world_objects: WorldObjectSnapshot {
+    world_objects: PropsSnapshot {
         as_of_ms: 0,
         map_round_epoch: 0,
         t6_glass: [],
         destructible_loop_sounds: [],
     },
     area_entities: None,
+    entity_kernel: FrozenSlotTable {
+        slots: [],
+        high_water: 26,
+        free_fifo: [],
+        level_time_ms: 0,
+        frame_serial: 0,
+    },
+    entities: [],
     entity_dobjs: [
         (
             ScriptModel(
-                ScriptModelId(
+                ScriptedModel(
                     77,
                 ),
             ),
-            DObjSemanticState {
-                composition: DObjCompositionDescriptor {
+            RigPoseRecord {
+                composition: RigLayout {
                     revision: 3,
                     models: [
-                        DObjModelDescriptor {
+                        RigMeshEntry {
                             model: "veh_body",
-                            parent_model: None,
-                            attach_tag: None,
-                            ignore_collision: false,
+                            host_index: None,
+                            mount_tag: None,
+                            no_hits: false,
+                            tag_offset: None,
                         },
-                        DObjModelDescriptor {
+                        RigMeshEntry {
                             model: "veh_turret",
-                            parent_model: Some(
+                            host_index: Some(
                                 0,
                             ),
-                            attach_tag: Some(
+                            mount_tag: Some(
                                 "tag_turret",
                             ),
-                            ignore_collision: true,
+                            no_hits: true,
+                            tag_offset: None,
                         },
                     ],
                 },
-                pose_revision: 9,
+                pose_epoch: 9,
                 tree: Some(
-                    XAnimTreeSnapshot {
-                        definition_revision: 2,
-                        state_revision: 5,
+                    GraphCapture {
+                        shape_epoch: 2,
+                        clock_epoch: 5,
                         nodes: [
-                            XAnimSemanticNode {
+                            GraphNodeRecord {
                                 parent: None,
                                 kind: Blend,
                                 clip: None,
                                 parts: None,
-                                state: XAnimNodeState {
+                                state: NodeClock {
                                     time: 0.25,
-                                    old_time: 0.125,
-                                    cycle_count: 3,
-                                    old_cycle_count: -2,
-                                    goal_time: 1.0,
-                                    goal_weight: 0.5,
+                                    prev_t: 0.125,
+                                    laps: 3,
+                                    prev_laps: -2,
+                                    blend_left: 1.0,
+                                    target_w: 0.5,
                                     weight: 1.0,
                                     rate: 1.5,
                                 },
                             },
-                            XAnimSemanticNode {
+                            GraphNodeRecord {
                                 parent: Some(
-                                    XAnimNodeId(
+                                    GraphSlot(
                                         0,
                                     ),
                                 ),
@@ -126,7 +136,7 @@ SnapshotMeta {
                                     "idle",
                                 ),
                                 parts: Some(
-                                    PartBits(
+                                    PartSet(
                                         [
                                             5,
                                             0,
@@ -136,20 +146,20 @@ SnapshotMeta {
                                         ],
                                     ),
                                 ),
-                                state: XAnimNodeState {
+                                state: NodeClock {
                                     time: 0.25,
-                                    old_time: 0.125,
-                                    cycle_count: 3,
-                                    old_cycle_count: -2,
-                                    goal_time: 1.0,
-                                    goal_weight: 0.5,
+                                    prev_t: 0.125,
+                                    laps: 3,
+                                    prev_laps: -2,
+                                    blend_left: 1.0,
+                                    target_w: 0.5,
                                     weight: 0.75,
                                     rate: 1.5,
                                 },
                             },
-                            XAnimSemanticNode {
+                            GraphNodeRecord {
                                 parent: Some(
-                                    XAnimNodeId(
+                                    GraphSlot(
                                         0,
                                     ),
                                 ),
@@ -158,13 +168,13 @@ SnapshotMeta {
                                     "recoil",
                                 ),
                                 parts: None,
-                                state: XAnimNodeState {
+                                state: NodeClock {
                                     time: 0.25,
-                                    old_time: 0.125,
-                                    cycle_count: 3,
-                                    old_cycle_count: -2,
-                                    goal_time: 1.0,
-                                    goal_weight: 0.5,
+                                    prev_t: 0.125,
+                                    laps: 3,
+                                    prev_laps: -2,
+                                    blend_left: 1.0,
+                                    target_w: 0.5,
                                     weight: 0.25,
                                     rate: 1.5,
                                 },
@@ -172,8 +182,8 @@ SnapshotMeta {
                         ],
                     },
                 ),
-                requested_parts: Some(
-                    PartBits(
+                wanted_mask: Some(
+                    PartSet(
                         [
                             1,
                             2,
@@ -183,7 +193,7 @@ SnapshotMeta {
                         ],
                     ),
                 ),
-                hide_part_bits: HidePartBits(
+                hidden_mask: HiddenParts(
                     [
                         0,
                         0,
@@ -201,30 +211,33 @@ SnapshotMeta {
                         -5.0,
                     ],
                 ),
+                ragdoll: None,
+                eye_luminance: None,
             },
         ),
         (
             ScriptModel(
-                ScriptModelId(
+                ScriptedModel(
                     78,
                 ),
             ),
-            DObjSemanticState {
-                composition: DObjCompositionDescriptor {
+            RigPoseRecord {
+                composition: RigLayout {
                     revision: 1,
                     models: [
-                        DObjModelDescriptor {
+                        RigMeshEntry {
                             model: "crate_small",
-                            parent_model: None,
-                            attach_tag: None,
-                            ignore_collision: false,
+                            host_index: None,
+                            mount_tag: None,
+                            no_hits: false,
+                            tag_offset: None,
                         },
                     ],
                 },
-                pose_revision: 0,
+                pose_epoch: 0,
                 tree: None,
-                requested_parts: None,
-                hide_part_bits: HidePartBits(
+                wanted_mask: None,
+                hidden_mask: HiddenParts(
                     [
                         0,
                         0,
@@ -235,24 +248,18 @@ SnapshotMeta {
                 ),
                 vehicle_steer: None,
                 turret_aim: None,
+                ragdoll: None,
+                eye_luminance: None,
             },
         ),
     ],
-    entities: [],
     script_movers: [],
-    entity_kernel: EntityKernelSnapshot {
-        slots: [],
-        high_water: 26,
-        free_fifo: [],
-        level_time_ms: 0,
-        frame_serial: 0,
-    },
-    corpses: PlayerCorpsePool {
+    corpses: CorpseYard {
         slots: [
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -265,9 +272,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -288,10 +295,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -304,9 +311,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -327,10 +334,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -343,9 +350,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -366,10 +373,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -382,9 +389,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -405,10 +412,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -421,9 +428,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -444,10 +451,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -460,9 +467,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -483,10 +490,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -499,9 +506,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -522,10 +529,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -538,9 +545,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -567,6 +574,7 @@ SnapshotMeta {
     item_ammo: [],
     item_pickups: [],
     oriented_blockers: [],
+    follows: [],
     feel: None,
     enemy_models: [],
 }

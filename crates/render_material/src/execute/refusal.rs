@@ -1,151 +1,152 @@
 //! Why a draw cannot be turned into an executable material.
 
-use asset_core::AssetNamespace;
+use asset_core::AssetCategoryScope;
 
-use crate::prepared::GfxPassStateBits;
+use crate::prepared::VisualPassStateBits;
 use crate::{
-    CatalogBuildError, MaterialAssetId, MaterialGenerationId, RuntimeShaderPair,
-    RuntimeShaderStage, RuntimeTechniqueSetId, TechType,
+    LedgerBuildError, MaterialAssetKey, MaterialEpochId, LiveShaderPair,
+    LiveShaderStage, LiveTechniqueBundleKey, MethodType,
+
 };
 
 /// Pass-state fields the host cannot reproduce.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct UnsupportedStateFields {
-    pub unknown_blend_factor: bool,
-    pub unknown_blend_operation: bool,
+pub struct UnhandledStateFields {
+    pub odd_blend_factor: bool,
+    pub odd_blend_op: bool,
     pub stencil: bool,
 }
 
-impl UnsupportedStateFields {
+impl UnhandledStateFields {
     pub fn any(self) -> bool {
-        self.unknown_blend_factor || self.unknown_blend_operation || self.stencil
+        self.stencil || self.odd_blend_factor || self.odd_blend_op
     }
 }
 
-impl GfxPassStateBits {
+impl VisualPassStateBits {
     /// `None` when every blend field of this pass maps onto the host.
-    pub fn unsupported_host_fields(self) -> Option<UnsupportedStateFields> {
-        use d3d9_state::BlendFactor;
+    pub fn unsupported_host_fields(self) -> Option<UnhandledStateFields> {
+        use d3d9_state::BlendWeight;
 
-        let colour_op = ((self.word0 >> 8) & 0x7) as u8;
-        let alpha_word = (self.word0 >> 16) & 0x7ff;
+        let colour_op = ((self.dword0 >> 8) & 0x7) as u8;
+        let alpha_word = (self.dword0 >> 16) & 0x7ff;
         let alpha_op = (alpha_word >> 8) & 0x7;
 
-        let colour_known = BlendFactor::from_raw(self.word0 & 0xf).is_known()
-            && BlendFactor::from_raw((self.word0 >> 4) & 0xf).is_known();
-        let alpha_known = BlendFactor::from_raw(alpha_word & 0xf).is_known()
-            && BlendFactor::from_raw((alpha_word >> 4) & 0xf).is_known();
+        let colour_known = BlendWeight::from_raw(self.dword0 & 0xf).is_listed()
+            && BlendWeight::from_raw((self.dword0 >> 4) & 0xf).is_listed();
+        let alpha_known = BlendWeight::from_raw(alpha_word & 0xf).is_listed()
+            && BlendWeight::from_raw((alpha_word >> 4) & 0xf).is_listed();
 
-        let fields = UnsupportedStateFields {
-            unknown_blend_factor: colour_op != 0
+        let unhandled = UnhandledStateFields {
+            odd_blend_factor: colour_op != 0
                 && (!colour_known || (alpha_op != 0 && !alpha_known)),
-            unknown_blend_operation: colour_op > 5 || (colour_op != 0 && alpha_op > 5),
+            odd_blend_op: colour_op > 5 || (colour_op != 0 && alpha_op > 5),
             stencil: false,
         };
-        fields.any().then_some(fields)
+        unhandled.any().then_some(unhandled)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MaterialRefusal {
-    SortedMaterialTableMissing,
-    SortedMaterialOrdinalOutOfRange {
-        ordinal: u32,
-        table_len: usize,
+pub enum MaterialExecutionDenial {
+    OrderedMaterialTableAbsent,
+    OrderedMaterialRankBeyondTable {
+        sorted_pos: u32,
+        table_size: usize,
     },
-    SortedMaterialBuildFailed {
-        cause: CatalogBuildError,
+    OrderedMaterialConstructionFailed {
+        cause: LedgerBuildError,
     },
-    StaleMaterialGeneration {
-        retained: MaterialGenerationId,
-        current: MaterialGenerationId,
+    ObsoleteMaterialRevision {
+        retained: MaterialEpochId,
+        current: MaterialEpochId,
     },
-    MaterialOutOfRange {
-        material: MaterialAssetId,
+    SurfaceSlotBeyondTable {
+        material: MaterialAssetKey,
     },
-    LocalTechniqueSetOutOfRange {
-        set: RuntimeTechniqueSetId,
+    OwnRecipeSetBeyondTable {
+        set: LiveTechniqueBundleKey,
     },
-    RemappedTechniqueSetOutOfRange {
-        set: RuntimeTechniqueSetId,
+    SubstitutedRecipeSetBeyondTable {
+        set: LiveTechniqueBundleKey,
     },
-    RemapMissing {
-        pointer_identity: u32,
+    SubstitutionTargetAbsent {
+        address_fingerprint: u32,
     },
-    RemapCycle {
-        first_set: RuntimeTechniqueSetId,
+    SubstitutionLoop {
+        first_set: LiveTechniqueBundleKey,
     },
-    TechniqueAbsent {
-        tech_type: TechType,
+    RenderTechniqueNotFound {
+        shading_technique_kind: MethodType,
     },
-    EmptyTechnique {
-        tech_type: TechType,
+    RecipeHasNoPasses {
+        shading_technique_kind: MethodType,
     },
-    StateEntriesMissing,
-    StateEntryOutOfRange {
-        tech_type: TechType,
+    RenderStateRecordsAbsent,
+    RenderStateRecordBeyondBounds {
+        shading_technique_kind: MethodType,
     },
-    StateRowOutOfRange {
+    RenderStateRowBeyondBounds {
         row: usize,
-        pass_index: u8,
+        technique_pass_ordinal: u8,
     },
-    UnsupportedState {
-        pass_index: u8,
-        fields: UnsupportedStateFields,
-        word0: u32,
-        word1: u32,
+    UnhandledRenderState {
+        technique_pass_ordinal: u8,
+        fields: UnhandledStateFields,
+        dword0: u32,
+        dword1: u32,
     },
-    PassIndexOverflow {
-        pass_index: usize,
+    PassNumberTooLarge {
+        technique_pass_ordinal: usize,
     },
-    ShaderProgramMissing {
-        pass_index: u8,
+    ShaderProgramAbsent {
+        technique_pass_ordinal: u8,
     },
-    UnsupportedShaderPair {
-        pass_index: u8,
-        pair: RuntimeShaderPair,
+    UnhandledShaderCombination {
+        technique_pass_ordinal: u8,
+        pair: LiveShaderPair,
     },
-    MissingTexture {
-        pass_index: u8,
-        name_hash: u32,
+    TextureUnavailable {
+        technique_pass_ordinal: u8,
+        label_digest: u32,
     },
-    MissingMaterialConstant {
-        pass_index: u8,
-        name_hash: u32,
+    SurfaceConstantUnavailable {
+        technique_pass_ordinal: u8,
+        label_digest: u32,
     },
-    MissingCodeConstant {
-        pass_index: u8,
-        stage: RuntimeShaderStage,
+    EngineConstantUnavailable {
+        technique_pass_ordinal: u8,
+        stage: LiveShaderStage,
         index: u16,
     },
-    CodeConstantRowsOutOfRange {
-        pass_index: u8,
-        stage: RuntimeShaderStage,
+    EngineConstantRowsBeyondTable {
+        technique_pass_ordinal: u8,
+        stage: LiveShaderStage,
         index: u16,
-        first_row: u8,
-        row_count: u8,
-        available_rows: usize,
+        row_base: u8,
+        line_total: u8,
+        rows_remaining: usize,
     },
-    MissingCodeTexture {
-        pass_index: u8,
+    EngineTextureUnavailable {
+        technique_pass_ordinal: u8,
         index: u32,
     },
-    MissingLiteralConstant {
-        pass_index: u8,
+    InlineConstantUnavailable {
+        technique_pass_ordinal: u8,
     },
-    UnknownArgumentType {
-        pass_index: u8,
-        argument_type: u16,
+    UnrecognisedArgumentKind {
+        technique_pass_ordinal: u8,
+        kind_code: u16,
     },
-    PassArgCountMismatch {
-        pass_index: u8,
-        per_prim: u8,
-        per_obj: u8,
+    PassArgumentTotalWrong {
+        technique_pass_ordinal: u8,
+        each_triangle_batch_inputs: u8,
+        each_mesh_inputs: u8,
         stable: u8,
-        arguments: usize,
+        arg_total: usize,
     },
-    TechniqueSetNamespaceMismatch {
-        want: AssetNamespace,
-        got: AssetNamespace,
+    SetNamespaceDiffers {
+        want: AssetCategoryScope,
+        got: AssetCategoryScope,
     },
 }

@@ -4,16 +4,15 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::{AcqRel, Acquire};
 
 use bevy::ecs::component::Mutable;
 use bevy::prelude::{Resource, World};
 
-type Handed = Box<dyn Any + Send + Sync>;
-
 #[derive(Resource, Default)]
 pub struct Retiring {
-    handed: Vec<Handed>,
+    handed: Vec<Box<dyn Any + Send + Sync>>,
     teardown_requested: bool,
     jobs: u64,
     values: u64,
@@ -35,7 +34,7 @@ impl Retiring {
 
     /// Empties the queue. The flag comes back set when a teardown was marked
     /// since the last call; an empty batch does not count as a job.
-    pub fn take_batch(&mut self) -> (Vec<Handed>, bool) {
+    pub fn take_batch(&mut self) -> (Vec<Box<dyn Any + Send + Sync>>, bool) {
         let batch = std::mem::take(&mut self.handed);
         let teardown = std::mem::take(&mut self.teardown_requested);
         if !batch.is_empty() {
@@ -46,9 +45,9 @@ impl Retiring {
 
     /// Counts a shipment as in flight until the returned token is settled.
     pub fn ship(&self, teardown: bool) -> RetiringInFlight {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        self.in_flight.fetch_add(1, AcqRel);
         let teardown = teardown.then(|| {
-            self.teardown_in_flight.fetch_add(1, Ordering::AcqRel);
+            self.teardown_in_flight.fetch_add(1, AcqRel);
             Arc::clone(&self.teardown_in_flight)
         });
         RetiringInFlight {
@@ -58,7 +57,7 @@ impl Retiring {
     }
 
     pub fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::Acquire)
+        self.in_flight.load(Acquire)
     }
 
     /// Anything queued, marked or still being dropped.
@@ -82,9 +81,9 @@ impl RetiringInFlight {
     /// Ends the shipment. For a teardown shipment, returns how many teardown
     /// shipments are still outstanding afterwards.
     pub fn settle(self) -> Option<usize> {
-        self.all.fetch_sub(1, Ordering::AcqRel);
+        self.all.fetch_sub(1, AcqRel);
         self.teardown
-            .map(|counter| counter.fetch_sub(1, Ordering::AcqRel) - 1)
+            .map(|counter| counter.fetch_sub(1, AcqRel) - 1)
     }
 }
 

@@ -6,11 +6,11 @@
 
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, BlendComponent, BlendFactor, BlendOperation, BlendState, RenderPipelineDescriptor,
+    AsBindGroup, BlendComponent, BlendFactor, BlendState, RenderPipelineDescriptor,
 };
 use bevy::shader::ShaderRef;
 
-const SHADER_PATH: &str = "embedded://ui/lui_additive.wgsl";
+const SHADER_SOURCE_PATH: &str = "embedded://ui/lui_additive.wgsl";
 
 /// One additive picture and its tint (linear, alpha = fade).
 #[derive(AsBindGroup, Asset, TypePath, Debug, Clone)]
@@ -37,18 +37,19 @@ pub struct AdditiveUi {
 
 impl UiMaterial for AdditiveUi {
     fn fragment_shader() -> ShaderRef {
-        SHADER_PATH.into()
+        SHADER_SOURCE_PATH.into()
     }
 
     fn specialize(descriptor: &mut RenderPipelineDescriptor, _key: UiMaterialKey<Self>) {
-        let add = BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
+        // Replace's sum, keeping what is already there too: plain addition.
+        let additive = BlendComponent { dst_factor: BlendFactor::One, ..BlendComponent::REPLACE };
         if let Some(target) = descriptor.fragment.as_mut().and_then(|f| f.targets.first_mut()).and_then(|t| t.as_mut()) {
-            target.blend = Some(BlendState { color: add, alpha: add });
+            target.blend = Some(BlendState { color: additive, alpha: additive });
         }
     }
 }
 
-pub(crate) fn register(app: &mut App) {
-    bevy::asset::embedded_asset!(app, "lui_additive.wgsl");
-    app.add_plugins(UiMaterialPlugin::<AdditiveUi>::default());
+pub(crate) fn attach(host: &mut App) {
+    bevy::asset::embedded_asset!(host, "lui_additive.wgsl");
+    host.add_plugins(UiMaterialPlugin::<AdditiveUi>::default());
 }

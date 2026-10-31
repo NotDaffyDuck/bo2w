@@ -1,25 +1,25 @@
-use super::definitions::{FxDefinitions, OwnedFxEffectDef};
-use crate::AssetNamespace;
+use super::definitions::{FxDefinitions, SelfContainedEffectDef};
+use crate::AssetCategoryScope;
 
 /// An effect's name together with the namespace that defines it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FxName<'a> {
-    pub namespace: AssetNamespace,
+    pub namespace: AssetCategoryScope,
     pub name: &'a str,
 }
 
 impl<'a> FxName<'a> {
-    pub fn new(namespace: AssetNamespace, name: &'a str) -> Self {
-        Self { namespace, name }
+    pub fn new(scope: AssetCategoryScope, fx_name: &'a str) -> Self {
+        Self { namespace: scope, name: fx_name }
     }
 
     /// An effect of the base game.
     pub fn engine(name: &'a str) -> Self {
-        Self::new(AssetNamespace::T6, name)
+        Self::new(AssetCategoryScope::T6, name)
     }
 
     /// The effect this names, if the catalog has one with parts to play.
-    pub fn resolve(self, catalog: &'a FxDefinitions) -> Option<&'a OwnedFxEffectDef> {
+    pub fn settle(self, catalog: &'a FxDefinitions) -> Option<&'a SelfContainedEffectDef> {
         catalog.resolve_def_in(self.namespace, self.name)
     }
 }

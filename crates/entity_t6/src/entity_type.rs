@@ -47,8 +47,8 @@ pub const BO2_MAX_GENTITIES: i32 = 1024;
 /// the game comes from this one number. It is still MW2's 2048; moving the
 /// game to BO2's 1024 ([`BO2_MAX_GENTITIES`]) is this one line.
 pub const MAX_GENTITIES: i32 = 2048;
-/// `ENTITYNUM_NONE`: no entity (`Dtp_Start` clears `groundEntityNum` to it).
-pub const ENTITYNUM_NONE: i32 = MAX_GENTITIES - 1;
+/// `NO_ENTITY_SLOT`: no entity (`Dtp_Start` clears `groundEntityNum` to it).
+pub const NO_ENTITY_SLOT: i32 = MAX_GENTITIES - 1;
 /// `ENTITYNUM_WORLD`: the world, as ground and as a trace hit.
 pub const ENTITYNUM_WORLD: i32 = MAX_GENTITIES - 2;
 
@@ -59,7 +59,7 @@ mod tests {
     #[test]
     fn numbers_are_bo2s() {
         assert_eq!(BO2_MAX_GENTITIES - 1, 0x3ff);
-        assert_eq!(ENTITYNUM_NONE, MAX_GENTITIES - 1);
+        assert_eq!(NO_ENTITY_SLOT, MAX_GENTITIES - 1);
         assert_eq!(ENTITYNUM_WORLD, MAX_GENTITIES - 2);
         assert_eq!(et::SCRIPTMOVER, 6);
         assert_eq!(et::EVENTS, 21);
@@ -78,6 +78,6 @@ mod tests {
 mod playerstate_bridge_tests {
     #[test]
     fn bridge_entitynum_none_matches() {
-        assert_eq!(playerstate_t6::game::ENTITYNUM_NONE, super::ENTITYNUM_NONE);
+        assert_eq!(playerstate_t6::game::NO_ENTITY_SLOT, super::NO_ENTITY_SLOT);
     }
 }

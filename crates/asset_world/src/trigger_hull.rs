@@ -2,7 +2,7 @@
 
 /// One convex piece of a trigger's volume: a box, narrowed by slabs.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MapTriggerHull {
+pub struct LevelTriggerVolume {
     /// Centre of the box.
     pub mid: [f32; 3],
     /// Half the box's size along each axis.

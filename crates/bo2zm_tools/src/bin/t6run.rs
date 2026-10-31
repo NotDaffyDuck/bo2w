@@ -12,13 +12,11 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
 use asset_t6::{capture_zone, parse_entities};
 use gsc_t6::value::ObjKind;
-use gsc_t6::{ObjRef, Program, ScriptObject, Strings, Value, Vm};
+use gsc_t6::{ObjRef, Program, ScriptObject, Strings, ScriptValue, Vm};
 
-const GAME: &str = r"C:\Program Files (x86)\Steam\steamapps\common\Call of Duty Black Ops II\zone\all";
 const PRE: [&str; 4] = ["code_post_gfx_zm", "common_zm", "patch_zm", "patch_ui_zm"];
 
 #[derive(Default)]
@@ -30,40 +28,55 @@ struct Mock {
     next_fx: i32,
 }
 
-fn unbound(vm: &mut Vm<Mock>, host: &mut Mock, id: u32, _self: &Value, args: &[Value]) -> Value {
-    let (name, method) = vm.program.builtins[id as usize];
-    let n = format!("{}{}", if method { "." } else { "" }, vm.str(name));
-    let e = host.unbound.entry(n).or_insert((0, String::new()));
-    if e.0 == 0 {
-        e.1 = args
-            .iter()
-            .map(|a| vm.to_text(a))
-            .collect::<Vec<_>>()
-            .join(", ");
+/// A run that already said why on its own.
+struct Failed;
+
+/// The items joined with ", ".
+fn comma_list(items: impl IntoIterator<Item = String>) -> String {
+    let mut out = String::new();
+    for (n, item) in items.into_iter().enumerate() {
+        if n > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&item);
     }
-    e.0 += 1;
-    Value::Undefined
+    out
 }
 
-fn typed(vm: &mut Vm<Mock>, key: &str, val: &str) -> Value {
+/// Three whitespace-separated numbers as a vector.
+fn parse_vec3(text: &str) -> Option<[f32; 3]> {
+    let parts: Vec<f32> = text.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+    <[f32; 3]>::try_from(parts).ok()
+}
+
+/// The command-line word parsed as `T`, or `default` when absent or not one.
+fn parse_or<T: std::str::FromStr>(word: Option<String>, default: T) -> T {
+    word.and_then(|w| w.parse().ok()).unwrap_or(default)
+}
+
+fn unbound(vm: &mut Vm<Mock>, host: &mut Mock, id: u32, _self: &ScriptValue, args: &[ScriptValue]) -> ScriptValue {
+    let (name, method) = vm.program.builtins[id as usize];
+    let n = format!("{}{}", if method { "." } else { "" }, vm.str(name));
+    let e = host.unbound.entry(n).or_insert((0, String::default()));
+    if e.0 == 0 {
+        e.1 = comma_list(args.iter().map(|a| vm.to_text(a)));
+    }
+    e.0 += 1;
+    ScriptValue::Undefined
+}
+
+fn typed(vm: &mut Vm<Mock>, key: &str, val: &str) -> ScriptValue {
     match key {
         "origin" | "angles" => {
-            let p: Vec<f32> = val
-                .split_whitespace()
-                .filter_map(|x| x.parse().ok())
-                .collect();
-            if p.len() == 3 {
-                return Value::Vec3([p[0], p[1], p[2]]);
-            }
-            vm.string(val)
+            parse_vec3(val).map_or_else(|| vm.string(val), ScriptValue::Vec3)
         }
-        "spawnflags" | "count" | "health" => Value::Int(val.trim().parse().unwrap_or(0)),
-        "radius" | "height" | "speed" => Value::Float(val.trim().parse().unwrap_or(0.0)),
+        "spawnflags" | "count" | "health" => ScriptValue::Int(val.trim().parse().unwrap_or(0)),
+        "radius" | "height" | "speed" => ScriptValue::Float(val.trim().parse().unwrap_or(0.0)),
         _ => vm.string(val),
     }
 }
 
-fn ents_matching(vm: &mut Vm<Mock>, host: &Mock, args: &[Value]) -> Vec<Value> {
+fn ents_matching(vm: &mut Vm<Mock>, host: &Mock, args: &[ScriptValue]) -> Vec<ScriptValue> {
     let want = args.first().map(|v| vm.to_text(v));
     let key = args.get(1).map(|v| vm.to_text(v).to_ascii_lowercase());
     let mut out = Vec::new();
@@ -75,23 +88,23 @@ fn ents_matching(vm: &mut Vm<Mock>, host: &Mock, args: &[Value]) -> Vec<Value> {
             (Some(w), Some(k)) => {
                 let k = vm.intern(k);
                 let v = vm.raw_field(e, k);
-                matches!(v, Value::Str(_)) && vm.to_text(&v) == *w
+                matches!(v, ScriptValue::Str(_)) && vm.to_text(&v) == *w
             }
             _ => true,
         };
         if ok {
-            out.push(Value::Object(e));
+            out.push(ScriptValue::Object(e));
         }
     }
     out
 }
 
-fn list(vals: Vec<Value>) -> Value {
+fn list(vals: Vec<ScriptValue>) -> ScriptValue {
     let mut a = gsc_t6::Array::new();
     for v in vals {
         a.push(v);
     }
-    Value::array(a)
+    ScriptValue::array(a)
 }
 
 fn bind_mock(vm: &mut Vm<Mock>) {
@@ -106,16 +119,16 @@ fn bind_mock(vm: &mut Vm<Mock>) {
     });
     vm.bind("getplayers", false, |_, host, _, _| {
         Ok(list(
-            host.player.iter().map(|p| Value::Object(*p)).collect(),
+            host.player.iter().map(|p| ScriptValue::Object(*p)).collect(),
         ))
     });
     vm.bind("isplayer", false, |_, host, _, a| {
-        Ok(Value::bool(
-            matches!(a.first(), Some(Value::Object(o)) if Some(*o) == host.player),
+        Ok(ScriptValue::bool(
+            matches!(a.first(), Some(ScriptValue::Object(o)) if Some(*o) == host.player),
         ))
     });
     vm.bind("isalive", false, |vm, _, _, a| {
-        Ok(Value::bool(a.first().is_some_and(|v| vm.is_defined(v))))
+        Ok(ScriptValue::bool(a.first().is_some_and(|v| vm.is_defined(v))))
     });
     vm.bind("spawn", false, |vm, host, _, a| {
         let o = vm.alloc_object(ObjKind::Entity(host.next_entnum));
@@ -129,17 +142,17 @@ fn bind_mock(vm: &mut Vm<Mock>) {
             vm.set_raw_field(o, org, p.clone());
         }
         host.ents.push(o);
-        Ok(Value::Object(o))
+        Ok(ScriptValue::Object(o))
     });
     vm.bind("delete", true, |vm, host, s, _| {
-        if let Value::Object(o) = s {
+        if let ScriptValue::Object(o) = s {
             vm.free_object(host, *o);
         }
-        Ok(Value::Undefined)
+        Ok(ScriptValue::Undefined)
     });
     vm.bind("loadfx", false, |_, host, _, _| {
         host.next_fx += 1;
-        Ok(Value::Int(host.next_fx))
+        Ok(ScriptValue::Int(host.next_fx))
     });
     for n in [
         "precachemodel",
@@ -160,39 +173,41 @@ fn bind_mock(vm: &mut Vm<Mock>) {
         "setclientnamemode",
         "setvoipattachment",
     ] {
-        vm.bind(n, false, |_, _, _, _| Ok(Value::Undefined));
+        vm.bind(n, false, |_, _, _, _| Ok(ScriptValue::Undefined));
     }
     vm.bind("getentitynumber", true, |vm, _, s, _| {
         Ok(match s {
-            Value::Object(o) => match vm.kind(*o) {
-                Some(ObjKind::Entity(n)) => Value::Int(n as i32),
-                _ => Value::Undefined,
+            ScriptValue::Object(o) => match vm.kind(*o) {
+                Some(ObjKind::Entity(n)) => ScriptValue::Int(n as i32),
+                _ => ScriptValue::Undefined,
             },
-            _ => Value::Undefined,
+            _ => ScriptValue::Undefined,
         })
     });
     vm.bind("sessionmodeiszombiesgame", false, |_, _, _, _| {
-        Ok(Value::Int(1))
+        Ok(ScriptValue::Int(1))
     });
-    vm.bind("ismp", false, |_, _, _, _| Ok(Value::Int(0)));
-    vm.bind("issplitscreen", false, |_, _, _, _| Ok(Value::Int(0)));
+    vm.bind("ismp", false, |_, _, _, _| Ok(ScriptValue::Int(0)));
+    vm.bind("issplitscreen", false, |_, _, _, _| Ok(ScriptValue::Int(0)));
     vm.bind("getnumexpectedplayers", false, |_, _, _, _| {
-        Ok(Value::Int(1))
+        Ok(ScriptValue::Int(1))
     });
     vm.bind("getnumconnectedplayers", false, |_, host, _, _| {
-        Ok(Value::Int(i32::from(host.player.is_some())))
+        Ok(ScriptValue::Int(i32::from(host.player.is_some())))
     });
 }
 
-fn main() -> ExitCode {
-    let map = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "zm_nuked".to_owned());
-    let seconds: i64 = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
-    let dir = PathBuf::from(GAME);
+fn main() {
+    std::process::exit(match drive() {
+        Ok(()) => 0,
+        Err(Failed) => 1,
+    });
+}
+
+fn drive() -> Result<(), Failed> {
+    let map = parse_or(std::env::args().nth(1), "zm_nuked".to_owned());
+    let seconds: i64 = parse_or(std::env::args().nth(2), 30);
+    let dir = bo2zm_tools::zones_dir();
     let mut zones: Vec<String> = PRE.iter().map(|z| (*z).to_owned()).collect();
     if map == "zm_nuked" {
         zones.push("dlczm0_load_zm".into());
@@ -205,22 +220,21 @@ fn main() -> ExitCode {
     let mut ent_text = Vec::new();
     let (mut sl, mut sr, mut il, mut ir) = (0, 0, 0, 0);
     for z in &zones {
-        let path = dir.join(format!("{z}.ff"));
-        if !path.is_file() {
+        let Some(path) = Some(dir.join(format!("{z}.ff"))).filter(|p| p.is_file()) else {
             continue;
-        }
+        };
         let cap = match capture_zone(&path) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("{z}: {e}");
-                return ExitCode::FAILURE;
+                return Err(Failed);
             }
         };
         ent_text.extend(cap.map_ents.iter().cloned());
-        // T6RUN_ENTS=<text>: each map entity block holding it, then stop.
+        // T6RUN_ENTS=<source>: each map entity block holding it, then stop.
         if let Ok(want) = std::env::var("T6RUN_ENTS") {
-            for text in &cap.map_ents {
-                for block in text.split('}') {
+            for source in &cap.map_ents {
+                for block in source.split('}') {
                     if block.contains(want.as_str()) {
                         println!("{z}: {}", block.trim().replace(['\n', '\r'], " "));
                     }
@@ -255,7 +269,7 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     println!("DECODE FAIL {sname}: {e}");
-                    return ExitCode::FAILURE;
+                    return Err(Failed);
                 }
             }
         }
@@ -270,7 +284,7 @@ fn main() -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             println!("LINK FAIL: {e}");
-            return ExitCode::FAILURE;
+            return Err(Failed);
         }
     };
     let ops: usize = program.functions.iter().map(|f| f.code.len()).sum();
@@ -304,7 +318,7 @@ fn main() -> ExitCode {
     }
 
     // Map entities and structs.
-    let level = Value::Object(vm.level);
+    let level = ScriptValue::Object(vm.level);
     let _ = vm.spawn_named(
         &mut host,
         "codescripts/struct",
@@ -317,16 +331,16 @@ fn main() -> ExitCode {
         .find(&vm.strings, "codescripts/struct", "createstruct");
     let structs_s = vm.intern("struct");
     let (mut n_ents, mut n_structs) = (0, 0);
-    for text in &ent_text {
-        for e in parse_entities(text) {
+    for source in &ent_text {
+        for e in parse_entities(source) {
             let cls = e.classname().to_owned();
             if cls == "script_struct" {
                 let Some(cs) = createstruct else { continue };
                 vm.spawn(&mut host, cs, level.clone(), vec![]);
                 // The struct createstruct appended last.
                 let arr = vm.raw_field(vm.level, structs_s);
-                let Value::Array(a) = arr else { continue };
-                let Some(Value::Object(s)) = a.get(&gsc_t6::Key::Int(a.len() as i32 - 1)) else {
+                let ScriptValue::Array(a) = arr else { continue };
+                let Some(ScriptValue::Object(s)) = a.get(&gsc_t6::Key::Int(a.len() as i32 - 1)) else {
                     continue;
                 };
                 for (k, v) in &e.fields {
@@ -378,7 +392,7 @@ fn main() -> ExitCode {
                 &mut host,
                 "maps/mp/gametypes_zm/_callbacksetup",
                 "codecallback_playerconnect",
-                Value::Object(p),
+                ScriptValue::Object(p),
                 vec![],
             );
             println!(
@@ -405,5 +419,33 @@ fn main() -> ExitCode {
     for (n, (c, a)) in un.iter().take(150) {
         println!("  {c:>6} {n}({})", a.chars().take(60).collect::<String>());
     }
-    ExitCode::SUCCESS
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comma_list_separates_without_a_trailing_comma() {
+        assert_eq!(comma_list(Vec::<String>::new()), "");
+        assert_eq!(comma_list(["a".to_owned()]), "a");
+        assert_eq!(comma_list(["a".to_owned(), "b".to_owned(), "c".to_owned()]), "a, b, c");
+    }
+
+    #[test]
+    fn vec3_wants_exactly_three_numbers() {
+        assert_eq!(parse_vec3("1 -2.5  3"), Some([1.0, -2.5, 3.0]));
+        assert_eq!(parse_vec3("1 2"), None);
+        assert_eq!(parse_vec3("1 2 3 4"), None);
+        assert_eq!(parse_vec3("1 two 3"), None);
+    }
+
+    #[test]
+    fn parse_or_falls_back_on_missing_or_bad_words() {
+        assert_eq!(parse_or(Some("12".into()), 30i64), 12);
+        assert_eq!(parse_or(Some("soon".into()), 30i64), 30);
+        assert_eq!(parse_or(None, "zm_nuked".to_owned()), "zm_nuked");
+        assert_eq!(parse_or(Some("mp_nuked".into()), String::default()), "mp_nuked");
+    }
 }

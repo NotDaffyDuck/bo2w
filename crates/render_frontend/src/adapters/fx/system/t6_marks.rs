@@ -5,10 +5,10 @@
 //! a frame are taken out of the mark mesh here first.
 
 use bevy::prelude::*;
-use fx::FxSystemHost;
-use render_frame::SmodelVertex;
+use fx::EffectSystemHost;
+use render_frame::PropVertex;
 
-use crate::assemble::drawsurf::MaterialGeneration;
+use crate::assemble::draw_items::MaterialEpoch;
 
 /// The most corners the light cache holds before it starts over: more than any match leaves
 /// marks for.
@@ -19,7 +19,6 @@ const SLOW_LIGHTING_MS: f64 = 2.0;
 
 /// A mark draw: first index, index count, catalog material, where the mark landed, and the
 /// primary light with its baked visibility when the mark sits on a lightmapped surface.
-pub type MarkDraw = (u32, u32, u32, [f32; 3], Option<(u8, f32)>);
 
 /// World-space mark triangles with the mark's own texcoords.
 ///
@@ -29,24 +28,26 @@ pub type MarkDraw = (u32, u32, u32, [f32; 3], Option<(u8, f32)>);
 /// mark landed does the lighting.
 #[derive(Resource, Clone, Debug, Default)]
 pub struct T6MarkMesh {
-    pub vertices: Vec<SmodelVertex>,
+    pub vertices: Vec<PropVertex>,
     pub indices: Vec<u32>,
-    pub draws: Vec<MarkDraw>,
+    pub draws: Vec<(u32, u32, u32, [f32; 3], Option<(u8, f32)>)>,
 }
 
 impl T6MarkMesh {
-    fn clear(&mut self) {
-        self.vertices.clear();
-        self.indices.clear();
-        self.draws.clear();
+    /// Empties the mesh for a new frame, keeping its allocations.
+    fn start_frame(&mut self) {
+        let Self { vertices, indices, draws } = self;
+        vertices.clear();
+        indices.clear();
+        draws.clear();
     }
 }
 
 /// Whether the catalog material is a Black Ops II one, which draws in the fallback pass.
-pub(super) fn t6_fx_material(runtime: &MaterialGeneration, asset_id: usize) -> bool {
+pub(super) fn t6_fx_material(runtime: &MaterialEpoch, asset_id: usize) -> bool {
     runtime
         .catalog
-        .derived(assets::MaterialIndex::from_order(asset_id))
+        .derived(assets::SurfaceMaterialId::from_sequence(asset_id))
         .is_some_and(|material| material.t6_draw.is_some())
 }
 
@@ -77,27 +78,32 @@ impl MaterialFilter {
         Self::parse(&var("BO2MP_T6_FX_ONLY"), &var("BO2MP_T6_FX_SKIP"))
     }
 
-    fn is_empty(&self) -> bool {
+    fn hides_nothing(&self) -> bool {
         self.only.is_empty() && self.skip.is_empty()
     }
 
-    fn hides(&self, material_name: &str) -> bool {
-        let named = |words: &[String]| words.iter().any(|word| material_name.contains(word.as_str()));
+    fn hides(&self, surface_title: &str) -> bool {
+        let named = |words: &[String]| words.iter().any(|word| surface_title.contains(word.as_str()));
         (!self.only.is_empty() && !named(&self.only)) || named(&self.skip)
     }
 }
 
 /// Whether the test-aid filter hides this effect material.
-pub(super) fn t6_fx_filtered_out(runtime: &MaterialGeneration, asset_id: usize) -> bool {
+pub(super) fn t6_fx_filtered_out(runtime: &MaterialEpoch, asset_id: usize) -> bool {
     static FILTER: std::sync::OnceLock<MaterialFilter> = std::sync::OnceLock::new();
     let filter = FILTER.get_or_init(MaterialFilter::from_env);
-    if filter.is_empty() {
+    let Some(material) = runtime.catalog.derived(assets::SurfaceMaterialId::from_sequence(asset_id)) else {
         return false;
+    };
+    // The `superflare` materials (`sw4_3d_superflare_*` techniques: a light's lens flare, its ghosts placed on screen
+    // by the shader from an atlas of flare shapes, no depth test) whose shader is not ported are not drawn: as a
+    // sprite each one drew its whole atlas, a grid of coloured hexagons 70 units wide (Origins' lamps,
+    // `fx_tomb_light_expensive`). The ported ones (`T6Draw::flare`) draw as ghosts.
+    let flare = material.t6_draw.as_ref().is_some_and(|draw| draw.flare);
+    if material.name.contains("superflare") && !flare {
+        return true;
     }
-    runtime
-        .catalog
-        .derived(assets::MaterialIndex::from_order(asset_id))
-        .is_some_and(|material| filter.hides(&material.name))
+    !filter.hides_nothing() && filter.hides(&material.name)
 }
 
 /// The lightmap light at a mark corner, by lightmap, coordinate and normal (their exact bits),
@@ -106,29 +112,29 @@ pub(super) fn t6_fx_filtered_out(runtime: &MaterialGeneration, asset_id: usize) 
 /// the lightmap.
 #[derive(Default)]
 struct CornerLightCache {
-    generation: u64,
+    epoch: u64,
     lights: std::collections::HashMap<(u8, [u32; 2], [u32; 3]), Option<([f32; 3], f32)>>,
 }
 
 impl CornerLightCache {
     /// Starts over when the lightmaps changed or the cache has grown too large.
     fn sync(&mut self, generation: u64) {
-        if self.generation != generation || self.lights.len() > MAX_CACHED_CORNERS {
-            self.generation = generation;
+        if self.epoch != generation || self.lights.len() > MAX_CACHED_CORNERS {
+            self.epoch = generation;
             self.lights.clear();
         }
     }
 
     fn light_with(
         &mut self,
-        lmap: u8,
-        uv: [f32; 2],
-        normal: [f32; 3],
+        baked_light_slot: u8,
+        lightmap_uv: [f32; 2],
+        nrm: [f32; 3],
         lookup: impl FnOnce() -> Option<([f32; 3], f32)>,
     ) -> Option<([f32; 3], f32)> {
         *self
             .lights
-            .entry((lmap, uv.map(f32::to_bits), normal.map(f32::to_bits)))
+            .entry((baked_light_slot, lightmap_uv.map(f32::to_bits), nrm.map(f32::to_bits)))
             .or_insert_with(lookup)
     }
 }
@@ -137,12 +143,11 @@ static CORNER_LIGHTS: std::sync::LazyLock<std::sync::Mutex<CornerLightCache>> =
     std::sync::LazyLock::new(Default::default);
 
 /// One mark corner's lightmap light: the vertex it colours, the light, and its baked visibility.
-type CornerLight = (usize, [f32; 3], f32);
 
 /// Recolours the lit corners as the tint (taken from the first) times the square root of the
 /// light over 32, the form the prop shader bakes light in. Returns the mean baked visibility
 /// times the mean squared tint, or `None` when no corner was lit.
-fn relight_corners(vertices: &mut [SmodelVertex], lit: &[CornerLight]) -> Option<f32> {
+fn relight_corners(vertices: &mut [PropVertex], lit: &[(usize, [f32; 3], f32)]) -> Option<f32> {
     let &(first, _, _) = lit.first()?;
     let [r, g, b, _] = vertices[first].color;
     let tint = [r, g, b];
@@ -163,47 +168,47 @@ fn relight_corners(vertices: &mut [SmodelVertex], lit: &[CornerLight]) -> Option
 /// baked visibility, or `None` to keep the light grid: the surface has no lightmap, or one of the
 /// mark's corners has no sample.
 fn light_from_lightmap(
-    surf: &fx::GfxMarkMeshSurf,
-    indices: &[u16],
-    points: &[marks_t6::FxMarkStagingPoint],
-    vertices: &mut [SmodelVertex],
+    surf: &fx::DecalMeshPatch,
+    triangle_corners: &[u16],
+    points: &[marks_t6::EffectStainStagingPoint],
+    vertices: &mut [PropVertex],
     cache: &mut CornerLightCache,
 ) -> Option<(u8, f32)> {
-    let lmap = surf.context.lmap_index;
-    if lmap == marks_t6::GFX_SURFACE_LIGHTMAP_NONE {
+    let baked_light_slot = surf.context.baked_light_slot_number;
+    if baked_light_slot == marks_t6::SURFACE_BAKED_LIGHT_ABSENT {
         return None;
     }
-    let mut corners = indices.to_vec();
+    let mut corners = triangle_corners.to_vec();
     corners.sort_unstable();
     corners.dedup();
 
     let mut lit = Vec::with_capacity(corners.len());
-    for corner in corners {
-        let at = usize::from(corner);
-        let (Some(point), true) = (points.get(at), at < vertices.len()) else {
+    for vertex in corners {
+        let at = usize::from(vertex);
+        let (Some(pt), true) = (points.get(at), at < vertices.len()) else {
             continue;
         };
-        let (light, visibility) = cache.light_with(lmap, point.lmap_coord, point.normal, || {
-            lighting_t6::t6_lightmap_light(lmap, point.lmap_coord, point.normal)
+        let (light, vis_state) = cache.light_with(baked_light_slot, pt.baked_light_uv, pt.normal, || {
+            lighting_t6::t6_lightmap_light(baked_light_slot, pt.baked_light_uv, pt.normal)
         })?;
-        lit.push((at, light, visibility));
+        lit.push((at, light, vis_state));
     }
     let baked = relight_corners(vertices, &lit)?;
-    Some((surf.context.primary_light_index, baked))
+    Some((surf.context.key_light_index, baked))
 }
 
 /// The vertices of the whole mark mesh, converted from the packed Black Ops II rows.
-fn mark_vertices(mesh: &fx::GfxMarkMeshCensus) -> Vec<SmodelVertex> {
-    mesh.packed
+fn mark_vertices(mesh: &fx::DecalMeshTally) -> Vec<PropVertex> {
+    mesh.vert_blob
         .iter()
-        .zip(&mesh.verts)
+        .zip(&mesh.vertex_points)
         .map(|(row, point)| {
             let packed = asset_t6::T6PackedVertex::read(row).expect("a whole BO2 mark row");
-            SmodelVertex {
-                position: point.xyz,
+            PropVertex {
+                position: point.spot,
                 normal: point.normal,
                 color: packed.color_unorm(),
-                uv0: packed.uv(),
+                first_texcoord: packed.uv(),
             }
         })
         .collect()
@@ -212,60 +217,50 @@ fn mark_vertices(mesh: &fx::GfxMarkMeshCensus) -> Vec<SmodelVertex> {
 /// Moves the frame's Black Ops II marks out of the mark mesh into `out`, before the engine's own
 /// mark plan sees it.
 pub(super) fn take_t6_marks(
-    host: &FxSystemHost,
-    mesh: Option<&fx::GfxMarkMeshCensus>,
-    runtime: &MaterialGeneration,
+    host: &EffectSystemHost,
+    tally: Option<&fx::DecalMeshTally>,
+    runtime: &MaterialEpoch,
     out: &mut T6MarkMesh,
 ) {
-    out.clear();
-    let Some(mesh) = mesh else {
+    out.start_frame();
+    let Some(mesh) = tally else {
         return;
     };
     let mut cache = CORNER_LIGHTS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(|held| held.into_inner());
     cache.sync(lighting_t6::t6_lightmap_generation());
 
     let mut lighting_ms = 0.0;
     for surf in mesh.surfs.iter().filter(|surf| surf.index_count != 0) {
-        let Some(name) = host.marks.material_name(surf.mark_slot) else {
+        let Some(name) = host.marks.surface_title(surf.stain_cell) else {
             continue;
         };
-        let Some(material) = runtime
+        let bound = runtime
             .catalog
-            .material_for_name(asset_game::material_bind_name(name))
-            .filter(|material| material.t6_draw.is_some())
-        else {
-            continue;
-        };
-        let first = surf.index_start as usize;
-        let Some(indices) = mesh
-            .indices
-            .get(first..first.saturating_add(surf.index_count as usize))
-        else {
+            .material_by_name(asset_game::material_bind_name(name))
+            .filter(|material| material.t6_draw.is_some());
+        let first = surf.first_triangle_slot as usize;
+        let count = surf.index_count;
+        let tris = mesh.index_list.get(first..first.saturating_add(count as usize));
+        let (Some(bound), Some(tris)) = (bound, tris) else {
             continue;
         };
         if out.vertices.is_empty() {
             out.vertices = mark_vertices(mesh);
         }
         let start = out.indices.len() as u32;
-        out.indices.extend(indices.iter().map(|&i| u32::from(i)));
-        let landed = indices
+        out.indices.extend(tris.iter().map(|&i| u32::from(i)));
+        let landed = tris
             .first()
-            .and_then(|&i| mesh.verts.get(usize::from(i)))
-            .map_or([0.0; 3], |point| point.xyz);
+            .and_then(|&i| mesh.vertex_points.get(usize::from(i)))
+            .map_or([0.0; 3], |point| point.spot);
 
         let began = std::time::Instant::now();
-        let lit = light_from_lightmap(surf, indices, &mesh.verts, &mut out.vertices, &mut cache);
+        let lit = light_from_lightmap(surf, tris, &mesh.vertex_points, &mut out.vertices, &mut cache);
         lighting_ms += began.elapsed().as_secs_f64() * 1000.0;
 
-        out.draws.push((
-            start,
-            surf.index_count,
-            u32::from(material.asset_id.0),
-            landed,
-            lit,
-        ));
+        out.draws.push((start, count, u32::from(bound.asset_id.0), landed, lit));
     }
     if lighting_ms > SLOW_LIGHTING_MS {
         diag::warn!(
@@ -280,19 +275,19 @@ pub(super) fn take_t6_marks(
 mod tests {
     use super::*;
 
-    fn corner(color: [f32; 4]) -> SmodelVertex {
-        SmodelVertex {
+    fn corner(color: [f32; 4]) -> PropVertex {
+        PropVertex {
             position: [0.0; 3],
-            normal: [0.0, 0.0, 1.0],
+            normal: Vec3::Z.to_array(),
             color,
-            uv0: [0.0; 2],
+            first_texcoord: [0.0; 2],
         }
     }
 
     #[test]
     fn an_empty_filter_hides_nothing() {
         let filter = MaterialFilter::parse("", "");
-        assert!(filter.is_empty());
+        assert!(filter.hides_nothing());
         assert!(!filter.hides("anything"));
     }
 
@@ -379,7 +374,7 @@ mod tests {
         mesh.vertices.push(corner([1.0; 4]));
         mesh.indices.push(0);
         mesh.draws.push((0, 1, 2, [0.0; 3], None));
-        mesh.clear();
+        mesh.start_frame();
         assert!(mesh.vertices.is_empty() && mesh.indices.is_empty() && mesh.draws.is_empty());
     }
 }

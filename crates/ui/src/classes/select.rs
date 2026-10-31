@@ -2,98 +2,98 @@
 //! in flight, and the rules for committing, accepting and refusing a choice.
 
 use bevy::prelude::*;
-use frame::{AppScreen, ClientSet, RuntimeRole};
-use net::SignonState;
+use frame::{ShellScreen, ProcessDuty};
+use net::JoinProgressRecord;
 
-use crate::classes::icons::{ClassSelectIconCache, UiAssetRoot, warm_class_select_icons};
-use crate::classes::store::SessionClassStore;
+use crate::classes::icons::{LoadoutPickerThumbs, MenuMediaAnchor, preload_kit_pictures};
+use crate::classes::store::MatchLoadoutVault;
 
 /// Whether the class-select overlay is showing.
 #[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ClassSelectOverlayOpen(pub bool);
+pub struct LoadoutPickerShown(pub bool);
 
 /// The overlay opens on arrival at the class screen and stays open for as
 /// long as the screen does; replays and failed signons never show it.
-pub(crate) fn overlay_open_after_screen(
-    prev: Option<AppScreen>,
-    now: AppScreen,
-    replay: bool,
-    failed: bool,
-    currently_open: bool,
+pub(crate) fn show_overlay_post_scene(
+    before: Option<ShellScreen>,
+    current: ShellScreen,
+    is_replay: bool,
+    signon_failed: bool,
+    was_open: bool,
 ) -> bool {
-    if replay || failed || now != AppScreen::ClassSelect {
+    if is_replay || signon_failed || current != ShellScreen::KitPicker {
         return false;
     }
-    prev != Some(AppScreen::ClassSelect) || currently_open
+    was_open || before != Some(ShellScreen::KitPicker)
 }
 
 /// Whether the player may change class at this moment.
 #[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ClassChangeAllowed(pub bool);
+pub struct LoadoutSwapPermit(pub bool);
 
 /// Why a class change is not allowed, when it is not.
 #[derive(Resource, Debug, Default, Clone, PartialEq, Eq)]
-pub struct ClassChangeBlockReason(pub Option<String>);
+pub struct LoadoutSwapDenial(pub Option<String>);
 
 /// Either the menu is free, or exactly one equip request awaits its answer.
 #[derive(Resource, Debug, Default, Clone, PartialEq, Eq)]
-pub enum ClassSelectPhase {
+pub enum LoadoutPickerStage {
     #[default]
-    Interactive,
+    Idle,
     Pending {
-        request_id: u32,
-        class_index: usize,
+        ask_number: u32,
+        category_slot: usize,
     },
 }
 
-impl ClassSelectPhase {
-    pub fn is_pending(&self) -> bool {
-        self.pending_request_id().is_some()
+impl LoadoutPickerStage {
+    pub fn queued_ask_number(&self) -> Option<u32> {
+        match self {
+            Self::Pending { ask_number, .. } => Some(*ask_number),
+            Self::Idle => None,
+        }
     }
 
-    pub fn pending_request_id(&self) -> Option<u32> {
-        match self {
-            Self::Pending { request_id, .. } => Some(*request_id),
-            Self::Interactive => None,
-        }
+    pub fn awaiting_host(&self) -> bool {
+        self.queued_ask_number().is_some()
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ClassEquipRequest {
-    pub request_id: u32,
-    pub class_index: usize,
+pub struct LoadoutArmAsk {
+    pub ask_number: u32,
+    pub category_slot: usize,
 }
 
 /// A committed request that has not been sent to the host yet.
 #[derive(Resource, Debug, Default)]
-pub struct PendingClassEquip(pub Option<ClassEquipRequest>);
+pub struct QueuedLoadoutArm(pub Option<LoadoutArmAsk>);
 
 /// One line of feedback shown under the class list.
 #[derive(Resource, Debug, Default, Clone, PartialEq, Eq)]
-pub struct ClassSelectStatus(pub Option<String>);
+pub struct LoadoutPickerReport(pub Option<String>);
 
 /// The class the list cursor is on.
 #[derive(Resource, Debug, Default, Clone, Copy)]
-pub struct ClassSelectHighlight(pub usize);
+pub struct LoadoutPickerFocus(pub usize);
 
 /// Why a commit was turned away before reaching the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ClassEquipRefusal {
-    AlreadyPending { request_id: u32 },
-    UnknownClass(String),
-    LockedContent { index: usize, reason: String },
+pub enum LoadoutArmRejection {
+    InFlightAlready { ask_number: u32 },
+    UnlistedLoadout(String),
+    FrozenSlot { preset: usize, why: String },
 }
 
-impl std::fmt::Display for ClassEquipRefusal {
+impl std::fmt::Display for LoadoutArmRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AlreadyPending { request_id } => {
-                write!(f, "equip already pending (request_id={request_id})")
+            Self::InFlightAlready { ask_number } => {
+                write!(f, "equip already pending (request_id={ask_number})")
             }
-            Self::UnknownClass(name) => write!(f, "unknown_class: `{name}`"),
-            Self::LockedContent { index, reason } => {
-                write!(f, "locked_content: preset {index} — {reason}")
+            Self::UnlistedLoadout(name) => write!(f, "unknown_class: `{name}`"),
+            Self::FrozenSlot { preset, why } => {
+                write!(f, "locked_content: preset {preset} — {why}")
             }
         }
     }
@@ -101,134 +101,174 @@ impl std::fmt::Display for ClassEquipRefusal {
 
 /// Finds a class by position (a number) or, failing that, by name ignoring
 /// case.
-pub fn class_index_by_name(store: &SessionClassStore, name: &str) -> Option<usize> {
-    let by_number = name
-        .parse::<usize>()
-        .ok()
-        .filter(|&index| index < store.slots.len());
+pub fn loadout_slot_named(vault: &MatchLoadoutVault, wanted: &str) -> Option<usize> {
+    let by_number = wanted.parse::<usize>().ok().filter(|&n| n < vault.slots.len());
     by_number.or_else(|| {
-        store
+        let lowered = wanted.to_ascii_lowercase();
+        vault
             .slots
             .iter()
-            .position(|slot| slot.name.eq_ignore_ascii_case(name))
+            .position(|slot| slot.name.to_ascii_lowercase() == lowered)
     })
 }
 
-/// Starts an equip of the class at `index`, returning the new request id.
-pub fn commit_class_equip(
+/// What stops an equip of the class at `index` right now, if anything.
+fn equip_blocker(
+    phase: &LoadoutPickerStage,
+    classes: &MatchLoadoutVault,
     index: usize,
-    store: &mut SessionClassStore,
-    highlight: &mut ClassSelectHighlight,
-    phase: &mut ClassSelectPhase,
-    pending: &mut PendingClassEquip,
-    status: &mut ClassSelectStatus,
-    seq: &mut net::ActionRequestIds,
-) -> Result<u32, ClassEquipRefusal> {
-    if let Some(request_id) = phase.pending_request_id() {
-        return Err(ClassEquipRefusal::AlreadyPending { request_id });
+) -> Option<LoadoutArmRejection> {
+    if let Some(ask_number) = phase.queued_ask_number() {
+        return Some(LoadoutArmRejection::InFlightAlready { ask_number });
     }
-    let slot = store
-        .slots
-        .get(index)
-        .ok_or_else(|| ClassEquipRefusal::UnknownClass(index.to_string()))?;
-    if let Some(reason) = &slot.lock_reason {
-        let refusal = ClassEquipRefusal::LockedContent {
-            index,
-            reason: reason.clone(),
-        };
-        status.0 = Some(refusal.to_string());
-        return Err(refusal);
+    match classes.slots.get(index) {
+        None => Some(LoadoutArmRejection::UnlistedLoadout(index.to_string())),
+        Some(slot) => slot.frozen_because.clone().map(|why| LoadoutArmRejection::FrozenSlot { preset: index, why }),
     }
-
-    let request_id = seq.allocate();
-    highlight.0 = index;
-    store.selected = index;
-    pending.0 = Some(ClassEquipRequest {
-        request_id,
-        class_index: index,
-    });
-    *phase = ClassSelectPhase::Pending {
-        request_id,
-        class_index: index,
-    };
-    status.0 = None;
-    Ok(request_id)
 }
 
-/// The host accepted `request_id`: the class becomes the equipped one and the
+/// Starts an equip of the class at `index`, returning the new request id.
+pub fn finalize_loadout_arm(
+    index: usize,
+    classes: &mut MatchLoadoutVault,
+    cursor: &mut LoadoutPickerFocus,
+    menu_phase: &mut LoadoutPickerStage,
+    outbox: &mut QueuedLoadoutArm,
+    feedback: &mut LoadoutPickerReport,
+    ids: &mut net::ActionRequestCounter,
+) -> Result<u32, LoadoutArmRejection> {
+    if let Some(blocker) = equip_blocker(menu_phase, classes, index) {
+        if let LoadoutArmRejection::FrozenSlot { .. } = blocker {
+            feedback.0 = Some(blocker.to_string());
+        }
+        return Err(blocker);
+    }
+
+    let LoadoutArmAsk { ask_number, category_slot } = LoadoutArmAsk {
+        category_slot: index,
+        ask_number: ids.allocate(),
+    };
+    feedback.0 = None;
+    *menu_phase = LoadoutPickerStage::Pending { ask_number, category_slot };
+    outbox.0 = Some(LoadoutArmAsk { ask_number, category_slot });
+    (classes.selected, cursor.0) = (index, index);
+    Ok(ask_number)
+}
+
+/// The host accepted `ask_number`: the class becomes the equipped one and the
 /// overlay closes. Answers for any other request are ignored (`false`).
-pub fn accept_class_equip(
-    store: &mut SessionClassStore,
-    phase: &mut ClassSelectPhase,
-    overlay: &mut ClassSelectOverlayOpen,
-    request_id: u32,
+pub fn grant_loadout_arm(
+    classes: &mut MatchLoadoutVault,
+    menu_phase: &mut LoadoutPickerStage,
+    shown: &mut LoadoutPickerShown,
+    answered: u32,
 ) -> bool {
-    let ClassSelectPhase::Pending {
-        request_id: awaited,
-        class_index,
-    } = *phase
-    else {
-        return false;
-    };
-    if awaited != request_id {
-        return false;
+    match *menu_phase {
+        LoadoutPickerStage::Pending { ask_number, category_slot } if ask_number == answered => {
+            *menu_phase = LoadoutPickerStage::default();
+            classes.equipped = Some(category_slot);
+            shown.0 = false;
+            true
+        }
+        _ => false,
     }
-    store.equipped = Some(class_index);
-    *phase = ClassSelectPhase::Interactive;
-    overlay.0 = false;
-    true
 }
 
-/// The host refused `request_id`: the menu frees up and shows why. Answers
+/// The host refused `ask_number`: the menu frees up and shows why. Answers
 /// for any other request are ignored (`false`).
-pub fn reject_class_equip(
-    phase: &mut ClassSelectPhase,
-    status: &mut ClassSelectStatus,
-    request_id: u32,
-    reason: impl Into<String>,
+pub fn refuse_loadout_arm(
+    menu_phase: &mut LoadoutPickerStage,
+    feedback: &mut LoadoutPickerReport,
+    answered: u32,
+    why: impl Into<String>,
 ) -> bool {
-    if phase.pending_request_id() != Some(request_id) {
-        return false;
+    let awaited = menu_phase.queued_ask_number() == Some(answered);
+    if awaited {
+        *menu_phase = LoadoutPickerStage::default();
+        feedback.0 = Some(why.into());
     }
-    *phase = ClassSelectPhase::Interactive;
-    status.0 = Some(reason.into());
-    true
+    awaited
 }
 
-pub(crate) struct ClassSelectPlugin;
+pub(crate) struct LoadoutPickerModule;
 
-impl Plugin for ClassSelectPlugin {
+impl Plugin for LoadoutPickerModule {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ClassSelectOverlayOpen>()
-            .init_resource::<ClassChangeAllowed>()
-            .init_resource::<ClassChangeBlockReason>()
-            .init_resource::<PendingClassEquip>()
-            .init_resource::<ClassSelectPhase>()
-            .init_resource::<ClassSelectStatus>()
-            .init_resource::<ClassSelectHighlight>()
-            .init_resource::<ClassSelectIconCache>()
-            .init_resource::<UiAssetRoot>()
-            .init_resource::<SessionClassStore>()
-            .add_systems(
-                PostUpdate,
-                sync_class_select_overlay_to_screen.before(crate::layers::ApplyUiLayers),
-            )
-            .add_systems(Update, warm_class_select_icons.in_set(ClientSet::Ui));
+        app.init_resource::<LoadoutSwapPermit>();
+        app.init_resource::<LoadoutSwapDenial>();
+        app.init_resource::<LoadoutPickerShown>();
+        app.init_resource::<MatchLoadoutVault>();
+        app.init_resource::<MenuMediaAnchor>();
+        app.init_resource::<LoadoutPickerThumbs>();
+        app.init_resource::<LoadoutPickerFocus>();
+        app.init_resource::<LoadoutPickerReport>();
+        app.init_resource::<LoadoutPickerStage>();
+        app.init_resource::<QueuedLoadoutArm>();
+        crate::every_ui_frame(app, preload_kit_pictures);
+        app.add_systems(
+            PostUpdate,
+            follow_screen_for_class_overlay.before(crate::tiers::OverlayTierPass),
+        );
     }
 }
 
-fn sync_class_select_overlay_to_screen(
-    screen: Res<AppScreen>,
-    role: Option<Res<RuntimeRole>>,
-    signon: Option<Res<SignonState>>,
-    mut overlay: ResMut<ClassSelectOverlayOpen>,
-    mut last_screen: Local<Option<AppScreen>>,
+fn follow_screen_for_class_overlay(
+    on_screen: Res<ShellScreen>,
+    role: Option<Res<ProcessDuty>>,
+    signon: Option<Res<JoinProgressRecord>>,
+    mut shown: ResMut<LoadoutPickerShown>,
+    mut last_screen: Local<Option<ShellScreen>>,
 ) {
-    let replay = role.is_some_and(|role| *role == RuntimeRole::Replay);
-    let failed = signon.is_some_and(|signon| signon.phase.is_failed());
-    let open = overlay_open_after_screen(*last_screen, *screen, replay, failed, overlay.0);
-    if overlay.0 != open {
-        overlay.0 = open;
+    let is_replay = matches!(role.as_deref(), Some(ProcessDuty::Replay));
+    let signon_failed = signon.is_some_and(|state| state.phase.has_failed());
+    let current = *on_screen;
+    let before = last_screen.replace(current);
+    let open = show_overlay_post_scene(before, current, is_replay, signon_failed, shown.0);
+    if open != shown.0 {
+        shown.0 = open;
     }
-    *last_screen = Some(*screen);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_opens_on_arrival_and_stays_until_the_screen_changes() {
+        let open = show_overlay_post_scene;
+        let screen = ShellScreen::KitPicker;
+        assert!(open(None, screen, false, false, false));
+        assert!(open(Some(screen), screen, false, false, true));
+        assert!(!open(Some(screen), screen, false, false, false));
+        assert!(!open(None, screen, true, false, false));
+        assert!(!open(None, screen, false, true, true));
+    }
+
+    #[test]
+    fn only_the_awaited_request_settles() {
+        let mut phase = LoadoutPickerStage::Pending {
+            ask_number: 4,
+            category_slot: 2,
+        };
+        let mut words = LoadoutPickerReport::default();
+        assert!(!refuse_loadout_arm(&mut phase, &mut words, 5, "nope"));
+        assert!(phase.awaiting_host());
+        assert!(refuse_loadout_arm(&mut phase, &mut words, 4, "full"));
+        assert_eq!(words.0.as_deref(), Some("full"));
+        assert_eq!(phase.queued_ask_number(), None);
+    }
+
+    #[test]
+    fn refusals_read_as_one_line_each() {
+        let locked = LoadoutArmRejection::FrozenSlot {
+            preset: 3,
+            why: "needs rank 9".into(),
+        };
+        assert_eq!(
+            locked.to_string(),
+            "locked_content: preset 3 — needs rank 9"
+        );
+        let busy = LoadoutArmRejection::InFlightAlready { ask_number: 7 };
+        assert_eq!(busy.to_string(), "equip already pending (request_id=7)");
+    }
 }

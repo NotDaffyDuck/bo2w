@@ -7,17 +7,18 @@ mod refusal;
 mod resolve;
 mod shell;
 
-pub use build::{execute_material, execute_material_with_shell};
+pub use build::run_material_pipeline;
 pub use lanes::{
-    PackedCodeConstantLane, PackedCodeConstants, PackedCodeSamplerLane, PackedCodeSamplers,
+    CodeConstantChannel, CodeConstantBundle, CodeSamplerChannel, CompactEngineSamplers,
 };
-pub use refusal::{MaterialRefusal, UnsupportedStateFields};
+pub use refusal::{MaterialExecutionDenial, UnhandledStateFields};
 pub use resolve::{
-    MaterialDrawKey, add_surf_has_technique, draw_binds_code_texture, draw_code_sampler_mask,
-    prepared_draw_technique, resolve_material_technique, resolve_sorted_material,
-    smodel_tess_vertex_type, world_tess_vertex_type, world_tess_vertex_type_authored,
+    SurfaceSortKeyPair, surface_add_gains_technique, draw_uses_engine_texture, draw_engine_sampler_bits,
+    resolved_draw_technique, select_material_technique, lookup_ordered_material,
 };
+pub use resolve::smodel_tess_vertex_type;
+pub use resolve::tess_vertex_kind;
+pub use resolve::level_stitch_vertex_type_designer;
 pub use shell::{
-    ExecutablePass, ExecutablePassView, MaterialExecution, StableMaterialShell, StablePassShell,
-    capture_stable_shell, rebind_stable_material,
+    BoundPass, CodeLanes, MaterialRunPlan, MaterialPlan, PassPlan, capture_plan, execute_plan,
 };

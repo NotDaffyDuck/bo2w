@@ -1,3 +1,4 @@
+#![cfg(test)]
 use super::*;
 
 #[test]
@@ -20,20 +21,20 @@ fn other_weapons_have_no_client_clip() {
 #[test]
 fn light_sample_sits_above_the_missile() {
     assert_eq!(
-        missile_lighting_origin([4.0, 5.0, 6.0]),
-        [4.0, 5.0, 6.0 + MISSILE_LIGHTING_Z_OFS]
+        rocket_light_point([4.0, 5.0, 6.0]),
+        [4.0, 5.0, 6.0 + ROCKET_LIGHT_LIFT]
     );
 }
 
 #[test]
 fn missile_matrix_places_and_turns() {
-    let m = missile_world_from_local([1.0, 2.0, 3.0], [0.0, 90.0, 0.0]);
+    let m = rocket_model_to_world([1.0, 2.0, 3.0], [0.0, 90.0, 0.0]);
     assert!(
         m.transform_point3(Vec3::ZERO)
             .abs_diff_eq(Vec3::new(1.0, 2.0, 3.0), 1e-5)
     );
     assert!(m.transform_vector3(Vec3::X).abs_diff_eq(Vec3::Y, 1e-5));
-    let tipped = missile_world_from_local([0.0; 3], [90.0, 0.0, 0.0]);
+    let tipped = rocket_model_to_world([0.0; 3], [90.0, 0.0, 0.0]);
     assert!(
         tipped
             .transform_vector3(Vec3::X)
@@ -51,7 +52,7 @@ fn clip_phase_loops_or_clamps() {
 
 #[test]
 fn atlas_prefers_the_first_source() {
-    assert!(missile_lighting_atlas(None, None).is_none());
+    assert!(rocket_light_atlas(None, None).is_none());
 }
 
 #[test]

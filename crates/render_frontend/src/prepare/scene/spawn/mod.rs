@@ -5,14 +5,14 @@
 mod drive;
 mod job;
 mod look;
-mod present;
-mod teardown;
+mod shown_frame;
+mod level_teardown;
 
-pub(crate) use drive::{spawn_world, spawn_world_finish};
-pub use job::{WorldSpawnJob, WorldSpawnPhase};
-pub(crate) use present::register_world_gpu_ready;
-pub(crate) use teardown::{
-    arm_world_spawn_on_install, despawn_fly_cameras_on_teardown,
-    despawn_world_entities_on_teardown, reset_world_spawn_on_teardown,
-    shutdown_world_on_teardown,
+pub(crate) use drive::{spawn_level_world, spawn_level_finish};
+pub use job::{LevelSpawnJob, LevelSpawnPhase};
+pub(crate) use shown_frame::register_level_gpu_ready;
+pub(crate) use level_teardown::{
+    arm_level_spawn_on_install, despawn_free_cameras_on_teardown,
+    despawn_level_entities_on_teardown, reset_level_spawn_on_teardown,
+    shutdown_level_on_teardown,
 };

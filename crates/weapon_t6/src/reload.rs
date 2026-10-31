@@ -8,15 +8,15 @@
 use crate::state;
 
 /// BO2's player weapon anim numbers used by reloading (`weapAnim`, low bits; 0x400 is the restart toggle).
-pub mod anim {
-    pub const IDLE: i32 = 0;
+pub mod refill_clips {
+    pub const REST: i32 = 0;
     pub const RELOAD: i32 = 17;
-    pub const RELOAD_EMPTY: i32 = 18;
-    pub const RELOAD_START: i32 = 19;
-    pub const RELOAD_END: i32 = 20;
+    pub const RELOAD_DRY: i32 = 18;
+    pub const RELOAD_BEGIN: i32 = 19;
+    pub const RELOAD_FINISH: i32 = 20;
     pub const RELOAD_QUICK: i32 = 21;
     pub const RELOAD_QUICK_EMPTY: i32 = 22;
-    pub const EMPTY_RAISE: i32 = 28;
+    pub const EMPTY_TAKE_OUT: i32 = 28;
     pub const TOGGLE: i32 = 0x400;
 }
 
@@ -35,7 +35,7 @@ pub struct ReloadDef {
     pub dual_wield: bool,
     /// Weapon used as a melee weapon (no empty raise after a knife).
     pub use_as_melee: bool,
-    pub clip_size: i32,
+    pub magazine_capacity: i32,
     pub reload: i32,
     pub reload_empty: i32,
     pub reload_quick: i32,
@@ -45,11 +45,11 @@ pub struct ReloadDef {
     pub reload_quick_add: i32,
     pub reload_quick_empty_add: i32,
     pub reload_start: i32,
-    pub reload_start_add: i32,
+    pub reload_begin_bonus: i32,
     pub reload_end: i32,
     pub rechamber_bolt_time: i32,
     pub empty_raise_time: i32,
-    pub no_partial_reload: bool,
+    pub forbid_topup_reload: bool,
     /// One-by-one reload (weapon or attachment).
     pub segmented: bool,
     pub no_ads_auto_reload: bool,
@@ -57,27 +57,27 @@ pub struct ReloadDef {
     pub ammo_add: i32,
     /// Rounds added during the start (0 = none).
     pub start_add: i32,
-    pub bolt_action: bool,
+    pub manual_cycle: bool,
     pub shots_before_rechamber: i32,
     pub unlimited_ammo: bool,
     /// Fast Mag.
     pub dual_mag: bool,
     pub charge_shot: bool,
     /// Third-person reload anim is skipped for clip-only weapons.
-    pub clip_only: bool,
+    pub motion_clip_exclusive: bool,
 }
 
 /// One hand's reload state (the player-state fields BO2 keeps for it).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Hand {
-    pub state: i32,
-    pub weapon_time: i32,
-    pub weapon_delay: i32,
+    pub phase: i32,
+    pub timer_ms: i32,
+    pub weapon_ready_wait: i32,
     /// Player anim number with the 0x400 toggle bit.
     pub anim: i32,
-    pub clip: i32,
-    pub stock: i32,
-    pub shot_count: i32,
+    pub mag_rounds: i32,
+    pub spare_rounds: i32,
+    pub rounds_fired: i32,
     pub shots_from_chamber: i32,
     pub needs_rechamber: bool,
     /// The held weapon's quick-reload flag (Fast Mag alternation).
@@ -89,12 +89,12 @@ pub struct Hand {
 /// This tick's input for the hand.
 #[derive(Clone, Debug)]
 pub struct Input {
-    pub msec: i32,
+    pub frame_ms: i32,
     pub reload: bool,
     /// Script asked for a reload (weapon flag bit 1, consumed by the check).
     pub script_reload: bool,
     pub fire: bool,
-    pub fire_last: bool,
+    pub final_round_fired: bool,
     /// specialty_fastreload (player or attachment perk).
     pub fast_reload: bool,
     pub reload_mult: f32,
@@ -117,11 +117,11 @@ pub struct Input {
 impl Default for Input {
     fn default() -> Self {
         Self {
-            msec: 0,
+            frame_ms: 0,
             reload: false,
             script_reload: false,
             fire: false,
-            fire_last: false,
+            final_round_fired: false,
             fast_reload: false,
             reload_mult: RELOAD_MULT,
             fully_ads: false,
@@ -142,7 +142,7 @@ pub enum Event {
     ResetAds = 17,
     Reload = 18,
     ReloadFromEmpty = 19,
-    ReloadStart = 20,
+    ReloadKickoff = 20,
     ReloadEnd = 21,
     /// The `reload_start` script notify.
     ReloadStartNotify = 22,
@@ -154,17 +154,17 @@ pub enum Event {
 }
 
 fn start_anim(h: &mut Hand, a: i32) {
-    h.anim = (!h.anim & anim::TOGGLE) | a;
+    h.anim = (!h.anim & refill_clips::TOGGLE) | a;
 }
 
 fn to_ready(h: &mut Hand) {
-    h.state = state::READY;
-    start_anim(h, anim::IDLE);
+    h.phase = state::READY;
+    start_anim(h, refill_clips::REST);
 }
 
 fn in_start(h: &Hand) -> bool {
     matches!(
-        h.state,
+        h.phase,
         state::RELOAD_START | state::RELOAD_START_RECHAMBER | state::RELOAD_START_INTERUPT
     )
 }
@@ -176,22 +176,22 @@ pub fn is_reload_state(s: i32) -> bool {
 
 /// This tick's timer step in ms for a hand in a reload state (plain `msec` otherwise).
 pub fn step_ms(h: &Hand, inp: &Input) -> i32 {
-    if !(inp.fast_reload && is_reload_state(h.state)) {
-        return inp.msec;
+    if !(inp.fast_reload && is_reload_state(h.phase)) {
+        return inp.frame_ms;
     }
     if inp.reload_mult == 0.0 {
-        return h.weapon_time.max(h.weapon_delay);
+        return h.timer_ms.max(h.weapon_ready_wait);
     }
-    (inp.msec as f64 / inp.reload_mult as f64 + 9.313226e-10).round() as i32
+    (inp.frame_ms as f64 / inp.reload_mult as f64 + 9.313226e-10).round() as i32
 }
 
 /// Counts both timers down by `dt`. True when the delayed action fires this tick.
 pub fn count_down(h: &mut Hand, dt: i32) -> bool {
-    h.weapon_time = (h.weapon_time - dt).max(0);
-    if h.weapon_delay != 0 {
-        h.weapon_delay -= dt;
-        if h.weapon_delay < 1 {
-            h.weapon_delay = 0;
+    h.timer_ms = (h.timer_ms - dt).max(0);
+    if h.weapon_ready_wait != 0 {
+        h.weapon_ready_wait -= dt;
+        if h.weapon_ready_wait < 1 {
+            h.weapon_ready_wait = 0;
             return true;
         }
     }
@@ -203,33 +203,33 @@ fn quick(def: &ReloadDef, h: &Hand) -> bool {
 }
 
 fn empty_bullet(def: &ReloadDef, h: &Hand) -> bool {
-    h.clip == 0 && def.bullet
+    h.mag_rounds == 0 && def.bullet
 }
 
 /// AllowReload: spare ammo, clip not full, and the no-partial rule.
 pub fn allow(def: &ReloadDef, h: &Hand) -> bool {
-    if h.stock == 0 || h.clip >= def.clip_size {
+    if h.spare_rounds == 0 || h.mag_rounds >= def.magazine_capacity {
         return false;
     }
-    if def.no_partial_reload {
-        if def.ammo_add != 0 && def.ammo_add < def.clip_size {
-            return def.ammo_add <= def.clip_size - h.clip;
+    if def.forbid_topup_reload {
+        if def.ammo_add != 0 && def.ammo_add < def.magazine_capacity {
+            return def.ammo_add <= def.magazine_capacity - h.mag_rounds;
         }
-        return h.clip == 0;
+        return h.mag_rounds == 0;
     }
     true
 }
 
 /// May an automatic (empty-clip) reload start in this state?
 fn auto_allowed(def: &ReloadDef, h: &Hand, inp: &Input, ev: &mut Vec<Event>) -> bool {
-    match h.state {
+    match h.phase {
         1..=5
         | state::RELOADING
         | state::RELOADING_INTERUPT
         | state::RELOAD_END
         | state::SWIM_IN => false,
         state::RELOAD_START | state::RELOAD_START_RECHAMBER | state::RELOAD_START_INTERUPT => {
-            if inp.prone_change && !def.clip_only {
+            if inp.prone_change && !def.motion_clip_exclusive {
                 ev.push(Event::ThirdPersonReload);
             }
             false
@@ -249,13 +249,13 @@ fn auto_allowed(def: &ReloadDef, h: &Hand, inp: &Input, ev: &mut Vec<Event>) -> 
 /// The reload check at its place in the weapon tick (BO2's CheckForReload). Returns true when the
 /// request was read (past the blockers and not locked): the caller then clears the script request flags.
 pub fn check(def: &ReloadDef, h: &mut Hand, inp: &Input, ev: &mut Vec<Event>) -> bool {
-    if h.state == state::MELEE_END && h.clip == 0 && !def.use_as_melee {
-        h.state = state::RAISING;
-        h.weapon_time = def.empty_raise_time;
-        start_anim(h, anim::EMPTY_RAISE);
+    if h.phase == state::MELEE_END && h.mag_rounds == 0 && !def.use_as_melee {
+        h.phase = state::RAISING;
+        h.timer_ms = def.empty_raise_time;
+        start_anim(h, refill_clips::EMPTY_TAKE_OUT);
         return false;
     }
-    let s = h.state;
+    let s = h.phase;
     if (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&s)
         || (state::MELEE_INIT..=state::MELEE_END).contains(&s)
         || (state::DTP_IN..=state::DTP_OUT).contains(&s)
@@ -268,20 +268,20 @@ pub fn check(def: &ReloadDef, h: &mut Hand, inp: &Input, ev: &mut Vec<Event>) ->
     let requested = !inp.request_locked && (inp.script_reload || inp.reload);
 
     // A fresh fire press stops a one-by-one reload after the current step.
-    if def.segmented && inp.fire && !inp.fire_last {
+    if def.segmented && inp.fire && !inp.final_round_fired {
         if matches!(s, state::RELOAD_START | state::RELOAD_START_RECHAMBER) && def.reload_start != 0
         {
-            let played = (def.reload_start - h.weapon_time) as f32 / def.reload_start as f32;
+            let played = (def.reload_start - h.timer_ms) as f32 / def.reload_start as f32;
             if played > START_INTERRUPT_IGNORE_FRAC {
-                h.state = state::RELOAD_START_INTERUPT;
+                h.phase = state::RELOAD_START_INTERUPT;
             }
         } else if s == state::RELOADING {
-            h.state = state::RELOADING_INTERUPT;
+            h.phase = state::RELOADING_INTERUPT;
         }
     }
 
     let asked = requested && allow(def, h);
-    let auto = h.clip == 0 && h.stock != 0 && auto_allowed(def, h, inp, ev);
+    let auto = h.mag_rounds == 0 && h.spare_rounds != 0 && auto_allowed(def, h, inp, ev);
     if asked || auto {
         begin(def, h, inp, ev);
     }
@@ -290,7 +290,7 @@ pub fn check(def: &ReloadDef, h: &mut Hand, inp: &Input, ev: &mut Vec<Event>) ->
 
 /// BeginWeaponReload: only from the states BO2 lets a reload start in.
 pub fn begin(def: &ReloadDef, h: &mut Hand, inp: &Input, ev: &mut Vec<Event>) {
-    let s = h.state;
+    let s = h.phase;
     let ok = s == state::READY
         || (state::CRAWL_FORWARD..=state::CRAWL_LEFT).contains(&s)
         || s == state::FIRING
@@ -302,7 +302,7 @@ pub fn begin(def: &ReloadDef, h: &mut Hand, inp: &Input, ev: &mut Vec<Event>) {
     if !ok || inp.no_reload || inp.mantling {
         return;
     }
-    h.shot_count = 0;
+    h.rounds_fired = 0;
     ev.push(Event::ResetAds);
     ev.push(Event::ReloadStartNotify);
     if def.charge_shot {
@@ -311,17 +311,17 @@ pub fn begin(def: &ReloadDef, h: &mut Hand, inp: &Input, ev: &mut Vec<Event>) {
     if def.reload_start == 0 || !def.segmented {
         set_reloading(def, h, ev);
     } else {
-        start_anim(h, anim::RELOAD_START);
-        h.weapon_time = def.reload_start;
-        h.state = if inp.enforce_rechamber && def.bolt_action && h.needs_rechamber {
+        start_anim(h, refill_clips::RELOAD_BEGIN);
+        h.timer_ms = def.reload_start;
+        h.phase = if inp.enforce_rechamber && def.manual_cycle && h.needs_rechamber {
             state::RELOAD_START_RECHAMBER
         } else {
             state::RELOAD_START
         };
-        ev.push(Event::ReloadStart);
+        ev.push(Event::ReloadKickoff);
         set_add_delay(def, h);
     }
-    if !def.clip_only {
+    if !def.motion_clip_exclusive {
         ev.push(Event::ThirdPersonReload);
     }
 }
@@ -334,24 +334,24 @@ pub fn set_reloading(def: &ReloadDef, h: &mut Hand, ev: &mut Vec<Event>) {
     let q = quick(def, h);
     if empty_bullet(def, h) {
         if q {
-            start_anim(h, anim::RELOAD_QUICK_EMPTY);
-            h.weapon_time = def.reload_quick_empty;
+            start_anim(h, refill_clips::RELOAD_QUICK_EMPTY);
+            h.timer_ms = def.reload_quick_empty;
         } else {
-            start_anim(h, anim::RELOAD_EMPTY);
-            h.weapon_time = def.reload_empty;
+            start_anim(h, refill_clips::RELOAD_DRY);
+            h.timer_ms = def.reload_empty;
         }
         ev.push(Event::ReloadFromEmpty);
     } else {
         if q {
-            start_anim(h, anim::RELOAD_QUICK);
-            h.weapon_time = def.reload_quick;
+            start_anim(h, refill_clips::RELOAD_QUICK);
+            h.timer_ms = def.reload_quick;
         } else {
-            start_anim(h, anim::RELOAD);
-            h.weapon_time = def.reload;
+            start_anim(h, refill_clips::RELOAD);
+            h.timer_ms = def.reload;
         }
         ev.push(Event::Reload);
     }
-    h.state = if h.state == state::RELOAD_START_INTERUPT {
+    h.phase = if h.phase == state::RELOAD_START_INTERUPT {
         state::RELOADING_INTERUPT
     } else {
         state::RELOADING
@@ -383,31 +383,31 @@ fn main_add_point(def: &ReloadDef, h: &Hand, use_quick: bool) -> i32 {
 }
 
 fn start_add_point(def: &ReloadDef) -> i32 {
-    if def.reload_start_add == 0 {
+    if def.reload_begin_bonus == 0 {
         0
     } else {
-        def.reload_start_add.min(def.reload_start)
+        def.reload_begin_bonus.min(def.reload_start)
     }
 }
 
 /// SetWeaponReloadAddAmmoDelay: when the ammo goes in.
 fn set_add_delay(def: &ReloadDef, h: &mut Hand) {
-    let mut delay = if in_start(h) {
+    let mut wait_ms = if in_start(h) {
         start_add_point(def)
     } else {
         main_add_point(def, h, true)
     };
-    if def.bolt_action && h.needs_rechamber {
-        if delay == 0 {
-            delay = h.weapon_time;
+    if def.manual_cycle && h.needs_rechamber {
+        if wait_ms == 0 {
+            wait_ms = h.timer_ms;
         }
-        delay = delay.min(def.rechamber_bolt_time);
-        if delay == 0 {
-            delay = 1;
+        wait_ms = wait_ms.min(def.rechamber_bolt_time);
+        if wait_ms == 0 {
+            wait_ms = 1;
         }
-        h.weapon_delay = delay;
-    } else if delay != 0 {
-        h.weapon_delay = delay;
+        h.weapon_ready_wait = wait_ms;
+    } else if wait_ms != 0 {
+        h.weapon_ready_wait = wait_ms;
     }
 }
 
@@ -417,24 +417,24 @@ fn reload_clip(def: &ReloadDef, h: &mut Hand, ev: &mut Vec<Event>) {
     if start && def.start_add == 0 {
         return;
     }
-    let mut n = h.stock.min(def.clip_size - h.clip);
+    let mut n = h.spare_rounds.min(def.magazine_capacity - h.mag_rounds);
     if start {
-        if def.start_add < def.clip_size && def.start_add < n {
+        if def.start_add < def.magazine_capacity && def.start_add < n {
             n = def.start_add;
         }
-    } else if def.ammo_add != 0 && def.ammo_add < def.clip_size && def.ammo_add < n {
+    } else if def.ammo_add != 0 && def.ammo_add < def.magazine_capacity && def.ammo_add < n {
         n = def.ammo_add;
     }
     if n != 0 {
-        h.stock -= n;
-        h.clip += n;
+        h.spare_rounds -= n;
+        h.mag_rounds += n;
         ev.push(Event::ReloadAddAmmo);
     }
 }
 
 /// ReloadDelayedAction: bolt work, then the ammo; Fast Mag flips after the ammo.
 pub fn delayed_action(def: &ReloadDef, h: &mut Hand, ev: &mut Vec<Event>) {
-    if def.bolt_action {
+    if def.manual_cycle {
         if def.shots_before_rechamber != 0 {
             h.shots_from_chamber = 0;
         }
@@ -444,10 +444,10 @@ pub fn delayed_action(def: &ReloadDef, h: &mut Hand, ev: &mut Vec<Event>) {
                 h.charge = 0;
             }
             ev.push(Event::EjectBrass);
-            if in_start(h) && def.reload_start_add == 0 {
+            if in_start(h) && def.reload_begin_bonus == 0 {
                 return;
             }
-            if h.weapon_time != 0 {
+            if h.timer_ms != 0 {
                 let add = if in_start(h) {
                     start_add_point(def)
                 } else {
@@ -459,7 +459,7 @@ pub fn delayed_action(def: &ReloadDef, h: &mut Hand, ev: &mut Vec<Event>) {
                     def.rechamber_bolt_time
                 };
                 if add - bolt > 0 {
-                    h.weapon_delay = add - bolt;
+                    h.weapon_ready_wait = add - bolt;
                     return;
                 }
             }
@@ -479,9 +479,9 @@ fn end_or_ready(def: &ReloadDef, h: &mut Hand, ev: &mut Vec<Event>) {
     if def.reload_end == 0 {
         to_ready(h);
     } else {
-        h.state = state::RELOAD_END;
-        start_anim(h, anim::RELOAD_END);
-        h.weapon_time = def.reload_end;
+        h.phase = state::RELOAD_END;
+        start_anim(h, refill_clips::RELOAD_FINISH);
+        h.timer_ms = def.reload_end;
         ev.push(Event::ReloadEnd);
     }
 }
@@ -497,13 +497,13 @@ pub fn finish_start(
     if delayed {
         delayed_action(def, h, ev);
     }
-    if h.weapon_time != 0 {
+    if h.timer_ms != 0 {
         return;
     }
     if def.segmented && inp.fire {
-        h.state = state::RELOAD_START_INTERUPT;
+        h.phase = state::RELOAD_START_INTERUPT;
     }
-    if (h.state != state::RELOAD_START_INTERUPT || h.clip == 0) && allow(def, h) {
+    if (h.phase != state::RELOAD_START_INTERUPT || h.mag_rounds == 0) && allow(def, h) {
         set_reloading(def, h, ev);
         return;
     }
@@ -522,14 +522,14 @@ pub fn finish_reload(
     if delayed {
         delayed_action(def, h, ev);
     }
-    if h.weapon_time != 0 {
+    if h.timer_ms != 0 {
         return;
     }
     if def.segmented && inp.fire {
-        h.state = state::RELOADING_INTERUPT;
+        h.phase = state::RELOADING_INTERUPT;
     }
     h.needs_rechamber = false;
-    if def.bolt_action && def.shots_before_rechamber != 0 {
+    if def.manual_cycle && def.shots_before_rechamber != 0 {
         h.shots_from_chamber = 0;
     }
     if def.charge_shot {
@@ -539,7 +539,7 @@ pub fn finish_reload(
         to_ready(h);
         return;
     }
-    if h.state != state::RELOADING_INTERUPT && allow(def, h) {
+    if h.phase != state::RELOADING_INTERUPT && allow(def, h) {
         set_reloading(def, h, ev);
         return;
     }
@@ -559,7 +559,7 @@ pub fn finish(
     delayed: bool,
     ev: &mut Vec<Event>,
 ) -> bool {
-    match h.state {
+    match h.phase {
         state::RELOADING | state::RELOADING_INTERUPT => finish_reload(def, h, inp, delayed, ev),
         state::RELOAD_START | state::RELOAD_START_RECHAMBER | state::RELOAD_START_INTERUPT => {
             finish_start(def, h, inp, delayed, ev)
@@ -576,7 +576,7 @@ pub fn tick(def: &ReloadDef, h: &mut Hand, inp: &Input, ev: &mut Vec<Event>) {
     let dt = step_ms(h, inp);
     let delayed = count_down(h, dt);
     check(def, h, inp, ev);
-    if !delayed && (h.weapon_time != 0 || h.weapon_delay != 0) {
+    if !delayed && (h.timer_ms != 0 || h.weapon_ready_wait != 0) {
         return;
     }
     finish(def, h, inp, delayed, ev);
@@ -591,7 +591,7 @@ mod tests {
     fn ar() -> ReloadDef {
         ReloadDef {
             bullet: true,
-            clip_size: 30,
+            magazine_capacity: 30,
             reload: 2000,
             reload_empty: 2600,
             reload_add: 1200,
@@ -607,7 +607,7 @@ mod tests {
     fn shotgun() -> ReloadDef {
         ReloadDef {
             bullet: true,
-            clip_size: 7,
+            magazine_capacity: 7,
             reload: 600,
             reload_empty: 600,
             reload_add: 300,
@@ -621,8 +621,8 @@ mod tests {
 
     fn hand(clip: i32, stock: i32) -> Hand {
         Hand {
-            clip,
-            stock,
+            mag_rounds: clip,
+            spare_rounds: stock,
             ..Default::default()
         }
     }
@@ -639,7 +639,7 @@ mod tests {
         let mut t = 0;
         while t < max {
             tick(def, h, inp, ev);
-            t += inp.msec;
+            t += inp.frame_ms;
             if until(h) {
                 break;
             }
@@ -649,7 +649,7 @@ mod tests {
 
     fn press() -> Input {
         Input {
-            msec: MS,
+            frame_ms: MS,
             reload: true,
             ..Default::default()
         }
@@ -657,7 +657,7 @@ mod tests {
 
     fn idle_in() -> Input {
         Input {
-            msec: MS,
+            frame_ms: MS,
             ..Default::default()
         }
     }
@@ -668,8 +668,8 @@ mod tests {
         let mut h = hand(10, 90);
         let mut ev = vec![];
         tick(&d, &mut h, &press(), &mut ev);
-        assert_eq!(h.state, state::RELOADING);
-        assert_eq!(h.anim & !anim::TOGGLE, anim::RELOAD);
+        assert_eq!(h.phase, state::RELOADING);
+        assert_eq!(h.anim & !refill_clips::TOGGLE, refill_clips::RELOAD);
         assert_eq!(
             ev,
             vec![
@@ -679,12 +679,12 @@ mod tests {
                 Event::ThirdPersonReload
             ]
         );
-        let t = run(&d, &mut h, &idle_in(), &mut ev, 5000, |h| h.clip == 30);
+        let t = run(&d, &mut h, &idle_in(), &mut ev, 5000, |h| h.mag_rounds == 30);
         assert!((1200 - MS..=1200 + MS).contains(&(t + MS)), "ammo at {t}");
-        assert_eq!(h.state, state::RELOADING);
-        assert_eq!(h.stock, 70);
+        assert_eq!(h.phase, state::RELOADING);
+        assert_eq!(h.spare_rounds, 70);
         let t2 = run(&d, &mut h, &idle_in(), &mut ev, 5000, |h| {
-            h.state == state::READY
+            h.phase == state::READY
         });
         assert!(
             (2000 - 2 * MS..=2000 + MS).contains(&(t + MS + t2)),
@@ -699,11 +699,11 @@ mod tests {
         let mut h = hand(0, 90);
         let mut ev = vec![];
         tick(&d, &mut h, &idle_in(), &mut ev);
-        assert_eq!(h.state, state::RELOADING, "auto-reload on empty");
-        assert_eq!(h.anim & !anim::TOGGLE, anim::RELOAD_EMPTY);
+        assert_eq!(h.phase, state::RELOADING, "auto-reload on empty");
+        assert_eq!(h.anim & !refill_clips::TOGGLE, refill_clips::RELOAD_DRY);
         assert!(ev.contains(&Event::ReloadFromEmpty));
-        assert_eq!(h.weapon_time, 2600);
-        assert_eq!(h.weapon_delay, 1500);
+        assert_eq!(h.timer_ms, 2600);
+        assert_eq!(h.weapon_ready_wait, 1500);
     }
 
     #[test]
@@ -725,7 +725,7 @@ mod tests {
             },
             &mut ev,
             5000,
-            |h| h.state == state::READY,
+            |h| h.phase == state::READY,
         );
         assert!(
             (1000 - 2 * MS..=1000 + 2 * MS).contains(&(t + MS)),
@@ -747,16 +747,16 @@ mod tests {
         let mut kinds = vec![];
         for _ in 0..3 {
             let mut ev = vec![];
-            h.clip = 10;
+            h.mag_rounds = 10;
             tick(&d, &mut h, &press(), &mut ev);
-            kinds.push(h.anim & !anim::TOGGLE);
+            kinds.push(h.anim & !refill_clips::TOGGLE);
             run(&d, &mut h, &idle_in(), &mut ev, 5000, |h| {
-                h.state == state::READY
+                h.phase == state::READY
             });
         }
         assert_eq!(
             kinds,
-            vec![anim::RELOAD_QUICK, anim::RELOAD, anim::RELOAD_QUICK]
+            vec![refill_clips::RELOAD_QUICK, refill_clips::RELOAD, refill_clips::RELOAD_QUICK]
         );
     }
 
@@ -775,8 +775,8 @@ mod tests {
         };
         let mut ev = vec![];
         tick(&d, &mut h, &press(), &mut ev);
-        assert_eq!(h.weapon_time, 1500);
-        assert_eq!(h.weapon_delay, 2000);
+        assert_eq!(h.timer_ms, 1500);
+        assert_eq!(h.weapon_ready_wait, 2000);
     }
 
     #[test]
@@ -787,9 +787,9 @@ mod tests {
         tick(&d, &mut h, &press(), &mut ev);
         run(&d, &mut h, &idle_in(), &mut ev, 1000, |_| false);
         // A switch/knife/grenade replaces the state; the delay never fires.
-        h.state = state::DROPPING;
-        h.weapon_delay = 0;
-        assert_eq!(h.clip, 10);
+        h.phase = state::DROPPING;
+        h.weapon_ready_wait = 0;
+        assert_eq!(h.mag_rounds, 10);
     }
 
     #[test]
@@ -798,19 +798,19 @@ mod tests {
         let mut h = hand(4, 20);
         let mut ev = vec![];
         tick(&d, &mut h, &press(), &mut ev);
-        assert_eq!(h.state, state::RELOAD_START);
-        assert_eq!(h.anim & !anim::TOGGLE, anim::RELOAD_START);
-        let mut seen = vec![h.state];
+        assert_eq!(h.phase, state::RELOAD_START);
+        assert_eq!(h.anim & !refill_clips::TOGGLE, refill_clips::RELOAD_BEGIN);
+        let mut seen = vec![h.phase];
         let mut t = MS;
-        while h.state != state::READY && t < 10000 {
+        while h.phase != state::READY && t < 10000 {
             tick(&d, &mut h, &idle_in(), &mut ev);
             t += MS;
-            if *seen.last().unwrap() != h.state {
-                seen.push(h.state);
+            if *seen.last().unwrap() != h.phase {
+                seen.push(h.phase);
             }
         }
-        assert_eq!(h.clip, 7);
-        assert_eq!(h.stock, 17);
+        assert_eq!(h.mag_rounds, 7);
+        assert_eq!(h.spare_rounds, 17);
         assert_eq!(
             seen,
             vec![
@@ -838,16 +838,16 @@ mod tests {
             ..idle_in()
         };
         tick(&d, &mut h, &fire, &mut ev);
-        assert_eq!(h.state, state::RELOAD_START);
+        assert_eq!(h.phase, state::RELOAD_START);
         // 50% in, fresh press: interrupt.
         run(&d, &mut h, &idle_in(), &mut ev, 80, |_| false);
         tick(&d, &mut h, &fire, &mut ev);
-        assert_eq!(h.state, state::RELOAD_START_INTERUPT);
+        assert_eq!(h.phase, state::RELOAD_START_INTERUPT);
         run(&d, &mut h, &idle_in(), &mut ev, 5000, |h| {
-            h.state == state::READY
+            h.phase == state::READY
         });
         // Clip was not empty, so no shell goes in; straight to the end anim.
-        assert_eq!(h.clip, 4);
+        assert_eq!(h.mag_rounds, 4);
         assert!(ev.contains(&Event::ReloadEnd));
     }
 
@@ -858,7 +858,7 @@ mod tests {
         let mut ev = vec![];
         tick(&d, &mut h, &press(), &mut ev);
         run(&d, &mut h, &idle_in(), &mut ev, 5000, |h| {
-            h.state == state::RELOADING
+            h.phase == state::RELOADING
         });
         tick(
             &d,
@@ -869,11 +869,11 @@ mod tests {
             },
             &mut ev,
         );
-        assert_eq!(h.state, state::RELOADING_INTERUPT);
+        assert_eq!(h.phase, state::RELOADING_INTERUPT);
         run(&d, &mut h, &idle_in(), &mut ev, 5000, |h| {
-            h.state == state::READY
+            h.phase == state::READY
         });
-        assert_eq!(h.clip, 3);
+        assert_eq!(h.mag_rounds, 3);
     }
 
     #[test]
@@ -892,17 +892,17 @@ mod tests {
             },
             &mut ev,
         );
-        assert_eq!(h.state, state::RELOAD_START_INTERUPT);
+        assert_eq!(h.phase, state::RELOAD_START_INTERUPT);
         run(&d, &mut h, &idle_in(), &mut ev, 5000, |h| {
-            h.state == state::READY
+            h.phase == state::READY
         });
-        assert_eq!(h.clip, 1);
+        assert_eq!(h.mag_rounds, 1);
     }
 
     #[test]
     fn bolt_gun_ejects_then_loads() {
         let d = ReloadDef {
-            bolt_action: true,
+            manual_cycle: true,
             rechamber_bolt_time: 400,
             ..ar()
         };
@@ -912,14 +912,14 @@ mod tests {
         };
         let mut ev = vec![];
         tick(&d, &mut h, &press(), &mut ev);
-        assert_eq!(h.weapon_delay, 400);
+        assert_eq!(h.weapon_ready_wait, 400);
         run(&d, &mut h, &idle_in(), &mut ev, 5000, |h| {
-            h.state == state::READY
+            h.phase == state::READY
         });
         let brass = ev.iter().position(|e| *e == Event::EjectBrass).unwrap();
         let ammo = ev.iter().position(|e| *e == Event::ReloadAddAmmo).unwrap();
         assert!(brass < ammo);
-        assert_eq!(h.clip, 30);
+        assert_eq!(h.mag_rounds, 30);
         assert!(!h.needs_rechamber);
     }
 
@@ -931,11 +931,11 @@ mod tests {
         };
         let mut ev = vec![];
         let mut h = Hand {
-            state: state::SPRINT_LOOP,
+            phase: state::SPRINT_LOOP,
             ..hand(0, 90)
         };
         tick(&d, &mut h, &idle_in(), &mut ev);
-        assert_eq!(h.state, state::SPRINT_LOOP);
+        assert_eq!(h.phase, state::SPRINT_LOOP);
         let mut h = hand(0, 90);
         tick(
             &d,
@@ -946,16 +946,16 @@ mod tests {
             },
             &mut ev,
         );
-        assert_eq!(h.state, state::READY);
+        assert_eq!(h.phase, state::READY);
         tick(&d, &mut h, &idle_in(), &mut ev);
-        assert_eq!(h.state, state::RELOADING);
+        assert_eq!(h.phase, state::RELOADING);
         // But the button works from sprint.
         let mut h = Hand {
-            state: state::SPRINT_LOOP,
+            phase: state::SPRINT_LOOP,
             ..hand(5, 90)
         };
         tick(&d, &mut h, &press(), &mut ev);
-        assert_eq!(h.state, state::RELOADING);
+        assert_eq!(h.phase, state::RELOADING);
     }
 
     #[test]
@@ -965,26 +965,26 @@ mod tests {
             ..ar()
         };
         let mut h = Hand {
-            state: state::MELEE_END,
+            phase: state::MELEE_END,
             ..hand(0, 90)
         };
         let mut ev = vec![];
         check(&d, &mut h, &idle_in(), &mut ev);
-        assert_eq!(h.state, state::RAISING);
-        assert_eq!(h.weapon_time, 500);
-        assert_eq!(h.anim & !anim::TOGGLE, anim::EMPTY_RAISE);
+        assert_eq!(h.phase, state::RAISING);
+        assert_eq!(h.timer_ms, 500);
+        assert_eq!(h.anim & !refill_clips::TOGGLE, refill_clips::EMPTY_TAKE_OUT);
     }
 
     #[test]
     fn no_partial_reload_rules() {
         let d = ReloadDef {
-            no_partial_reload: true,
+            forbid_topup_reload: true,
             ..ar()
         };
         assert!(!allow(&d, &hand(5, 90)));
         assert!(allow(&d, &hand(0, 90)));
         let d = ReloadDef {
-            no_partial_reload: true,
+            forbid_topup_reload: true,
             ammo_add: 10,
             ..ar()
         };

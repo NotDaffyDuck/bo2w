@@ -1,8 +1,3 @@
 # `cargo xtask <command>` runs the workspace's own task runner.
 [alias]
 xtask = "run --quiet --package xtask --"
-
-# Build output goes to a data disk: an incremental Rust build writes tens of
-# gigabytes of small files, which the system SSD handles badly. A machine
-# without this disk sets CARGO_TARGET_DIR, which wins over this line.
-[build]

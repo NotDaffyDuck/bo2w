@@ -27,7 +27,7 @@
 
 use rustc_hash::FxHashMap;
 
-pub const MAGIC: &[u8; 8] = b"\x80GSC\r\n\x00\x06";
+pub const FORMAT_TAG: &[u8; 8] = b"\x80GSC\r\n\x00\x06";
 
 /// Opcodes by value (Black Ops II, PC).
 pub mod op {
@@ -94,7 +94,7 @@ pub mod op {
     pub const JUMP_ON_TRUE: u8 = 0x3c;
     pub const JUMP_ON_FALSE_EXPR: u8 = 0x3d;
     pub const JUMP_ON_TRUE_EXPR: u8 = 0x3e;
-    pub const JUMP: u8 = 0x3f;
+    pub const LEAP: u8 = 0x3f;
     pub const JUMP_BACK: u8 = 0x40;
     pub const INC: u8 = 0x41;
     pub const DEC: u8 = 0x42;
@@ -299,7 +299,7 @@ pub struct Import {
     pub ns: String,
     pub name: String,
     pub params: u8,
-    pub flags: u8,
+    pub flag_bits: u8,
 }
 
 impl Import {
@@ -307,20 +307,20 @@ impl Import {
         if self.ns.is_empty() {
             self.name.clone()
         } else {
-            format!("{}::{}", self.ns, self.name)
+            [self.ns.as_str(), self.name.as_str()].join("::")
         }
     }
 
     /// Imported only by developer code.
     pub fn developer(&self) -> bool {
-        self.flags & 0x10 != 0
+        self.flag_bits & 0x10 != 0
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CaseValue {
     Int(i32),
-    Str(String),
+    Quoted(String),
     Default,
 }
 
@@ -341,7 +341,7 @@ pub enum Insn {
     /// the count for `WaitTillMatch` and pointer calls, the flags for
     /// `VectorConstant`.
     Int(u8, i32),
-    Float(f32),
+    Real(f32),
     Vector([f32; 3]),
     /// GetString / GetIString / EvalFieldVariable(Ref) / ClearFieldVariable.
     Str(u8, String),
@@ -378,7 +378,7 @@ pub enum Insn {
 pub struct DecodedFunction {
     pub name: String,
     pub params: u8,
-    pub flags: u8,
+    pub flag_bits: u8,
     pub address: u32,
     /// Reachable instructions in address order.
     pub code: Vec<(u32, Insn)>,
@@ -412,11 +412,11 @@ fn cstr_at(b: &[u8], o: usize) -> Result<String, String> {
     let tail = b
         .get(o..)
         .ok_or_else(|| format!("string at {o:#x} past the end"))?;
-    let end = tail
+    let stop = tail
         .iter()
         .position(|&c| c == 0)
         .ok_or("unterminated string")?;
-    Ok(tail[..end].iter().map(|&c| char::from(c)).collect())
+    Ok(tail[..stop].iter().map(|&c| char::from(c)).collect())
 }
 
 const fn align(p: usize, n: usize) -> usize {
@@ -434,17 +434,17 @@ struct Tables {
 
 impl ScriptObject {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.get(..8) != Some(MAGIC.as_slice()) {
+        if bytes.get(..8) != Some(FORMAT_TAG.as_slice()) {
             return Err("not a Black Ops II script object".into());
         }
         let b = bytes;
-        let include_off = u32_at(b, 0x0c)? as usize;
-        let animtree_off = u32_at(b, 0x10)? as usize;
-        let code = u32_at(b, 0x14)? as usize;
-        let strings_off = u32_at(b, 0x18)? as usize;
-        let exports_off = u32_at(b, 0x1c)? as usize;
-        let imports_off = u32_at(b, 0x20)? as usize;
-        let code_size = u32_at(b, 0x2c)? as usize;
+        let include_off = off_at(b, 0x0c)?;
+        let animtree_off = off_at(b, 0x10)?;
+        let code = off_at(b, 0x14)?;
+        let strings_off = off_at(b, 0x18)?;
+        let exports_off = off_at(b, 0x1c)?;
+        let imports_off = off_at(b, 0x20)?;
+        let code_size = off_at(b, 0x2c)?;
         let name = cstr_at(b, usize::from(u16_at(b, 0x30)?))?;
         let n_strings = usize::from(u16_at(b, 0x32)?);
         let n_exports = usize::from(u16_at(b, 0x34)?);
@@ -468,7 +468,7 @@ impl ScriptObject {
                 ns,
                 name,
                 params,
-                flags,
+                flag_bits: flags,
             };
             for k in 0..n {
                 imports.insert(u32_at(b, o + 4 * k)? as usize, imp.clone());
@@ -525,7 +525,7 @@ impl ScriptObject {
             functions.push(DecodedFunction {
                 name: fname,
                 params,
-                flags,
+                flag_bits: flags,
                 address,
                 code,
             });
@@ -591,9 +591,13 @@ impl ScriptObject {
         })
     }
 }
+fn off_at(b: &[u8], pos: usize) -> Result<usize, String> {
+    Ok(u32_at(b, pos)? as usize)
+}
 
-fn switch_table_addr(b: &[u8], at: usize) -> Result<usize, String> {
-    let p = align(at + 1, 4);
+
+fn switch_table_addr(b: &[u8], pos: usize) -> Result<usize, String> {
+    let p = align(pos + 1, 4);
     let rel = u32_at(b, p)? as i32;
     Ok((p as i64 + 4 + i64::from(rel)) as usize)
 }
@@ -685,7 +689,7 @@ fn decode_one(b: &[u8], t: &Tables, pc: usize) -> Result<(Insn, usize, Vec<u32>)
             pc = align(pc, 4);
             let v = f32::from_bits(u32_at(b, pc)?);
             pc += 4;
-            Insn::Float(v)
+            Insn::Real(v)
         }
         op::GET_VECTOR => {
             pc = align(pc, 4);
@@ -752,7 +756,7 @@ fn decode_one(b: &[u8], t: &Tables, pc: usize) -> Result<(Insn, usize, Vec<u32>)
         | op::JUMP_ON_TRUE
         | op::JUMP_ON_FALSE_EXPR
         | op::JUMP_ON_TRUE_EXPR
-        | op::JUMP
+        | op::LEAP
         | op::JUMP_BACK => {
             pc = align(pc, 2);
             let v = i32::from(u16_at(b, pc)? as i16);
@@ -774,7 +778,7 @@ fn decode_one(b: &[u8], t: &Tables, pc: usize) -> Result<(Insn, usize, Vec<u32>)
                 let off = u32_at(b, a + 4)? as i32;
                 let target = (a as i64 + 8 + i64::from(off)) as u32;
                 let value = if let Some(s) = t.strings.get(&(a + 2)) {
-                    CaseValue::Str(s.clone())
+                    CaseValue::Quoted(s.clone())
                 } else if v == 0 {
                     CaseValue::Default
                 } else {
@@ -817,7 +821,7 @@ fn decode_function(b: &[u8], t: &Tables, start: usize) -> Result<Vec<(u32, Insn)
             work.extend(succ);
             let stop = match &insn {
                 Insn::Plain(c) => matches!(*c, op::END | op::RETURN | op::ABORT),
-                Insn::Jump(c, _) => matches!(*c, op::JUMP | op::JUMP_BACK),
+                Insn::Jump(c, _) => matches!(*c, op::LEAP | op::JUMP_BACK),
                 Insn::Switch { .. } => true,
                 _ => false,
             };

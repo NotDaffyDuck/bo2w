@@ -1,7 +1,7 @@
 //! Deciding whether an element is worth spawning or drawing at all.
 
-use crate::runtime::flags::elem_spawn_frustum_cull;
-use crate::runtime::rotation::FX_RECIP_255;
+use crate::runtime::mode_bits::elem_spawn_frustum_cull;
+use crate::runtime::angle_graph::FX_RECIP_255;
 
 /// The flag that limits drawing culls to five of the view's planes.
 const CULL_AGAINST_FIVE_PLANES: i32 = 0x400;
@@ -13,94 +13,87 @@ const FIVE_PLANES: u32 = 5;
 /// whether a sphere around its spawn point lies outside the view. An element
 /// with a spawn range only spawns while the camera is inside it.
 pub fn cull_elem_for_spawn_allows(
-    spawn_range_base: f32,
-    spawn_range_amplitude: f32,
-    camera_distance_inches: f32,
+    birth_span_floor: f32,
+    birth_span_swing: f32,
+    eye_gap: f32,
     flags: i32,
-    sphere_outside_frustum: bool,
+    ball_outside: bool,
 ) -> bool {
-    if spawn_range_amplitude != 0.0 {
-        let past_start = camera_distance_inches - spawn_range_base;
-        if past_start < 0.0 || spawn_range_amplitude < past_start {
-            return false;
-        }
-    }
-    !(elem_spawn_frustum_cull(flags) && sphere_outside_frustum)
+    let past_start = eye_gap - birth_span_floor;
+    let out_of_range =
+        birth_span_swing != 0.0 && (past_start < 0.0 || birth_span_swing < past_start);
+    let culled_by_view = elem_spawn_frustum_cull(flags) && ball_outside;
+    !(out_of_range || culled_by_view)
 }
 
 /// How many of the view's planes an element is tested against.
-const fn cull_plane_count(elem_flags: i32, view_plane_count: u32) -> u32 {
-    if elem_flags & CULL_AGAINST_FIVE_PLANES != 0 {
-        FIVE_PLANES
-    } else {
-        view_plane_count
+const fn cull_plane_count(elem_flags: i32, sight_wall_total: u32) -> u32 {
+    match elem_flags & CULL_AGAINST_FIVE_PLANES {
+        0 => sight_wall_total,
+        _ => FIVE_PLANES,
     }
 }
 
 /// The radius of a cloud element's culling sphere: its larger size plus the
 /// scale.
-fn cull_cloud_radius(size0: f32, size1: f32, scale: f32) -> f32 {
-    let mut radius = size1;
-    if radius < size0 {
-        radius = size0;
-    }
-    radius + scale
+fn cull_cloud_radius(start_extent: f32, second_extent: f32, factor: f32) -> f32 {
+    let larger = if start_extent > second_extent { start_extent } else { second_extent };
+    larger + factor
 }
 
-/// Whether a sphere lies wholly behind any of the first `plane_count`
-/// planes. Each plane is `[nx, ny, nz, d]` with its normal pointing inside.
-fn cull_sphere(planes: &[[f32; 4]], plane_count: u32, pos: [f32; 3], radius: f32) -> bool {
-    let limit = -radius;
-    planes.iter().take(plane_count as usize).any(|p| {
-        let side = p[0] * pos[0] + p[1] * pos[1] + p[2] * pos[2] + p[3];
-        side < limit
-    })
+/// Whether a sphere lies wholly behind any of the first `plane_tally`
+/// planes. Each plane is `[facing_x, facing_y, facing_z, d]` with its normal pointing inside.
+fn cull_sphere(planes: &[[f32; 4]], plane_tally: u32, pos: [f32; 3], reach: f32) -> bool {
+    planes[..planes.len().min(plane_tally as usize)]
+        .iter()
+        .map(|&[a, b, c, d]| a * pos[0] + b * pos[1] + c * pos[2] + d)
+        .any(|signed_distance| signed_distance < -reach)
 }
 
 /// Whether a cloud element is outside the view and need not be drawn.
-/// `cull_elem_draw` is the system-wide switch for culling.
+/// `cull_each` is the system-wide switch for culling.
 #[allow(clippy::too_many_arguments)]
 pub fn cull_cloud(
-    cull_elem_draw: bool,
-    planes: &[[f32; 4]],
-    view_plane_count: u32,
-    elem_flags: i32,
+    cull_each: bool,
+    walls: &[[f32; 4]],
+    sight_wall_total: u32,
+    elem_bits: i32,
     pos: [f32; 3],
-    size0: f32,
-    size1: f32,
+    start_extent: f32,
+    second_extent: f32,
     scale: f32,
 ) -> bool {
-    if !cull_elem_draw {
-        return false;
-    }
-    let count = cull_plane_count(elem_flags, view_plane_count);
-    cull_sphere(planes, count, pos, cull_cloud_radius(size0, size1, scale))
+    cull_each
+        && cull_sphere(
+            walls,
+            cull_plane_count(elem_bits, sight_wall_total),
+            pos,
+            cull_cloud_radius(start_extent, second_extent, scale),
+        )
 }
 
 /// Whether a light element is outside the view and need not be drawn.
 pub fn cull_elem_light(
-    cull_elem_draw: bool,
-    planes: &[[f32; 4]],
-    view_plane_count: u32,
-    elem_flags: i32,
+    cull_each: bool,
+    walls: &[[f32; 4]],
+    sight_wall_total: u32,
+    elem_bits: i32,
     pos: [f32; 3],
-    size0: f32,
+    start_extent: f32,
 ) -> bool {
-    if !cull_elem_draw {
-        return false;
-    }
-    let count = cull_plane_count(elem_flags, view_plane_count);
-    cull_sphere(planes, count, pos, size0)
+    cull_each
+        && cull_sphere(
+            walls,
+            cull_plane_count(elem_bits, sight_wall_total),
+            pos,
+            start_extent,
+        )
 }
 
-/// A light element's colour as blue, green, red floats, scaled by `scale`.
-pub fn elem_light_color_bgr(color_rgba: [u8; 4], scale: f32) -> [f32; 3] {
-    let per_step = scale * (FX_RECIP_255 as f32);
-    [
-        f32::from(color_rgba[2]) * per_step,
-        f32::from(color_rgba[1]) * per_step,
-        f32::from(color_rgba[0]) * per_step,
-    ]
+/// A light element's colour as blue, green, red floats, scaled by `factor`.
+pub fn elem_light_color_bgr(color_rgba: [u8; 4], factor: f32) -> [f32; 3] {
+    let per_step = factor * (FX_RECIP_255 as f32);
+    [2, 1, 0].map(|channel| f32::from(color_rgba[channel]) * per_step)
 }
 
 #[cfg(test)]
@@ -174,20 +167,20 @@ mod tests {
 
     #[test]
     fn the_frustum_test_only_applies_when_the_element_asks_for_it() {
-        use crate::runtime::flags::FX_ELEM_SPAWN_FRUSTUM_CULL;
+        use crate::runtime::mode_bits::ELEM_CULL_AT_BIRTH;
         assert!(cull_elem_for_spawn_allows(0.0, 0.0, 0.0, 0, true));
         assert!(!cull_elem_for_spawn_allows(
             0.0,
             0.0,
             0.0,
-            FX_ELEM_SPAWN_FRUSTUM_CULL,
+            ELEM_CULL_AT_BIRTH,
             true
         ));
         assert!(cull_elem_for_spawn_allows(
             0.0,
             0.0,
             0.0,
-            FX_ELEM_SPAWN_FRUSTUM_CULL,
+            ELEM_CULL_AT_BIRTH,
             false
         ));
     }

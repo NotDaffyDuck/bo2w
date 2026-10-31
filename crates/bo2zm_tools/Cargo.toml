@@ -2,7 +2,7 @@
 name = "bo2zm_tools"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
+publish.workspace = true
 description = "bo2zm: command-line probes for Black Ops II game files (read-only)."
 
 [[bin]]
@@ -78,6 +78,8 @@ png.workspace = true
 bcdec_rs.workspace = true
 xmodel_runtime.workspace = true
 asset_world.workspace = true
+dpvs_t6.workspace = true # t6world: T6WORLD_CELLS
+glam.workspace = true
 lighting_t6.workspace = true # t6mat: light grid lookups
 sim.workspace = true # bo2mp: t6walk
 movement_t6.workspace = true # bo2mp: t6walk

@@ -7,7 +7,7 @@ mod tables;
 
 use std::collections::HashMap;
 
-use crate::{AssetKey, AssetKind, AssetNamespace, CapturedStringTable};
+use crate::{AssetIdentity, AssetVariety, AssetCategoryScope, SnapshotStringTable};
 use tables::AttachmentRules;
 
 /// Limits a class puts on one weapon.
@@ -22,43 +22,35 @@ impl Default for LoadoutRules {
     }
 }
 
-impl LoadoutRules {
-    /// The first perk decides: Bling allows a second attachment.
-    pub fn for_class(perk1: &str) -> Self {
-        let max_attachments = if perk1 == "specialty_bling" { 2 } else { 1 };
-        Self { max_attachments }
-    }
-}
-
 /// A weapon family: the game it belongs to and its base name, lower case and
 /// without the `_mp` suffix.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FamilyKey {
-    pub namespace: AssetNamespace,
+    pub game: AssetCategoryScope,
     pub base: String,
 }
 
 impl FamilyKey {
-    pub fn new(namespace: AssetNamespace, base: &str) -> Self {
+    pub fn new(namespace: AssetCategoryScope, base: &str) -> Self {
         let lower = base.to_ascii_lowercase();
         let base = lower.strip_suffix("_mp").unwrap_or(&lower).to_owned();
-        Self { namespace, base }
+        Self { game: namespace, base }
     }
 
     /// Accepts a full weapon asset key or `game:name`.
     pub fn parse(raw: &str) -> Option<Self> {
-        if let Ok(key) = AssetKey::parse(raw) {
-            return (key.kind == AssetKind::Weapon).then(|| Self::new(key.namespace, &key.name));
+        if let Ok(key) = AssetIdentity::parse(raw) {
+            return (key.kind == AssetVariety::Weapon).then(|| Self::new(key.namespace, &key.name));
         }
         let (game, name) = raw.split_once(':')?;
-        let namespace = AssetNamespace::parse(game)?;
+        let namespace = AssetCategoryScope::parse(game)?;
         let plain = !name.is_empty() && !name.contains('/');
         plain.then(|| Self::new(namespace, name))
     }
 
     /// `game:name`, with a leading `game_` taken off the name.
     pub fn short(&self) -> String {
-        let game = self.namespace.as_str();
+        let game = self.game.as_str();
         let name = self
             .base
             .strip_prefix(game)
@@ -68,7 +60,7 @@ impl FamilyKey {
     }
 
     pub fn asset_key(&self) -> String {
-        format!("{}:weapon/{}_mp", self.namespace.as_str(), self.base)
+        format!("{}:weapon/{}_mp", self.game.as_str(), self.base)
     }
 }
 
@@ -97,14 +89,14 @@ pub struct AttachmentChoice {
     pub point: String,
     pub caption_key: String,
     pub icon: String,
-    pub desc_key: String,
+    pub description_lookup: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WeaponFamily {
     pub key: FamilyKey,
-    pub item_group: String,
-    pub slot: FamilySlot,
+    pub loot_bundle: String,
+    pub bay: FamilySlot,
     pub display_key: String,
     pub image: String,
     /// The bare weapon's id, when the loaded content has it.
@@ -143,10 +135,10 @@ pub enum ConfigurationRefusal {
         b: String,
     },
     RuleRestricted(String),
-    MissingContent(String),
+    AbsentResource(String),
     MissingDependency {
-        weapon: String,
-        kind: &'static str,
+        gun_name: String,
+        gap_kind: &'static str,
         name: String,
     },
 }
@@ -160,23 +152,23 @@ impl ConfigurationRefusal {
             Self::NotOffered(_) => "weapon.not_offered",
             Self::Incompatible { .. } => "weapon.incompatible",
             Self::RuleRestricted(_) => "weapon.rule_restricted",
-            Self::MissingContent(_) => "weapon.missing_content",
+            Self::AbsentResource(_) => "weapon.missing_content",
             Self::MissingDependency { .. } => "weapon.missing_dependency",
         }
     }
 }
 
 impl core::fmt::Display for ConfigurationRefusal {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&self, sink: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::UnknownFamily(name) => write!(f, "no weapon family `{name}`"),
-            Self::UnknownAttachment(name) => write!(f, "no attachment `{name}` in this game"),
-            Self::NotOffered(name) => write!(f, "`{name}` is not offered for this weapon"),
-            Self::Incompatible { a, b } => write!(f, "`{a}` and `{b}` cannot be combined"),
-            Self::RuleRestricted(why) => write!(f, "not allowed here: {why}"),
-            Self::MissingContent(name) => write!(f, "`{name}` is not in the loaded content"),
-            Self::MissingDependency { weapon, kind, name } => {
-                write!(f, "`{weapon}` names {kind} `{name}`, which is not loaded")
+            Self::UnknownFamily(name) => write!(sink, "no weapon family `{name}`"),
+            Self::UnknownAttachment(name) => write!(sink, "no attachment `{name}` in this game"),
+            Self::NotOffered(name) => write!(sink, "`{name}` is not offered for this weapon"),
+            Self::Incompatible { a, b } => write!(sink, "`{a}` and `{b}` cannot be combined"),
+            Self::RuleRestricted(why) => write!(sink, "not allowed here: {why}"),
+            Self::AbsentResource(name) => write!(sink, "`{name}` is not in the loaded content"),
+            Self::MissingDependency { gun_name, gap_kind, name } => {
+                write!(sink, "`{gun_name}` names {gap_kind} `{name}`, which is not loaded")
             }
         }
     }
@@ -201,38 +193,55 @@ pub struct AttachmentOption {
 
 /// What the families need to know about the loaded weapons.
 pub(crate) trait FamilyContent {
-    fn lookup(&self, namespace: AssetNamespace, name: &str) -> Option<u32>;
-    fn offhand_class(&self, id: u32) -> i32;
+    fn lookup(&self, namespace: AssetCategoryScope, gun_name: &str) -> Option<u32>;
+    fn secondary_hand_category(&self, id: u32) -> i32;
     fn admission(&self, id: u32) -> Result<(), ConfigurationRefusal>;
     /// Every weapon of the game as (id, name without `_mp`).
-    fn names_in(&self, namespace: AssetNamespace) -> Vec<(u32, String)>;
+    fn names_in(&self, namespace: AssetCategoryScope) -> Vec<(u32, String)>;
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct WeaponFamilies {
     families: Vec<WeaponFamily>,
     index: HashMap<FamilyKey, usize>,
-    rules: HashMap<AssetNamespace, AttachmentRules>,
+    rules: HashMap<AssetCategoryScope, AttachmentRules>,
     /// The selection each weapon id comes from, when it is the canonical one.
-    by_id: HashMap<u32, WeaponSelection>,
+    canon_by_id: HashMap<u32, WeaponSelection>,
     /// Families left out of the class menu, with the reason.
     excluded: Vec<(String, String)>,
+    /// The perks the stats tables offer, in table order.
+    perks: Vec<crate::LoadoutPerkEntry>,
 }
 
 impl WeaponFamilies {
     pub(crate) fn build(
-        tables: &[(AssetNamespace, CapturedStringTable)],
+        tables: &[(AssetCategoryScope, SnapshotStringTable)],
         content: &impl FamilyContent,
     ) -> Self {
         let mut out = Self::default();
         out.read_attachment_tables(tables);
-        for (namespace, table) in tables {
-            if crate::is_stats_table_name(&table.name) {
-                out.read_family_rows(*namespace, table, content);
-            }
+        let stats_tables = tables.iter().filter(|(_, table)| crate::names_scoreboard_sheet(&table.name));
+        for (scope, table) in stats_tables {
+            out.read_family_rows(*scope, table, content);
+            out.perks.extend(crate::perk_rows(table));
         }
         out.index_weapons(content);
         out
+    }
+
+    /// The perks a class can pick, in stats table order.
+    pub fn perks(&self) -> &[crate::LoadoutPerkEntry] {
+        &self.perks
+    }
+
+    /// The perk with the stats table item number `index`.
+    pub fn perk(&self, index: u32) -> Option<&crate::LoadoutPerkEntry> {
+        self.perks.iter().find(|perk| perk.index == index)
+    }
+
+    /// The perk whose reference (the specialties joined by `|`) is `reference`.
+    pub fn perk_by_reference(&self, reference: &str) -> Option<&crate::LoadoutPerkEntry> {
+        self.perks.iter().find(|perk| perk.reference == reference)
     }
 
     pub fn families(&self) -> &[WeaponFamily] {
@@ -245,11 +254,11 @@ impl WeaponFamilies {
 
     /// Like [`Self::family`], but also tries the name with the game's own
     /// prefix put back on.
-    pub fn find(&self, key: &FamilyKey) -> Option<&WeaponFamily> {
-        self.family(key).or_else(|| {
+    pub fn find(&self, wanted: &FamilyKey) -> Option<&WeaponFamily> {
+        self.family(wanted).or_else(|| {
             let prefixed = FamilyKey {
-                namespace: key.namespace,
-                base: format!("{}_{}", key.namespace.as_str(), key.base),
+                game: wanted.game,
+                base: format!("{}_{}", wanted.game.as_str(), wanted.base),
             };
             self.family(&prefixed)
         })
@@ -259,7 +268,7 @@ impl WeaponFamilies {
     pub fn offered(&self) -> impl Iterator<Item = &WeaponFamily> {
         self.families.iter().filter(|family| {
             let key = family.key.asset_key();
-            family.slot != FamilySlot::Other && !self.excluded.iter().any(|(left_out, _)| *left_out == key)
+            family.bay != FamilySlot::Other && !self.excluded.iter().any(|(left_out, _)| *left_out == key)
         })
     }
 
@@ -269,6 +278,6 @@ impl WeaponFamilies {
 
     /// The selection a weapon id is the canonical form of.
     pub fn describe(&self, id: u32) -> Option<&WeaponSelection> {
-        self.by_id.get(&id)
+        self.canon_by_id.get(&id)
     }
 }

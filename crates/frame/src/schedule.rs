@@ -13,21 +13,21 @@ use bevy::prelude::*;
 macro_rules! ordered_sets {
     (
         $(#[$meta:meta])*
-        $ty:ident, $toc:ident, $label:ident { $($variant:ident),+ $(,)? }
+        $ty:ident, $toc:ident, $label:ident { $($member:ident),+ $(,)? }
     ) => {
         $(#[$meta])*
-        #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+        #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum $ty {
-            $($variant),+
+            $($member),+
         }
 
         /// Every member, in the order the family runs.
-        pub const $toc: &[$ty] = &[$($ty::$variant),+];
+        pub const $toc: &[$ty] = &[$($ty::$member),+];
 
         /// The member's name as a static string.
         pub fn $label(set: &$ty) -> &'static str {
             match set {
-                $($ty::$variant => stringify!($variant)),+
+                $($ty::$member => stringify!($member)),+
             }
         }
     };
@@ -46,79 +46,68 @@ macro_rules! marker_sets {
 
 ordered_sets! {
     /// The server tick, front to back.
-    AuthoritySet, AUTHORITY_TOC, authority_set_name {
+    ServerStage, SERVER_STAGES, server_stage_name {
         Advance, Ingress, Gather, Step, Snapshot, Fanout, Bookkeeping,
     }
 }
 
 ordered_sets! {
     /// The client frame, front to back.
-    ClientSet, CLIENT_TOC, client_set_name {
+    ClientStep, CLIENT_STAGES, client_stage_name {
         Load, Receive, Reconcile, Input, Predict, Send, Present, Ui, Effects, Diag,
     }
 }
 
-/// Render stages inside [`ClientSet::Present`] (and again, unnested, in
-/// `PostUpdate`).
-#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RenderSet {
-    FrontendPrepare,
-    Anim,
-    Fx,
-    FrontendAssemble,
-    Gpu,
+ordered_sets! {
+    /// Render stages inside [`ClientSet::Present`] (and again, unnested, in
+    /// `PostUpdate`).
+    DrawPassStage, RENDER_ORDER, render_set_name {
+        FrontPrep, Anim, Fx, FrontBuild, Gpu,
+    }
 }
 
-const RENDER_ORDER: [RenderSet; 5] = [
-    RenderSet::FrontendPrepare,
-    RenderSet::Anim,
-    RenderSet::Fx,
-    RenderSet::FrontendAssemble,
-    RenderSet::Gpu,
-];
-
 /// Bracket sets around position `n` of a table of contents: everything
-/// before member `n` runs before `ClientEdge(n)`, and member `n` runs
-/// before `ClientEdge(n + 1)`. Lets a system say "after the first four
+/// before member `n` runs before `PlayerHandoffLink(n)`, and member `n` runs
+/// before `PlayerHandoffLink(n + 1)`. Lets a system say "after the first four
 /// stages" without naming them.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ClientEdge(pub u8);
+pub struct PlayerHandoffLink(pub u8);
 
 /// The same brackets for [`AUTHORITY_TOC`].
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AuthorityEdge(pub u8);
+pub struct ServerHandoffLink(pub u8);
 
 marker_sets! {
     /// Systems that finish the tick's bookkeeping.
-    AuthorityBookkeeping;
+    ServerLedgerMark;
     /// The class a player will spawn with has been resolved.
-    ClassEquipResolved;
+    KitEquipDone;
     /// The presented state for this frame has been published.
-    PresentedPublished;
+    ShownStatePosted;
     /// The front of a life (its first frame) has been published.
-    LifeFrontPublished;
+    LifeStatePosted;
     /// Effect and sound requests for this frame have been published.
-    FxSoundPublished;
+    EffectAudioPosted;
     /// A session swap has been applied to the world.
-    SessionSwapApplied;
+    MatchSwapDone;
     /// Model lighting has been seated for the frame's scene entities.
-    ModelLightingSeated;
+    ModelLightPlaced;
 }
 
 /// Declares the render-worker command table: one entry per command, in the
 /// order the table is kept, each with the name it prints under.
 macro_rules! worker_commands {
-    ($($variant:ident => $name:literal),+ $(,)?) => {
+    ($($member:ident => $name:literal),+ $(,)?) => {
         /// A command the render worker runs inside the Present stage.
         /// The discriminant is the command's index in [`WORKER_CMD_TOC`].
         #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[repr(u8)]
-        pub enum WorkerCmdSet {
-            $($variant),+
+        pub enum JobQueueStage {
+            $($member),+
         }
 
         /// Every command, indexed by discriminant.
-        pub const WORKER_CMD_TOC: &[WorkerCmdSet] = &[$(WorkerCmdSet::$variant),+];
+        pub const WORKER_CMD_TOC: &[JobQueueStage] = &[$(JobQueueStage::$member),+];
 
         /// Each command's printed name, indexed like [`WORKER_CMD_TOC`].
         pub const WORKER_CMD_RETAIL_NAMES: &[&str] = &[$($name),+];
@@ -149,38 +138,40 @@ worker_commands! {
     Physics => "physics",
 }
 
-pub fn worker_cmd_name(set: WorkerCmdSet) -> &'static str {
-    WORKER_CMD_RETAIL_NAMES[set as usize]
+pub fn worker_cmd_name(set: JobQueueStage) -> &'static str {
+    // The discriminant is the table index (checked by the tests).
+    let index = set as u8;
+    WORKER_CMD_RETAIL_NAMES[usize::from(index)]
 }
 
 /// `(later, earlier)`: `later` must run after `earlier`. Commands not named
 /// here are unordered against each other.
-pub const WORKER_CMD_AFTER: &[(WorkerCmdSet, WorkerCmdSet)] = &[
-    (WorkerCmdSet::FxRemaining, WorkerCmdSet::FxNonDependent),
-    (WorkerCmdSet::FxRemaining, WorkerCmdSet::Glass),
-    (WorkerCmdSet::CellGlass, WorkerCmdSet::Glass),
-    (WorkerCmdSet::GlassLight, WorkerCmdSet::CellGlass),
-    (WorkerCmdSet::GlassVerts, WorkerCmdSet::CellGlass),
-    (WorkerCmdSet::GlassVerts, WorkerCmdSet::GlassLight),
-    (WorkerCmdSet::DynMarkVerts, WorkerCmdSet::MarkVerts),
-    (WorkerCmdSet::FxPhysics, WorkerCmdSet::Glass),
+pub const WORKER_CMD_AFTER: &[(JobQueueStage, JobQueueStage)] = &[
+    (JobQueueStage::FxRemaining, JobQueueStage::FxNonDependent),
+    (JobQueueStage::FxRemaining, JobQueueStage::Glass),
+    (JobQueueStage::CellGlass, JobQueueStage::Glass),
+    (JobQueueStage::GlassLight, JobQueueStage::CellGlass),
+    (JobQueueStage::GlassVerts, JobQueueStage::CellGlass),
+    (JobQueueStage::GlassVerts, JobQueueStage::GlassLight),
+    (JobQueueStage::DynMarkVerts, JobQueueStage::MarkVerts),
+    (JobQueueStage::FxPhysics, JobQueueStage::Glass),
 ];
 
 /// Commands whose results the frame waits on before it finishes.
-pub const WORKER_CMD_END_FENCE: &[WorkerCmdSet] = &[
-    WorkerCmdSet::GlassVerts,
-    WorkerCmdSet::MarkVerts,
-    WorkerCmdSet::FxVerts,
-    WorkerCmdSet::SmodelCache,
-    WorkerCmdSet::SkinModel,
+pub const JOB_QUEUE_TAIL_BARRIER: &[JobQueueStage] = &[
+    JobQueueStage::GlassVerts,
+    JobQueueStage::MarkVerts,
+    JobQueueStage::FxVerts,
+    JobQueueStage::SmodelCache,
+    JobQueueStage::SkinModel,
 ];
 
 /// Commands that run on a worker thread rather than on the render thread.
-pub const WORKER_CMD_NOT_RENDER_THREAD: &[WorkerCmdSet] = &[
-    WorkerCmdSet::DpvsEnt,
-    WorkerCmdSet::BoundEnt,
-    WorkerCmdSet::SpotShadowEnt,
-    WorkerCmdSet::FxRemaining,
+pub const WORKER_CMD_NOT_RENDER_THREAD: &[JobQueueStage] = &[
+    JobQueueStage::DpvsEnt,
+    JobQueueStage::BoundEnt,
+    JobQueueStage::SpotShadowEnt,
+    JobQueueStage::FxRemaining,
 ];
 
 /// Runs `toc` in order inside `schedule`, and brackets member `i` between
@@ -198,50 +189,54 @@ fn order_with_edges<S, E>(
         app.configure_sets(schedule.clone(), pair[1].clone().after(pair[0].clone()));
     }
     for (index, set) in (0u8..).zip(toc) {
-        app.configure_sets(
-            schedule.clone(),
-            set.clone().after(edge(index)).before(edge(index + 1)),
-        );
+        let bracketed = set.clone().after(edge(index)).before(edge(index + 1));
+        app.configure_sets(schedule.clone(), bracketed);
     }
 }
 
-pub fn configure_render_sets(app: &mut App) {
-    for stage in RENDER_ORDER {
-        app.configure_sets(Update, stage.in_set(ClientSet::Present));
+pub fn order_draw_stages(app: &mut App) {
+    let mut previous: Option<DrawPassStage> = None;
+    for &stage in RENDER_ORDER {
+        App::configure_sets(app, Update, stage.in_set(ClientStep::Present));
+        if let Some(before) = previous {
+            // The same order holds in the unnested PostUpdate copy.
+            App::configure_sets(app, Update, stage.after(before));
+            app.configure_sets(PostUpdate, stage.after(before));
+        }
+        previous = Some(stage);
     }
-    for pair in RENDER_ORDER.windows(2) {
-        app.configure_sets(Update, pair[1].after(pair[0]));
-        app.configure_sets(PostUpdate, pair[1].after(pair[0]));
-    }
 }
 
-pub fn configure_authority_sets(app: &mut App) {
-    order_with_edges(app, FixedUpdate, AUTHORITY_TOC, AuthorityEdge);
-    app.configure_sets(
-        FixedUpdate,
-        AuthorityBookkeeping.in_set(AuthoritySet::Bookkeeping),
-    );
+pub fn order_server_side_stages(app: &mut App) {
+    let server_tick = FixedUpdate;
+    let members = SERVER_STAGES;
+    order_with_edges(app, server_tick, members, ServerHandoffLink);
+    let bookkeeping = ServerLedgerMark.in_set(ServerStage::Bookkeeping);
+    app.configure_sets(FixedUpdate, bookkeeping);
 }
 
-pub fn configure_client_sets(app: &mut App) {
-    order_with_edges(app, Update, CLIENT_TOC, ClientEdge);
-    app.configure_sets(Update, FxSoundPublished.in_set(ClientSet::Effects));
-    configure_worker_cmd_sets(app);
+pub fn order_player_side_stages(app: &mut App) {
+    let members = CLIENT_STAGES;
+    order_with_edges(app, Update, members, PlayerHandoffLink);
+    let publication = EffectAudioPosted.in_set(ClientStep::Effects);
+    App::configure_sets(app, Update, publication);
+    order_job_queue_stages(app);
 }
 
-pub fn configure_worker_cmd_sets(app: &mut App) {
+/// Every worker command sits inside Present, after the commands
+/// [`WORKER_CMD_AFTER`] says it follows; lighting is seated while scene
+/// entities are added.
+pub fn order_job_queue_stages(app: &mut App) {
     for &cmd in WORKER_CMD_TOC {
-        app.configure_sets(Update, cmd.in_set(ClientSet::Present));
+        App::configure_sets(app, Update, cmd.in_set(ClientStep::Present));
+        let follows = WORKER_CMD_AFTER.iter().filter(|edge| edge.0 == cmd).map(|edge| edge.1);
+        for earlier in follows {
+            App::configure_sets(app, Update, cmd.after(earlier));
+        }
     }
-    for &(later, earlier) in WORKER_CMD_AFTER {
-        app.configure_sets(Update, later.after(earlier));
-    }
-    app.configure_sets(
-        Update,
-        ModelLightingSeated.in_set(WorkerCmdSet::AddSceneEnt),
-    );
+    let seated = ModelLightPlaced.in_set(JobQueueStage::AddSceneEnt);
+    App::configure_sets(app, Update, seated);
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +263,13 @@ mod tests {
         std::mem::take(&mut app.world_mut().resource_mut::<Order>().0)
     }
 
+    /// A bare app with one family's sets configured.
+    fn app_with(configure: &[fn(&mut App)]) -> App {
+        let mut app = App::new();
+        configure.iter().for_each(|step| step(&mut app));
+        app
+    }
+
     fn position(order: &[String], tag: &str) -> usize {
         order
             .iter()
@@ -277,38 +279,32 @@ mod tests {
 
     #[test]
     fn tables_list_every_member_once_in_declaration_order() {
-        assert_eq!(AUTHORITY_TOC.len(), 7);
-        assert_eq!(CLIENT_TOC.len(), 10);
+        assert_eq!(SERVER_STAGES.len(), 7);
+        assert_eq!(CLIENT_STAGES.len(), 10);
         assert_eq!(WORKER_CMD_TOC.len(), 21);
         assert_eq!(WORKER_CMD_RETAIL_NAMES.len(), WORKER_CMD_TOC.len());
-        for (index, cmd) in WORKER_CMD_TOC.iter().enumerate() {
-            assert_eq!(*cmd as usize, index, "{cmd:?} is out of place");
-        }
-        for (index, set) in AUTHORITY_TOC.iter().enumerate() {
-            assert_eq!(authority_set_name(set), format!("{set:?}"), "at {index}");
-        }
-        for (index, set) in CLIENT_TOC.iter().enumerate() {
-            assert_eq!(client_set_name(set), format!("{set:?}"), "at {index}");
-        }
+        assert!(WORKER_CMD_TOC.iter().zip(0usize..).all(|(cmd, at)| *cmd as usize == at), "a command is out of place");
+        let server_debug: Vec<String> = SERVER_STAGES.iter().map(|set| format!("{set:?}")).collect();
+        assert_eq!(SERVER_STAGES.iter().map(server_stage_name).collect::<Vec<_>>(), server_debug);
+        let client: Vec<String> = CLIENT_STAGES.iter().map(|set| format!("{set:?}")).collect();
+        assert_eq!(CLIENT_STAGES.iter().map(client_stage_name).collect::<Vec<_>>(), client);
+        let render: Vec<String> = RENDER_ORDER.iter().map(|set| format!("{set:?}")).collect();
+        assert_eq!(RENDER_ORDER.iter().map(render_set_name).collect::<Vec<_>>(), render);
     }
 
     #[test]
     fn worker_names_are_unique_and_looked_up_by_discriminant() {
-        let mut names = WORKER_CMD_RETAIL_NAMES.to_vec();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), WORKER_CMD_TOC.len());
-        assert_eq!(
-            worker_cmd_name(WorkerCmdSet::CellDynBrush),
-            "cell_dyn_brush"
-        );
-        assert_eq!(worker_cmd_name(WorkerCmdSet::SmodelCache), "smodelcache");
-        assert_eq!(worker_cmd_name(WorkerCmdSet::Physics), "physics");
+        let distinct: std::collections::BTreeSet<&str> = WORKER_CMD_RETAIL_NAMES.iter().copied().collect();
+        assert_eq!(distinct.len(), WORKER_CMD_TOC.len());
+        let brush_name = worker_cmd_name(JobQueueStage::CellDynBrush);
+        assert_eq!(brush_name, "cell_dyn_brush");
+        assert_eq!(worker_cmd_name(JobQueueStage::SmodelCache), "smodelcache");
+        assert_eq!(worker_cmd_name(JobQueueStage::Physics), "physics");
     }
 
     #[test]
     fn worker_side_tables_only_name_known_commands_once() {
-        for list in [WORKER_CMD_END_FENCE, WORKER_CMD_NOT_RENDER_THREAD] {
+        for list in [JOB_QUEUE_TAIL_BARRIER, WORKER_CMD_NOT_RENDER_THREAD] {
             let mut seen = Vec::new();
             for cmd in list {
                 assert!(WORKER_CMD_TOC.contains(cmd));
@@ -316,8 +312,8 @@ mod tests {
                 seen.push(*cmd);
             }
         }
-        for (later, earlier) in WORKER_CMD_AFTER {
-            assert_ne!(later, earlier);
+        for (late, early) in WORKER_CMD_AFTER {
+            assert_ne!(late, early);
         }
     }
 
@@ -326,59 +322,56 @@ mod tests {
         // Following "runs after" links from any command must terminate.
         for &start in WORKER_CMD_TOC {
             let mut frontier = vec![start];
-            let mut steps = 0;
-            while let Some(cmd) = frontier.pop() {
-                steps += 1;
-                assert!(steps <= WORKER_CMD_TOC.len() * 4, "cycle through {start:?}");
-                frontier.extend(
-                    WORKER_CMD_AFTER
-                        .iter()
-                        .filter(|(later, _)| *later == cmd)
-                        .map(|(_, earlier)| *earlier),
-                );
+            let budget = WORKER_CMD_TOC.len() * 4;
+            for visited in 1.. {
+                let Some(cmd) = frontier.pop() else { break };
+                assert!(visited <= budget, "cycle through {start:?}");
+                let next = WORKER_CMD_AFTER.iter().filter(|(later, _)| *later == cmd);
+                frontier.extend(next.map(|(_, earlier)| *earlier));
             }
         }
     }
 
     #[test]
     fn the_server_tick_runs_in_table_order() {
-        let mut app = App::new();
-        configure_authority_sets(&mut app);
-        for set in AUTHORITY_TOC {
-            probe(&mut app, FixedUpdate, set.clone(), authority_set_name(set));
+        let mut app = app_with(&[order_server_side_stages]);
+        let tick = FixedUpdate.intern();
+        for member in SERVER_STAGES {
+            probe(&mut app, tick, member.clone(), server_stage_name(member));
         }
-        let ran = run(&mut app, FixedUpdate);
-        let expected: Vec<&str> = AUTHORITY_TOC.iter().map(authority_set_name).collect();
+        let ran = run(&mut app, tick);
+        let expected: Vec<&str> = SERVER_STAGES.iter().map(server_stage_name).collect();
         assert_eq!(ran, expected);
     }
 
     #[test]
     fn bookkeeping_marker_runs_with_the_bookkeeping_stage() {
-        let mut app = App::new();
-        configure_authority_sets(&mut app);
-        probe(&mut app, FixedUpdate, AuthorityBookkeeping, "marker");
-        probe(&mut app, FixedUpdate, AuthoritySet::Fanout, "fanout");
-        let ran = run(&mut app, FixedUpdate);
+        let mut app = app_with(&[order_server_side_stages]);
+        let tick = FixedUpdate.intern();
+        let marker = ServerLedgerMark;
+        let fanout = ServerStage::Fanout;
+        probe(&mut app, tick, marker, "marker");
+        probe(&mut app, tick, fanout, "fanout");
+        let ran = run(&mut app, tick);
         assert!(position(&ran, "fanout") < position(&ran, "marker"));
     }
 
     #[test]
     fn authority_edges_bracket_their_member() {
-        let mut app = App::new();
-        configure_authority_sets(&mut app);
-        for (index, set) in (0u8..).zip(AUTHORITY_TOC) {
+        let mut app = app_with(&[order_server_side_stages]);
+        for (index, set) in (0u8..).zip(SERVER_STAGES) {
             probe(&mut app, FixedUpdate, set.clone(), format!("set{index}"));
         }
-        for index in 0..=AUTHORITY_TOC.len() as u8 {
+        for index in 0..=SERVER_STAGES.len() as u8 {
             probe(
                 &mut app,
                 FixedUpdate,
-                AuthorityEdge(index),
+                ServerHandoffLink(index),
                 format!("edge{index}"),
             );
         }
         let ran = run(&mut app, FixedUpdate);
-        for index in 0..AUTHORITY_TOC.len() {
+        for index in 0..SERVER_STAGES.len() {
             let before = position(&ran, &format!("edge{index}"));
             let member = position(&ran, &format!("set{index}"));
             let after = position(&ran, &format!("edge{}", index + 1));
@@ -388,28 +381,26 @@ mod tests {
 
     #[test]
     fn the_client_frame_runs_in_table_order() {
-        let mut app = App::new();
-        configure_client_sets(&mut app);
-        for set in CLIENT_TOC {
-            probe(&mut app, Update, set.clone(), client_set_name(set));
+        let mut app = app_with(&[order_player_side_stages]);
+        for member in CLIENT_STAGES {
+            probe(&mut app, Update, member.clone(), client_stage_name(member));
         }
         let ran = run(&mut app, Update);
-        let expected: Vec<&str> = CLIENT_TOC.iter().map(client_set_name).collect();
+        let expected: Vec<&str> = CLIENT_STAGES.iter().map(client_stage_name).collect();
         assert_eq!(ran, expected);
     }
 
     #[test]
     fn client_edges_bracket_their_member() {
-        let mut app = App::new();
-        configure_client_sets(&mut app);
-        for (index, set) in (0u8..).zip(CLIENT_TOC) {
+        let mut app = app_with(&[order_player_side_stages]);
+        for (index, set) in (0u8..).zip(CLIENT_STAGES) {
             probe(&mut app, Update, set.clone(), format!("set{index}"));
         }
-        for index in 0..=CLIENT_TOC.len() as u8 {
-            probe(&mut app, Update, ClientEdge(index), format!("edge{index}"));
+        for index in 0..=CLIENT_STAGES.len() as u8 {
+            probe(&mut app, Update, PlayerHandoffLink(index), format!("edge{index}"));
         }
         let ran = run(&mut app, Update);
-        for index in 0..CLIENT_TOC.len() {
+        for index in 0..CLIENT_STAGES.len() {
             let before = position(&ran, &format!("edge{index}"));
             let member = position(&ran, &format!("set{index}"));
             let after = position(&ran, &format!("edge{}", index + 1));
@@ -419,11 +410,11 @@ mod tests {
 
     #[test]
     fn effect_publication_belongs_to_the_effects_stage() {
-        let mut app = App::new();
-        configure_client_sets(&mut app);
-        probe(&mut app, Update, ClientSet::Ui, "ui");
-        probe(&mut app, Update, FxSoundPublished, "published");
-        probe(&mut app, Update, ClientSet::Diag, "diag");
+        let mut app = app_with(&[order_player_side_stages]);
+        probe(&mut app, Update, ClientStep::Ui, "ui");
+        let published = EffectAudioPosted;
+        probe(&mut app, Update, published, "published");
+        probe(&mut app, Update, ClientStep::Diag, "diag");
         let ran = run(&mut app, Update);
         assert!(position(&ran, "ui") < position(&ran, "published"));
         assert!(position(&ran, "published") < position(&ran, "diag"));
@@ -431,10 +422,9 @@ mod tests {
 
     #[test]
     fn worker_commands_run_inside_present_and_honour_their_after_edges() {
-        let mut app = App::new();
-        configure_client_sets(&mut app);
-        probe(&mut app, Update, ClientSet::Send, "send");
-        probe(&mut app, Update, ClientSet::Ui, "ui");
+        let mut app = app_with(&[order_player_side_stages]);
+        probe(&mut app, Update, ClientStep::Send, "send");
+        probe(&mut app, Update, ClientStep::Ui, "ui");
         for &cmd in WORKER_CMD_TOC {
             probe(&mut app, Update, cmd, worker_cmd_name(cmd));
         }
@@ -445,25 +435,25 @@ mod tests {
             assert!(position(&ran, "send") < at, "{cmd:?} ran before Send");
             assert!(at < position(&ran, "ui"), "{cmd:?} ran after Ui");
         }
-        for &(later, earlier) in WORKER_CMD_AFTER {
+        for &(late, early) in WORKER_CMD_AFTER {
             assert!(
-                position(&ran, worker_cmd_name(earlier)) < position(&ran, worker_cmd_name(later)),
-                "{later:?} must follow {earlier:?}"
+                position(&ran, worker_cmd_name(early)) < position(&ran, worker_cmd_name(late)),
+                "{late:?} must follow {early:?}"
             );
         }
     }
 
     #[test]
     fn lighting_is_seated_as_part_of_adding_scene_entities() {
-        let mut app = App::new();
-        configure_client_sets(&mut app);
-        probe(&mut app, Update, ModelLightingSeated, "lighting");
+        let mut app = app_with(&[order_player_side_stages]);
+        let seated = ModelLightPlaced;
+        probe(&mut app, Update, seated, "lighting");
         app.add_systems(
             Update,
             (|mut order: ResMut<Order>| order.0.push("after_add".into()))
-                .after(WorkerCmdSet::AddSceneEnt),
+                .after(JobQueueStage::AddSceneEnt),
         );
-        probe(&mut app, Update, ClientSet::Ui, "ui");
+        probe(&mut app, Update, ClientStep::Ui, "ui");
         let ran = run(&mut app, Update);
         assert!(position(&ran, "lighting") < position(&ran, "after_add"));
         assert!(position(&ran, "lighting") < position(&ran, "ui"));
@@ -472,12 +462,11 @@ mod tests {
     #[test]
     fn render_stages_run_in_order_in_both_schedules() {
         for post in [false, true] {
-            let mut app = App::new();
-            configure_client_sets(&mut app);
-            configure_render_sets(&mut app);
-            for (index, stage) in (0..).zip(RENDER_ORDER) {
+            let mut app = app_with(&[order_player_side_stages, order_draw_stages]);
+            for (index, &stage) in (0..).zip(RENDER_ORDER) {
                 if post {
-                    probe(&mut app, PostUpdate, stage, format!("stage{index}"));
+                    let late_copy = PostUpdate;
+                    probe(&mut app, late_copy, stage, format!("stage{index}"));
                 } else {
                     probe(&mut app, Update, stage, format!("stage{index}"));
                 }
@@ -496,16 +485,14 @@ mod tests {
 
     #[test]
     fn render_stages_sit_between_send_and_ui_in_the_client_frame() {
-        let mut app = App::new();
-        configure_client_sets(&mut app);
-        configure_render_sets(&mut app);
-        probe(&mut app, Update, ClientSet::Send, "send");
-        probe(&mut app, Update, ClientSet::Ui, "ui");
-        for stage in RENDER_ORDER {
+        let mut app = app_with(&[order_player_side_stages, order_draw_stages]);
+        probe(&mut app, Update, ClientStep::Send, "send");
+        probe(&mut app, Update, ClientStep::Ui, "ui");
+        for &stage in RENDER_ORDER {
             probe(&mut app, Update, stage, format!("{stage:?}"));
         }
         let ran = run(&mut app, Update);
-        for stage in RENDER_ORDER {
+        for &stage in RENDER_ORDER {
             let at = position(&ran, &format!("{stage:?}"));
             assert!(position(&ran, "send") < at && at < position(&ran, "ui"));
         }

@@ -68,11 +68,11 @@ pub fn digest(data: &[u8]) -> [u8; DIGEST_LEN] {
         compress(&mut h, block);
     }
 
-    let mut out = [0u8; DIGEST_LEN];
+    let mut hash_out = [0u8; DIGEST_LEN];
     for (i, word) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        hash_out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
-    out
+    hash_out
 }
 
 #[cfg(test)]
@@ -80,13 +80,13 @@ mod tests {
     use super::*;
 
     fn hex(d: [u8; DIGEST_LEN]) -> [u8; 40] {
-        const H: &[u8; 16] = b"0123456789abcdef";
-        let mut out = [0u8; 40];
-        for (i, b) in d.iter().enumerate() {
-            out[i * 2] = H[(b >> 4) as usize];
-            out[i * 2 + 1] = H[(b & 15) as usize];
+        let nibble = |v: u8| char::from_digit(u32::from(v), 16).map_or(b'?', |ch| ch as u8);
+        let mut text = [0u8; 40];
+        for (pos, byte) in d.iter().enumerate() {
+            text[pos * 2] = nibble(byte >> 4);
+            text[pos * 2 + 1] = nibble(byte & 15);
         }
-        out
+        text
     }
 
     #[test]

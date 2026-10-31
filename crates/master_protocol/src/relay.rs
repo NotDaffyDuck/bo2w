@@ -2,28 +2,28 @@
 //! the low byte of the protocol version, a route byte, the member id for the two routes
 //! that name one, then the packet itself.
 
-use crate::{MemberId, ProtocolError, MAX_BOOTSTRAP_PAYLOAD, MAX_OPAQUE_PAYLOAD, PROTOCOL_VERSION};
+use crate::{RoomOccupantId, ControlCodecFault, TRANSFER_SIZE_LIMIT, OPAQUE_BODY_BYTE_CAP, WIRE_REV};
 
 /// One forwarded packet and the way it travels.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RelayDatagram<'a> {
+pub enum ForwardedPacket<'a> {
     /// A member's packet on its way to the host.
-    ClientToHost(&'a [u8]),
+    ReceiverToHost(&'a [u8]),
     /// The host's packet for one member.
-    HostToMember {
-        member_id: MemberId,
+    HostToParticipant {
+        member_id: RoomOccupantId,
         payload: &'a [u8],
     },
     /// A member's packet as the service hands it to the host, tagged with the sender.
-    ServiceToHost {
-        member_id: MemberId,
+    DirectoryToHost {
+        member_id: RoomOccupantId,
         payload: &'a [u8],
     },
     /// The host's packet as the service hands it to the member.
-    ServiceToMember(&'a [u8]),
+    DirectoryToParticipant(&'a [u8]),
 }
 
-const VERSION_BYTE: u8 = PROTOCOL_VERSION as u8;
+const VERSION_BYTE: u8 = WIRE_REV as u8;
 
 /// Route bytes.
 mod route {
@@ -34,74 +34,72 @@ mod route {
 }
 
 /// A datagram-sized packet (game traffic).
-pub fn encode_relay(datagram: RelayDatagram<'_>) -> Result<Vec<u8>, ProtocolError> {
-    pack(datagram, MAX_OPAQUE_PAYLOAD)
+pub fn write_relay(datagram: ForwardedPacket<'_>) -> Result<Vec<u8>, ControlCodecFault> {
+    pack(datagram, OPAQUE_BODY_BYTE_CAP)
 }
 
 /// A join snapshot sent on its own one-way stream.
-pub fn encode_relay_stream(datagram: RelayDatagram<'_>) -> Result<Vec<u8>, ProtocolError> {
-    pack(datagram, MAX_BOOTSTRAP_PAYLOAD)
+pub fn write_relay_stream(datagram: ForwardedPacket<'_>) -> Result<Vec<u8>, ControlCodecFault> {
+    pack(datagram, TRANSFER_SIZE_LIMIT)
 }
 
-pub fn decode_relay(bytes: &[u8]) -> Result<RelayDatagram<'_>, ProtocolError> {
-    unpack(bytes, MAX_OPAQUE_PAYLOAD)
+pub fn read_relay(bytes: &[u8]) -> Result<ForwardedPacket<'_>, ControlCodecFault> {
+    unpack(bytes, OPAQUE_BODY_BYTE_CAP)
 }
 
-pub fn decode_relay_stream(bytes: &[u8]) -> Result<RelayDatagram<'_>, ProtocolError> {
-    unpack(bytes, MAX_BOOTSTRAP_PAYLOAD)
+pub fn read_relay_stream(bytes: &[u8]) -> Result<ForwardedPacket<'_>, ControlCodecFault> {
+    unpack(bytes, TRANSFER_SIZE_LIMIT)
 }
 
-fn pack(datagram: RelayDatagram<'_>, cap: usize) -> Result<Vec<u8>, ProtocolError> {
-    use RelayDatagram as D;
+fn pack(datagram: ForwardedPacket<'_>, cap: usize) -> Result<Vec<u8>, ControlCodecFault> {
     let (code, addressee, packet) = match datagram {
-        D::ClientToHost(packet) => (route::TO_HOST, None, packet),
-        D::HostToMember { member_id, payload } => (route::TO_MEMBER, Some(member_id), payload),
-        D::ServiceToHost { member_id, payload } => {
-            (route::FROM_SERVICE_TO_HOST, Some(member_id), payload)
+        ForwardedPacket::ReceiverToHost(packet) => (route::TO_HOST, None, packet),
+        ForwardedPacket::HostToParticipant { member_id: to, payload: body } => (route::TO_MEMBER, Some(to), body),
+        ForwardedPacket::DirectoryToHost { member_id: from, payload: body } => {
+            (route::FROM_SERVICE_TO_HOST, Some(from), body)
         }
-        D::ServiceToMember(packet) => (route::FROM_SERVICE_TO_MEMBER, None, packet),
+        ForwardedPacket::DirectoryToParticipant(packet) => (route::FROM_SERVICE_TO_MEMBER, None, packet),
     };
     if packet.len() > cap {
-        return Err(ProtocolError::LengthExceeded(packet.len()));
+        return Err(ControlCodecFault::SizeOverLimit(packet.len()));
     }
     let id_bytes = addressee.as_ref().map_or(&[][..], |member| &member.0[..]);
     Ok([&[VERSION_BYTE, code][..], id_bytes, packet].concat())
 }
 
-fn unpack(bytes: &[u8], cap: usize) -> Result<RelayDatagram<'_>, ProtocolError> {
-    use RelayDatagram as D;
+fn unpack(bytes: &[u8], cap: usize) -> Result<ForwardedPacket<'_>, ControlCodecFault> {
     let [version, code, after @ ..] = bytes else {
-        return Err(ProtocolError::Truncated);
+        return Err(ControlCodecFault::Truncated);
     };
     if *version != VERSION_BYTE {
-        return Err(ProtocolError::VersionMismatch {
-            ours: PROTOCOL_VERSION,
-            theirs: u16::from(*version),
+        return Err(ControlCodecFault::WireRevisionSkew {
+            local: WIRE_REV,
+            remote: u16::from(*version),
         });
     }
     let names_member = matches!(*code, route::TO_MEMBER | route::FROM_SERVICE_TO_HOST);
     let (addressee, packet) = if names_member {
         let (id, packet) = after
             .split_first_chunk::<16>()
-            .ok_or(ProtocolError::Truncated)?;
-        (Some(MemberId(*id)), packet)
+            .ok_or(ControlCodecFault::Truncated)?;
+        (Some(RoomOccupantId(*id)), packet)
     } else {
         (None, after)
     };
     if packet.len() > cap {
-        return Err(ProtocolError::LengthExceeded(packet.len()));
+        return Err(ControlCodecFault::SizeOverLimit(packet.len()));
     }
     match (*code, addressee) {
-        (route::TO_HOST, None) => Ok(D::ClientToHost(packet)),
-        (route::TO_MEMBER, Some(member_id)) => Ok(D::HostToMember {
+        (route::TO_HOST, None) => Ok(ForwardedPacket::ReceiverToHost(packet)),
+        (route::TO_MEMBER, Some(member_id)) => Ok(ForwardedPacket::HostToParticipant {
             member_id,
             payload: packet,
         }),
-        (route::FROM_SERVICE_TO_HOST, Some(member_id)) => Ok(D::ServiceToHost {
+        (route::FROM_SERVICE_TO_HOST, Some(member_id)) => Ok(ForwardedPacket::DirectoryToHost {
             member_id,
             payload: packet,
         }),
-        (route::FROM_SERVICE_TO_MEMBER, None) => Ok(D::ServiceToMember(packet)),
-        (other, _) => Err(ProtocolError::UnknownTag(other)),
+        (route::FROM_SERVICE_TO_MEMBER, None) => Ok(ForwardedPacket::DirectoryToParticipant(packet)),
+        (other, _) => Err(ControlCodecFault::UnrecognizedKindByte(other)),
     }
 }

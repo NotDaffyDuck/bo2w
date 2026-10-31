@@ -1,70 +1,70 @@
 [
-    ClassAccepted {
+    LoadoutTaken {
         request_id: 1,
-        class_id: ClassId(
+        class_id: LoadoutClass(
             2,
         ),
         revision: 3,
     },
-    ClassRejected {
+    LoadoutRefused {
         request_id: 10,
-        class_id: ClassId(
+        class_id: LoadoutClass(
             20,
         ),
         revision: 30,
         reason: UnknownOrStaleClass,
     },
-    ClassRejected {
+    LoadoutRefused {
         request_id: 11,
-        class_id: ClassId(
+        class_id: LoadoutClass(
             21,
         ),
         revision: 31,
         reason: NoSpawnAvailable,
     },
-    ClassRejected {
+    LoadoutRefused {
         request_id: 12,
-        class_id: ClassId(
+        class_id: LoadoutClass(
             22,
         ),
         revision: 32,
         reason: LockedContent,
     },
-    ClassRejected {
+    LoadoutRefused {
         request_id: 13,
-        class_id: ClassId(
+        class_id: LoadoutClass(
             23,
         ),
         revision: 33,
-        reason: UnknownWeaponId,
+        reason: NoSuchGun,
     },
-    GiveAccepted {
+    HandoutTaken {
         request_id: 40,
-        weapon: 41,
+        gun: 41,
     },
-    GiveRejected {
+    HandoutRefused {
         request_id: 50,
-        weapon: 60,
+        gun: 60,
         reason: NotAlive,
     },
-    GiveRejected {
+    HandoutRefused {
         request_id: 51,
-        weapon: 61,
+        gun: 61,
         reason: InvalidWeapon,
     },
-    GiveRejected {
+    HandoutRefused {
         request_id: 52,
-        weapon: 62,
-        reason: UnknownWeaponId,
+        gun: 62,
+        reason: NoSuchGun,
     },
-    GiveRejected {
+    HandoutRefused {
         request_id: 53,
-        weapon: 63,
+        gun: 63,
         reason: UnsupportedWeapon,
     },
-    GiveRejected {
+    HandoutRefused {
         request_id: 54,
-        weapon: 64,
+        gun: 64,
         reason: EmptyCombatProfile,
     },
     ConfigurationChangeAccepted {
@@ -121,146 +121,146 @@
         reason: SharedAmmoConflict,
     },
     Spawned {
-        class_id: ClassId(
+        class_id: LoadoutClass(
             5,
         ),
-        spawn_index: 17,
-        life_sequence: LifeSequence(
+        spawn_slot: 17,
+        life_sequence: LifeCount(
             9,
         ),
     },
     Died {
-        victim: ClientId(
+        victim: SeatNo(
             0,
         ),
-        life_sequence: LifeSequence(
+        life_sequence: LifeCount(
             110,
         ),
         attacker: Some(
-            ClientId(
+            SeatNo(
                 10,
             ),
         ),
         attacker_life: Some(
-            LifeSequence(
+            LifeCount(
                 120,
             ),
         ),
         source: Some(
             Shot(
-                ShotId(
+                BulletNo(
                     1001,
                 ),
             ),
         ),
-        weapon: 130,
-        killcam_entity_start_time: -1,
+        gun: 130,
+        cam_ent_since: -1,
     },
     Died {
-        victim: ClientId(
+        victim: SeatNo(
             1,
         ),
-        life_sequence: LifeSequence(
+        life_sequence: LifeCount(
             111,
         ),
         attacker: Some(
-            ClientId(
+            SeatNo(
                 11,
             ),
         ),
         attacker_life: Some(
-            LifeSequence(
+            LifeCount(
                 121,
             ),
         ),
         source: Some(
             Projectile(
-                ProjectileId(
+                ThrownId(
                     2002,
                 ),
             ),
         ),
-        weapon: 131,
-        killcam_entity_start_time: -2,
+        gun: 131,
+        cam_ent_since: -2,
     },
     Died {
-        victim: ClientId(
+        victim: SeatNo(
             2,
         ),
-        life_sequence: LifeSequence(
+        life_sequence: LifeCount(
             112,
         ),
         attacker: Some(
-            ClientId(
+            SeatNo(
                 12,
             ),
         ),
         attacker_life: Some(
-            LifeSequence(
+            LifeCount(
                 122,
             ),
         ),
         source: Some(
             Radius(
-                ScriptModelId(
+                ScriptedModel(
                     3003,
                 ),
             ),
         ),
-        weapon: 132,
-        killcam_entity_start_time: -3,
+        gun: 132,
+        cam_ent_since: -3,
     },
     Died {
-        victim: ClientId(
+        victim: SeatNo(
             3,
         ),
-        life_sequence: LifeSequence(
+        life_sequence: LifeCount(
             113,
         ),
         attacker: Some(
-            ClientId(
+            SeatNo(
                 13,
             ),
         ),
         attacker_life: Some(
-            LifeSequence(
+            LifeCount(
                 123,
             ),
         ),
         source: Some(
             Melee,
         ),
-        weapon: 133,
-        killcam_entity_start_time: -4,
+        gun: 133,
+        cam_ent_since: -4,
     },
     Died {
-        victim: ClientId(
+        victim: SeatNo(
             17,
         ),
-        life_sequence: LifeSequence(
+        life_sequence: LifeCount(
             3,
         ),
         attacker: None,
         attacker_life: None,
         source: None,
-        weapon: 0,
-        killcam_entity_start_time: 90000,
+        gun: 0,
+        cam_ent_since: 90000,
     },
-    ScoreChanged {
-        client: ClientId(
+    TallyMoved {
+        client: SeatNo(
             4,
         ),
         score: 1250,
         kills: 12,
-        deaths: -1,
+        times_died: -1,
     },
     MatchEnded {
-        reason: ScoreLimit,
+        reason: PointsReached,
     },
     MatchEnded {
         reason: TimeLimit,
     },
-    AttackReleased,
+    TriggerLet,
     WeaponSwitchRequested {
         weapon: 3735928559,
     },

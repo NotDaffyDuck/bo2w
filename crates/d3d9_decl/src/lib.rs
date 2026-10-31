@@ -1,5 +1,5 @@
-//! Vertex declaration vocabulary: what an element's data looks like in memory
-//! and which shader input it feeds.
+//! What a D3D9 vertex declaration says about each element: how its data is
+//! laid out, and which shader input receives it.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -7,8 +7,5 @@
 mod decl_type;
 mod usage;
 
-pub use decl_type::DeclType;
-pub use usage::{
-    D3DDECLUSAGE_COLOR, D3DDECLUSAGE_DEPTH, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION,
-    D3DDECLUSAGE_TEXCOORD, Semantic,
-};
+pub use decl_type::VertexElementFormat;
+pub use usage::*;

@@ -3,16 +3,16 @@
 //! (`adsLowerSoundPlayer`), and a scope's zoom click (`adsZoomSound`,
 //! `fly_scope_zoom`) the moment its overlay snaps on.
 
-use asset_game::WeaponSoundSlot;
-use assets::PreparedWeapons;
+use asset_game::WeaponAudioRole;
+use assets::StagedWeapons;
 use bevy::prelude::*;
-use net::{LocalPresentClient, PresentedSnapshot};
+use net::{HostViewClient, ShownWorldFrame};
 
-use crate::{SND_ENT_LOCAL, SoundBank, WeaponSound};
+use crate::{SOUND_SOURCE_SELF, AudioCatalogRes, GunNoiseMsg};
 
 #[derive(Default)]
 pub(crate) struct AdsSoundState {
-    weapon: u32,
+    weapon_ix: u32,
     frac: f32,
     /// Which way the sights last moved (true: up).
     raising: bool,
@@ -20,10 +20,10 @@ pub(crate) struct AdsSoundState {
 
 /// What the sights did this frame: (raise started, lower started, reached
 /// full ADS).
-fn ads_edges(state: &mut AdsSoundState, weapon: u32, frac: f32) -> (bool, bool, bool) {
-    if weapon != state.weapon {
+fn ads_edges(state: &mut AdsSoundState, wpn: u32, frac: f32) -> (bool, bool, bool) {
+    if wpn != state.weapon_ix {
         *state = AdsSoundState {
-            weapon,
+            weapon_ix: wpn,
             frac,
             raising: frac > 0.0,
         };
@@ -44,39 +44,39 @@ fn ads_edges(state: &mut AdsSoundState, weapon: u32, frac: f32) -> (bool, bool, 
 
 pub(crate) fn play_ads_sounds(
     mut state: Local<AdsSoundState>,
-    presented: Res<PresentedSnapshot>,
-    local: Res<LocalPresentClient>,
-    weapons: Option<Res<PreparedWeapons>>,
-    bank: Option<Res<SoundBank>>,
-    mut out: MessageWriter<WeaponSound>,
+    shown: Res<ShownWorldFrame>,
+    local: Res<HostViewClient>,
+    weapons: Option<Res<StagedWeapons>>,
+    bank: Option<Res<AudioCatalogRes>>,
+    mut out: MessageWriter<GunNoiseMsg>,
 ) {
-    let Some(ps) = presented.player(local.0) else {
+    let Some(pstate) = shown.player(local.0) else {
         *state = AdsSoundState::default();
         return;
     };
-    let (up, down, full) = ads_edges(&mut state, ps.weapon, ps.f_weapon_pos_frac);
+    let (up, down, full) = ads_edges(&mut state, pstate.weapon, pstate.weapon_raise_fraction);
     let (Some(weapons), Some(bank)) = (weapons.as_deref(), bank.as_deref()) else {
         return;
     };
     // Only Black Ops II's guns name these.
-    if weapons.0.namespace_of(ps.weapon) != Some(asset_core::AssetNamespace::T6) {
+    if weapons.0.scope_for(pstate.weapon) != Some(asset_core::AssetCategoryScope::T6) {
         return;
     }
-    let scoped = weapons.0.overlay_is_hud_iris(ps.weapon);
+    let scoped = weapons.0.scope_is_iris(pstate.weapon);
     for (fire, slot) in [
-        (up, WeaponSoundSlot::AdsRaisePlayer),
-        (down, WeaponSoundSlot::AdsLowerPlayer),
-        (full && scoped, WeaponSoundSlot::AdsZoom),
+        (up, WeaponAudioRole::AdsRaisePlayer),
+        (down, WeaponAudioRole::AdsLowerPlayer),
+        (full && scoped, WeaponAudioRole::AdsZoom),
     ] {
         if !fire {
             continue;
         }
-        if let Some((namespace, alias)) = weapons.0.weapon_sound_key(ps.weapon, slot, &bank.0) {
-            out.write(WeaponSound {
-                namespace,
-                alias: alias.to_owned(),
-                origin_inches: None,
-                snd_ent: Some(SND_ENT_LOCAL),
+        if let Some((cue_ns, cue_id)) = weapons.0.weapon_sound_key(pstate.weapon, slot, &bank.0) {
+            out.write(GunNoiseMsg {
+                cue_ns,
+                alias: cue_id.to_owned(),
+                position_in_inches: None,
+                source_entity_no: Some(SOUND_SOURCE_SELF),
             });
         }
     }

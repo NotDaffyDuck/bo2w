@@ -1,273 +1,261 @@
-//! The on-disk format of a recording.
+//! How a recording sits on disk.
+//!
+//! A 64-byte header comes first, then the frames:
 //!
 //! ```text
-//! offset  bytes  what
-//!      0      8  MAGIC
-//!      8      4  network protocol version of the build that wrote it
-//!     12      4  random-number scheme
-//!     16      8  root seed
-//!     24      8  content digest
-//!     32     32  zone name, zero padded
-//!     64    ...  frames, each a 4-byte length and then that many bytes
+//! at   size  field
+//!  0      8  FORMAT_TAG
+//!  8      4  wire revision of the writing build
+//! 12      4  random stream layout
+//! 16      8  seed the world grew from
+//! 24      8  content fingerprint
+//! 32     32  map name, padded with zeros
+//! 64      -  frames: a 4-byte byte count, then the frame's wire bytes
 //! ```
 //!
-//! Numbers are little-endian. A frame is exactly what the server would put on
-//! the wire for that tick. A recording cut short by a crash is still good up
-//! to its last whole frame.
+//! Every number is stored little-endian. Each frame holds the same bytes the
+//! host would have sent for that tick, so a file cut off mid-write still plays
+//! up to the last frame that made it whole.
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use net::{
-    Frame, PROTOCOL_VERSION, Transport, TransportError, WireError, WireReader,
-    WorldObjectSyncDecoder,
+    Frame, WIRE_REVISION_NUMBER, Transport, LinkIoFailure, PacketDecodeFault, ByteCursorReader,
+    WorldPropStreamDecoder,
 };
-use sim::RNG_DOMAIN_SCHEME;
+use sim::RANDOM_STREAM_LAYOUT_VERSION;
 
-use crate::error::ReplayError;
-use crate::identity::{MatchRecordIdentity, ZONE_FIELD_LEN};
+use crate::error::RecordingFault;
+use crate::identity::{RecordedGameLabel, REGION_LABEL_CAPACITY};
 
-pub const MAGIC: [u8; 8] = *b"BO2MPDEM";
+pub const FORMAT_TAG: [u8; 8] = *b"BO2MPDEM";
 
-const HEADER_LEN: usize = 8 + 4 + 4 + 8 + 8 + ZONE_FIELD_LEN;
+const HEADER_LEN: usize = 8 + 4 + 4 + 8 + 8 + REGION_LABEL_CAPACITY;
 
-/// A frame longer than this is taken to be a damaged length, not a frame.
-const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
+/// Any byte count above this is read as a corrupt length rather than a frame.
+const FRAME_SIZE_LIMIT: u32 = 16 << 20;
 
-fn take<const N: usize>(from: &mut impl Read) -> io::Result<[u8; N]> {
-    let mut bytes = [0u8; N];
-    from.read_exact(&mut bytes)?;
-    Ok(bytes)
+fn read_array<const N: usize>(src: &mut impl Read) -> io::Result<[u8; N]> {
+    let mut filled = [0u8; N];
+    src.read_exact(&mut filled).map(|()| filled)
 }
 
-/// `None` where a read hit the end of the file, the error for any other
-/// failure.
-fn or_end<T>(read: io::Result<T>) -> Result<Option<T>, ReplayError> {
-    match read {
-        Ok(value) => Ok(Some(value)),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(error) => Err(error.into()),
+/// Turns running out of file into `Ok(None)`; any other failure stays an error.
+fn none_at_eof<T>(attempt: io::Result<T>) -> Result<Option<T>, RecordingFault> {
+    match attempt {
+        Err(failure) if failure.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        other => Ok(Some(other?)),
     }
 }
 
-fn header_bytes(identity: &MatchRecordIdentity) -> [u8; HEADER_LEN] {
-    let scheme = match identity.rng_scheme {
-        0 => RNG_DOMAIN_SCHEME,
-        chosen => chosen,
+fn encode_header(label: &RecordedGameLabel) -> [u8; HEADER_LEN] {
+    let layout = if label.random_stream_layout == 0 {
+        RANDOM_STREAM_LAYOUT_VERSION
+    } else {
+        label.random_stream_layout
     };
-    let mut header = [0u8; HEADER_LEN];
-    header[0..8].copy_from_slice(&MAGIC);
-    header[8..12].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    header[12..16].copy_from_slice(&scheme.to_le_bytes());
-    header[16..24].copy_from_slice(&identity.root_seed.to_le_bytes());
-    header[24..32].copy_from_slice(&identity.content_digest.to_le_bytes());
-    header[32..].copy_from_slice(&identity.zone);
-    header
+    let mut packed = Vec::with_capacity(HEADER_LEN);
+    packed.extend_from_slice(&FORMAT_TAG);
+    packed.extend_from_slice(&WIRE_REVISION_NUMBER.to_le_bytes());
+    packed.extend_from_slice(&layout.to_le_bytes());
+    packed.extend_from_slice(&label.world_seed.to_le_bytes());
+    packed.extend_from_slice(&label.content_fingerprint.to_le_bytes());
+    packed.extend_from_slice(&label.map_bytes);
+    packed.try_into().expect("the header fields add up to HEADER_LEN")
 }
 
-/// Reads and checks a header. The magic and the protocol are checked as soon
-/// as they are read, so a file from another build is reported as that and not
-/// as a short header.
-fn read_header(from: &mut impl Read) -> Result<MatchRecordIdentity, ReplayError> {
-    let magic = take::<8>(from)?;
-    if magic != MAGIC {
-        return Err(ReplayError::Magic { found: magic });
+/// Reads a header field by field. The tag and the wire revision are checked
+/// the moment they arrive, so a file from some other build is reported as
+/// such rather than as a short header.
+fn decode_header(src: &mut impl Read) -> Result<RecordedGameLabel, RecordingFault> {
+    let tag: [u8; 8] = read_array(src)?;
+    if tag != FORMAT_TAG {
+        return Err(RecordingFault::Magic { found: tag });
     }
-    let version = u32::from_le_bytes(take(from)?);
-    if version != PROTOCOL_VERSION {
-        return Err(ReplayError::Version {
-            found: version,
-            expected: PROTOCOL_VERSION,
-        });
+    let found = u32::from_le_bytes(read_array(src)?);
+    if found != WIRE_REVISION_NUMBER {
+        return Err(RecordingFault::Version { found, wanted: WIRE_REVISION_NUMBER });
     }
-    Ok(MatchRecordIdentity {
-        rng_scheme: u32::from_le_bytes(take(from)?),
-        root_seed: u64::from_le_bytes(take(from)?),
-        content_digest: u64::from_le_bytes(take(from)?),
-        zone: take(from)?,
-    })
+    let mut label = RecordedGameLabel::default();
+    label.random_stream_layout = u32::from_le_bytes(read_array(src)?);
+    label.world_seed = u64::from_le_bytes(read_array(src)?);
+    label.content_fingerprint = u64::from_le_bytes(read_array(src)?);
+    label.map_bytes = read_array(src)?;
+    Ok(label)
 }
 
+/// Writes one recording, frame after frame.
 #[derive(Debug)]
-pub struct RecordWriter {
-    out: BufWriter<File>,
-    path: PathBuf,
-    frames: u64,
+pub struct DemoFileWriter {
+    sink: BufWriter<File>,
+    location: PathBuf,
+    frame_count: u64,
 }
 
-impl RecordWriter {
-    pub fn create(path: &Path) -> Result<Self, ReplayError> {
-        Self::create_with_identity(path, MatchRecordIdentity::default())
+impl DemoFileWriter {
+    pub fn blank(at: &Path) -> Result<Self, RecordingFault> {
+        Self::build_with_signature(at, RecordedGameLabel::default())
     }
 
-    /// Starts a recording at `path`, making its folders if they are missing
-    /// and replacing any file already there.
-    pub fn create_with_identity(
-        path: &Path,
-        identity: MatchRecordIdentity,
-    ) -> Result<Self, ReplayError> {
-        if let Some(folder) = path.parent() {
+    /// Opens a new recording at `at` with `header` written first, creating
+    /// missing folders on the way and overwriting whatever file was there.
+    pub fn build_with_signature(
+        at: &Path,
+        header: RecordedGameLabel,
+    ) -> Result<Self, RecordingFault> {
+        if let Some(folder) = at.parent() {
             fs::create_dir_all(folder)?;
         }
-        let mut out = BufWriter::new(File::create(path)?);
-        out.write_all(&header_bytes(&identity))?;
-        Ok(Self {
-            out,
-            path: path.to_path_buf(),
-            frames: 0,
-        })
+        let mut sink = BufWriter::new(File::create(at)?);
+        sink.write_all(&encode_header(&header))?;
+        Ok(Self { sink, location: at.to_owned(), frame_count: 0u64 })
     }
 
-    pub fn write_frame(&mut self, frame: &Frame) -> Result<(), ReplayError> {
-        let bytes = frame.to_bytes();
-        let length = u32::try_from(bytes.len())
-            .ok()
-            .filter(|&length| length <= MAX_FRAME_LEN)
-            .ok_or(WireError::Malformed(
-                "frame is too large for a recording to hold",
-            ))?;
-        self.out.write_all(&length.to_le_bytes())?;
-        self.out.write_all(&bytes)?;
-        self.frames += 1;
+    pub fn append(&mut self, frame: &Frame) -> Result<(), RecordingFault> {
+        let encoded = frame.wire_bytes();
+        let Some(length) = u32::try_from(encoded.len()).ok().filter(|&n| n <= FRAME_SIZE_LIMIT) else {
+            return Err(PacketDecodeFault::GarbledRequest("this frame is bigger than a recording allows").into());
+        };
+        self.sink.write_all(&length.to_le_bytes())?;
+        self.sink.write_all(&encoded)?;
+        self.frame_count += 1;
         Ok(())
     }
 
-    pub fn frames(&self) -> u64 {
-        self.frames
+    pub fn frame_count(&self) -> u64 {
+        self.frame_count
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.location
     }
 
-    /// Flushes to disk; the frame count and the file's path.
-    pub fn finish(mut self) -> Result<(u64, PathBuf), ReplayError> {
-        self.out.flush()?;
-        Ok((self.frames, self.path))
+    /// Pushes everything to disk and hands back how many frames went in and
+    /// where the file is.
+    pub fn close(mut self) -> Result<(u64, PathBuf), RecordingFault> {
+        self.sink.flush()?;
+        let Self { location, frame_count, .. } = self;
+        Ok((frame_count, location))
     }
 }
 
+/// Reads one recording back, frame after frame.
 #[derive(Debug)]
-pub struct RecordReader {
-    input: BufReader<File>,
-    path: PathBuf,
-    identity: MatchRecordIdentity,
-    world_objects: WorldObjectSyncDecoder,
+pub struct DemoFileReader {
+    source: BufReader<File>,
+    location: PathBuf,
+    label: RecordedGameLabel,
+    object_sync: WorldPropStreamDecoder,
 }
 
-impl RecordReader {
-    pub fn open(path: &Path) -> Result<Self, ReplayError> {
-        let mut input = BufReader::new(File::open(path)?);
-        let identity = read_header(&mut input)?;
+impl DemoFileReader {
+    pub fn open_at(at: &Path) -> Result<Self, RecordingFault> {
+        let mut source = BufReader::new(File::open(at)?);
+        let label = decode_header(&mut source)?;
         Ok(Self {
-            input,
-            path: path.to_path_buf(),
-            identity,
-            world_objects: WorldObjectSyncDecoder::default(),
+            source,
+            location: at.to_owned(),
+            label,
+            object_sync: WorldPropStreamDecoder::default(),
         })
     }
 
-    pub fn identity(&self) -> MatchRecordIdentity {
-        self.identity
+    pub fn identity(&self) -> RecordedGameLabel {
+        self.label
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.location
     }
 
-    /// The next frame, or `None` at the end of the file (a frame cut off by
-    /// the end counts as the end).
-    pub fn read_frame(&mut self) -> Result<Option<Frame>, ReplayError> {
-        let Some(prefix) = or_end(take::<4>(&mut self.input))? else {
+    /// The following frame; `None` once the file runs out, including when it
+    /// runs out partway through a frame.
+    pub fn next_frame(&mut self) -> Result<Option<Frame>, RecordingFault> {
+        let Some(length) = none_at_eof(read_array::<4>(&mut self.source))?.map(u32::from_le_bytes) else {
             return Ok(None);
         };
-        let length = u32::from_le_bytes(prefix);
-        if length > MAX_FRAME_LEN {
-            return Err(
-                WireError::Malformed("frame length is implausible; the file is damaged").into(),
-            );
+        if length > FRAME_SIZE_LIMIT {
+            return Err(PacketDecodeFault::GarbledRequest("frame length is implausible; the file is damaged").into());
         }
-        let mut bytes = vec![0u8; length as usize];
-        if or_end(self.input.read_exact(&mut bytes))?.is_none() {
+        let body_len = length as usize;
+        let mut body = vec![0u8; body_len];
+        if none_at_eof(self.source.read_exact(&mut body))?.is_none() {
             return Ok(None);
         }
-        let frame = Frame::decode(&mut WireReader::new(&bytes), &mut self.world_objects)?;
-        Ok(Some(frame))
+        Ok(Some(Frame::decode(&mut ByteCursorReader::new(&body), &mut self.object_sync)?))
     }
 }
 
 #[derive(Debug)]
-enum Mode {
-    /// Writing; `None` once finished.
-    Recording(Option<RecordWriter>),
-    Playing(RecordReader),
+enum Direction {
+    /// Taking frames in; empty after it is closed.
+    Writing(Option<DemoFileWriter>),
+    Reading(DemoFileReader),
 }
 
-/// A recording seen as a [`Transport`]: sending writes a frame, receiving
-/// reads one.
+/// A demo file wearing the [`Transport`] shape: send appends a frame and
+/// receive reads the next one.
 #[derive(Debug)]
-pub struct FileTransport {
-    mode: Mode,
+pub struct DemoFileLink {
+    direction: Direction,
 }
 
-impl FileTransport {
-    pub fn recording(path: &Path) -> Result<Self, ReplayError> {
-        Self::recording_with_identity(path, MatchRecordIdentity::default())
+impl DemoFileLink {
+    pub fn for_recording(at: &Path) -> Result<Self, RecordingFault> {
+        Self::capture_with_signature(at, RecordedGameLabel::default())
     }
 
-    pub fn recording_with_identity(
-        path: &Path,
-        identity: MatchRecordIdentity,
-    ) -> Result<Self, ReplayError> {
-        let writer = RecordWriter::create_with_identity(path, identity)?;
-        Ok(Self {
-            mode: Mode::Recording(Some(writer)),
-        })
+    pub fn capture_with_signature(
+        at: &Path,
+        header: RecordedGameLabel,
+    ) -> Result<Self, RecordingFault> {
+        let writer = DemoFileWriter::build_with_signature(at, header)?;
+        Ok(Self { direction: Direction::Writing(Some(writer)) })
     }
 
-    pub fn playback(path: &Path) -> Result<Self, ReplayError> {
-        Ok(Self {
-            mode: Mode::Playing(RecordReader::open(path)?),
-        })
+    pub fn for_playback(at: &Path) -> Result<Self, RecordingFault> {
+        let reader = DemoFileReader::open_at(at)?;
+        Ok(Self { direction: Direction::Reading(reader) })
     }
 
-    /// The header of the recording being played; `None` when recording.
-    pub fn identity(&self) -> Option<MatchRecordIdentity> {
-        match &self.mode {
-            Mode::Playing(reader) => Some(reader.identity()),
-            Mode::Recording(_) => None,
+    /// The header of a demo being read back; `None` while writing.
+    pub fn identity(&self) -> Option<RecordedGameLabel> {
+        if let Direction::Reading(reader) = &self.direction {
+            Some(reader.identity())
+        } else {
+            None
         }
     }
 
-    /// Ends a recording: its frame count and path. `None` when there is
-    /// nothing to end (playing, or already finished).
-    pub fn finish(&mut self) -> Result<Option<(u64, PathBuf)>, ReplayError> {
-        match &mut self.mode {
-            Mode::Recording(writer) => writer.take().map(RecordWriter::finish).transpose(),
-            Mode::Playing(_) => Ok(None),
-        }
+    /// Closes a recording and gives its frame count and path. `None` when
+    /// there is nothing open to close (reading, or closed already).
+    pub fn close(&mut self) -> Result<Option<(u64, PathBuf)>, RecordingFault> {
+        let Direction::Writing(slot) = &mut self.direction else {
+            return Ok(None);
+        };
+        slot.take().map(DemoFileWriter::close).transpose()
     }
 }
 
-impl Transport for FileTransport {
-    fn send(&mut self, frame: &Frame) -> Result<(), TransportError> {
-        match &mut self.mode {
-            Mode::Recording(Some(writer)) => Ok(writer.write_frame(frame)?),
-            Mode::Recording(None) => Err(TransportError::Io(io::Error::other(
-                "this recording is finished",
-            ))),
-            Mode::Playing(_) => Err(TransportError::Io(io::Error::other(
-                "this FileTransport was opened for playback, not recording",
-            ))),
-        }
+impl Transport for DemoFileLink {
+    #[allow(clippy::needless_arbitrary_self_type)]
+    fn send(self: &mut Self, outgoing: &Frame) -> Result<(), LinkIoFailure> {
+        let refusal = match &mut self.direction {
+            Direction::Writing(Some(writer)) => return writer.append(outgoing).map_err(Into::into),
+            Direction::Writing(None) => "this recording is finished",
+            Direction::Reading(_) => "a demo opened for playback takes no frames",
+        };
+        Err(LinkIoFailure::Io(io::Error::other(refusal)))
     }
 
-    fn recv(&mut self) -> Result<Option<Frame>, TransportError> {
-        match &mut self.mode {
-            Mode::Playing(reader) => reader.read_frame()?.map(Some).ok_or(TransportError::Ended),
-            Mode::Recording(_) => Err(TransportError::Ended),
-        }
+    fn take_frame(&mut self) -> Result<Option<Frame>, LinkIoFailure> {
+        // A recording gives nothing back; playback stops where the file does.
+        let Direction::Reading(reader) = &mut self.direction else {
+            return Err(LinkIoFailure::Ended);
+        };
+        reader.next_frame()?.ok_or(LinkIoFailure::Ended).map(Some)
     }
 }
 
@@ -277,42 +265,42 @@ mod tests {
     use crate::testdir::TestDir;
     use crate::testing::frames;
 
-    fn identity() -> MatchRecordIdentity {
-        let mut identity = MatchRecordIdentity {
-            rng_scheme: 3,
-            root_seed: 0x0123_4567_89AB_CDEF,
-            content_digest: 0xFEDC_BA98_7654_3210,
-            ..MatchRecordIdentity::default()
+    fn identity() -> RecordedGameLabel {
+        let mut identity = RecordedGameLabel {
+            random_stream_layout: 3,
+            world_seed: 0x0123_4567_89AB_CDEF,
+            content_fingerprint: 0xFEDC_BA98_7654_3210,
+            ..RecordedGameLabel::default()
         };
-        identity.set_zone("zm_transit");
+        identity.assign_region_label("zm_transit");
         identity
     }
 
-    fn write_all(path: &Path, frames: &[Frame]) {
-        let mut writer = RecordWriter::create_with_identity(path, identity()).unwrap();
-        for frame in frames {
-            writer.write_frame(frame).unwrap();
+    fn write_all(at: &Path, sent: &[Frame]) {
+        let mut writer = DemoFileWriter::build_with_signature(at, identity()).unwrap();
+        for frame in sent {
+            writer.append(frame).unwrap();
         }
-        writer.finish().unwrap();
+        writer.close().unwrap();
     }
 
-    fn read_all(path: &Path) -> Vec<Frame> {
-        let mut reader = RecordReader::open(path).unwrap();
-        std::iter::from_fn(|| reader.read_frame().unwrap()).collect()
+    fn read_all(at: &Path) -> Vec<Frame> {
+        let mut reader = DemoFileReader::open_at(at).unwrap();
+        std::iter::from_fn(|| reader.next_frame().unwrap()).collect()
     }
 
     #[test]
     fn the_header_is_64_bytes_that_start_with_the_magic_and_the_protocol() {
         let dir = TestDir::new("header");
         let path = dir.path().join("h.bo2mpdemo");
-        RecordWriter::create_with_identity(&path, identity())
+        DemoFileWriter::build_with_signature(&path, identity())
             .unwrap()
-            .finish()
+            .close()
             .unwrap();
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes.len(), 64);
         assert_eq!(&bytes[..8], b"BO2MPDEM");
-        assert_eq!(bytes[8..12], PROTOCOL_VERSION.to_le_bytes());
+        assert_eq!(bytes[8..12], WIRE_REVISION_NUMBER.to_le_bytes());
         assert_eq!(bytes[12..16], 3u32.to_le_bytes());
         assert_eq!(bytes[16..24], 0x0123_4567_89AB_CDEFu64.to_le_bytes());
         assert_eq!(bytes[24..32], 0xFEDC_BA98_7654_3210u64.to_le_bytes());
@@ -324,10 +312,10 @@ mod tests {
     fn an_identity_with_no_scheme_is_written_with_the_current_one() {
         let dir = TestDir::new("scheme");
         let path = dir.path().join("s.bo2mpdemo");
-        RecordWriter::create(&path).unwrap().finish().unwrap();
-        let read = RecordReader::open(&path).unwrap().identity();
-        assert_eq!(read.rng_scheme, RNG_DOMAIN_SCHEME);
-        assert_eq!(read.zone_name(), None);
+        DemoFileWriter::blank(&path).unwrap().close().unwrap();
+        let read = DemoFileReader::open_at(&path).unwrap().identity();
+        assert_eq!(read.random_stream_layout, RANDOM_STREAM_LAYOUT_VERSION);
+        assert_eq!(read.map_name(), None);
     }
 
     #[test]
@@ -335,7 +323,7 @@ mod tests {
         let dir = TestDir::new("identity");
         let path = dir.path().join("i.bo2mpdemo");
         write_all(&path, &[]);
-        assert_eq!(RecordReader::open(&path).unwrap().identity(), identity());
+        assert_eq!(DemoFileReader::open_at(&path).unwrap().identity(), identity());
     }
 
     #[test]
@@ -351,20 +339,20 @@ mod tests {
     fn finishing_reports_the_count_and_the_path() {
         let dir = TestDir::new("finish");
         let path = dir.path().join("c.bo2mpdemo");
-        let mut writer = RecordWriter::create(&path).unwrap();
+        let mut writer = DemoFileWriter::blank(&path).unwrap();
         for frame in frames(4) {
-            writer.write_frame(&frame).unwrap();
+            writer.append(&frame).unwrap();
         }
-        assert_eq!(writer.frames(), 4);
+        assert_eq!(writer.frame_count(), 4);
         assert_eq!(writer.path(), path);
-        assert_eq!(writer.finish().unwrap(), (4, path));
+        assert_eq!(writer.close().unwrap(), (4, path));
     }
 
     #[test]
     fn a_recording_makes_the_folders_it_sits_in() {
         let dir = TestDir::new("folders");
         let path = dir.path().join("a").join("b").join("n.bo2mpdemo");
-        RecordWriter::create(&path).unwrap().finish().unwrap();
+        DemoFileWriter::blank(&path).unwrap().close().unwrap();
         assert!(path.is_file());
     }
 
@@ -381,22 +369,22 @@ mod tests {
         let dir = TestDir::new("magic");
         let path = dir.path().join("m.bo2mpdemo");
         fs::write(&path, b"RIFFxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").unwrap();
-        let error = RecordReader::open(&path).unwrap_err();
-        assert!(matches!(error, ReplayError::Magic { found } if &found == b"RIFFxxxx"));
+        let error = DemoFileReader::open_at(&path).unwrap_err();
+        assert!(matches!(error, RecordingFault::Magic { found } if &found == b"RIFFxxxx"));
     }
 
     #[test]
     fn another_protocol_is_refused_before_the_rest_of_the_header_is_read() {
         let dir = TestDir::new("version");
         let path = dir.path().join("v.bo2mpdemo");
-        let mut bytes = MAGIC.to_vec();
-        bytes.extend_from_slice(&(PROTOCOL_VERSION + 1).to_le_bytes());
+        let mut bytes = FORMAT_TAG.to_vec();
+        bytes.extend_from_slice(&(WIRE_REVISION_NUMBER + 1).to_le_bytes());
         fs::write(&path, bytes).unwrap();
-        let error = RecordReader::open(&path).unwrap_err();
+        let error = DemoFileReader::open_at(&path).unwrap_err();
         assert!(matches!(
             error,
-            ReplayError::Version { found, expected }
-                if found == PROTOCOL_VERSION + 1 && expected == PROTOCOL_VERSION
+            RecordingFault::Version { found: seen, wanted: ours }
+                if seen == WIRE_REVISION_NUMBER + 1 && ours == WIRE_REVISION_NUMBER
         ));
     }
 
@@ -408,9 +396,9 @@ mod tests {
             write_all(&path, &[]);
             let full = fs::read(&path).unwrap();
             fs::write(&path, &full[..keep]).unwrap();
-            let error = RecordReader::open(&path).unwrap_err();
+            let error = DemoFileReader::open_at(&path).unwrap_err();
             assert!(
-                matches!(&error, ReplayError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof),
+                matches!(&error, RecordingFault::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof),
                 "{tag}: {error}"
             );
         }
@@ -419,8 +407,8 @@ mod tests {
     #[test]
     fn a_missing_file_is_not_found() {
         let dir = TestDir::new("missing");
-        let error = RecordReader::open(&dir.path().join("nope.bo2mpdemo")).unwrap_err();
-        assert!(matches!(error, ReplayError::Io(e) if e.kind() == io::ErrorKind::NotFound));
+        let error = DemoFileReader::open_at(&dir.path().join("nope.bo2mpdemo")).unwrap_err();
+        assert!(matches!(error, RecordingFault::Io(e) if e.kind() == io::ErrorKind::NotFound));
     }
 
     #[test]
@@ -452,10 +440,10 @@ mod tests {
         let mut bytes = fs::read(&path).unwrap();
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
         fs::write(&path, bytes).unwrap();
-        let mut reader = RecordReader::open(&path).unwrap();
-        assert!(reader.read_frame().unwrap().is_some());
-        let error = reader.read_frame().unwrap_err();
-        assert!(matches!(error, ReplayError::Wire(WireError::Malformed(_))));
+        let mut reader = DemoFileReader::open_at(&path).unwrap();
+        assert!(reader.next_frame().unwrap().is_some());
+        let error = reader.next_frame().unwrap_err();
+        assert!(matches!(error, RecordingFault::Wire(PacketDecodeFault::GarbledRequest(_))));
     }
 
     #[test]
@@ -467,8 +455,8 @@ mod tests {
         bytes.extend_from_slice(&3u32.to_le_bytes());
         bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
         fs::write(&path, bytes).unwrap();
-        let error = RecordReader::open(&path).unwrap().read_frame().unwrap_err();
-        assert!(matches!(error, ReplayError::Wire(_)), "{error}");
+        let error = DemoFileReader::open_at(&path).unwrap().next_frame().unwrap_err();
+        assert!(matches!(error, RecordingFault::Wire(_)), "{error}");
     }
 
     #[test]
@@ -476,20 +464,20 @@ mod tests {
         let dir = TestDir::new("transport");
         let path = dir.path().join("t.bo2mpdemo");
         let sent = frames(4);
-        let mut recording = FileTransport::recording_with_identity(&path, identity()).unwrap();
+        let mut recording = DemoFileLink::capture_with_signature(&path, identity()).unwrap();
         assert_eq!(recording.identity(), None);
         for frame in &sent {
             recording.send(frame).unwrap();
         }
-        assert_eq!(recording.finish().unwrap(), Some((4, path.clone())));
+        assert_eq!(recording.close().unwrap(), Some((4, path.clone())));
 
-        let mut playing = FileTransport::playback(&path).unwrap();
+        let mut playing = DemoFileLink::for_playback(&path).unwrap();
         assert_eq!(playing.identity(), Some(identity()));
         for frame in &sent {
-            assert_eq!(playing.recv().unwrap().as_ref(), Some(frame));
+            assert_eq!(playing.take_frame().unwrap().as_ref(), Some(frame));
         }
-        assert!(matches!(playing.recv(), Err(TransportError::Ended)));
-        assert!(matches!(playing.recv(), Err(TransportError::Ended)));
+        assert!(matches!(playing.take_frame(), Err(LinkIoFailure::Ended)));
+        assert!(matches!(playing.take_frame(), Err(LinkIoFailure::Ended)));
     }
 
     #[test]
@@ -497,15 +485,15 @@ mod tests {
         let dir = TestDir::new("oneway");
         let path = dir.path().join("o.bo2mpdemo");
         let frame = frames(1).remove(0);
-        let mut recording = FileTransport::recording(&path).unwrap();
-        assert!(matches!(recording.recv(), Err(TransportError::Ended)));
+        let mut recording = DemoFileLink::for_recording(&path).unwrap();
+        assert!(matches!(recording.take_frame(), Err(LinkIoFailure::Ended)));
         recording.send(&frame).unwrap();
-        recording.finish().unwrap();
-        assert!(matches!(recording.send(&frame), Err(TransportError::Io(_))));
-        assert_eq!(recording.finish().unwrap(), None);
+        recording.close().unwrap();
+        assert!(matches!(recording.send(&frame), Err(LinkIoFailure::Io(_))));
+        assert_eq!(recording.close().unwrap(), None);
 
-        let mut playing = FileTransport::playback(&path).unwrap();
-        assert!(matches!(playing.send(&frame), Err(TransportError::Io(_))));
-        assert_eq!(playing.finish().unwrap(), None);
+        let mut playing = DemoFileLink::for_playback(&path).unwrap();
+        assert!(matches!(playing.send(&frame), Err(LinkIoFailure::Io(_))));
+        assert_eq!(playing.close().unwrap(), None);
     }
 }

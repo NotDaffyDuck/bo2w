@@ -1,219 +1,237 @@
-//! The renderer's vertex-declaration table: 16 vertex types, 13 routings and 9
-//! stream sources. The packed (1), world (2..=13, stream 0) and static-model
-//! cache (0xf) rows read BO2's vertex rows as uploaded (vertex-format-t6.md):
-//! colour R,G,B,A @16 (cache @12), half2 texcoord @20, 10:10:10 normal and
-//! tangent @24/@28, world lightmap coordinate @32. The routing and the other
-//! types are still MW2's.
+//! Which vertex streams each of the 16 vertex types reads, and where the 13
+//! routings of a vertex shader take their semantic from.
+//!
+//! A vertex type is a set of up to nine sources. Each source names the stream
+//! it reads, the byte offset inside that stream's row and the element type.
+//! The packed (1), world (2..=13, stream 0) and static-model cache (0xf)
+//! types follow BO2's vertex rows as uploaded (vertex-format-t6.md): colour
+//! R,G,B,A at 16 (cache: 12), half2 uv_semantic at 20, 10:10:10 normal and
+//! tangent at 24 and 28, world lightmap coordinate at 32. The routing and the
+//! remaining types are still the fallback family's.
 //! TODO(fact): BO2's colour byte order (R,G,B,A kept, as the CPU had it).
 
-pub const ROUTING_COUNT: usize = 13;
+pub const MIX_PATH_TOTAL: usize = 13;
 
-pub const VERTEX_TYPE_COUNT: usize = 16;
+pub const VERTEX_LAYOUT_KIND_TOTAL: usize = 16;
 
-pub const STREAM_SOURCE_COUNT: usize = 9;
+pub const VERTEX_STREAM_SLOT_COUNT: usize = 9;
 
-pub const WORLD_VERTEX_TYPE: u8 = 2;
+pub const COMPRESSED_VERTEX_KIND: u8 = 1;
 
-pub const PACKED_VERTEX_TYPE: u8 = 1;
+pub const WORLD_VERTEX_LAYOUT_ID: u8 = 2;
 
-pub const POS_TEX_VERTEX_TYPE: u8 = 0xe;
+pub const POSITION_UV_VERTEX_KIND: u8 = 0xe;
 
-pub const STATICMODELCACHE_VERTEX_TYPE: u8 = 0xf;
+pub const STATIC_CACHE_VERTEX_LAYOUT_ID: u8 = 0xf;
 
-pub const TECHNIQUE_FLAG_VERTEX_TYPE_FROM_SURFACE: u16 = 0x20;
+/// A technique with this flag takes its world vertex type from the surface.
+pub const TECHNIQUE_FLAG_TAKES_SURFACE_VERTEX_LAYOUT: u16 = 0x20;
 
-pub const fn world_vert_decl_type(technique_flags: u16, world_vert_format: u8) -> u8 {
-    if technique_flags & TECHNIQUE_FLAG_VERTEX_TYPE_FROM_SURFACE == 0 {
-        WORLD_VERTEX_TYPE
-    } else {
-        WORLD_VERTEX_TYPE.saturating_add(world_vert_format)
-    }
+/// The world vertex type a technique draws a surface with: the plain one,
+/// shifted by the surface's own format when the technique asks for that.
+pub const fn world_decl_kind(tech_bits: u16, level_format: u8) -> u8 {
+    let from_surface = tech_bits & TECHNIQUE_FLAG_TAKES_SURFACE_VERTEX_LAYOUT != 0;
+    WORLD_VERTEX_LAYOUT_ID.saturating_add(if from_surface { level_format } else { 0 })
 }
 
+/// The vertex types a colour pass is tessellated with: world, then packed.
 #[must_use]
-pub fn colour_tess_vertex_types(technique_flags: u16, world_vert_format: u8) -> [u8; 2] {
+pub fn colour_tess_vertex_types(tech_flags: u16, level_format: u8) -> [u8; 2] {
     [
-        world_vert_decl_type(technique_flags, world_vert_format),
-        PACKED_VERTEX_TYPE,
+        world_decl_kind(tech_flags, level_format),
+        COMPRESSED_VERTEX_KIND,
     ]
 }
 
+/// The vertex types a colour pass has to compile for: the world type, its
+/// layered twin (the next type up unless the surface already chose one),
+/// packed, and the static-model cache.
 #[must_use]
-pub fn colour_tess_compile_vertex_types(technique_flags: u16, world_vert_format: u8) -> [u8; 4] {
-    let [world, packed] = colour_tess_vertex_types(technique_flags, world_vert_format);
-    let layer = if world == WORLD_VERTEX_TYPE {
-        WORLD_VERTEX_TYPE.saturating_add(1)
-    } else {
-        world
+pub fn colour_tess_compile_vertex_types(tech_flags: u16, level_format: u8) -> [u8; 4] {
+    let [world, packed] = colour_tess_vertex_types(tech_flags, level_format);
+    let layered = match world {
+        WORLD_VERTEX_LAYOUT_ID => WORLD_VERTEX_LAYOUT_ID.saturating_add(1),
+        kept => kept,
     };
-    [world, layer, packed, STATICMODELCACHE_VERTEX_TYPE]
+    [world, layered, packed, STATIC_CACHE_VERTEX_LAYOUT_ID]
 }
 
+/// The colour pass's compile set plus the position/uv_semantic type.
 #[must_use]
-pub fn emissive_tess_compile_vertex_types(technique_flags: u16, world_vert_format: u8) -> [u8; 5] {
-    let [world, layer, packed, cached] =
-        colour_tess_compile_vertex_types(technique_flags, world_vert_format);
-    [world, layer, packed, cached, POS_TEX_VERTEX_TYPE]
+pub fn emissive_tess_compile_vertex_types(tech_flags: u16, level_format: u8) -> [u8; 5] {
+    let mut types = [POSITION_UV_VERTEX_KIND; 5];
+    types[..4].copy_from_slice(&colour_tess_compile_vertex_types(
+        tech_flags,
+        level_format,
+    ));
+    types
 }
 
 pub use d3d9_decl::{
-    D3DDECLUSAGE_COLOR, D3DDECLUSAGE_DEPTH, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION,
-    D3DDECLUSAGE_TEXCOORD, DeclType as D3dDeclType, Semantic,
+    VERTEX_USAGE_TINT, VERTEX_ROLE_DEPTH, VERTEX_ROLE_NORMAL, VERTEX_ROLE_POSITION,
+    VERTEX_ROLE_UV, VertexElementFormat as VertexElemType, VertexInputRole,
 };
 
+/// Where one source of a vertex type reads its element from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StreamSourceLayout {
+pub struct VertexStreamArrangement {
     pub stream: u8,
-
     pub offset: u8,
-
-    pub decl_type: D3dDeclType,
+    pub decl_type: d3d9_decl::VertexElementFormat,
 }
 
-pub const SOURCE_LAYOUT_TABLE: [[u8; STREAM_SOURCE_COUNT * 3]; VERTEX_TYPE_COUNT] = [
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x04, 0x00, 0x14, 0x01, 0x00, 0x1c, 0x05, 0xff, 0x00, 0x00,
-        0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x41, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0x01, 0x00, 0x01, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0x01, 0x00, 0x01, 0xff, 0x00, 0x00, 0x01, 0x08, 0x04, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0x01, 0x00, 0x03, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0x01, 0x00, 0x03, 0xff, 0x00, 0x00, 0x01, 0x10, 0x04, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0x01, 0x00, 0x03, 0xff, 0x00, 0x00, 0x01, 0x10, 0x04, 0x01, 0x14, 0x04,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0x01, 0x00, 0x03, 0x01, 0x10, 0x01, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0x01, 0x00, 0x03, 0x01, 0x10, 0x01, 0x01, 0x18, 0x04, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0x01, 0x00, 0x03, 0x01, 0x10, 0x01, 0x01, 0x18, 0x04, 0x01, 0x1c, 0x04,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0x01, 0x00, 0x03, 0x01, 0x10, 0x03, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0x01, 0x00, 0x03, 0x01, 0x10, 0x03, 0x01, 0x20, 0x04, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x03, 0x00, 0x10, 0x08, 0x00, 0x14, 0x42, 0x00, 0x18, 0x40, 0x00, 0x1c, 0x40,
-        0x01, 0x00, 0x03, 0x01, 0x10, 0x03, 0x01, 0x20, 0x04, 0x01, 0x24, 0x04,
-    ],
-    [
-        0x00, 0x00, 0x02, 0xff, 0x00, 0x00, 0x00, 0x0c, 0x01, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00,
-        0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00,
-    ],
-    [
-        0x00, 0x00, 0x02, 0x00, 0x0c, 0x08, 0x00, 0x10, 0x41, 0x00, 0x14, 0x40, 0x00, 0x18, 0x40,
-        0x00, 0x1c, 0x05, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00,
-    ],
-];
-
-pub const DESTINATION_USAGE_TABLE: [[u8; 2]; ROUTING_COUNT] = [
-    [0x00, 0x00],
-    [0x03, 0x00],
-    [0x0a, 0x00],
-    [0x0a, 0x01],
-    [0x0c, 0x00],
-    [0x05, 0x00],
-    [0x05, 0x01],
-    [0x05, 0x02],
-    [0x05, 0x03],
-    [0x05, 0x04],
-    [0x05, 0x05],
-    [0x05, 0x06],
-    [0x05, 0x07],
-];
-
-pub const fn destination_usage(dest: u8) -> Option<(u8, u8)> {
-    if (dest as usize) < ROUTING_COUNT {
-        let row = DESTINATION_USAGE_TABLE[dest as usize];
-        Some((row[0], row[1]))
-    } else {
-        None
-    }
+/// `feeds` with input `input` reading element type `raw_type` at `offset` of `stream_no`.
+const fn with(mut feeds: [Option<(u8, u8, u8)>; VERTEX_STREAM_SLOT_COUNT], input: usize, stream_no: u8, offset: u8, raw_type: u8) -> [Option<(u8, u8, u8)>; VERTEX_STREAM_SLOT_COUNT] {
+    feeds[input] = Some((stream_no, offset, raw_type));
+    feeds
 }
 
-pub const fn source_layout(vertex_type: u8, source: u8) -> Option<StreamSourceLayout> {
-    if vertex_type as usize >= VERTEX_TYPE_COUNT || source as usize >= STREAM_SOURCE_COUNT {
-        return None;
-    }
-    let row = SOURCE_LAYOUT_TABLE[vertex_type as usize];
-    let base = source as usize * 3;
-    if row[base] == 0xff {
-        return None;
-    }
-    Some(StreamSourceLayout {
-        stream: row[base],
-        offset: row[base + 1],
-        decl_type: D3dDeclType::from_raw(row[base + 2]),
+const NO_FEEDS: [Option<(u8, u8, u8)>; VERTEX_STREAM_SLOT_COUNT] = [None; VERTEX_STREAM_SLOT_COUNT];
+
+/// The five stream-0 sources every skinned/world row starts with; only the
+/// uv_semantic element differs between the packed row and the world rows.
+const fn model_row(texcoord_type: u8) -> [Option<(u8, u8, u8)>; VERTEX_STREAM_SLOT_COUNT] {
+    let feeds = with(NO_FEEDS, 0, 0, 0x00, 0x03);
+    let feeds = with(feeds, 1, 0, 0x10, 0x08);
+    let feeds = with(feeds, 2, 0, 0x14, texcoord_type);
+    let feeds = with(feeds, 3, 0, 0x18, 0x40);
+    with(feeds, 4, 0, 0x1c, 0x40)
+}
+
+const WORLD: [Option<(u8, u8, u8)>; VERTEX_STREAM_SLOT_COUNT] = model_row(0x42);
+/// World rows whose lightmap coordinate lives in stream 1 as a float4.
+const LIT_WIDE: [Option<(u8, u8, u8)>; VERTEX_STREAM_SLOT_COUNT] = with(WORLD, 5, 1, 0x00, 0x03);
+/// The wide-lightmap rows that go on with a second stream-1 element.
+const LIT_WIDE_AND_TWO: [Option<(u8, u8, u8)>; VERTEX_STREAM_SLOT_COUNT] = with(LIT_WIDE, 6, 1, 0x10, 0x01);
+const LIT_WIDE_AND_FOUR: [Option<(u8, u8, u8)>; VERTEX_STREAM_SLOT_COUNT] = with(LIT_WIDE, 6, 1, 0x10, 0x03);
+
+const FEEDS_BY_TYPE: [[Option<(u8, u8, u8)>; VERTEX_STREAM_SLOT_COUNT]; VERTEX_LAYOUT_KIND_TOTAL] = [
+    with(
+        with(
+            with(with(NO_FEEDS, 0, 0, 0x00, 0x03), 1, 0, 0x10, 0x04),
+            2,
+            0,
+            0x14,
+            0x01,
+        ),
+        3,
+        0,
+        0x1c,
+        0x05,
+    ),
+    model_row(0x41),
+    WORLD,
+    with(WORLD, 5, 1, 0x00, 0x01),
+    with(with(WORLD, 5, 1, 0x00, 0x01), 7, 1, 0x08, 0x04),
+    LIT_WIDE,
+    with(LIT_WIDE, 7, 1, 0x10, 0x04),
+    with(with(LIT_WIDE, 7, 1, 0x10, 0x04), 8, 1, 0x14, 0x04),
+    LIT_WIDE_AND_TWO,
+    with(LIT_WIDE_AND_TWO, 7, 1, 0x18, 0x04),
+    with(with(LIT_WIDE_AND_TWO, 7, 1, 0x18, 0x04), 8, 1, 0x1c, 0x04),
+    LIT_WIDE_AND_FOUR,
+    with(LIT_WIDE_AND_FOUR, 7, 1, 0x20, 0x04),
+    with(with(LIT_WIDE_AND_FOUR, 7, 1, 0x20, 0x04), 8, 1, 0x24, 0x04),
+    with(with(NO_FEEDS, 0, 0, 0x00, 0x02), 2, 0, 0x0c, 0x01),
+    {
+        let feeds = with(NO_FEEDS, 0, 0, 0x00, 0x02);
+        let feeds = with(feeds, 1, 0, 0x0c, 0x08);
+        let feeds = with(feeds, 2, 0, 0x10, 0x41);
+        let feeds = with(feeds, 3, 0, 0x14, 0x40);
+        let feeds = with(feeds, 4, 0, 0x18, 0x40);
+        with(feeds, 5, 0, 0x1c, 0x05)
+    },
+];
+
+/// The (usage, usage index) a routing's vertex-shader input binds to:
+/// routings 5 to 12 are the uv_semantic usage with consecutive indices.
+pub const fn destination_usage(write_target: u8) -> Option<(u8, u8)> {
+    Some(match write_target {
+        0 => (0x00, 0),
+        1 => (0x03, 0),
+        2 => (0x0a, 0),
+        3 => (0x0a, 1),
+        4 => (0x0c, 0),
+        5..=12 => (0x05, write_target - 5),
+        _ => return None,
     })
 }
 
-pub const fn stream_extent(vertex_type: u8, stream: u8) -> Option<u16> {
-    if vertex_type as usize >= VERTEX_TYPE_COUNT {
+pub const fn origin_layout(vertex_format_code: u8, source: u8) -> Option<VertexStreamArrangement> {
+    if vertex_format_code as usize >= VERTEX_LAYOUT_KIND_TOTAL || source as usize >= VERTEX_STREAM_SLOT_COUNT {
         return None;
     }
-    let mut extent: u16 = 0;
-    let mut found = false;
-    let mut source = 0usize;
-    while source < STREAM_SOURCE_COUNT {
-        if let Some(layout) = source_layout(vertex_type, source as u8) {
-            if layout.stream == stream {
-                if let Some(len) = layout.decl_type.byte_len() {
-                    let end = layout.offset as u16 + len as u16;
-                    if end > extent {
-                        extent = end;
-                    }
-                    found = true;
-                }
+    match FEEDS_BY_TYPE[vertex_format_code as usize][source as usize] {
+        Some((stream, offset, raw_type)) => Some(VertexStreamArrangement {
+            stream,
+            offset,
+            decl_type: VertexElemType::from_raw(raw_type),
+        }),
+        None => None,
+    }
+}
+
+/// How many bytes of `wanted_stream`'s row the vertex type reads, or `None`
+/// when it reads nothing from that stream.
+pub const fn stream_extent(vertex_format_code: u8, wanted_stream: u8) -> Option<u16> {
+    let mut extent = None;
+    let mut source = 0;
+    while source < VERTEX_STREAM_SLOT_COUNT as u8 {
+        if let Some(layout) = origin_layout(vertex_format_code, source)
+            && layout.stream == wanted_stream
+            && let Some(len) = layout.decl_type.byte_len()
+        {
+            let reach = len as u16 + layout.offset as u16;
+            if !matches!(extent, Some(seen) if seen >= reach) {
+                extent = Some(reach);
             }
         }
         source += 1;
     }
-    if found { Some(extent) } else { None }
+    extent
 }
 
 #[cfg(test)]
 mod tests {
-    use super::stream_extent;
+    use super::*;
 
     /// vertex-format-t6.md: the model row is 32 bytes, the world row 36
     /// (lightmap u16x2 @32), and stream 0 uploads them as they are.
     #[test]
     fn stream_zero_describes_bo2_rows() {
-        assert_eq!(stream_extent(1, 0), Some(32));
-        for vertex_type in 2..=13 {
-            assert_eq!(stream_extent(vertex_type, 0), Some(36), "type {vertex_type}");
+        assert_eq!(stream_extent(COMPRESSED_VERTEX_KIND, 0), Some(32));
+        for vertex_format_code in WORLD_VERTEX_LAYOUT_ID..=13 {
+            assert_eq!(stream_extent(vertex_format_code, 0), Some(36), "type {vertex_format_code}");
         }
-        assert_eq!(stream_extent(0xf, 0), Some(32));
+        assert_eq!(stream_extent(STATIC_CACHE_VERTEX_LAYOUT_ID, 0), Some(32));
+    }
+
+    #[test]
+    fn routings_five_to_twelve_count_up_from_the_texcoord_usage() {
+        assert_eq!(destination_usage(5), Some((5, 0)));
+        assert_eq!(destination_usage(12), Some((5, 7)));
+        assert_eq!(destination_usage(13), None);
+    }
+
+    #[test]
+    fn only_the_wide_lightmap_types_feed_from_stream_one_slot_five() {
+        let wide = origin_layout(5, 5).unwrap();
+        assert_eq!((wide.stream, wide.offset), (1, 0));
+        assert!(origin_layout(2, 5).is_none());
+        assert!(origin_layout(16, 0).is_none());
+        assert!(origin_layout(2, 9).is_none());
+    }
+
+    #[test]
+    fn the_compile_sets_extend_one_another() {
+        let colour = colour_tess_compile_vertex_types(0, 0);
+        assert_eq!(colour, [2, 3, 1, 0xf]);
+        let emissive = emissive_tess_compile_vertex_types(0, 0);
+        assert_eq!(emissive[..4], colour);
+        assert_eq!(emissive[4], POSITION_UV_VERTEX_KIND);
+        assert_eq!(
+            colour_tess_compile_vertex_types(TECHNIQUE_FLAG_TAKES_SURFACE_VERTEX_LAYOUT, 3)[..2],
+            [5, 5]
+        );
     }
 }

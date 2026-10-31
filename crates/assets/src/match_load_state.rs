@@ -4,12 +4,12 @@
 
 use std::path::PathBuf;
 
-use asset_transport::progress::LoadProgress;
+use asset_transport::progress::LoadCompletion;
 use bevy::prelude::*;
 
-use crate::session_load::PreparedMatch;
+use crate::load_stages::ReadiedSession;
 
-/// Turns an approved map load into a `MatchLoadRequest`.
+/// Turns an approved map load into a `SessionLoadOrder`.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MapLoadApproval;
 
@@ -19,56 +19,56 @@ pub struct MatchLoadDispatch;
 
 /// Set while a walk is running or about to.
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MatchLoadBusy(pub bool);
+pub struct SessionLoadOccupied(pub bool);
 
 /// The request id whose load the player has given up on.
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MatchLoadAbort(pub u64);
+pub struct SessionLoadCancel(pub u64);
 
-impl MatchLoadAbort {
+impl SessionLoadCancel {
     /// Whether `request_id` is the load that was given up on.
-    pub fn covers(abort: Option<&Self>, request_id: u64) -> bool {
-        abort.is_some_and(|abort| abort.0 == request_id)
+    pub fn covers(abort: Option<&Self>, load_req_id: u64) -> bool {
+        abort.is_some_and(|abort| abort.0 == load_req_id)
     }
 }
 
 /// A load waiting for its turn: where to find the zone, and the progress its
 /// walk will report into.
 #[derive(Resource)]
-pub struct MatchLoadRequest {
-    pub request_id: u64,
-    pub load_key: frame::LocalLoadKey,
+pub struct SessionLoadOrder {
+    pub ticket: u64,
+    pub decrypt_secret: frame::OwnLevelLoadTicket,
     pub zone: String,
-    pub zone_ff: Result<PathBuf, String>,
-    pub common_mp: Result<PathBuf, String>,
-    pub progress: LoadProgress,
+    pub zone_archive_file: Result<PathBuf, String>,
+    pub common_zone: Result<PathBuf, String>,
+    pub progress: LoadCompletion,
 }
 
 /// A request whose walk has been started.
 #[derive(Resource, Clone, Debug)]
-pub struct MatchLoadAccepted {
-    pub request_id: u64,
-    pub load_key: frame::LocalLoadKey,
+pub struct SessionLoadApproved {
+    pub ticket: u64,
+    pub decrypt_secret: frame::OwnLevelLoadTicket,
     pub zone: String,
 }
 
 /// A finished walk, waiting to be applied to the session.
 #[derive(Resource)]
-pub struct PreparedMatchReady {
-    pub request_id: u64,
-    pub load_key: frame::LocalLoadKey,
+pub struct ReadiedSessionSignal {
+    pub ticket: u64,
+    pub decrypt_secret: frame::OwnLevelLoadTicket,
     pub zone: String,
-    pub prepared: PreparedMatch,
+    pub prepared: ReadiedSession,
 }
 
 /// The sound half of a finished walk, handed on for the audio side.
 #[derive(Resource)]
 pub struct PreparedMatchSound {
-    pub load_key: frame::LocalLoadKey,
+    pub decrypt_secret: frame::OwnLevelLoadTicket,
     pub zone: String,
     pub common_profile_id: u64,
     pub products_id: u64,
-    pub sound: Result<asset_audio::SoundCatalog, String>,
+    pub sound: Result<asset_audio::AudioRoster, String>,
 }
 
 #[cfg(test)]
@@ -77,9 +77,9 @@ mod tests {
 
     #[test]
     fn only_the_abandoned_request_is_covered() {
-        let abort = MatchLoadAbort(7);
-        assert!(MatchLoadAbort::covers(Some(&abort), 7));
-        assert!(!MatchLoadAbort::covers(Some(&abort), 8));
-        assert!(!MatchLoadAbort::covers(None, 7));
+        let abort = SessionLoadCancel(7);
+        assert!(SessionLoadCancel::covers(Some(&abort), 7));
+        assert!(!SessionLoadCancel::covers(Some(&abort), 8));
+        assert!(!SessionLoadCancel::covers(None, 7));
     }
 }

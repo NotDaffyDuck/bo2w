@@ -1,40 +1,38 @@
 //! A short match for the tests: one player walking along x, with a join
 //! request on the first tick.
 
-use net::{Frame, SnapshotEncoder, frame_from_tick};
-use playerstate_t6::game::{PlayerState, UserCmd};
-use sim::{ClientAction, ClientId, Snapshot, Tick, TickInput};
+use playerstate_t6::game::{AvatarState, InputCommand};
 
-pub const PLAYER: ClientId = ClientId(1);
+pub const PLAYER: sim::ClientId = sim::ClientId(1);
 
-pub fn snapshot(tick: u32) -> Snapshot {
-    let mut state = PlayerState::ZERO;
-    state.command_time = tick as i32 * 50;
+pub fn snapshot(tick: u32) -> sim::Snapshot {
+    let mut state = AvatarState::ZERO;
+    state.last_cmd_ms = tick as i32 * 50;
     state.origin = [tick as f32, 2.0, 3.0];
-    let mut snapshot = Snapshot::unpublished(Tick(tick));
+    let mut snapshot = sim::Snapshot::unpublished(sim::Tick(tick));
     snapshot.players.push((PLAYER, state));
     snapshot
 }
 
-pub fn input(tick: u32) -> TickInput {
-    let cmd = UserCmd {
-        server_time: tick as i32 * 50,
-        forwardmove: 127,
-        ..UserCmd::default()
+pub fn input(tick: u32) -> sim::StepInputs {
+    let cmd = InputCommand {
+        authority_clock_ms: tick as i32 * 50,
+        thrust_ahead: 127,
+        ..InputCommand::default()
     };
-    let mut input = TickInput::from_cmds(vec![(PLAYER, cmd)]);
+    let mut input = sim::StepInputs::from_cmds(vec![(PLAYER, cmd)]);
     if tick == 1 {
         input
             .actions
-            .push((PLAYER, ClientAction::JoinMatch { request_id: 7 }));
+            .push((PLAYER, sim::PlayerIntent::JoinMatch { request_id: 7 }));
     }
     input
 }
 
 /// The frames ticks 1..=`count` go out as, in order, one encoder for all.
-pub fn frames(count: u32) -> Vec<Frame> {
-    let mut encoder = SnapshotEncoder::new();
+pub fn frames(count: u32) -> Vec<net::Frame> {
+    let mut encoder = net::FrameDiffWriter::new();
     (1..=count)
-        .map(|tick| frame_from_tick(&mut encoder, &input(tick), &snapshot(tick)))
+        .map(|tick| net::frame_for_tick(&mut encoder, &input(tick), &snapshot(tick)))
         .collect()
 }

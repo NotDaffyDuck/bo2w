@@ -4,10 +4,10 @@
 
 use bevy::prelude::*;
 
-use super::outbox::PendingClientSends;
-use super::stores::ClientPredictionState;
-use crate::authority::inbox::ClientActionInbox;
-use crate::authority::runtime::AuthorityInputGate;
+use super::outbox::QueuedOutgoingPlayerMessages;
+use super::stores::ClientGuessState;
+use crate::host_tick::peer_mail::PlayerActionIntake;
+use crate::host_tick::tick_systems::HostInputValve;
 use crate::client::frame_clock::FrameClock;
 use crate::client::realtime::ClientRealtime;
 
@@ -19,7 +19,7 @@ const STALL_MS: i32 = 1000;
 /// How many stalls the link may take before the session is failed. A hitch costs one and is
 /// recovered from; a host that has really gone away keeps earning them until they run out.
 const STALLS_BEFORE_FAIL: u32 =
-    (master_protocol::SESSION_IDLE.as_millis() / STALL_MS as u128) as u32 - 1;
+    (master_protocol::LINK_IDLE_LIMIT.as_millis() / STALL_MS as u128) as u32 - 1;
 
 const ACTION_TIMEOUT_REASON: &str = "ActionOutcomeUnknown: authority outcome deadline exceeded";
 const BACKLOG_REASON: &str = "InputBacklogExceeded";
@@ -35,15 +35,15 @@ pub struct BacklogStalls {
 impl BacklogStalls {
     /// Counts a stall: at most one per `STALL_MS`, and only while the acknowledgement count has
     /// stayed where it was. `None` means this moment was already dealt with.
-    fn note(&mut self, now_ms: i32, acks: u64) -> Option<u32> {
-        if acks != self.acks_seen {
-            *self = Self { run: 0, acks_seen: acks, marked_at: Some(now_ms) };
+    fn record_stall(&mut self, clock_millis: i32, receipts_batch: u64) -> Option<u32> {
+        if receipts_batch != self.acks_seen {
+            *self = Self { run: 0, acks_seen: receipts_batch, marked_at: Some(clock_millis) };
             return None;
         }
-        if self.marked_at.is_some_and(|at| now_ms.saturating_sub(at) < STALL_MS) {
+        if self.marked_at.is_some_and(|at| clock_millis.saturating_sub(at) < STALL_MS) {
             return None;
         }
-        self.marked_at = Some(now_ms);
+        self.marked_at = Some(clock_millis);
         self.run = self.run.saturating_add(1);
         Some(self.run)
     }
@@ -83,64 +83,64 @@ fn span_of(times: impl IntoIterator<Item = i32>) -> i32 {
         return 0;
     };
     let mut span = 0i32;
-    for time in times {
-        span = span.saturating_add(time.saturating_sub(before).max(0));
-        before = time;
+    for tm in times {
+        span = span.saturating_add(tm.saturating_sub(before).max(0));
+        before = tm;
     }
     span
 }
 
-pub fn enforce_client_work_limits(
-    pending: Res<PendingClientSends>,
-    mut prediction: ResMut<ClientPredictionState>,
+pub fn cap_receiver_workload(
+    pending: Res<QueuedOutgoingPlayerMessages>,
+    mut forecast: ResMut<ClientGuessState>,
     cg: Res<FrameClock>,
     cls: Res<ClientRealtime>,
-    mut signon: ResMut<crate::SignonState>,
-    bridge: Option<Res<crate::MasterBridge>>,
-    mut gate: ResMut<AuthorityInputGate>,
-    actions: Res<ClientActionInbox>,
+    mut join_rec: ResMut<crate::JoinProgressRecord>,
+    dir_link: Option<Res<crate::DirectoryLink>>,
+    mut gate: ResMut<HostInputValve>,
+    actions: Res<PlayerActionIntake>,
     mut stalls: Local<BacklogStalls>,
 ) {
-    if signon.phase.is_failed() {
+    if join_rec.phase.has_failed() {
         gate.local_cmds_enabled = false;
         return;
     }
-    let waiting_since = pending.iter().next().map(|(_, cmd, _)| cmd.server_time);
-    let piled_up = span_of(prediction.0.history().iter().map(|row| row.cmd.server_time));
+    let waiting_since = pending.iter().next().map(|(_, cmd, _)| cmd.authority_clock_ms);
+    let piled_up = span_of(forecast.0.history().iter().map(|row| row.cmd.authority_clock_ms));
     let stalled = waiting_since.is_some_and(|since| cg.time().saturating_sub(since) > STALL_MS)
         || piled_up > STALL_MS;
     let stall = if stalled {
-        let acks = pending.acked_through().map_or(0, |seq| u64::from(seq.0));
-        stalls.note(cls.realtime(), acks)
+        let receipts_batch = pending.acked_through().map_or(0, |seq| u64::from(seq.0));
+        stalls.record_stall(cls.now_ms(), receipts_batch)
     } else {
         stalls.forget();
         None
     };
 
-    let reason = match judge(actions.timed_out(), stall) {
+    let why = match judge(actions.deadline_passed(), stall) {
         Verdict::Carry => return,
         Verdict::Resync { stall } => {
             diag::warn!(
-                Net,
+                WireLink,
                 "input backlog: no authority ack in {STALL_MS} ms \
                  (stall {stall}/{STALLS_BEFORE_FAIL}) — re-adopting"
             );
-            prediction.0.force_resync();
+            forecast.0.force_resync();
             return;
         }
-        Verdict::Fail(reason) => reason,
+        Verdict::Fail(why) => why,
     };
 
     gate.local_cmds_enabled = false;
-    prediction.0.disarm();
-    let match_key = crate::signon::live_match_key(bridge.as_deref());
-    if let Some(bridge) = bridge {
-        bridge.fail(reason);
+    forecast.0.stand_down();
+    let game_session_key = crate::join_walk::current_round_key(dir_link.as_deref());
+    if let Some(dir_link) = dir_link {
+        dir_link.mark_failed(why);
     }
-    signon.set_phase(crate::SignonPhase::Failed(crate::SignonFailReason::Transport {
-        source: reason.to_owned(),
-        stage: crate::FailStage::Transport,
-        match_key,
+    join_rec.enter_phase(crate::JoinSequenceStep::Failed(crate::JoinFailureCause::Transport {
+        source: why.to_owned(),
+        stage: crate::AbortStep::Transport,
+        game_session_key,
     }));
 }
 
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn the_failure_threshold_follows_the_session_idle_time() {
-        let idle_seconds = master_protocol::SESSION_IDLE.as_secs() as u32;
+        let idle_seconds = master_protocol::LINK_IDLE_LIMIT.as_secs() as u32;
         assert_eq!(STALLS_BEFORE_FAIL, idle_seconds - 1);
         assert!(STALLS_BEFORE_FAIL >= 1);
     }
@@ -158,39 +158,39 @@ mod tests {
     #[test]
     fn a_stall_needs_a_full_stall_length_after_the_last_news() {
         let mut stalls = BacklogStalls::default();
-        // The count starts at zero acks, so a first call with none is already "no news".
-        assert_eq!(stalls.note(0, 0), Some(1));
-        assert_eq!(stalls.note(10, 5), None);
-        assert_eq!(stalls.note(500, 5), None);
-        assert_eq!(stalls.note(1010, 5), Some(1));
+        // The count starts at zero receipts_batch, so a first call with none is already "no news".
+        assert_eq!(stalls.record_stall(0, 0), Some(1));
+        assert_eq!(stalls.record_stall(10, 5), None);
+        assert_eq!(stalls.record_stall(500, 5), None);
+        assert_eq!(stalls.record_stall(1010, 5), Some(1));
     }
 
     #[test]
     fn at_most_one_stall_is_counted_per_stall_length() {
         let mut stalls = BacklogStalls::default();
-        assert_eq!(stalls.note(100, 0), Some(1));
-        assert_eq!(stalls.note(600, 0), None);
-        assert_eq!(stalls.note(1099, 0), None);
-        assert_eq!(stalls.note(1100, 0), Some(2));
-        assert_eq!(stalls.note(2100, 0), Some(3));
+        assert_eq!(stalls.record_stall(100, 0), Some(1));
+        assert_eq!(stalls.record_stall(600, 0), None);
+        assert_eq!(stalls.record_stall(1099, 0), None);
+        assert_eq!(stalls.record_stall(1100, 0), Some(2));
+        assert_eq!(stalls.record_stall(2100, 0), Some(3));
     }
 
     #[test]
     fn an_acknowledgement_starts_the_count_over() {
         let mut stalls = BacklogStalls::default();
-        stalls.note(0, 0);
-        stalls.note(1000, 0);
-        assert_eq!(stalls.note(1500, 7), None);
-        assert_eq!(stalls.note(2500, 7), Some(1));
+        stalls.record_stall(0, 0);
+        stalls.record_stall(1000, 0);
+        assert_eq!(stalls.record_stall(1500, 7), None);
+        assert_eq!(stalls.record_stall(2500, 7), Some(1));
     }
 
     #[test]
     fn forgetting_clears_everything() {
         let mut stalls = BacklogStalls::default();
-        stalls.note(0, 0);
-        stalls.note(1000, 0);
+        stalls.record_stall(0, 0);
+        stalls.record_stall(1000, 0);
         stalls.forget();
-        assert_eq!(stalls.note(1100, 0), Some(1));
+        assert_eq!(stalls.record_stall(1100, 0), Some(1));
     }
 
     #[test]
@@ -227,20 +227,20 @@ mod tests {
 
     fn app_with_failed_signon(failed: bool) -> App {
         let mut app = App::new();
-        app.init_resource::<PendingClientSends>()
-            .init_resource::<ClientPredictionState>()
+        app.init_resource::<QueuedOutgoingPlayerMessages>()
+            .init_resource::<ClientGuessState>()
             .init_resource::<FrameClock>()
             .init_resource::<ClientRealtime>()
-            .init_resource::<crate::SignonState>()
-            .insert_resource(AuthorityInputGate { local_cmds_enabled: true })
-            .init_resource::<ClientActionInbox>()
-            .add_systems(Update, enforce_client_work_limits);
+            .init_resource::<crate::JoinProgressRecord>()
+            .insert_resource(HostInputValve { local_cmds_enabled: true })
+            .init_resource::<PlayerActionIntake>()
+            .add_systems(Update, cap_receiver_workload);
         if failed {
-            app.world_mut().resource_mut::<crate::SignonState>().set_phase(
-                crate::SignonPhase::Failed(crate::SignonFailReason::Transport {
+            app.world_mut().resource_mut::<crate::JoinProgressRecord>().enter_phase(
+                crate::JoinSequenceStep::Failed(crate::JoinFailureCause::Transport {
                     source: "gone".to_owned(),
-                    stage: crate::FailStage::Transport,
-                    match_key: crate::signon::live_match_key(None),
+                    stage: crate::AbortStep::Transport,
+                    game_session_key: crate::join_walk::current_round_key(None),
                 }),
             );
         }
@@ -251,14 +251,14 @@ mod tests {
     fn a_failed_signon_switches_local_commands_off() {
         let mut app = app_with_failed_signon(true);
         app.update();
-        assert!(!app.world().resource::<AuthorityInputGate>().local_cmds_enabled);
+        assert!(!app.world().resource::<HostInputValve>().local_cmds_enabled);
     }
 
     #[test]
     fn a_quiet_link_with_nothing_queued_leaves_commands_on() {
         let mut app = app_with_failed_signon(false);
         app.update();
-        assert!(app.world().resource::<AuthorityInputGate>().local_cmds_enabled);
-        assert!(!app.world().resource::<crate::SignonState>().phase.is_failed());
+        assert!(app.world().resource::<HostInputValve>().local_cmds_enabled);
+        assert!(!app.world().resource::<crate::JoinProgressRecord>().phase.has_failed());
     }
 }

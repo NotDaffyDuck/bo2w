@@ -5,12 +5,12 @@
 //! (PM_Weapon hooks in `pm/spread.rs`, the client view code) fill the inputs.
 //! Spec and the BO2 function each piece matches: docs/gun/RECOIL.md.
 //!
-//! - Spread: [`adjust_aim_spread_scale`] (every move), [`add_firing_aim_spread`] (every shot),
+//! - Spread: [`adjust_aim_spread_scale`] (every move), [`widen_cone_on_shot`] (every shot),
 //!   [`spread_for_weapon`], [`bullet_cone`], [`stack_fire_yaw`], [`reticle_spread`].
 //! - Kick: [`fire_recoil`] (every shot), [`settle_view_kick`] (every client frame),
 //!   [`gun_spring`] (every weapon movement update).
 //! - Gun movement: [`sway`], [`gun_bob`], [`idle_angles`], [`weapon_movement_angles`],
-//!   [`landing_offset`]; the camera's [`camera_bob`].
+//!   [`touchdown_shift`]; the camera's [`camera_bob`].
 
 use crate::pm::spread::{KickRange, SpreadFacts, SwaySettings};
 use crate::state;
@@ -19,7 +19,7 @@ use std::f32::consts::PI;
 /// The widest the hip spread scale goes.
 pub const SPREAD_MAX: f32 = 255.0;
 /// A command angle unit in degrees (65536 units per turn).
-pub const SHORT2ANGLE: f32 = 360.0 / 65536.0;
+pub const WORD16_TO_DEGREES: f32 = 360.0 / 65536.0;
 
 /// The dvars this file reads, at BO2's defaults.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,7 +33,7 @@ pub struct RecoilDvars {
     /// `zero_idle_movement`.
     pub zero_idle_movement: bool,
     /// `bg_aimSpreadMoveSpeedThreshold`.
-    pub move_speed_threshold: f32,
+    pub stride_velocity_cutoff: f32,
     /// `player_standingViewHeight`.
     pub standing_view_height: i32,
     /// `perk_weapSpreadMultiplier` (Steady Aim).
@@ -78,7 +78,7 @@ impl Default for RecoilDvars {
             aqs_style: 2,
             ads_zero_spread: true,
             zero_idle_movement: false,
-            move_speed_threshold: 11.0,
+            stride_velocity_cutoff: 11.0,
             standing_view_height: 60,
             perk_weap_spread_multiplier: 0.65,
             charge_view_kick_increase: 0.5,
@@ -119,8 +119,8 @@ pub fn bg_random(seed: &mut u32) -> f32 {
     (*seed >> 17) as f32 / 32768.0
 }
 
-fn rand_range(seed: &mut u32, min: f32, max: f32) -> f32 {
-    bg_random(seed) * (max - min) + min
+fn rand_range(seed: &mut u32, low: f32, high: f32) -> f32 {
+    bg_random(seed) * (high - low) + low
 }
 
 /// Wrap an angle to -180..180 (rounding the turn count half up).
@@ -137,9 +137,9 @@ pub fn angle_wrap360(a: f32) -> f32 {
 
 /// Ease `cur` toward `tgt` by `(tgt - cur) * rate * dt`; snap when close (0.001) or when the step
 /// would overshoot.
-pub fn diff_track(tgt: f32, cur: f32, rate: f32, dt: f32) -> f32 {
+pub fn diff_track(tgt: f32, cur: f32, rate: f32, secs: f32) -> f32 {
     let gap = tgt - cur;
-    let step = gap * rate * dt;
+    let step = gap * rate * secs;
     if gap.abs() > 0.001 && step.abs() <= gap.abs() {
         cur + step
     } else {
@@ -148,18 +148,18 @@ pub fn diff_track(tgt: f32, cur: f32, rate: f32, dt: f32) -> f32 {
 }
 
 /// [`diff_track`] for angles: the target is brought within 180 of `cur` first; the result is 0..360.
-pub fn diff_track_angle(mut tgt: f32, cur: f32, rate: f32, dt: f32) -> f32 {
+pub fn diff_track_angle(mut tgt: f32, cur: f32, rate: f32, secs: f32) -> f32 {
     while tgt - cur > 180.0 {
         tgt -= 360.0;
     }
     while tgt - cur < -180.0 {
         tgt += 360.0;
     }
-    angle_wrap360(diff_track(tgt, cur, rate, dt))
+    angle_wrap360(diff_track(tgt, cur, rate, secs))
 }
 
-fn lerp(a: f32, b: f32, f: f32) -> f32 {
-    (b - a) * f + a
+fn lerp(start: f32, end: f32, amount: f32) -> f32 {
+    (end - start) * amount + start
 }
 
 fn is_firing(weaponstate: i32) -> bool {
@@ -179,7 +179,7 @@ pub struct SpreadOverride {
 /// What PM_AdjustAimSpreadScale reads from the player for one move.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AimSpreadInput {
-    pub frametime: f32,
+    pub step_millis_elapsed: f32,
     /// No ground entity and not a dead/noclip move type.
     pub in_air: bool,
     pub prone: bool,
@@ -188,11 +188,11 @@ pub struct AimSpreadInput {
     pub quick_scope_scale: f32,
     pub quick_scope_timer: i32,
     /// This move's and the last move's command angles (pitch, yaw) in command units.
-    pub cmd_angles: [i32; 2],
+    pub input_angles: [i32; 2],
     pub old_cmd_angles: [i32; 2],
     /// Forward or right move held.
     pub moving: bool,
-    pub velocity_xy: [f32; 2],
+    pub vel_flat: [f32; 2],
     /// The player's move speed (`ps.speed`).
     pub speed: i32,
     /// Riding a vehicle that allows weapons: its velocity (xy) and its type's max speed.
@@ -220,53 +220,53 @@ pub fn adjust_aim_spread_scale(
     i: &AimSpreadInput,
     d: &RecoilDvars,
 ) {
-    let mut rate = s.decay_rate;
+    let mut rate = s.settle_rate;
     let mut r = 1.0;
     let mut grow = 0.0;
     if rate == 0.0 {
         rate = 1.0;
     } else {
         let ovf = ov.value as f32;
-        r = (ovf - s.stand_min) / (s.stand_max - s.stand_min);
+        r = (ovf - s.upright_narrowest) / (s.upright_widest - s.upright_narrowest);
         if i.in_air {
             rate *= 0.5;
         } else if i.prone {
-            rate *= s.prone_decay;
-            r = (ovf - s.prone_min) / (s.prone_max - s.prone_min);
+            rate *= s.lying_settle;
+            r = (ovf - s.lying_narrowest) / (s.lying_widest - s.lying_narrowest);
         } else if i.ducked {
-            rate *= s.ducked_decay;
-            r = (ovf - s.ducked_min) / (s.ducked_max - s.ducked_min);
+            rate *= s.crouch_settle;
+            r = (ovf - s.crouch_narrowest) / (s.crouch_widest - s.crouch_narrowest);
         }
-        rate *= i.frametime;
+        rate *= i.step_millis_elapsed;
         if ov.state == 1 {
             rate /= r;
         } else if i.frac != 1.0 || (d.aqs && i.quick_scope_timer != 0) {
             let mut g = quick_scope_spread(s, *scale, i.quick_scope_scale, i.quick_scope_timer, d);
-            if s.turn_add != 0.0 {
+            if s.turn_gain != 0.0 {
                 for k in 0..2 {
-                    let turn = i.cmd_angles[k] as f32 * SHORT2ANGLE - i.old_cmd_angles[k] as f32 * SHORT2ANGLE;
-                    g += angle_wrap180(turn).abs() * 0.01 * s.turn_add * (1.0 / i.frametime);
+                    let turn = i.input_angles[k] as f32 * WORD16_TO_DEGREES - i.old_cmd_angles[k] as f32 * WORD16_TO_DEGREES;
+                    g += angle_wrap180(turn).abs() * 0.01 * s.turn_gain * (1.0 / i.step_millis_elapsed);
                 }
             }
-            if s.move_add != 0.0 {
-                let thr = d.move_speed_threshold * d.move_speed_threshold;
+            if s.motion_bloom != 0.0 {
+                let thr = d.stride_velocity_cutoff * d.stride_velocity_cutoff;
                 if i.moving {
-                    let v2 = i.velocity_xy[0] * i.velocity_xy[0] + i.velocity_xy[1] * i.velocity_xy[1];
+                    let v2 = i.vel_flat[0] * i.vel_flat[0] + i.vel_flat[1] * i.vel_flat[1];
                     if thr < v2 {
-                        g += v2.sqrt() * s.move_add / i.speed as f32;
+                        g += v2.sqrt() * s.motion_bloom / i.speed as f32;
                     }
                 }
-                if let Some((v, max_speed)) = i.vehicle {
+                if let Some((v, top_velocity)) = i.vehicle {
                     let v2 = v[0] * v[0] + v[1] * v[1];
-                    if thr < v2 && max_speed > 0.0 {
-                        g += v2.sqrt() * s.move_add / max_speed;
+                    if thr < v2 && top_velocity > 0.0 {
+                        g += v2.sqrt() * s.motion_bloom / top_velocity;
                     }
                 }
             }
             if i.in_air {
                 g += 1.28 + 1.28;
             }
-            grow = i.frametime * g;
+            grow = i.step_millis_elapsed * g;
         } else if d.ads_zero_spread {
             *scale = 0.0;
         }
@@ -281,11 +281,11 @@ pub fn adjust_aim_spread_scale(
 }
 
 /// PM_Weapon_AddFiringAimSpreadScale: a shot not fully aimed adds the weapon's fire add.
-pub fn add_firing_aim_spread(scale: f32, s: &SpreadFacts, frac: f32) -> f32 {
-    if frac == 1.0 {
-        return scale;
+pub fn widen_cone_on_shot(factor: f32, s: &SpreadFacts, share: f32) -> f32 {
+    if share == 1.0 {
+        return factor;
     }
-    (s.fire_add * SPREAD_MAX + scale).min(SPREAD_MAX)
+    (s.per_shot_bloom * SPREAD_MAX + factor).min(SPREAD_MAX)
 }
 
 /// What BG_GetSpreadForWeapon reads besides the weapon.
@@ -295,7 +295,7 @@ pub struct SpreadInput {
     pub override_: SpreadOverride,
     /// The weapon fires stacked shots (fire type STACKED) and its clip size.
     pub stacked: bool,
-    pub clip_size: i32,
+    pub magazine_capacity: i32,
     pub player_perks: u64,
     pub zombies: bool,
     pub frac: f32,
@@ -311,16 +311,16 @@ pub fn spread_for_weapon(s: &SpreadFacts, i: &SpreadInput, d: &RecoilDvars) -> (
         let h = i.view_height;
         if h <= 40.0 {
             let t = (h - 11.0) * 0.034_482_76;
-            min = lerp(s.prone_min, s.ducked_min, t);
-            max = lerp(s.prone_max, s.ducked_max, t);
+            min = lerp(s.lying_narrowest, s.crouch_narrowest, t);
+            max = lerp(s.lying_widest, s.crouch_widest, t);
         } else {
             let t = (h - 40.0) / (d.standing_view_height - 40) as f32;
-            min = lerp(s.ducked_min, s.stand_min, t);
-            max = lerp(s.ducked_max, s.stand_max, t);
+            min = lerp(s.crouch_narrowest, s.upright_narrowest, t);
+            max = lerp(s.crouch_widest, s.upright_widest, t);
         }
     }
-    if i.stacked && i.clip_size > 1 {
-        let k = s.stack_fire_accuracy_decay.powi(i.clip_size - 1);
+    if i.stacked && i.magazine_capacity > 1 {
+        let k = s.stack_fire_accuracy_decay.powi(i.magazine_capacity - 1);
         min *= k;
         max *= k;
     }
@@ -343,10 +343,10 @@ pub fn spread_for_weapon(s: &SpreadFacts, i: &SpreadInput, d: &RecoilDvars) -> (
 }
 
 /// The bullet cone in degrees at fire: fully aimed lerps from the ADS spread, else from the hip min.
-pub fn bullet_cone(s: &SpreadFacts, scale: f32, min: f32, max: f32, frac: f32) -> f32 {
-    let n = scale / SPREAD_MAX;
-    if frac == 1.0 {
-        (max - s.ads_spread) * n + s.ads_spread
+pub fn bullet_cone(s: &SpreadFacts, factor: f32, min: f32, max: f32, share: f32) -> f32 {
+    let n = factor / SPREAD_MAX;
+    if share == 1.0 {
+        (max - s.aimed_cone) * n + s.aimed_cone
     } else {
         (max - min) * n + min
     }
@@ -355,18 +355,18 @@ pub fn bullet_cone(s: &SpreadFacts, scale: f32, min: f32, max: f32, frac: f32) -
 /// G_CalcMuzzlePoints: a stacked gun's yaw offset for one bullet of the stack, in degrees.
 /// `shot` is the fire event's shot number (1-based); a two-round stack reads the hand's shot
 /// count after the tick instead, as BO2 does. Zero for a stack of one.
-pub fn stack_fire_yaw(stack_spread: f32, clip_size: i32, shot: u32, shot_count: u32) -> f32 {
-    if clip_size <= 1 {
+pub fn stack_fire_yaw(stack_spread: f32, magazine_capacity: i32, shot: u32, rounds_fired: u32) -> f32 {
+    if magazine_capacity <= 1 {
         return 0.0;
     }
-    if clip_size == 2 {
-        return if shot_count == 2 { stack_spread * 0.5 } else { stack_spread * -0.5 };
+    if magazine_capacity == 2 {
+        return if rounds_fired == 2 { stack_spread * 0.5 } else { stack_spread * -0.5 };
     }
-    stack_spread / (clip_size - 1) as f32 * (shot as f32 - 1.0) - stack_spread * 0.5
+    stack_spread / (magazine_capacity - 1) as f32 * (shot as f32 - 1.0) - stack_spread * 0.5
 }
 
 /// CG_CalcReticleSpread: each crosshair side's distance from the centre (virtual 640x480 units).
-/// `cone_scale` is the drawer's multiplier, `side_shift` each axis' shift, `tan_half_fov_y` the view.
+/// `cone_scale` is the drawer's multiplier, `side_shift` each axis' shift, `fov_half_tan_y` the view.
 pub fn reticle_spread(
     s: &SpreadFacts,
     scale: f32,
@@ -374,10 +374,10 @@ pub fn reticle_spread(
     max: f32,
     cone_scale: f32,
     side_shift: [f32; 2],
-    tan_half_fov_y: f32,
+    fov_half_tan_y: f32,
 ) -> [f32; 2] {
     let cone = ((max - min) * scale * (1.0 / 255.0) + min) * cone_scale;
-    let d = ((cone * 0.017_453_292).tan() * 240.0 / tan_half_fov_y).max(s.reticle_min_ofs as f32);
+    let d = ((cone * 0.017_453_292).tan() * 240.0 / fov_half_tan_y).max(s.reticle_min_ofs as f32);
     [d - side_shift[0] * s.reticle_side_pos, d - side_shift[1] * s.reticle_side_pos]
 }
 
@@ -388,10 +388,10 @@ pub fn reticle_spread(
 /// gun's recoil spring (pitch, yaw), and the ADS recoil reduction memory.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct KickState {
-    pub view_angles: [f32; 3],
+    pub look_rotation: [f32; 3],
     pub view_avel: [f32; 3],
-    pub gun_angles: [f32; 2],
-    pub gun_speed: [f32; 2],
+    pub weapon_aim_angles: [f32; 2],
+    pub gun_swing_rate: [f32; 2],
     pub ads_recoil_reduction: f32,
     pub last_shot_ms: i32,
 }
@@ -412,7 +412,7 @@ pub struct FireRecoilInput<'a> {
     pub charge_level: Option<i32>,
     /// Gas-type weapon (flamethrower).
     pub gas: bool,
-    pub weaponstate: i32,
+    pub gun_phase: i32,
     pub weaponstate_left: i32,
 }
 
@@ -436,7 +436,7 @@ fn min_magnitude(p: f32, y: f32, m: f32) -> (f32, f32) {
 
 /// BG_WeaponFireRecoil: one shot's kick. Sets the camera's kick velocity and pushes the gun spring.
 /// Random draws, in order: view pitch, view yaw, gun pitch, gun yaw.
-pub fn fire_recoil(k: &mut KickState, i: &FireRecoilInput, seed: &mut u32, d: &RecoilDvars) {
+pub fn fire_recoil(k: &mut KickState, i: &FireRecoilInput, rand_state: &mut u32, d: &RecoilDvars) {
     let s = i.facts;
     let mut scale = 1.0;
     if i.restrict_kick_time > 0 {
@@ -458,23 +458,23 @@ pub fn fire_recoil(k: &mut KickState, i: &FireRecoilInput, seed: &mut u32, d: &R
             reduction = reduction.min(s.ads_recoil_reduction_limit).max(0.0);
             range = range.scaled(1.0 - reduction);
         }
-        let mut p = rand_range(seed, range.pitch_min, range.pitch_max);
+        let mut p = rand_range(rand_state, range.pitch_lower_bound, range.pitch_upper_bound);
         if let Some(level) = i.charge_level {
             p = charged_pitch(p, level, d);
         }
-        let y = rand_range(seed, range.yaw_min, range.yaw_max);
+        let y = rand_range(rand_state, range.turn_floor, range.turn_ceiling);
         (pitch, yaw) = min_magnitude(p, y, (1.0 - rate.max(0.0)) * s.ads_view_kick_min_magnitude);
     } else if let Some(left) = i.dual {
         let range = dual_range(s.hip_view_kick, left.hip_view_kick, i);
-        pitch = rand_range(seed, range.pitch_min, range.pitch_max);
-        yaw = rand_range(seed, range.yaw_min, range.yaw_max);
+        pitch = rand_range(rand_state, range.pitch_lower_bound, range.pitch_upper_bound);
+        yaw = rand_range(rand_state, range.turn_floor, range.turn_ceiling);
     } else {
         let range = s.hip_view_kick;
-        let mut p = rand_range(seed, range.pitch_min, range.pitch_max);
+        let mut p = rand_range(rand_state, range.pitch_lower_bound, range.pitch_upper_bound);
         if let Some(level) = i.charge_level {
             p = charged_pitch(p, level, d);
         }
-        let y = rand_range(seed, range.yaw_min, range.yaw_max);
+        let y = rand_range(rand_state, range.turn_floor, range.turn_ceiling);
         (pitch, yaw) = min_magnitude(p, y, s.hip_view_kick_min_magnitude);
     }
     k.ads_recoil_reduction = reduction;
@@ -495,15 +495,15 @@ pub fn fire_recoil(k: &mut KickState, i: &FireRecoilInput, seed: &mut u32, d: &R
     } else {
         s.hip_gun_kick
     };
-    let gp = rand_range(seed, gun.pitch_min, gun.pitch_max);
-    let gy = rand_range(seed, gun.yaw_min, gun.yaw_max);
-    k.gun_speed[0] += gp * scale;
-    k.gun_speed[1] += gy * scale;
+    let gp = rand_range(rand_state, gun.pitch_lower_bound, gun.pitch_upper_bound);
+    let gy = rand_range(rand_state, gun.turn_floor, gun.turn_ceiling);
+    k.gun_swing_rate[0] += gp * scale;
+    k.gun_swing_rate[1] += gy * scale;
 }
 
 /// Dual wield: both guns firing add their ranges; only the left firing uses the left gun's.
 fn dual_range(right: KickRange, left: KickRange, i: &FireRecoilInput) -> KickRange {
-    match (is_firing(i.weaponstate), is_firing(i.weaponstate_left)) {
+    match (is_firing(i.gun_phase), is_firing(i.weaponstate_left)) {
         (true, true) => left.plus(right),
         (_, true) => left,
         _ => right,
@@ -519,7 +519,7 @@ pub struct CenterInput<'a> {
     pub dual: Option<&'a SpreadFacts>,
     pub frac: f32,
     pub charge_level: Option<i32>,
-    pub weaponstate: i32,
+    pub gun_phase: i32,
     pub weaponstate_left: i32,
     /// PM_GetEffectiveStance: 0 standing, 1 prone, 2 crouched.
     pub stance: i32,
@@ -540,7 +540,7 @@ pub fn view_kick_center_speed(i: &CenterInput, d: &RecoilDvars) -> f32 {
     let Some(s) = i.facts else { return 2400.0 };
     if i.frac <= 0.5 {
         if let Some(left) = i.dual {
-            match (is_firing(i.weaponstate), is_firing(i.weaponstate_left)) {
+            match (is_firing(i.gun_phase), is_firing(i.weaponstate_left)) {
                 (true, true) => left.hip_center_speed + s.hip_center_speed,
                 (_, true) => left.hip_center_speed,
                 _ => s.hip_center_speed,
@@ -570,7 +570,7 @@ pub fn settle_view_kick(k: &mut KickState, frame_ms: i32, center: f32) {
     while left > 0 {
         let step = left.min(5) as f32;
         for ax in 0..3 {
-            let (a, v) = (k.view_angles[ax], k.view_avel[ax]);
+            let (a, v) = (k.look_rotation[ax], k.view_avel[ax]);
             if a == 0.0 && v == 0.0 {
                 continue;
             }
@@ -584,19 +584,19 @@ pub fn settle_view_kick(k: &mut KickState, frame_ms: i32, center: f32) {
                 dlt *= 0.06;
             }
             if (a + dlt) * a < 0.0 {
-                k.view_angles[ax] = 0.0;
+                k.look_rotation[ax] = 0.0;
                 k.view_avel[ax] = 0.0;
                 continue;
             }
             let na = a + dlt;
             if na == 0.0 {
-                k.view_angles[ax] = 0.0;
+                k.look_rotation[ax] = 0.0;
                 k.view_avel[ax] = 0.0;
             } else if na.abs() > 10.0 {
-                k.view_angles[ax] = if na > 0.0 { 10.0 } else { -10.0 };
+                k.look_rotation[ax] = if na > 0.0 { 10.0 } else { -10.0 };
                 k.view_avel[ax] = 0.0;
             } else {
-                k.view_angles[ax] = na;
+                k.look_rotation[ax] = na;
                 k.view_avel[ax] = v;
             }
         }
@@ -605,23 +605,23 @@ pub fn settle_view_kick(k: &mut KickState, frame_ms: i32, center: f32) {
 }
 
 /// The gun recoil spring in BG_CalculateWeaponMovement (only weapons that can aim down sights).
-/// Runs `frametime` seconds in 5 ms steps; stops early once both axes rest.
-pub fn gun_spring(k: &mut KickState, s: &SpreadFacts, frac: f32, frametime: f32) {
-    if !s.aim_down_sight {
+/// Runs `step_millis_elapsed` seconds in 5 ms steps; stops early once both axes rest.
+pub fn gun_spring(k: &mut KickState, s: &SpreadFacts, frac: f32, step_millis_elapsed: f32) {
+    if !s.scoped_aiming {
         return;
     }
     let sp = s.hip_spring.lerp(s.ads_spring, frac);
-    let max = [s.gun_max_pitch, s.gun_max_yaw];
-    let mut t = frametime;
+    let max = [s.weapon_pitch_ceiling, s.weapon_yaw_ceiling];
+    let mut t = step_millis_elapsed;
     while t > 0.0 {
         let step = t.min(0.005);
         t = if t <= 0.005 { 0.0 } else { t - 0.005 };
         let mut rested = [false; 2];
         for ax in 0..2 {
-            let (mut a, mut v) = (k.gun_angles[ax], k.gun_speed[ax]);
+            let (mut a, mut v) = (k.weapon_aim_angles[ax], k.gun_swing_rate[ax]);
             if a.abs() < 0.25 && v.abs() < 1.0 {
-                k.gun_angles[ax] = 0.0;
-                k.gun_speed[ax] = 0.0;
+                k.weapon_aim_angles[ax] = 0.0;
+                k.gun_swing_rate[ax] = 0.0;
                 rested[ax] = true;
                 continue;
             }
@@ -638,12 +638,12 @@ pub fn gun_spring(k: &mut KickState, s: &SpreadFacts, frac: f32, frametime: f32)
                 }
             }
             if a > 0.0 {
-                v -= step * sp.accel;
+                v -= step * sp.speed_up_rate;
             } else if a < 0.0 {
-                v += step * sp.accel;
+                v += step * sp.speed_up_rate;
             }
-            v -= v * sp.speed_decay * step;
-            let sd = step * sp.static_decay;
+            v -= v * sp.velocity_falloff * step;
+            let sd = step * sp.resting_falloff;
             if v <= 0.0 {
                 v += sd;
                 if v > 0.0 {
@@ -655,9 +655,9 @@ pub fn gun_spring(k: &mut KickState, s: &SpreadFacts, frac: f32, frametime: f32)
                     v = 0.0;
                 }
             }
-            v = v.clamp(-sp.speed_max, sp.speed_max);
-            k.gun_angles[ax] = a;
-            k.gun_speed[ax] = v;
+            v = v.clamp(-sp.velocity_cap, sp.velocity_cap);
+            k.weapon_aim_angles[ax] = a;
+            k.gun_swing_rate[ax] = v;
         }
         if rested[0] && rested[1] {
             break;
@@ -680,7 +680,7 @@ pub struct SwayState {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SwayInput {
     pub frac: f32,
-    pub view_angles: [f32; 3],
+    pub look_rotation: [f32; 3],
     pub dt: f32,
     /// Shellshock time left (start + duration - now, ms) and its fade time (ms).
     pub shock_ms_left: i32,
@@ -693,9 +693,9 @@ pub fn sway(st: &mut SwayState, s: &SpreadFacts, i: &SwayInput) {
         return;
     }
     let mut set: SwaySettings = s.sway;
-    if s.aim_down_sight {
+    if s.scoped_aiming {
         if i.frac > 0.0 && s.overlay {
-            st.last_view = i.view_angles;
+            st.last_view = i.look_rotation;
             return;
         }
         set = set.lerp(s.ads_sway, i.frac);
@@ -706,20 +706,20 @@ pub fn sway(st: &mut SwayState, s: &SpreadFacts, i: &SwayInput) {
             f = i.shock_ms_left as f32 / i.shock_fade_ms as f32;
         }
         let k = (s.sway_shellshock_scale - 1.0) * (3.0 - f * 2.0) * f * f + 1.0;
-        set.pitch_scale *= k;
-        set.yaw_scale *= k;
-        set.horiz_scale *= k;
-        set.vert_scale *= k;
+        set.tilt_multiplier *= k;
+        set.turn_factor *= k;
+        set.sideways_factor *= k;
+        set.upward_factor *= k;
     }
-    let inv = 1.0 / (i.dt * 60.0);
-    let m = set.max_angle;
-    let dp = (angle_wrap180(i.view_angles[0] - st.last_view[0]) * inv).clamp(-m, m);
-    let dy = (angle_wrap180(i.view_angles[1] - st.last_view[1]) * inv).clamp(-m, m);
-    st.side = diff_track(dy * set.horiz_scale, st.side, set.lerp_speed, i.dt);
-    st.up = diff_track(dp * set.vert_scale, st.up, set.lerp_speed, i.dt);
-    st.angles[0] = diff_track_angle(dp * set.pitch_scale, st.angles[0], set.lerp_speed, i.dt);
-    st.angles[1] = diff_track_angle(dy * set.yaw_scale, st.angles[1], set.lerp_speed, i.dt);
-    st.last_view = i.view_angles;
+    let stow_kind = 1.0 / (i.dt * 60.0);
+    let m = set.widest_cone;
+    let dp = (angle_wrap180(i.look_rotation[0] - st.last_view[0]) * stow_kind).clamp(-m, m);
+    let dy = (angle_wrap180(i.look_rotation[1] - st.last_view[1]) * stow_kind).clamp(-m, m);
+    st.side = diff_track(dy * set.sideways_factor, st.side, set.ease_rate, i.dt);
+    st.up = diff_track(dp * set.upward_factor, st.up, set.ease_rate, i.dt);
+    st.angles[0] = diff_track_angle(dp * set.tilt_multiplier, st.angles[0], set.ease_rate, i.dt);
+    st.angles[1] = diff_track_angle(dy * set.turn_factor, st.angles[1], set.ease_rate, i.dt);
+    st.last_view = i.look_rotation;
 }
 
 /// The idle clock step (PM_UpdateSwayPrediction / BG_IncrementWeaponMovementIdleTime). The caller
@@ -729,8 +729,8 @@ pub fn step_idle_time(time: i32, s: &SpreadFacts, frac: f32, hold_breath: f32, d
     step_weapon_idle_time(t, s, frac, hold_breath, dt)
 }
 
-fn idle_speed(s: &SpreadFacts, frac: f32) -> f32 {
-    if s.aim_down_sight { lerp(s.hip_idle_speed, s.ads_idle_speed, frac) } else { s.hip_idle_speed }
+fn idle_speed(s: &SpreadFacts, amount: f32) -> f32 {
+    if s.scoped_aiming { lerp(s.hip_idle_speed, s.ads_idle_speed, amount) } else { s.hip_idle_speed }
 }
 
 /// BG_IncrementViewMovementIdleTime: the camera's step, scoped weapons only.
@@ -757,11 +757,11 @@ pub struct IdleClocks {
 }
 
 impl IdleClocks {
-    pub fn step(&mut self, s: &SpreadFacts, frac: f32, hold_breath: f32, dt: f32) -> i32 {
-        if frac != 0.0 {
-            self.ps = step_idle_time(self.ps, s, frac, hold_breath, dt);
+    pub fn step(&mut self, s: &SpreadFacts, pull: f32, hold_breath: f32, secs: f32) -> i32 {
+        if pull != 0.0 {
+            self.ps = step_idle_time(self.ps, s, pull, hold_breath, secs);
         } else {
-            self.hip = step_weapon_idle_time(self.hip, s, frac, hold_breath, dt);
+            self.hip = step_weapon_idle_time(self.hip, s, pull, hold_breath, secs);
             self.ps = self.hip;
         }
         self.ps
@@ -775,20 +775,20 @@ pub fn idle_angles(
     factor: &mut f32,
     s: &SpreadFacts,
     frac: f32,
-    prone: bool,
+    lying: bool,
     ducked: bool,
-    frametime: f32,
+    step_millis_elapsed: f32,
     idle_time: i32,
     d: &RecoilDvars,
 ) -> [f32; 3] {
     let mut amt = s.hip_idle_amount;
-    if s.aim_down_sight {
+    if s.scoped_aiming {
         amt = lerp(amt, s.ads_idle_amount, frac);
         if d.zero_idle_movement {
             amt = 0.0;
         }
     }
-    ease_idle_factor(factor, s, prone, ducked, frametime);
+    ease_idle_factor(factor, s, lying, ducked, step_millis_elapsed);
     let mut a = *factor * amt;
     if s.overlay {
         a *= 1.0 - frac;
@@ -798,15 +798,15 @@ pub fn idle_angles(
 }
 
 /// The stance factor eases toward 1 / crouch / prone at half a unit per second.
-fn ease_idle_factor(factor: &mut f32, s: &SpreadFacts, prone: bool, ducked: bool, frametime: f32) {
-    let target = if prone {
+fn ease_idle_factor(factor: &mut f32, s: &SpreadFacts, lying: bool, ducked: bool, step_millis_elapsed: f32) {
+    let target = if lying {
         s.idle_prone_factor
     } else if ducked {
         s.idle_crouch_factor
     } else {
         1.0
     };
-    let step = frametime * 0.5;
+    let step = step_millis_elapsed * 0.5;
     if *factor < target {
         *factor = (*factor + step).min(target);
     } else if *factor > target {
@@ -821,7 +821,7 @@ pub struct CameraIdleInput {
     /// Prone, and not diving (a dive keeps the standing factor).
     pub prone: bool,
     pub ducked: bool,
-    pub frametime: f32,
+    pub step_millis_elapsed: f32,
     pub idle_time: i32,
     pub hold_breath: f32,
     pub quick_scope_scale: f32,
@@ -836,7 +836,7 @@ pub fn camera_idle_angles(factor: &mut f32, s: &SpreadFacts, i: &CameraIdleInput
         return [0.0; 2];
     }
     let mut amt = s.hip_idle_amount;
-    if s.aim_down_sight {
+    if s.scoped_aiming {
         amt = lerp(amt, s.ads_idle_amount, i.frac);
         if d.zero_idle_movement {
             amt = 0.0;
@@ -844,7 +844,7 @@ pub fn camera_idle_angles(factor: &mut f32, s: &SpreadFacts, i: &CameraIdleInput
     } else if amt == 0.0 {
         amt = 80.0;
     }
-    ease_idle_factor(factor, s, i.prone, i.ducked, i.frametime);
+    ease_idle_factor(factor, s, i.prone, i.ducked, i.step_millis_elapsed);
     let mut a = *factor * amt * i.frac * i.hold_breath;
     if d.aqs && d.aqs_style == 1 {
         a *= i.quick_scope_scale;
@@ -899,13 +899,13 @@ impl QuickScope {
 /// What bob reads from the player.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct BobInput {
-    pub bob_cycle: i32,
-    pub xyspeed: f32,
+    pub sway_phase: i32,
+    pub ground_velocity: f32,
     pub waterlevel: i32,
-    /// Dive-to-prone in the air (pm_flags 0x200000).
+    /// Dive-to-prone in the air (movement_state_bits 0x200000).
     pub dtp: bool,
-    pub view_height_target: i32,
-    /// Sprinting (pm_flags 0x8000).
+    pub eye_height_goal: i32,
+    /// Sprinting (movement_state_bits 0x8000).
     pub sprinting: bool,
     pub frac: f32,
 }
@@ -917,11 +917,11 @@ fn gun_bob_amp(s: &SpreadFacts, i: &BobInput, m: f32, d: &RecoilDvars) -> [f32; 
     } else if i.dtp {
         let v = d.weapon_bob_dtp;
         [v[0] * m * s.dtp_bob[0], v[1] * m * s.dtp_bob[1]]
-    } else if i.view_height_target == 11 {
+    } else if i.eye_height_goal == 11 {
         let v = d.weapon_bob_prone;
         [v[0] * m, v[1] * m]
-    } else if i.view_height_target == 40 || !i.sprinting {
-        let v = if i.view_height_target == 40 { d.weapon_bob_ducked } else { d.weapon_bob_standing };
+    } else if i.eye_height_goal == 40 || !i.sprinting {
+        let v = if i.eye_height_goal == 40 { d.weapon_bob_ducked } else { d.weapon_bob_standing };
         let k = (1.0 - i.frac) * m;
         [k * v[0], k * v[1]]
     } else {
@@ -931,16 +931,16 @@ fn gun_bob_amp(s: &SpreadFacts, i: &BobInput, m: f32, d: &RecoilDvars) -> [f32; 
     [a[0].min(d.weapon_bob_max), a[1].min(d.weapon_bob_max)]
 }
 
-fn bob_vertical(th: f32, amp: f32) -> f32 {
-    ((th + th).sin() + (4.0 * th + 1.570_796_4).sin() * 0.2) * 0.75 * amp
+fn bob_vertical(th: f32, swing: f32) -> f32 {
+    ((th + th).sin() + (4.0 * th + 1.570_796_4).sin() * 0.2) * 0.75 * swing
 }
 
 /// BG_CalculateWeaponMovement_Bob: the gun's walk bob angles (pitch, yaw, roll).
 pub fn gun_bob(s: &SpreadFacts, i: &BobInput, d: &RecoilDvars) -> [f32; 3] {
-    let c = (i.bob_cycle & 0xff) as f32 * (1.0 / 255.0) * PI;
+    let c = (i.sway_phase & 0xff) as f32 * (1.0 / 255.0) * PI;
     let th = d.weapon_bob_lag * PI + c + c + 2.0 * PI + 2.0 * PI;
     let base = if s.laser_sight { d.weapon_bob_base_laser } else { d.weapon_bob_base };
-    let m = i.xyspeed * base;
+    let m = i.ground_velocity * base;
     let amp = gun_bob_amp(s, i, m, d);
     let roll_k = if s.laser_sight { d.weapon_bob_roll_laser } else { d.weapon_bob_roll };
     let roll_amp = gun_bob_amp(s, i, roll_k * m, d);
@@ -965,9 +965,9 @@ pub fn camera_bob(i: &BobInput, speed: f32, d: &RecoilDvars) -> [f32; 2] {
     } else {
         let v = if i.dtp {
             d.bob_dtp
-        } else if i.view_height_target == 11 {
+        } else if i.eye_height_goal == 11 {
             d.bob_prone
-        } else if i.view_height_target == 40 {
+        } else if i.eye_height_goal == 40 {
             [lerp(d.bob_ducked[0], d.bob_ducked_ads[0], i.frac), lerp(d.bob_ducked[1], d.bob_ducked_ads[1], i.frac)]
         } else if i.sprinting {
             d.bob_sprinting
@@ -976,7 +976,7 @@ pub fn camera_bob(i: &BobInput, speed: f32, d: &RecoilDvars) -> [f32; 2] {
         };
         [v[0] * speed, v[1] * speed]
     };
-    let c = (i.bob_cycle & 0xff) as f32 * (1.0 / 255.0) * PI;
+    let c = (i.sway_phase & 0xff) as f32 * (1.0 / 255.0) * PI;
     let th = c + c + 2.0 * PI;
     [th.sin() * a[0].min(d.bob_max), bob_vertical(th, a[1].min(d.bob_max))]
 }
@@ -988,7 +988,7 @@ pub struct MovementAnglesInput {
     pub base: [f32; 3],
     pub frac: f32,
     pub sway: [f32; 2],
-    pub leanf: f32,
+    pub tilt_sideways: f32,
     pub recoil: [f32; 2],
     pub bob: [f32; 3],
     pub idle: [f32; 3],
@@ -997,15 +997,13 @@ pub struct MovementAnglesInput {
 }
 
 pub fn weapon_movement_angles(i: &MovementAnglesInput) -> [f32; 3] {
-    let mut out = [0.0f32; 3];
-    let f = 1.0 - i.frac * 2.0;
-    if f > 0.0 {
-        out = [f * i.base[0], f * i.base[1], f * i.base[2]];
-    }
+    // The base offset fades out over the first half of the blend and stays at rest after it.
+    let fade = 1.0 - i.frac * 2.0;
+    let mut out = if fade > 0.0 { i.base.map(|axis| fade * axis) } else { [0.0; 3] };
     out[0] = angle_wrap180(out[0] - i.sway[0]);
     out[1] = angle_wrap180(out[1] - i.sway[1]);
-    if i.leanf != 0.0 {
-        let lean = (2.0 - i.leanf.abs()) * i.leanf;
+    if i.tilt_sideways != 0.0 {
+        let lean = (2.0 - i.tilt_sideways.abs()) * i.tilt_sideways;
         out[2] -= lean + lean;
     }
     out[0] += i.recoil[0];
@@ -1019,20 +1017,20 @@ pub fn weapon_movement_angles(i: &MovementAnglesInput) -> [f32; 3] {
 
 /// The landing dip offset (up), `ms` after landing: down over 150 ms, back up over the next 300.
 /// The camera uses scale 1; the gun uses [`gun_landing_scale`].
-pub fn landing_offset(ms: i32, dip: f32, scale: f32) -> f32 {
+pub fn touchdown_shift(ms: i32, dip: f32, factor: f32) -> f32 {
     if ms < 150 {
-        dip * scale * ms as f32 / 150.0
+        dip * factor * ms as f32 / 150.0
     } else if ms < 450 {
-        dip * scale * (450 - ms) as f32 / 300.0
+        dip * factor * (450 - ms) as f32 / 300.0
     } else {
         0.0
     }
 }
 
 /// The gun's landing scale: 0.25, easing to 0.02 while aiming with the rangefinder.
-pub fn gun_landing_scale(s: &SpreadFacts, frac: f32) -> f32 {
-    if s.rangefinder && frac > 0.0 {
-        (1.0 - frac) * 0.25 + frac * 0.02
+pub fn gun_landing_scale(s: &SpreadFacts, share: f32) -> f32 {
+    if s.rangefinder && share > 0.0 {
+        (1.0 - share) * 0.25 + share * 0.02
     } else {
         0.25
     }
@@ -1044,32 +1042,32 @@ mod tests {
 
     fn rifle() -> SpreadFacts {
         SpreadFacts {
-            stand_min: 3.0,
-            stand_max: 7.0,
-            ducked_min: 2.5,
-            ducked_max: 6.0,
-            prone_min: 2.0,
-            prone_max: 5.0,
-            decay_rate: 4.0,
-            fire_add: 0.6,
-            turn_add: 0.2,
-            move_add: 0.5,
-            ducked_decay: 1.05,
-            prone_decay: 1.1,
+            upright_narrowest: 3.0,
+            upright_widest: 7.0,
+            crouch_narrowest: 2.5,
+            crouch_widest: 6.0,
+            lying_narrowest: 2.0,
+            lying_widest: 5.0,
+            settle_rate: 4.0,
+            per_shot_bloom: 0.6,
+            turn_gain: 0.2,
+            motion_bloom: 0.5,
+            crouch_settle: 1.05,
+            lying_settle: 1.1,
             hip_min_scale: 1.0,
             hip_max_scale: 1.0,
-            ads_spread: 0.5,
+            aimed_cone: 0.5,
             reticle_min_ofs: 8,
             reticle_side_pos: 0.0,
-            hip_view_kick: KickRange { pitch_min: 1.0, pitch_max: 1.0, yaw_min: -0.5, yaw_max: -0.5 },
-            ads_view_kick: KickRange { pitch_min: 1.0, pitch_max: 1.0, yaw_min: 0.0, yaw_max: 0.0 },
-            ads_gun_kick: KickRange { pitch_min: 10.0, pitch_max: 10.0, yaw_min: 0.0, yaw_max: 0.0 },
-            hip_gun_kick: KickRange { pitch_min: 20.0, pitch_max: 20.0, yaw_min: 5.0, yaw_max: 5.0 },
+            hip_view_kick: KickRange { pitch_lower_bound: 1.0, pitch_upper_bound: 1.0, turn_floor: -0.5, turn_ceiling: -0.5 },
+            ads_view_kick: KickRange { pitch_lower_bound: 1.0, pitch_upper_bound: 1.0, turn_floor: 0.0, turn_ceiling: 0.0 },
+            ads_gun_kick: KickRange { pitch_lower_bound: 10.0, pitch_upper_bound: 10.0, turn_floor: 0.0, turn_ceiling: 0.0 },
+            hip_gun_kick: KickRange { pitch_lower_bound: 20.0, pitch_upper_bound: 20.0, turn_floor: 5.0, turn_ceiling: 5.0 },
             ads_center_speed: 1500.0,
             ads_center_speed_raw: 1500.0,
-            aim_down_sight: true,
-            gun_max_pitch: 6.0,
-            gun_max_yaw: 6.0,
+            scoped_aiming: true,
+            weapon_pitch_ceiling: 6.0,
+            weapon_yaw_ceiling: 6.0,
             ..Default::default()
         }
     }
@@ -1087,7 +1085,9 @@ mod tests {
         let d = RecoilDvars::default();
         let mut sc = 200.0;
         let mut ov = SpreadOverride::default();
-        let i = AimSpreadInput { frametime: 0.05, speed: 190, ..Default::default() };
+        let mut i = AimSpreadInput::default();
+        i.step_millis_elapsed = 0.05;
+        i.speed = 190;
         adjust_aim_spread_scale(&mut sc, &mut ov, &s, &i, &d);
         // 4/s decay x 0.05 s x 255 = 51
         assert!((sc - 149.0).abs() < 1e-3, "{sc}");
@@ -1099,10 +1099,16 @@ mod tests {
         let d = RecoilDvars::default();
         let mut ov = SpreadOverride::default();
         let mut sc = 0.0;
-        let air = AimSpreadInput { frametime: 0.05, in_air: true, speed: 190, ..Default::default() };
+        let mut air = AimSpreadInput::default();
+        air.step_millis_elapsed = 0.05;
+        air.in_air = true;
+        air.speed = 190;
         adjust_aim_spread_scale(&mut sc, &mut ov, &s, &air, &d);
         assert!((sc - 2.56 * 0.05 * 255.0).abs() < 1e-3, "{sc}");
-        let aimed = AimSpreadInput { frametime: 0.05, frac: 1.0, speed: 190, ..Default::default() };
+        let mut aimed = AimSpreadInput::default();
+        aimed.step_millis_elapsed = 0.05;
+        aimed.frac = 1.0;
+        aimed.speed = 190;
         adjust_aim_spread_scale(&mut sc, &mut ov, &s, &aimed, &d);
         assert_eq!(sc, 0.0);
     }
@@ -1110,16 +1116,20 @@ mod tests {
     #[test]
     fn fire_add_caps() {
         let s = rifle();
-        assert_eq!(add_firing_aim_spread(200.0, &s, 0.0), 255.0);
-        assert_eq!(add_firing_aim_spread(10.0, &s, 1.0), 10.0);
-        assert!((add_firing_aim_spread(10.0, &s, 0.5) - (10.0 + 0.6 * 255.0)).abs() < 1e-3);
+        assert_eq!(widen_cone_on_shot(200.0, &s, 0.0), 255.0);
+        assert_eq!(widen_cone_on_shot(10.0, &s, 1.0), 10.0);
+        assert!((widen_cone_on_shot(10.0, &s, 0.5) - (10.0 + 0.6 * 255.0)).abs() < 1e-3);
     }
 
     #[test]
     fn spread_by_height() {
         let s = rifle();
         let d = RecoilDvars::default();
-        let at = |h| spread_for_weapon(&s, &SpreadInput { view_height: h, ..Default::default() }, &d);
+        let at = |h| spread_for_weapon(&s, &{
+            let mut input = SpreadInput::default();
+            input.view_height = h;
+            input
+        }, &d);
         assert_eq!(at(60.0), (3.0, 7.0));
         assert_eq!(at(40.0), (2.5, 6.0));
         let (pmin, pmax) = at(11.0);
@@ -1141,48 +1151,50 @@ mod tests {
             now: 1000,
             charge_level: None,
             gas: false,
-            weaponstate: state::FIRING,
+            gun_phase: state::FIRING,
             weaponstate_left: 0,
         };
         fire_recoil(&mut k, &i, &mut seed, &d);
         assert_eq!(k.view_avel, [-1.0, -0.5, 0.25]);
-        assert_eq!(k.gun_speed, [20.0, 5.0]);
+        assert_eq!(k.gun_swing_rate, [20.0, 5.0]);
         assert_eq!(k.last_shot_ms, 1000);
     }
 
     #[test]
     fn view_kick_returns_to_zero() {
-        let mut k = KickState { view_avel: [-30.0, 0.0, 0.0], ..Default::default() };
+        let mut k = KickState::default();
+        k.view_avel = [-30.0, 0.0, 0.0];
         let mut min = 0.0f32;
         for _ in 0..200 {
             settle_view_kick(&mut k, 16, 1500.0);
-            min = min.min(k.view_angles[0]);
+            min = min.min(k.look_rotation[0]);
         }
         assert!(min < -0.1, "kicked up: {min}");
-        assert_eq!(k.view_angles[0], 0.0);
+        assert_eq!(k.look_rotation[0], 0.0);
         assert_eq!(k.view_avel[0], 0.0);
     }
 
     #[test]
     fn spring_rests() {
         let mut s = rifle();
-        s.hip_spring = crate::pm::spread::GunSpring { accel: 800.0, speed_max: 2000.0, speed_decay: 16.0, static_decay: 20.0 };
-        let mut k = KickState { gun_speed: [20.0, 5.0], ..Default::default() };
+        s.hip_spring = crate::pm::spread::GunSpring { speed_up_rate: 800.0, velocity_cap: 2000.0, velocity_falloff: 16.0, resting_falloff: 20.0 };
+        let mut k = KickState::default();
+        k.gun_swing_rate = [20.0, 5.0];
         gun_spring(&mut k, &s, 0.0, 0.005);
-        assert!((k.gun_angles[0] - 0.1).abs() < 1e-6, "first 5 ms step moves 20 deg/s x 0.005");
+        assert!((k.weapon_aim_angles[0] - 0.1).abs() < 1e-6, "first 5 ms step moves 20 deg/s x 0.005");
         for _ in 0..200 {
             gun_spring(&mut k, &s, 0.0, 0.016);
         }
-        assert_eq!(k.gun_angles, [0.0, 0.0]);
-        assert_eq!(k.gun_speed, [0.0, 0.0]);
+        assert_eq!(k.weapon_aim_angles, [0.0, 0.0]);
+        assert_eq!(k.gun_swing_rate, [0.0, 0.0]);
     }
 
     #[test]
     fn landing_shape() {
-        assert_eq!(landing_offset(0, -8.0, 1.0), 0.0);
-        assert_eq!(landing_offset(150, -8.0, 1.0), -8.0);
-        assert_eq!(landing_offset(300, -8.0, 0.25), -1.0);
-        assert_eq!(landing_offset(450, -8.0, 1.0), 0.0);
+        assert_eq!(touchdown_shift(0, -8.0, 1.0), 0.0);
+        assert_eq!(touchdown_shift(150, -8.0, 1.0), -8.0);
+        assert_eq!(touchdown_shift(300, -8.0, 0.25), -1.0);
+        assert_eq!(touchdown_shift(450, -8.0, 1.0), 0.0);
     }
 
     #[test]
@@ -1225,10 +1237,11 @@ mod tests {
     #[test]
     fn zero_idle_only_on_ads_weapons() {
         let s = SpreadFacts { hip_idle_amount: 100.0, ..scope() };
-        let d = RecoilDvars { zero_idle_movement: true, ..Default::default() };
+        let mut d = RecoilDvars::default();
+        d.zero_idle_movement = true;
         // A weapon that cannot aim keeps its drift.
         let mut f = 1.0;
-        let n = SpreadFacts { aim_down_sight: false, ..s };
+        let n = SpreadFacts { scoped_aiming: false, ..s };
         let hip = idle_angles(&mut f, &n, 0.0, false, false, 0.016, 2000, &d);
         assert!(hip[0] != 0.0);
         let mut f = 1.0;
@@ -1242,7 +1255,7 @@ mod tests {
         let d = RecoilDvars::default();
         let base = CameraIdleInput {
             frac: 1.0,
-            frametime: 0.016,
+            step_millis_elapsed: 0.016,
             idle_time: 1500,
             hold_breath: 1.0,
             quick_scope_scale: 1.0,
@@ -1261,7 +1274,7 @@ mod tests {
         assert!((p2 - p - 0.2).abs() < 1e-5, "{p2}");
         assert!((y2 - (y - 0.2 * (1.05f32).sin())).abs() < 1e-5, "{y2}");
         // A non-ADS scoped weapon with no idle amount drifts by 80.
-        let n = SpreadFacts { aim_down_sight: false, ..s };
+        let n = SpreadFacts { scoped_aiming: false, ..s };
         let [p3, _] = camera_idle_angles(&mut f, &n, &base, &d);
         assert!((p3 - (1.5f32).sin() * 0.8).abs() < 1e-5, "{p3}");
         // No scope picture: nothing.
@@ -1271,7 +1284,10 @@ mod tests {
 
     #[test]
     fn quickscope_rises_then_settles() {
-        let a = crate::pm::ads::AdsFacts { anti_quick_scope: true, aqs_time: 0.5, aqs_scale: 3.0, ..Default::default() };
+        let mut a = crate::pm::ads::AdsFacts::default();
+        a.anti_quick_scope = true;
+        a.aqs_time = 0.5;
+        a.aqs_scale = 3.0;
         let mut q = QuickScope::default();
         q.step(&a, 0.0, 0.5, 16);
         assert_eq!(q.timer, 500);

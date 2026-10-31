@@ -1,386 +1,448 @@
-//! The spawned world as the main world holds it.
+//! `LevelStage`: the loaded map as a main-world resource, plus the read-only
+//! queries other systems make against it (light regions, cells, probes).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
+use bevy::render::mesh::PrimitiveTopology;
 
-use super::dpvs::{WorldCull, WorldDpvs};
-use super::models::{
-    SmodelMarkCpu, WorldBatchGeometry, WorldDrawGeometry, WorldDynEntBrush, WorldDynEntInstance,
-    WorldLightmap, WorldScriptModelInstance, WorldSmodelLightingSample, WorldStaticModelInstance,
-    WorldStaticModelMesh,
+use super::dpvs::{LevelHide, LevelSight};
+use super::model_set::{
+    LevelBatchGeometry, LevelDebrisInstance, LevelDebrisSolid, LevelDrawGeometry, LevelLightbake,
+    StaticPropLightSample, FixedPropPlacement, LevelPropMesh, LevelScriptModelInstance, PropStainCpu,
 };
-use super::{LightAttenuationBind, T5LightFalloffPack, WorldCameraPose};
-use crate::assemble::drawsurf::{DynamicLightBind, RuntimeMaterialCatalog};
+use super::{LegacyFalloffParams, LightFalloffBind, WorldEyePlacement};
+use crate::assemble::draw_items::{DynamicLightBind, LiveMaterialLedger};
 
-pub const SMODEL_LIGHTING_MAX_CLIENT_VIEWS: u32 = 1;
+/// How many client views the model-lighting atlas is sized for.
+pub const PROP_ILLUM_MAX_CLIENT_VIEWS: u32 = 1;
 
-/// The map's directional (sun) primary light as the material side reads it.
+/// Vision presets by name; a preset that failed to decode keeps its error.
+
+
+/// The sun: the one directional primary light, in the form material
+/// constants are filled from.
 #[derive(Clone, Copy, Debug, Resource)]
-pub struct MapDirPrimaryLight {
-    pub light_type: u8,
+pub struct MapDirKeyLight {
+    pub light_kind: u8,
     pub direction: [f32; 3],
     pub color: [f32; 3],
-    pub diffuse_color_scale: f32,
-    pub specular_color_scale: f32,
-    pub t5_diffuse_color: Option<[f32; 4]>,
-    pub t5_specular_color: Option<[f32; 4]>,
+    /// Gain applied to `color` for the diffuse term when no classic colour is set.
+    pub diffuse_gain: f32,
+    /// Gain applied to `color` for the specular term when no classic colour is set.
+    pub specular_gain: f32,
+    pub classic_diffuse_color: Option<[f32; 4]>,
+    pub classic_specular_color: Option<[f32; 4]>,
 }
 
 #[derive(Resource, Default)]
-pub struct WorldScene {
-    pub sky_model: Option<WorldStaticModelMesh>,
-    pub batches: Vec<WorldBatchGeometry>,
-    pub runtime_material_catalog: Arc<RuntimeMaterialCatalog>,
-    pub exact_material_images: Vec<Option<Arc<Image>>>,
+pub struct LevelStage {
+    // --- draw batches and materials ---
+    pub sky_dome_model: Option<LevelPropMesh>,
+    pub batches: Vec<LevelBatchGeometry>,
+    pub live_material_ledger: Arc<LiveMaterialLedger>,
+    pub precise_material_images: Vec<Option<Arc<Image>>>,
     pub common_profile_id: u64,
     pub products_id: u64,
     pub exact_material_common: Vec<bool>,
-    /// Which prepared variant each of those images is, where it came from a
-    /// decode plan. Two slots carrying the same variant hold byte-identical
-    /// images under the same sampler and colour space, so the upload gives
-    /// them one asset and a cloned handle instead of two textures.
+    /// The decoded variant behind each image slot, when known. Equal variants
+    /// mean equal bytes, sampler and colour space, so the uploader shares one
+    /// texture between those slots.
     pub exact_material_variants: Vec<Option<asset_material::ImageVariantId>>,
-    pub exact_material_names: Vec<String>,
-    pub lightmaps: Vec<Option<WorldLightmap>>,
-    pub reflection_probes: Vec<Option<Image>>,
-    pub reflection_probe_origins: Vec<[f32; 3]>,
-    pub static_model_meshes: Vec<WorldStaticModelMesh>,
-    pub smodel_mesh_names: Vec<String>,
-    pub script_brush_gameobjects: Vec<String>,
-    pub script_brush_exploders: Vec<String>,
-    pub script_brush_targetnames: Vec<String>,
-    pub script_brush_models: Vec<asset_world::ScriptBrushModelPlacement>,
-    pub static_model_instances: Vec<Option<WorldStaticModelInstance>>,
-    pub smodel_mark_cpu: Option<SmodelMarkCpu>,
-    pub map_xmodel_scene_assets: asset_world::MapXModelSceneCatalog,
-    pub script_model_instances: Vec<WorldScriptModelInstance>,
-    pub dyn_ent_instances: Vec<WorldDynEntInstance>,
-    pub dyn_ent_brush_n: usize,
-    pub dyn_ent_brushes: Vec<WorldDynEntBrush>,
-    pub smodel_lighting_samples: Vec<WorldSmodelLightingSample>,
-    pub light_grid: Option<asset_model::OwnedLightGrid>,
-    pub model_lighting_image: Option<Handle<Image>>,
-    pub model_lighting_dims: Option<lighting_t6::ModelLightingAtlasDims>,
-    pub center: Vec3,
-    pub radius: f32,
-    pub world_bounds: Option<[f32; 6]>,
-    pub cull: Option<WorldCull>,
-    pub intermission_view: Option<WorldCameraPose>,
+    pub precise_material_names: Vec<String>,
+    pub lightmaps: Vec<Option<LevelLightbake>>,
+    /// Cube images for the reflection probes; taken by the image upload.
+    pub env_probe_images: Vec<Option<Image>>,
+    pub env_probe_origins: Vec<[f32; 3]>,
+
+    // --- static and scripted models ---
+    pub prop_meshes: Vec<LevelPropMesh>,
+    pub prop_mesh_names: Vec<String>,
+    pub script_solid_gameobjects: Vec<String>,
+    pub script_solid_exploders: Vec<String>,
+    pub script_solid_targetnames: Vec<String>,
+    pub script_solid_models: Vec<asset_world::ScriptSolidPlacementInfo>,
+    pub prop_instances: Vec<Option<FixedPropPlacement>>,
+    pub smodel_mark_cpu: Option<PropStainCpu>,
+    pub map_figure_stage_assets: asset_world::LevelModelPlacementRoster,
+    pub scripted_prop_placements: Vec<LevelScriptModelInstance>,
+    pub debris_instances: Vec<LevelDebrisInstance>,
+    pub debris_solid_tally: usize,
+    pub debris_solids: Vec<LevelDebrisSolid>,
+    pub prop_illum_samples: Vec<StaticPropLightSample>,
+    pub light_grid: Option<asset_model::DetachedLightGrid>,
+    pub model_illum_image: Option<Handle<Image>>,
+    pub model_illum_dims: Option<lighting_t6::ModelIllumAtlasDims>,
+
+    // --- extent, culling, cameras ---
+    pub mid: Vec3,
+    pub rad: f32,
+    pub level_bounds: Option<[f32; 6]>,
+    pub culling: Option<LevelHide>,
+    pub scoreboard_eye: Option<WorldEyePlacement>,
     pub t6_glass: Option<asset_world::T6Glass>,
+
+    // --- vertex streams kept on the CPU side ---
     pub retained_packed_vertices: asset_world::WorldVertexPayload,
-    pub retained_vertex_layer: Vec<u8>,
-    pub surface_vertex_layer: Vec<i32>,
-    pub surface_first_vertex: Vec<u32>,
-    pub retained_positions: Vec<[f32; 3]>,
-    pub retained_normals: Vec<[f32; 3]>,
-    pub retained_tangents: Vec<[f32; 4]>,
-    pub retained_colors: Vec<[f32; 4]>,
-    pub retained_texture_uvs: Vec<[f32; 2]>,
-    pub retained_lightmap_uvs: Vec<[f32; 2]>,
-    /// See `asset_world::WorldDraw::t6_layer_uvs`.
+    pub held_vertex_layer: Vec<u8>,
+    pub facet_vertex_layer: Vec<i32>,
+    pub facet_first_vertex: Vec<u32>,
+    pub held_positions: Vec<[f32; 3]>,
+    pub held_normals: Vec<[f32; 3]>,
+    pub held_tangents: Vec<[f32; 4]>,
+    pub held_colors: Vec<[f32; 4]>,
+    pub held_texture_uvs: Vec<[f32; 2]>,
+    pub held_lightbake_uvs: Vec<[f32; 2]>,
+    /// Same layout as `asset_world::LevelDrawCall::t6_layer_uvs`.
     pub retained_t6_layer_uvs: Vec<[f32; 4]>,
-    pub exp_fog: Option<asset_world::ExpFog>,
-    pub film_vision: Option<asset_world::FilmVision>,
-    pub film_visions:
-        BTreeMap<String, Result<asset_world::FilmVision, asset_world::FilmVisionParseError>>,
-    pub createart_name: Option<String>,
-    pub dir_primary_light: Option<MapDirPrimaryLight>,
-    pub t5_sun_parse_exposure: Option<f32>,
-    pub t5_sky_dynamic_intensity: Option<[f32; 4]>,
-    /// The map's `sm_sunSampleSizeNear`: units per texel of the near sun-shadow
-    /// partition; 0 means not set.
+
+    // --- look: haze, grading, sun ---
+    pub exp_haze: Option<asset_world::ExpHaze>,
+    pub colour_grade: Option<asset_world::ScreenGradeLook>,
+    pub film_visions: BTreeMap<String, Result<asset_world::ScreenGradeLook, asset_world::GradeVisionDecodeFault>>,
+    pub art_profile_name: Option<String>,
+    pub dir_key_light: Option<MapDirKeyLight>,
+    pub classic_daylight_parse_exposure: Option<f32>,
+    pub classic_sky_dynamic_intensity: Option<[f32; 4]>,
+    /// Near sun-shadow partition texel size in world units (0 = map left it unset).
     pub t6_sun_sample_size_near: f32,
-    pub t5_exposure_volume_count: u32,
-    /// See `asset_world::WorldDraw::t6_lights`.
+    pub classic_exposure_volume_tally: u32,
+    /// bo2zm: see `asset_world::LevelDrawCall::t6_vision_saturation`.
+    pub t6_vision_saturation: Option<f32>,
+    /// bo2zm: see `asset_world::LevelDrawCall::t6_sky_parms`.
+    pub t6_sky_parms: Option<[f32; 2]>,
+    /// bo2zm: see `asset_world::LevelDrawCall::t6_vision_grade`.
+    pub t6_vision_grade: Option<[[f32; 4]; 14]>,
+    /// bo2zm: the map's own grade as loaded, and the visions a script can
+    /// turn on (`adapters::t6_vision` picks among them).
+    pub t6_vision_grade_loaded: Option<[[f32; 4]; 14]>,
+    pub t6_script_grades: Arc<Vec<(String, [[f32; 4]; 14])>>,
+
+    // --- light tables ---
+    /// Same layout as `asset_world::LevelDrawCall::t6_lights`.
     pub t6_lights: Arc<Vec<[f32; 16]>>,
-    /// See `asset_world::WorldDraw::t6_fog_banks`: the table as loaded
-    /// (`t6_lights` may carry another bank's fog), and the bank shown
-    /// (0 is the map's own).
-    pub t6_fog_banks: Vec<(u32, [[f32; 16]; 2])>,
+    /// Every fog bank the map ships (layout as in
+    /// `asset_world::LevelDrawCall::t6_fog_banks`). `t6_lights_loaded` is the
+    /// light table untouched, since `t6_lights` can be patched with another
+    /// bank's fog; `t6_fog_bank` names the bank on screen, 0 being the map's.
+    pub t6_fog_banks: Vec<asset_world::T6FogVolume>,
+    /// bo2zm: see `asset_world::LevelDrawCall::t6_fog_modifiers`.
+    pub t6_fog_modifiers: Vec<asset_world::T6FogModifier>,
     pub t6_lights_loaded: Arc<Vec<[f32; 16]>>,
+    /// bo2zm: see `asset_world::LevelDrawCall::t6_flicker`.
+    pub t6_flicker: Vec<asset_world::T6Flicker>,
     pub t6_fog_bank: u32,
-    /// See `asset_world::WorldDraw::t6_probes`.
+    /// bo2zm: see `asset_world::LevelDrawCall::t6_exposure_volumes`.
+    pub t6_exposure_volumes: Arc<Vec<asset_world::T6ExposureVolume>>,
+    /// bo2zm: see `asset_world::LevelDrawCall::t6_lut` and `t6_lut_volumes`.
+    pub t6_lut: Option<Arc<asset_world::T6Lut>>,
+    pub t6_lut_volumes: Arc<Vec<asset_world::T6LutVolume>>,
+    /// bo2zm: the colour tables drawn this frame (`adapters::t6_lut`): the
+    /// first rows of tables A and B, A's weight, 1 when the map has them.
+    pub t6_lut_pick: [f32; 4],
+    /// bo2zm: the table a client script forces (`setlutscriptindex`), if any.
+    pub t6_lut_script: Option<u32>,
+    /// bo2zm: see `asset_world::LevelDrawCall::t6_light_tweaks`.
+    pub t6_light_tweaks: Option<asset_world::T6LightTweaks>,
+    /// bo2zm: this frame's sun and sky multipliers (`adapters::t6_light_tweaks`):
+    /// the scripts' sun colour times light over the map's (red, green, blue),
+    /// and the sky intensity blend.
+    pub t6_sun_sky_scale: [f32; 4],
+    /// Same layout as `asset_world::LevelDrawCall::t6_probes`.
     pub t6_probes: Arc<Vec<[[f32; 4]; 3]>>,
-    pub primary_light_types: Vec<u8>,
-    pub primary_light_cull: Vec<lighting_t6::PrimaryLightCull>,
-    pub primary_light_pack: Vec<lighting_t6::GfxLightPack>,
-    pub primary_light_attenuation: Vec<LightAttenuationBind>,
+    pub key_light_types: Vec<u8>,
+    pub key_light_hide: Vec<lighting_t6::LampReach>,
+    pub key_light_pack: Vec<lighting_t6::LampRecord>,
+    pub key_light_attenuation: Vec<LightFalloffBind>,
     pub dynamic_light: Option<DynamicLightBind>,
-    pub primary_light_def_names: Vec<Option<String>>,
-    pub primary_light_t5_falloff: Vec<T5LightFalloffPack>,
-    pub sun_primary_light_count: u32,
-    pub light_region_hulls: Option<Vec<Vec<asset_world::WorldLightRegionHull>>>,
-    pub shadow_geometry: Vec<asset_world::WorldShadowGeometry>,
-    pub outdoor_image: Option<u32>,
-    pub outdoor_lookup: [u32; 16],
+    pub key_light_def_names: Vec<Option<String>>,
+    pub key_light_classic_falloff: Vec<LegacyFalloffParams>,
+    pub daylight_key_light_tally: u32,
+    pub light_zone_hulls: Option<Vec<Vec<asset_world::LevelLightZoneHull>>>,
+    pub shadow_geometry: Vec<asset_world::LevelShadowMesh>,
+    pub openair_image: Option<u32>,
+    pub openair_lookup: [u32; 16],
     pub sun_effects: Option<render_frame::SunEffectsDef>,
+
+    // --- bookkeeping ---
     pub spawned: bool,
-    pub asset_ref: asset_material::AssetRefDumpCensus,
+    pub asset_ref: asset_material::AssetPointerDumpTally,
 }
 
-/// Borrowed views of the light-region hulls, the shape `lighting_t6` walks.
-fn hull_views(
-    lists: &[Vec<asset_world::WorldLightRegionHull>],
-) -> Vec<Vec<lighting_t6::LightRegionHull<'_>>> {
-    lists
-        .iter()
-        .map(|list| {
-            list.iter()
-                .map(|hull| lighting_t6::LightRegionHull {
-                    kdop_mid: hull.kdop_mid,
-                    kdop_half: hull.kdop_half,
-                    axes: &hull.axes,
-                })
-                .collect()
-        })
-        .collect()
+/// The borrowed hull shape `lighting_t6` walks, for one stored hull.
+fn borrow_hull(stored: &asset_world::LevelLightZoneHull) -> lighting_t6::LightVolumeHull<'_> {
+    lighting_t6::LightVolumeHull {
+        bounds_center_point: stored.bounds_center_point,
+        bounds_half_extent: stored.bounds_half_extent,
+        axes: &stored.axes,
+    }
 }
 
-impl WorldScene {
-    /// An empty scene sized to the given world bounds.
-    fn around(min: [f32; 3], max: [f32; 3]) -> Self {
-        let (min, max) = (Vec3::from_array(min), Vec3::from_array(max));
-        WorldScene {
-            center: (min + max) * 0.5,
-            radius: ((max - min).length() * 0.5).max(1.0),
-            ..Default::default()
+/// An empty mesh that lives only in the main world; batches keep it as a
+/// stand-in once their real geometry has gone to the GPU side.
+fn hollow_mesh() -> Mesh {
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::MAIN_WORLD)
+}
+
+impl LevelStage {
+    /// A stage with nothing in it but the extent of the box `lo..hi`. The
+    /// radius never drops below one unit.
+    fn spanning(lo: [f32; 3], hi: [f32; 3]) -> Self {
+        let (lo, hi) = (Vec3::from_array(lo), Vec3::from_array(hi));
+        let diagonal = hi - lo;
+        Self {
+            mid: (lo + hi) * 0.5,
+            rad: f32::max(diagonal.length() / 2.0, 1.0),
+            t6_sun_sky_scale: [1.0; 4],
+            ..Self::default()
         }
     }
 
-    /// A one-batch placeholder world: just a mesh and its bounds.
-    pub fn from_bounds(mesh: Mesh, min: [f32; 3], max: [f32; 3]) -> Self {
-        WorldScene {
-            batches: vec![WorldBatchGeometry {
-                mesh,
-                packed_indices: Vec::new(),
-                material: None,
-                lightmapped: false,
-                lightmap_index: 0,
-                primary_light_index: 0,
-                reflection_probe_index: 0,
-                sun: None,
-            }],
-            retained_packed_vertices: asset_world::WorldVertexPayload::Unavailable {
-                source_layout: "synthetic bounds mesh",
-            },
-            ..Self::around(min, max)
-        }
+    /// A stand-in stage made of a single unlit batch holding `mesh`.
+    pub fn from_bounds(shape: Mesh, lo: [f32; 3], hi: [f32; 3]) -> Self {
+        let material = None;
+        let only_batch = LevelBatchGeometry {
+            mesh_h: shape,
+            compact_indices: Vec::new(),
+            material,
+            lmapped: false,
+            lightbake_index: 0,
+            key_light_index: 0,
+            env_probe_index: 0,
+            sun: None,
+        };
+        let mut stage = Self::spanning(lo, hi);
+        stage.batches.push(only_batch);
+        stage.retained_packed_vertices = asset_world::WorldVertexPayload::Unavailable {
+            origin_layout: "synthetic bounds mesh",
+        };
+        stage
     }
 
-    /// The scene for loaded world geometry. Batch meshes are emptied here: the
-    /// GPU copy is built elsewhere and the main world keeps only the arrays.
-    pub fn from_draw(
-        draw: WorldDrawGeometry,
-        min: [f32; 3],
-        max: [f32; 3],
-        dpvs: WorldDpvs,
-        intermission_view: Option<WorldCameraPose>,
+    /// Takes ownership of the loaded map geometry. The per-batch meshes and
+    /// index lists are dropped right away (the GPU copy is built from the
+    /// shared arrays instead); the surface tables move into the cull state.
+    pub fn from_geometry(
+        geometry: LevelDrawGeometry,
+        lo: [f32; 3],
+        hi: [f32; 3],
+        sight: LevelSight,
+        scoreboard_eye: Option<WorldEyePlacement>,
     ) -> Self {
-        let WorldDrawGeometry {
+        let LevelDrawGeometry {
             mut batches,
             lightmaps,
-            reflection_probes,
-            packed_vertices,
-            vertex_layer,
-            surface_vertex_layer,
-            surface_first_vertex,
-            surface_draw_fields,
-            positions,
-            normals,
-            tangents,
+            reflect_probes: env_probe_images,
+            compact_vertices,
+            vertex_tier,
+            facet_vertex_layer,
+            facet_first_vertex,
+            facet_draw_fields,
+            pos_list: positions,
+            surface_directions,
+            tangent_list: tangents,
             colors,
-            texture_uvs,
-            lightmap_uvs,
+            texture_coords,
+            lightbake_uvs,
             t6_layer_uvs,
-            packed_indices,
-            surface_index_ranges,
-            surface_batch_ranges,
-            surface_materials,
-            surface_lightmap_indices,
-            surface_reflection_probes,
-            surface_primary_lights,
-            sort_key_distortion,
-            surface_sort_keys,
+            compact_indices,
+            facet_index_ranges,
+            facet_batch_ranges,
+            facet_materials,
+            facet_lightbake_indices,
+            facet_env_probes,
+            facet_key_lights,
+            warp_sort_key,
+            facet_sort_keys,
             capture,
-            brush_models,
-            brush_model_bounds,
-            bmodel_world_from_local,
+            solid_models,
+            solid_model_bounds,
+            solid_model_level_from_local,
             t6_brush_surfaces,
-            static_model_meshes,
-            static_model_instances,
-            map_xmodel_scene_assets,
-            script_model_instances,
-            smodel_lighting_samples,
-        } = draw;
+            prop_meshes,
+            prop_instances,
+            map_figure_stage_assets,
+            scripted_prop_placements,
+            prop_illum_samples,
+        } = geometry;
 
-        let batch_lightmapped: Vec<bool> = batches.iter().map(|batch| batch.lightmapped).collect();
-        let batch_count = batches.len() as u32;
-        for batch in &mut batches {
-            batch.mesh = Mesh::new(
-                bevy::render::mesh::PrimitiveTopology::TriangleList,
-                bevy::asset::RenderAssetUsages::MAIN_WORLD,
-            );
-            batch.packed_indices.clear();
+        let mut lit_flags = Vec::with_capacity(batches.len());
+        for batch in batches.iter_mut() {
+            lit_flags.push(batch.lmapped);
+            batch.mesh_h = hollow_mesh();
+            batch.compact_indices = Vec::new();
         }
 
-        let cull = WorldCull {
-            packed_indices,
-            surface_index_ranges,
-            surface_draw_fields,
-            surface_batch_ranges,
-            surface_materials,
-            surface_lightmap_indices,
-            surface_reflection_probes,
-            surface_primary_lights,
-            sort_key_distortion,
-            surface_sort_keys,
+        let hide = LevelHide {
+            compact_indices,
+            facet_index_ranges,
+            facet_draw_fields,
+            facet_batch_ranges,
+            facet_materials,
+            facet_lightbake_indices,
+            facet_env_probes,
+            facet_key_lights,
+            warp_sort_key,
+            facet_sort_keys,
             capture,
-            brush_models,
-            brush_model_bounds,
-            bmodel_world_from_local,
+            solid_models,
+            solid_model_bounds,
+            solid_model_level_from_local,
             t6_brush_surfaces,
-            dpvs,
-            batch_count,
-            batch_lightmapped,
-            surface_vis: Vec::new(),
-            draw_items: Vec::new(),
+            dpvs: sight,
+            batches_n: u32::try_from(lit_flags.len()).unwrap_or(u32::MAX),
+            batch_lightbaked: lit_flags,
+            // Per-frame working state starts empty.
+            facet_vis: Vec::new(),
+            draw_batch_list: Vec::new(),
             item_surfs: Vec::new(),
-            bsp_run_scratch: Vec::new(),
-            draw_items_id: 0,
-            g0_surfs: Vec::new(),
-            static_model_entities: Vec::new(),
-            static_model_cull_dists: Vec::new(),
-            smodel_vis: Vec::new(),
-            cell_vis: Vec::new(),
-            cell_vis_all: false,
+            level_tree_run_scratch: Vec::new(),
+            draw_batch_list_id: 0,
+            g0_facets: Vec::new(),
+            prop_entities: Vec::new(),
+            prop_hide_dists: Vec::new(),
+            prop_vis: Vec::new(),
+            room_vis: Vec::new(),
+            room_vis_all: false,
         };
 
-        WorldScene {
-            batches,
-            lightmaps,
-            reflection_probes,
-            static_model_meshes,
-            static_model_instances,
-            map_xmodel_scene_assets,
-            script_model_instances,
-            smodel_lighting_samples,
-            retained_packed_vertices: packed_vertices,
-            retained_vertex_layer: vertex_layer,
-            surface_vertex_layer,
-            surface_first_vertex,
-            retained_positions: positions,
-            retained_normals: normals,
-            retained_tangents: tangents,
-            retained_colors: colors,
-            retained_texture_uvs: texture_uvs,
-            retained_lightmap_uvs: lightmap_uvs,
-            retained_t6_layer_uvs: t6_layer_uvs,
-            cull: Some(cull),
-            intermission_view,
-            ..Self::around(min, max)
-        }
+        let mut stage = Self::spanning(lo, hi);
+        stage.batches = batches;
+        stage.lightmaps = lightmaps;
+        stage.env_probe_images = env_probe_images;
+        stage.prop_meshes = prop_meshes;
+        stage.prop_instances = prop_instances;
+        stage.map_figure_stage_assets = map_figure_stage_assets;
+        stage.scripted_prop_placements = scripted_prop_placements;
+        stage.prop_illum_samples = prop_illum_samples;
+        stage.retained_packed_vertices = compact_vertices;
+        stage.held_vertex_layer = vertex_tier;
+        stage.facet_vertex_layer = facet_vertex_layer;
+        stage.facet_first_vertex = facet_first_vertex;
+        stage.held_positions = positions;
+        stage.held_normals = surface_directions;
+        stage.held_tangents = tangents;
+        stage.held_colors = colors;
+        stage.held_texture_uvs = texture_coords;
+        stage.held_lightbake_uvs = lightbake_uvs;
+        stage.retained_t6_layer_uvs = t6_layer_uvs;
+        stage.culling = Some(hide);
+        stage.scoreboard_eye = scoreboard_eye;
+        stage
     }
 
-    /// Bakes each surface's packed draw-surf from its material.
-    pub(crate) fn stamp_surface_materials(
-        cull: &mut WorldCull,
-        catalog: &RuntimeMaterialCatalog,
-    ) -> Result<(), asset_world::SurfaceMaterialStampError> {
-        let baked: Vec<Option<dpvs_t6::GfxDrawSurf>> = catalog
-            .materials
+    /// Writes every surface's packed sort word, taken from the material it
+    /// uses, into the level snapshot.
+    pub(crate) fn stamp_facet_materials(
+        hide: &mut LevelHide,
+        ledger: &LiveMaterialLedger,
+    ) -> Result<(), asset_world::FacetMaterialStampError> {
+        let LevelHide { facet_materials, facet_key_lights, capture, .. } = hide;
+        let mats = &ledger.materials;
+        let sort_word_by_material: Vec<Option<dpvs_t6::SortedDraw>> = mats
             .iter()
-            .map(|material| material.baked_draw_surf.map(dpvs_t6::GfxDrawSurf::from_packed))
+            .map(|entry| entry.baked_facet_draw.map(dpvs_t6::SortedDraw::unpack_from_bits))
             .collect();
-        let slots: Vec<Option<usize>> = cull
-            .surface_materials
-            .iter()
-            .map(|id| id.map(|index| index.order()))
-            .collect();
-        asset_world::stamp_packed_surface_materials(
-            &slots,
-            &cull.surface_primary_lights,
-            &baked,
-            &mut cull.capture,
+        let material_slot_by_facet: Vec<Option<usize>> =
+            facet_materials.iter().map(|slot| slot.map(|material| material.order())).collect();
+        asset_world::stamp_compact_facet_materials(
+            &material_slot_by_facet,
+            facet_key_lights,
+            &sort_word_by_material,
+            capture,
         )
     }
 
-    pub fn dyn_atpoint_lookup_fallback(&self, mid: [f32; 3], box_half: Option<[f32; 3]>) -> u8 {
-        self.dyn_atpoint_walk_trace(mid, box_half)
-            .map_or(lighting_t6::LIGHT_GRID_ATPOINT_EMPTY_PRIMARY, |trace| {
-                trace.walk as u8
-            })
+    /// The secondary-light walk result for a box, as a byte; when the walk
+    /// cannot run (no box, or no light regions) the vacant-sun value is used.
+    pub fn loose_at_spot_lookup_fallback(&self, mid: [f32; 3], half_extent: Option<[f32; 3]>) -> u8 {
+        match self.loose_at_spot_walk_trace(mid, half_extent) {
+            Some(log) => log.first_hit as u8,
+            None => lighting_t6::GRID_SAMPLE_VACANT_SUN_BAND,
+        }
     }
 
-    pub fn publish_dyn_atpoint(&self, lookup: &mut render_scene::DynAtPointLookup) {
-        lookup.replace(
-            self.primary_light_cull.clone(),
-            self.sun_primary_light_count,
-            self.light_region_hulls.clone(),
-        );
+    /// Copies what the at-spot light lookup needs into the shared resource.
+    pub fn publish_loose_at_spot(&self, target: &mut render_scene::LooseAtSpotLookup) {
+        let culls = self.key_light_hide.clone();
+        let regions = self.light_zone_hulls.clone();
+        target.load(culls, self.daylight_key_light_tally, regions);
     }
 
-    pub fn publish_dpvs_cells(&self, cells: &mut render_scene::WorldDpvsCells) {
-        let Some(cull) = self.cull.as_ref() else {
-            *cells = render_scene::WorldDpvsCells::default();
-            return;
-        };
-        cells.planes.clone_from(&cull.dpvs.planes);
-        cells.nodes.clone_from(&cull.dpvs.nodes);
-        cells.cell_count = cull.dpvs.cell_count;
+    /// Copies the cell tree into the shared resource, or empties it when the
+    /// stage has no cull data.
+    pub fn publish_sight_rooms(&self, rooms: &mut render_scene::LevelSightRooms) {
+        match &self.culling {
+            Some(hide) => {
+                let tree = &hide.dpvs;
+                rooms.planes.clone_from(&tree.plane_set);
+                rooms.knots.clone_from(&tree.node_list);
+                rooms.cells_in = tree.cells_n;
+            }
+            None => *rooms = render_scene::LevelSightRooms::default(),
+        }
     }
 
-    /// Runs `f` over the light-region hulls, or `None` when the map has none.
-    pub fn with_light_region_hulls<R>(
+    /// Hands `visit` the light-region hulls in borrowed form (`None` when the
+    /// map defines no regions) and returns what it returns.
+    pub fn with_light_zone_hulls<R>(
         &self,
-        f: impl FnOnce(Option<&[lighting_t6::LightRegionHulls<'_>]>) -> R,
+        visit: impl FnOnce(Option<&[lighting_t6::LightVolumeHullList<'_>]>) -> R,
     ) -> R {
-        let Some(lists) = self.light_region_hulls.as_ref() else {
-            return f(None);
+        let Some(stored) = self.light_zone_hulls.as_deref() else {
+            return visit(None);
         };
-        let hulls = hull_views(lists);
-        let regions: Vec<lighting_t6::LightRegionHulls<'_>> =
-            hulls.iter().map(Vec::as_slice).collect();
-        f(Some(&regions))
+        let borrowed: Vec<Vec<lighting_t6::LightVolumeHull<'_>>> = stored
+            .iter()
+            .map(|region| region.iter().map(borrow_hull).collect())
+            .collect();
+        let region_slices: Vec<lighting_t6::LightVolumeHullList<'_>> =
+            borrowed.iter().map(Vec::as_slice).collect();
+        visit(Some(region_slices.as_slice()))
     }
 
-    pub fn dyn_atpoint_walk_trace(
+    /// Runs the secondary-light walk for the box at `mid`. `None` without a
+    /// box or without light regions.
+    pub fn loose_at_spot_walk_trace(
         &self,
         mid: [f32; 3],
-        box_half: Option<[f32; 3]>,
-    ) -> Option<lighting_t6::NonSunPrimaryWalkTrace> {
-        let half = box_half?;
-        let hulls = hull_views(self.light_region_hulls.as_ref()?);
-        let regions: Vec<lighting_t6::LightRegionHulls<'_>> =
-            hulls.iter().map(Vec::as_slice).collect();
-        Some(lighting_t6::non_sun_primary_light_walk_trace(
-            &self.primary_light_cull,
-            self.sun_primary_light_count,
-            Some(&regions),
-            mid,
-            half,
-        ))
+        half_extent: Option<[f32; 3]>,
+    ) -> Option<lighting_t6::SecondaryLightWalkLog> {
+        let extent = half_extent?;
+        self.with_light_zone_hulls(|regions| {
+            regions.map(|regions| {
+                lighting_t6::secondary_main_light_walk_trace(
+                    &self.key_light_hide,
+                    self.daylight_key_light_tally,
+                    Some(regions),
+                    mid,
+                    extent,
+                )
+            })
+        })
     }
 
-    /// The reflection probe nearest `origin`, preferring the ones listed for the
-    /// cell the point stands in.
-    pub fn reflection_probe_for_lighting_origin(&self, origin: [f32; 3]) -> u8 {
-        let origins = self.reflection_probe_origins.as_slice();
-        let cell = self.cull.as_ref().and_then(|cull| {
-            let dpvs = &cull.dpvs;
-            let planes = dpvs_t6::DpvsPlanes {
-                planes: &dpvs.planes,
-                nodes: &dpvs.nodes,
-                cell_count: dpvs.cell_count as u32,
+    /// Picks the reflection probe for a lighting origin: among the probes the
+    /// containing cell lists when the point lands in a cell, otherwise the
+    /// nearest of all probes (slot 0 excluded).
+    pub fn env_probe_for_illum_origin(&self, pos: [f32; 3]) -> u8 {
+        let all_origins = &self.env_probe_origins[..];
+        let cell_candidates = self.culling.as_ref().and_then(|hide| {
+            let box_tree = &hide.dpvs;
+            let lookup = dpvs_t6::VisibilityCellPlanes {
+                planes: &box_tree.plane_set,
+                nodes: &box_tree.node_list,
+                leaf_cells: box_tree.cells_n as u32,
             };
-            let cell = planes.cell_for_point(origin)?;
-            let list = dpvs.cell_reflection_probes.get(cell).map_or(&[][..], Vec::as_slice);
-            Some(list)
+            let room = lookup.cell_holding(pos)?;
+            Some(box_tree.room_env_probes.get(room).map(Vec::as_slice).unwrap_or_default())
         });
-        match cell {
-            None => lighting_t6::nearest_reflection_probe_skip_0(origins, origin),
-            Some(list) => lighting_t6::nearest_reflection_probe_in_cell_list(origins, list, origin),
+        if let Some(options) = cell_candidates {
+            lighting_t6::nearest_cube_in_cells(all_origins, options, pos)
+        } else {
+            lighting_t6::nearest_cube_probe(all_origins, pos)
         }
     }
 }

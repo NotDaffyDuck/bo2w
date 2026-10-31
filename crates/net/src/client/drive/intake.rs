@@ -8,204 +8,229 @@ use std::sync::Arc;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
-use super::outbox::PendingClientSends;
-use super::reliable::ReliableInbound;
+use super::outbox::QueuedOutgoingPlayerMessages;
+use super::reliable::GuaranteedIntakeParams;
 use super::stores::{
-    ClientPhaseTrace, ClientPredictionState, LastAdoptedSnapshot, PendingDebris, PendingPelletFx,
-    PendingPresentedEntityEvents, ReceivedTicks, RemoteProxyState, note_phase,
+    ReceiverStageLog, ClientGuessState, NewestTakenSnapshot, PendingDebris, QueuedPelletEffect,
+    StagedShownEntityEvents, ArrivedStepQueue, OtherPlayerSmootherHolder, note_phase,
 };
-use crate::client::presentation::presented::LocalPresentClient;
-use crate::transport::loopback_live::{ListenLoopback, ReceivedTick};
-use crate::transport::relay::UdpClientLink;
+use crate::client::presentation::shown_frame::HostViewClient;
+use crate::net_links::listen_link::{LocalHostTickPipe, ArrivedHostStep};
+use crate::net_links::relay::PlayerUdpSession;
 
-/// Remembers whether the "connected" line has been logged for the current link.
-#[derive(Default)]
-pub struct JoinLinkWatch {
-    announced: bool,
-}
-
-impl JoinLinkWatch {
-    /// `true` exactly once: the first time the link is seen with a live connection.
-    fn first_connection(&mut self, connected: bool) -> bool {
-        let first = connected && !self.announced;
-        self.announced |= first;
-        first
+/// Flips `announced` and answers `true` the first time a live connection is seen on a link.
+fn first_sight_of_connection(announced: &mut bool, connected: bool) -> bool {
+    if *announced || !connected {
+        return false;
     }
+    *announced = true;
+    true
 }
 
-/// The three queues of snapshot content the presentation spawns later.
+/// Where ticks can arrive from: the network link, or the in-process loopback of a listen host.
 #[derive(SystemParam)]
-pub struct PendingFx<'w> {
-    events: ResMut<'w, PendingPresentedEntityEvents>,
-    pellets: ResMut<'w, PendingPelletFx>,
+pub struct TickSources<'w> {
+    udp: Option<ResMut<'w, PlayerUdpSession>>,
+    loopback: Option<ResMut<'w, LocalHostTickPipe>>,
+}
+
+/// The queues of snapshot content the presentation spawns later.
+#[derive(SystemParam)]
+pub struct EffectQueues<'w> {
+    entity_events: ResMut<'w, StagedShownEntityEvents>,
+    pellet_fx: ResMut<'w, QueuedPelletEffect>,
     debris: ResMut<'w, PendingDebris>,
 }
 
-impl PendingFx<'_> {
+impl EffectQueues<'_> {
     /// Moves the entity events, pellet effects and debris out of a snapshot into the queues.
-    /// A snapshot that is not newer than `newest_known` is refused and left untouched.
-    fn take_from(
-        &mut self,
-        newest_known: Option<sim::Tick>,
-        local: sim::ClientId,
-        snapshot: &mut sim::Snapshot,
-    ) -> bool {
-        if !self.events.take_from(newest_known, local, snapshot) {
-            return false;
+    /// A snapshot that is not newer than `newest_known` is refused (`false`) and left untouched.
+    fn claim(&mut self, newest_known: Option<sim::Tick>, me: sim::ClientId, snapshot: &mut sim::Snapshot) -> bool {
+        let accepted = self.entity_events.take_from(newest_known, me, snapshot);
+        if accepted {
+            self.pellet_fx.0.extend(std::mem::take(&mut snapshot.meta.pellet_fx));
+            self.debris.0.extend(std::mem::take(&mut snapshot.meta.debris));
         }
-        self.pellets.0.append(&mut snapshot.meta.pellet_fx);
-        self.debris.0.append(&mut snapshot.meta.debris);
-        true
+        accepted
     }
 }
 
-fn drain_udp(link: &mut UdpClientLink, into: &mut VecDeque<ReceivedTick>) {
-    match link.recv_ticks() {
-        Ok(ticks) => into.extend(ticks),
-        Err(e) if link.handshake_reject().is_some() => diag::error!(Net, "udp recv: {e}"),
-        Err(e) => diag::warn!(Net, "udp recv: {e}"),
+/// What adopting a snapshot touches: the held pair, the remote-proxy history, the prediction and
+/// the commands still waiting for an acknowledgement.
+#[derive(SystemParam)]
+pub struct Adoption<'w> {
+    held: ResMut<'w, NewestTakenSnapshot>,
+    proxy: ResMut<'w, OtherPlayerSmootherHolder>,
+    forecast: ResMut<'w, ClientGuessState>,
+    unacked: ResMut<'w, QueuedOutgoingPlayerMessages>,
+}
+
+fn pull_from_udp(link: &mut PlayerUdpSession, queue: &mut VecDeque<ArrivedHostStep>) {
+    let failure = match link.arrived_steps() {
+        Ok(arrived) => {
+            queue.extend(arrived);
+            return;
+        }
+        Err(failure) => failure,
+    };
+    // A refused handshake is an error worth shouting about; other read failures are transient.
+    if link.greeting_refusal().is_none() {
+        diag::warn!(WireLink, "udp recv: {failure}");
+    } else {
+        diag::error!(WireLink, "udp recv: {failure}");
     }
 }
 
-fn drain_loopback(loopback: &mut ListenLoopback, into: &mut VecDeque<ReceivedTick>) {
-    let mut arrived = Vec::new();
-    let outcome = loopback.recv_all(&mut arrived);
-    into.extend(arrived);
-    if let Err(e) = outcome {
-        diag::warn!(Net, "client_runtime: recv_all failed: {e}");
+fn pull_from_loopback(link: &mut LocalHostTickPipe, queue: &mut VecDeque<ArrivedHostStep>) {
+    let mut batch = Vec::new();
+    let result = link.drain_into(&mut batch);
+    queue.extend(batch);
+    if let Err(failure) = result {
+        diag::warn!(WireLink, "client_runtime: recv_all failed: {failure}");
     }
 }
 
 /// When the host has given this client an id, the prediction and the presentation follow it.
 fn follow_assigned_client(
     assigned: Option<sim::ClientId>,
-    local: &mut LocalPresentClient,
-    prediction: &mut ClientPredictionState,
+    local: &mut HostViewClient,
+    forecast: &mut ClientGuessState,
 ) {
-    if let Some(id) = assigned.filter(|id| *id != local.0) {
-        local.0 = id;
-        prediction.0.set_local(id);
+    let Some(handed_out) = assigned else { return };
+    if handed_out != local.0 {
+        forecast.0.assign_scoped(handed_out);
+        local.0 = handed_out;
     }
 }
 
 /// Reads whatever has arrived: from the network link when there is one, otherwise from the
 /// in-process loopback a listen host uses to talk to itself.
-pub fn receive_ticks(
-    mut link: Option<ResMut<UdpClientLink>>,
-    loopback: Option<ResMut<ListenLoopback>>,
-    mut received: ResMut<ReceivedTicks>,
-    mut local: ResMut<LocalPresentClient>,
-    mut prediction: ResMut<ClientPredictionState>,
-    trace: Option<ResMut<ClientPhaseTrace>>,
-    mut watch: Local<JoinLinkWatch>,
-    mut reliable: ReliableInbound,
+pub fn ingest_host_steps(
+    mut sources: TickSources,
+    mut inbox: ResMut<ArrivedStepQueue>,
+    mut me: ResMut<HostViewClient>,
+    mut forecast: ResMut<ClientGuessState>,
+    trace: Option<ResMut<ReceiverStageLog>>,
+    mut announced: Local<bool>,
+    mut reliable: GuaranteedIntakeParams,
 ) {
     note_phase(trace, "Receive");
-    if let Some(link) = link.as_deref_mut() {
-        drain_udp(link, &mut received.0);
-        for payload in link.take_controls() {
-            reliable.apply(link.assigned_client.unwrap_or(local.0), &payload);
+    let Some(udp) = sources.udp.as_deref_mut() else {
+        if let Some(link) = sources.loopback.as_deref_mut() {
+            pull_from_loopback(link, &mut inbox.0);
         }
-        if watch.first_connection(link.connection.is_some()) {
-            diag::info!(
-                Net,
-                "udp client accepted as client {}",
-                link.assigned_client.map_or(0, |id| id.0)
-            );
-        }
-        follow_assigned_client(link.assigned_client, &mut local, &mut prediction);
-    } else if let Some(mut loopback) = loopback {
-        drain_loopback(&mut loopback, &mut received.0);
+        return;
+    };
+    pull_from_udp(udp, &mut inbox.0);
+    let owner = udp.granted_player_slot.unwrap_or(me.0);
+    udp.take_controls().iter().for_each(|control| reliable.apply(owner, control));
+    if first_sight_of_connection(&mut announced, udp.connection.is_some()) {
+        let id = udp.granted_player_slot.map(|c| c.0).unwrap_or(0);
+        diag::info!(WireLink, "udp client accepted as client {id}");
     }
+    follow_assigned_client(udp.granted_player_slot, &mut me, &mut forecast);
 }
 
 /// Whether no tick still waiting in `queue` is newer than `tick`.
-fn nothing_newer_waiting(queue: &VecDeque<ReceivedTick>, tick: sim::Tick) -> bool {
-    !queue.iter().any(|waiting| waiting.snapshot.tick.0 > tick.0)
+fn nothing_newer_waiting(queue: &VecDeque<ArrivedHostStep>, tick: sim::Tick) -> bool {
+    queue.iter().all(|waiting| waiting.snapshot.tick.0 <= tick.0)
 }
 
 /// Takes in every waiting tick that is newer than the last one adopted, oldest first. Only the
 /// newest of a batch is reconciled with the prediction; the older ones just retire the
 /// commands they acknowledge.
-pub fn reconcile_prediction(
-    mut received: ResMut<ReceivedTicks>,
-    mut prediction: ResMut<ClientPredictionState>,
-    local: Res<LocalPresentClient>,
-    mut reliable: ReliableInbound,
-    mut adopted: ResMut<LastAdoptedSnapshot>,
-    mut proxy: ResMut<RemoteProxyState>,
-    mut sends: ResMut<PendingClientSends>,
-    mut fx: PendingFx,
-    trace: Option<ResMut<ClientPhaseTrace>>,
+pub fn correct_forecast(
+    mut inbox: ResMut<ArrivedStepQueue>,
+    me: Res<HostViewClient>,
+    mut reliable: GuaranteedIntakeParams,
+    mut adoption: Adoption,
+    mut effects: EffectQueues,
+    trace: Option<ResMut<ReceiverStageLog>>,
 ) {
     note_phase(trace, "Reconcile");
-    adopted.applied_this_frame = false;
-    while let Some(mut tick) = received.0.pop_front() {
-        let newest_known = adopted.next().map(|snap| snap.tick);
-        if !fx.take_from(newest_known, local.0, &mut tick.snapshot) {
+    let me = me.0;
+    adoption.held.taken_in_current_step = false;
+    while let Some(arrival) = inbox.0.pop_front() {
+        let ArrivedHostStep { mut snapshot, frame } = arrival;
+        let newest_known = adoption.held.next().map(|held| held.tick);
+        if !effects.claim(newest_known, me, &mut snapshot) {
             continue;
         }
-        reliable.apply(local.0, &tick.frame.reliable);
+        reliable.apply(me, &frame.reliable);
+        let receipt_confirmed = frame.receipt_for(me);
+        receipt_confirmed.into_iter().for_each(|seq| adoption.unacked.retire_through(seq));
 
-        let ack = tick.ack_for(local.0);
-        if let Some(acked) = ack {
-            sends.clear_acknowledged(acked);
-        }
+        adoption.held.taken_in_current_step = true;
+        let shared = Arc::new(snapshot);
+        adoption.proxy.0.enqueue_shared_item(shared.clone());
+        adoption.held.take_in(shared);
 
-        adopted.applied_this_frame = true;
-        let snapshot = Arc::new(tick.snapshot);
-        proxy.0.push_arc(Arc::clone(&snapshot));
-        adopted.take_in(snapshot);
-
-        let latest = adopted.next().expect("a snapshot was just taken in");
-        if nothing_newer_waiting(&received.0, latest.tick) {
-            prediction.0.on_authority(latest, ack);
+        let newest = adoption.held.next().expect("a snapshot was just taken in");
+        // Older ticks of the batch only retire acknowledged commands; the newest is reconciled.
+        if !nothing_newer_waiting(&inbox.0, newest.tick) {
+            adoption.forecast.0.drop_confirmed(receipt_confirmed);
         } else {
-            prediction.0.retire_acks(ack);
+            adoption.forecast.0.on_authority(newest, receipt_confirmed);
         }
-
-        reliable.take_frame_commands(tick.frame);
+        reliable.take_frame_commands(frame);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authority::inbox::ClientActionInbox;
-    use crate::client::predict::CmdSeq;
-    use crate::transport::frame::frame_from_acked_tick;
+    use crate::host_tick::peer_mail::PlayerActionIntake;
+    use crate::client::run_ahead::InputCommandNumber;
+    use crate::net_links::tick_frames::frame_for_confirmed_tick;
     use crate::{
-        ReliablePayload, Scoreboard, SignonState, SvcCardSlotCmd, SvcGameNotify, SvcHudSplash,
-        SvcLocalSound, SvcOpenMenuCmd,
+        GuaranteedEnvelope, Scoreboard, JoinProgressRecord, CardSlotCommand, HostGameAnnouncement, HostScreenFlash,
+        HostLocalSoundMsg, MenuOpenCommand,
     };
 
-    use super::super::stores::{ClientReliableAck, ReliableControlEvent};
+    use super::super::stores::{PlayerGuaranteedReceipt, GuaranteedSimEvent};
 
     const ME: sim::ClientId = sim::ClientId(2);
 
-    fn base_app() -> App {
+    macro_rules! defaults {
+        ($app:ident: $($res:ty),+ $(,)?) => {
+            $( $app.init_resource::<$res>(); )+
+        };
+    }
+
+    macro_rules! messages {
+        ($app:ident: $($msg:ty),+ $(,)?) => {
+            $( $app.add_message::<$msg>(); )+
+        };
+    }
+
+    /// An app with every store the two intake systems touch.
+    fn stores_app() -> App {
         let mut app = App::new();
-        app.init_resource::<ClientActionInbox>()
-            .init_resource::<ClientReliableAck>()
-            .init_resource::<Scoreboard>()
-            .init_resource::<SignonState>()
-            .init_resource::<ReceivedTicks>()
-            .init_resource::<LastAdoptedSnapshot>()
-            .init_resource::<RemoteProxyState>()
-            .init_resource::<PendingClientSends>()
-            .init_resource::<PendingPresentedEntityEvents>()
-            .init_resource::<PendingPelletFx>()
-            .init_resource::<PendingDebris>()
-            .init_resource::<ClientPredictionState>()
-            .insert_resource(LocalPresentClient(ME))
-            .insert_resource(ClientPhaseTrace::default())
-            .add_message::<ReliableControlEvent>()
-            .add_message::<SvcLocalSound>()
-            .add_message::<SvcCardSlotCmd>()
-            .add_message::<SvcOpenMenuCmd>()
-            .add_message::<SvcHudSplash>()
-            .add_message::<SvcGameNotify>();
+        defaults!(app:
+            PlayerActionIntake, PlayerGuaranteedReceipt, Scoreboard, JoinProgressRecord, ArrivedStepQueue,
+            NewestTakenSnapshot, OtherPlayerSmootherHolder, QueuedOutgoingPlayerMessages, StagedShownEntityEvents,
+            QueuedPelletEffect, PendingDebris, ClientGuessState, ReceiverStageLog,
+        );
+        messages!(app:
+            GuaranteedSimEvent, HostLocalSoundMsg, CardSlotCommand, MenuOpenCommand, HostScreenFlash,
+            HostGameAnnouncement,
+        );
+        app.insert_resource(HostViewClient(ME));
         app
+    }
+
+    fn app_running(system: Which) -> App {
+        let mut app = stores_app();
+        match system {
+            Which::Receive => app.add_systems(Update, ingest_host_steps),
+            Which::Reconcile => app.add_systems(Update, correct_forecast),
+        };
+        app
+    }
+
+    enum Which {
+        Receive,
+        Reconcile,
     }
 
     fn snapshot_at(tick: u32) -> sim::Snapshot {
@@ -214,284 +239,233 @@ mod tests {
         snapshot
     }
 
-    fn tick_at(tick: u32, acks: Vec<(sim::ClientId, CmdSeq)>) -> ReceivedTick {
-        let snapshot = snapshot_at(tick);
-        let frame = frame_from_acked_tick(
-            &mut crate::SnapshotEncoder::new(),
-            &sim::TickInput::default(),
-            &snapshot,
-            acks,
-        );
-        ReceivedTick { snapshot, frame }
+    fn arrival(tick: u32, receipts_batch: Vec<(sim::ClientId, InputCommandNumber)>) -> ArrivedHostStep {
+        let snap = snapshot_at(tick);
+        let mut diff_writer = crate::FrameDiffWriter::new();
+        let frame = frame_for_confirmed_tick(&mut diff_writer, &sim::StepInputs::default(), &snap, receipts_batch);
+        ArrivedHostStep { snapshot: snap, frame }
     }
 
-    fn queue(app: &mut App, ticks: impl IntoIterator<Item = ReceivedTick>) {
-        app.world_mut().resource_mut::<ReceivedTicks>().0.extend(ticks);
+    fn bare(tick: u32) -> ArrivedHostStep {
+        arrival(tick, Vec::new())
     }
 
-    fn adopted_ticks(app: &App) -> (Option<u32>, Option<u32>) {
-        let held = app.world().resource::<LastAdoptedSnapshot>();
-        (
-            held.snap.as_ref().map(|snap| snap.tick.0),
-            held.next_snap.as_ref().map(|snap| snap.tick.0),
-        )
+    fn deliver(app: &mut App, ticks: impl IntoIterator<Item = ArrivedHostStep>) {
+        app.world_mut().resource_mut::<ArrivedStepQueue>().0.extend(ticks);
     }
 
-    fn loopback_with(ticks: &[u32]) -> ListenLoopback {
-        let mut loopback = ListenLoopback::new();
-        for tick in ticks {
-            loopback
-                .send_tick(
-                    &sim::TickInput::default(),
-                    &snapshot_at(*tick),
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    ReliablePayload {
-                        ack_through: 0,
-                        rows: Vec::new(),
-                        dropped_oldest: 0,
-                    },
-                )
-                .expect("the loopback takes a tick");
+    fn held_ids(app: &App) -> (Option<u32>, Option<u32>) {
+        let held = app.world().resource::<NewestTakenSnapshot>();
+        let tick_of = |slot: &Option<_>| slot.as_ref().map(|snap: &Arc<sim::Snapshot>| snap.tick.0);
+        (tick_of(&held.frame_state), tick_of(&held.upcoming_world_state))
+    }
+
+    fn loopback_with(ticks: &[u32]) -> LocalHostTickPipe {
+        let mut loopback = LocalHostTickPipe::new();
+        let input = sim::StepInputs::default();
+        for &tick in ticks {
+            let sent = loopback.transmit_step(
+                &input,
+                &snapshot_at(tick),
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                GuaranteedEnvelope::has_no_debt(),
+            );
+            sent.expect("the loopback takes a tick");
         }
         loopback
     }
 
     #[test]
     fn the_connected_line_is_due_once_per_link() {
-        let mut watch = JoinLinkWatch::default();
-        assert!(!watch.first_connection(false));
-        assert!(watch.first_connection(true));
-        assert!(!watch.first_connection(true));
-        assert!(!watch.first_connection(false));
+        let mut announced = false;
+        let answers: Vec<bool> =
+            [false, true, true, false].into_iter().map(|up| first_sight_of_connection(&mut announced, up)).collect();
+        assert_eq!(answers, [false, true, false, false]);
     }
 
     #[test]
     fn the_prediction_and_presentation_follow_the_id_the_host_hands_out() {
-        let mut local = LocalPresentClient(sim::ClientId(0));
-        let mut prediction = ClientPredictionState::default();
-        follow_assigned_client(None, &mut local, &mut prediction);
+        let mut local = HostViewClient(sim::ClientId(0));
+        let mut forecast = ClientGuessState::default();
+        follow_assigned_client(None, &mut local, &mut forecast);
         assert_eq!(local.0, sim::ClientId(0));
-
-        follow_assigned_client(Some(sim::ClientId(6)), &mut local, &mut prediction);
-        assert_eq!(local.0, sim::ClientId(6));
-        assert_eq!(prediction.0.local(), sim::ClientId(6));
-
-        follow_assigned_client(Some(sim::ClientId(6)), &mut local, &mut prediction);
-        assert_eq!(prediction.0.local(), sim::ClientId(6));
+        for _ in 0..2 {
+            follow_assigned_client(Some(sim::ClientId(6)), &mut local, &mut forecast);
+            assert_eq!((local.0, forecast.0.local()), (sim::ClientId(6), sim::ClientId(6)));
+        }
     }
 
     #[test]
     fn with_no_connection_at_all_receiving_only_notes_the_phase() {
-        let mut app = base_app();
-        app.add_systems(Update, receive_ticks);
+        let mut app = app_running(Which::Receive);
         app.update();
-        assert!(app.world().resource::<ReceivedTicks>().0.is_empty());
-        assert_eq!(app.world().resource::<ClientPhaseTrace>().0, ["Receive"]);
+        assert_eq!(app.world().resource::<ArrivedStepQueue>().0.len(), 0);
+        assert_eq!(app.world().resource::<ReceiverStageLog>().0, ["Receive"]);
     }
 
     #[test]
     fn ticks_from_the_listen_loopback_are_queued_in_the_order_they_were_sent() {
-        let mut app = base_app();
+        let mut app = app_running(Which::Receive);
         app.insert_resource(loopback_with(&[7, 8, 9]));
-        app.add_systems(Update, receive_ticks);
+        let queued_ticks = |app: &App| -> Vec<u32> {
+            app.world().resource::<ArrivedStepQueue>().0.iter().map(|t| t.snapshot.tick.0).collect()
+        };
         app.update();
-        let queued: Vec<u32> = app
-            .world()
-            .resource::<ReceivedTicks>()
-            .0
-            .iter()
-            .map(|tick| tick.snapshot.tick.0)
-            .collect();
-        assert_eq!(queued, [7, 8, 9]);
-
+        assert_eq!(queued_ticks(&app), [7, 8, 9]);
         app.update();
-        assert_eq!(app.world().resource::<ReceivedTicks>().0.len(), 3);
+        assert_eq!(queued_ticks(&app), [7, 8, 9], "nothing more arrives");
     }
 
     #[test]
     fn newer_waiting_ticks_are_recognised() {
-        let queue: VecDeque<ReceivedTick> = [tick_at(4, Vec::new()), tick_at(6, Vec::new())].into();
-        assert!(!nothing_newer_waiting(&queue, sim::Tick(5)));
-        assert!(nothing_newer_waiting(&queue, sim::Tick(6)));
-        assert!(nothing_newer_waiting(&queue, sim::Tick(9)));
+        let queue = VecDeque::from([bare(4), bare(6)]);
+        let answers: Vec<bool> = [5, 6, 9].into_iter().map(|t| nothing_newer_waiting(&queue, sim::Tick(t))).collect();
+        assert_eq!(answers, [false, true, true]);
         assert!(nothing_newer_waiting(&VecDeque::new(), sim::Tick(0)));
     }
 
     #[test]
     fn the_newest_tick_becomes_the_adopted_snapshot_and_feeds_the_proxy() {
-        let mut app = base_app();
-        app.add_systems(Update, reconcile_prediction);
-        queue(&mut app, [tick_at(3, Vec::new())]);
+        let mut app = app_running(Which::Reconcile);
+        deliver(&mut app, [bare(3)]);
         app.update();
 
-        assert_eq!(adopted_ticks(&app), (None, Some(3)));
-        assert!(app.world().resource::<LastAdoptedSnapshot>().applied_this_frame);
-        assert!(app.world().resource::<ReceivedTicks>().0.is_empty());
-        let proxied = app.world().resource::<RemoteProxyState>().0.snapshot_at(i32::MAX);
-        assert_eq!(proxied.map(|snap| snap.tick.0), Some(3));
-        assert_eq!(app.world().resource::<ClientPhaseTrace>().0, ["Reconcile"]);
+        let world = app.world();
+        assert_eq!(held_ids(&app), (None, Some(3)));
+        assert!(world.resource::<NewestTakenSnapshot>().taken_in_current_step);
+        assert_eq!(world.resource::<ArrivedStepQueue>().0.len(), 0);
+        let proxied = world.resource::<OtherPlayerSmootherHolder>().0.blended_frame_at(i32::MAX).map(|s| s.tick.0);
+        assert_eq!(proxied, Some(3));
+        assert_eq!(world.resource::<ReceiverStageLog>().0, ["Reconcile"]);
     }
 
     #[test]
     fn several_ticks_in_one_frame_leave_the_last_two_in_hand() {
-        let mut app = base_app();
-        app.add_systems(Update, reconcile_prediction);
-        queue(&mut app, [tick_at(3, Vec::new()), tick_at(4, Vec::new()), tick_at(5, Vec::new())]);
+        let mut app = app_running(Which::Reconcile);
+        deliver(&mut app, (3..=5).map(bare));
         app.update();
-        assert_eq!(adopted_ticks(&app), (Some(4), Some(5)));
+        assert_eq!(held_ids(&app), (Some(4), Some(5)));
     }
 
     #[test]
     fn a_tick_that_is_not_newer_is_dropped_without_adopting_anything() {
-        let mut app = base_app();
-        app.add_systems(Update, reconcile_prediction);
-        queue(&mut app, [tick_at(5, Vec::new())]);
+        let mut app = app_running(Which::Reconcile);
+        deliver(&mut app, [bare(5)]);
+        app.update();
+        deliver(&mut app, [bare(5), bare(4)]);
         app.update();
 
-        queue(&mut app, [tick_at(5, Vec::new()), tick_at(4, Vec::new())]);
-        app.update();
-        assert_eq!(adopted_ticks(&app), (None, Some(5)));
-        assert!(!app.world().resource::<LastAdoptedSnapshot>().applied_this_frame);
-        assert!(app.world().resource::<ReceivedTicks>().0.is_empty());
+        assert_eq!(held_ids(&app), (None, Some(5)));
+        assert!(!app.world().resource::<NewestTakenSnapshot>().taken_in_current_step);
+        assert_eq!(app.world().resource::<ArrivedStepQueue>().0.len(), 0);
     }
 
     #[test]
     fn a_tick_that_is_not_newer_keeps_its_commands_to_itself() {
-        let mut app = base_app();
-        app.add_systems(Update, reconcile_prediction);
-        queue(&mut app, [tick_at(5, Vec::new())]);
+        let mut app = app_running(Which::Reconcile);
+        deliver(&mut app, [bare(5)]);
         app.update();
-
-        let mut stale = tick_at(4, Vec::new());
-        stale.frame.svc_scores = Some("late scores".to_owned());
-        queue(&mut app, [stale]);
+        let mut late = bare(4);
+        late.frame.board_text = Some(String::from("late scores"));
+        deliver(&mut app, [late]);
         app.update();
-        assert_eq!(app.world().resource::<Scoreboard>().cmd, None);
+        assert!(app.world().resource::<Scoreboard>().command_text.is_none());
     }
 
     #[test]
     fn an_acknowledgement_clears_the_commands_it_covers() {
-        let mut app = base_app();
-        app.add_systems(Update, reconcile_prediction);
-        {
-            let mut sends = app.world_mut().resource_mut::<PendingClientSends>();
-            for n in 1..=5 {
-                sends.push(CmdSeq(n), Default::default(), Default::default());
-            }
-        }
-        queue(&mut app, [tick_at(2, vec![(ME, CmdSeq(3))])]);
+        let mut app = app_running(Which::Reconcile);
+        let mut sends = app.world_mut().resource_mut::<QueuedOutgoingPlayerMessages>();
+        (1..=5).for_each(|n| sends.enqueue(InputCommandNumber(n), Default::default(), Default::default()));
+        deliver(&mut app, [arrival(2, vec![(ME, InputCommandNumber(3))])]);
         app.update();
-        let sends = app.world().resource::<PendingClientSends>();
-        assert_eq!(sends.oldest_seq(), Some(CmdSeq(4)));
-        assert_eq!(sends.len(), 2);
+        let sends = app.world().resource::<QueuedOutgoingPlayerMessages>();
+        assert_eq!((sends.oldest_seq(), sends.len()), (Some(InputCommandNumber(4)), 2));
     }
 
     #[test]
     fn an_acknowledgement_meant_for_someone_else_changes_nothing() {
-        let mut app = base_app();
-        app.add_systems(Update, reconcile_prediction);
-        app.world_mut()
-            .resource_mut::<PendingClientSends>()
-            .push(CmdSeq(1), Default::default(), Default::default());
-        queue(&mut app, [tick_at(2, vec![(sim::ClientId(9), CmdSeq(1))])]);
+        let mut app = app_running(Which::Reconcile);
+        let mut sends = app.world_mut().resource_mut::<QueuedOutgoingPlayerMessages>();
+        sends.enqueue(InputCommandNumber(1), Default::default(), Default::default());
+        deliver(&mut app, [arrival(2, vec![(sim::ClientId(9), InputCommandNumber(1))])]);
         app.update();
-        assert_eq!(app.world().resource::<PendingClientSends>().len(), 1);
+        assert_eq!(app.world().resource::<QueuedOutgoingPlayerMessages>().len(), 1);
     }
 
     #[test]
     fn effects_leave_the_snapshot_for_their_queues() {
-        let mut app = base_app();
-        app.add_systems(Update, reconcile_prediction);
-        let mut tick = tick_at(2, Vec::new());
-        tick.snapshot.meta.pellet_fx = vec![sim::PelletFxRecord { pellet: 3, ..Default::default() }];
-        tick.snapshot.meta.debris = vec![sim::DebrisRecord {
-            model: "chunk".to_owned(),
-            origin: [1.0, 2.0, 3.0],
-            rotation: [0.0, 0.0, 0.0, 1.0],
-            velocity: [0.0; 3],
-            mass: 1.0,
-            bounce: 0.2,
-            ..Default::default()
-        }];
-        queue(&mut app, [tick]);
+        let mut app = app_running(Which::Reconcile);
+        let mut carrying = bare(2);
+        let meta = &mut carrying.snapshot.meta;
+        meta.pellet_fx.push(sim::PelletFxRecord { pellet: 3, ..Default::default() });
+        let mut chunk = sim::DebrisRecord { mesh: "chunk".to_owned(), ..Default::default() };
+        (chunk.origin, chunk.rotation) = ([1.0, 2.0, 3.0], [0.0, 0.0, 0.0, 1.0]);
+        (chunk.mass, chunk.bounce) = (1.0, 0.2);
+        meta.debris.push(chunk);
+        deliver(&mut app, [carrying]);
         app.update();
 
-        assert_eq!(app.world().resource::<PendingPelletFx>().0.len(), 1);
-        assert_eq!(app.world().resource::<PendingDebris>().0.len(), 1);
-        let held = app.world().resource::<LastAdoptedSnapshot>();
-        let snap = held.next().expect("adopted");
-        assert!(snap.meta.pellet_fx.is_empty() && snap.meta.debris.is_empty());
+        let world = app.world();
+        assert_eq!(world.resource::<QueuedPelletEffect>().0.len(), 1);
+        assert_eq!(world.resource::<PendingDebris>().0.len(), 1);
+        let adopted = world.resource::<NewestTakenSnapshot>().next().expect("adopted");
+        assert_eq!((adopted.meta.pellet_fx.len(), adopted.meta.debris.len()), (0, 0));
     }
 
     #[test]
     fn the_small_commands_of_an_adopted_tick_are_passed_on() {
-        let mut app = base_app();
-        app.add_systems(Update, reconcile_prediction);
-        let mut tick = tick_at(2, Vec::new());
-        tick.frame.svc_scores = Some("scores".to_owned());
-        tick.frame.svc_sounds = vec![crate::SvcSound { stop: false, index: 9 }];
-        queue(&mut app, [tick]);
+        let mut app = app_running(Which::Reconcile);
+        let mut carrying = bare(2);
+        carrying.frame.board_text = Some(String::from("scores"));
+        carrying.frame.host_sound_triggers.push(crate::HostSoundCue { halt: false, slot: 9 });
+        deliver(&mut app, [carrying]);
         app.update();
 
-        assert_eq!(app.world().resource::<Scoreboard>().cmd.as_deref(), Some("scores"));
-        let sounds: Vec<u8> = app
-            .world_mut()
-            .resource_mut::<Messages<SvcLocalSound>>()
-            .drain()
-            .map(|sound| sound.index)
-            .collect();
-        assert_eq!(sounds, [9]);
+        assert_eq!(app.world().resource::<Scoreboard>().command_text.as_deref(), Some("scores"));
+        let mut played = app.world_mut().resource_mut::<Messages<HostLocalSoundMsg>>();
+        let indices: Vec<u8> = played.drain().map(|sound| sound.index).collect();
+        assert_eq!(indices, [9]);
     }
 
     #[test]
     fn the_reliable_rows_of_an_adopted_tick_are_acted_on() {
-        let mut app = base_app();
-        app.add_systems(Update, reconcile_prediction);
-        let mut tick = tick_at(2, Vec::new());
-        tick.frame.reliable = ReliablePayload {
-            ack_through: 0,
-            rows: vec![(1, crate::ReliableRow::Scores("from a row".to_owned()))],
-            dropped_oldest: 0,
-        };
-        queue(&mut app, [tick]);
+        let mut app = app_running(Which::Reconcile);
+        let mut carrying = bare(2);
+        carrying.frame.reliable.entries.push((1, crate::GuaranteedEntry::Standings(String::from("from a row"))));
+        deliver(&mut app, [carrying]);
         app.update();
-        assert_eq!(app.world().resource::<ClientReliableAck>().0, 1);
-        assert_eq!(app.world().resource::<Scoreboard>().cmd.as_deref(), Some("from a row"));
+        assert_eq!(app.world().resource::<PlayerGuaranteedReceipt>().0, 1);
+        assert_eq!(app.world().resource::<Scoreboard>().command_text.as_deref(), Some("from a row"));
     }
 
     #[test]
     fn entity_events_go_to_the_live_list_unless_the_player_is_in_a_replay() {
-        let mut app = base_app();
-        app.add_systems(Update, reconcile_prediction);
+        let mut app = app_running(Which::Reconcile);
         let record = sim::EntityEventRecord {
             sequence: sim::EventSequence(1),
             tick: sim::Tick(2),
-            audience: sim::EventAudience::All,
-            event: entity_t6::EntityEventKind(4),
+            audience: sim::EventRecipients::All,
+            event: entity_t6::EventCode(4),
             payload: sim::EntityEventPayload::default(),
         };
-        let mut live = tick_at(2, Vec::new());
-        live.snapshot.meta.entity_events = vec![record.clone()];
-        let mut replay = tick_at(3, Vec::new());
-        replay.snapshot.meta.entity_events = vec![record];
-        replay.snapshot.meta.clients.push((
-            ME,
-            sim::ClientSnapshotMeta {
-                killcam_hud: Some(sim::KillcamHud { final_kill: true }),
-                ..Default::default()
-            },
-        ));
-        queue(&mut app, [live, replay]);
+        let mut live = bare(2);
+        live.snapshot.meta.entity_events.push(record.clone());
+        let mut replay = bare(3);
+        replay.snapshot.meta.entity_events.push(record);
+        let mut watching = sim::ClientSnapshotMeta::default();
+        watching.killcam_hud = Some(sim::KillcamHud { final_kill: true });
+        replay.snapshot.meta.clients.push((ME, watching));
+        deliver(&mut app, [live, replay]);
         app.update();
 
-        let pending = app.world().resource::<PendingPresentedEntityEvents>();
-        assert_eq!((pending.live.len(), pending.archived.len()), (1, 1));
-        assert!(pending.in_killcam);
+        let pending = app.world().resource::<StagedShownEntityEvents>();
+        assert_eq!((pending.live.len(), pending.archived.len(), pending.replaying_final_death), (1, 1, true));
     }
 }

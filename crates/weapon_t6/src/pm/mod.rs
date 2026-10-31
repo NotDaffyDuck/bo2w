@@ -44,15 +44,15 @@ impl FrameOut {
 /// `BG_GetViewmodelWeaponIndex`: the weapon in the arms. The offhand while one is in use
 /// (PWF_USING_OFFHAND) in the offhand states, the melee weapon while a gun that is not itself
 /// a melee weapon swings (MELEE_INIT, MELEE_FIRE), else the held weapon.
-pub fn viewmodel_weapon(ps: &T6WeaponPs, facts: &FactsTable) -> u32 {
-    let swinging = matches!(ps.weaponstate, state::MELEE_INIT | state::MELEE_FIRE);
+pub fn viewmodel_weapon(player: &T6WeaponPs, facts: &FactsTable) -> u32 {
+    let swinging = matches!(player.gun_phase, state::MELEE_INIT | state::MELEE_FIRE);
     viewmodel_weapon_of(&ViewmodelWeaponInputs {
-        using_offhand: ps.weap_flags & wf::USING_OFFHAND != 0,
-        weaponstate: ps.weaponstate,
-        weapon: ps.weapon,
-        off_hand_weapon: ps.off_hand_weapon,
-        melee_weapon: ps.melee_weapon,
-        weapon_is_melee: swinging && facts.get(ps.weapon).melee.use_as_melee,
+        using_offhand: player.weapon_state_bits & wf::USING_OFFHAND != 0,
+        gun_phase: player.gun_phase,
+        weapon: player.weapon,
+        off_hand_weapon: player.off_hand_weapon,
+        melee_weapon: player.melee_weapon,
+        weapon_is_melee: swinging && facts.get(player.weapon).melee.use_as_melee,
     })
 }
 
@@ -61,7 +61,7 @@ pub fn viewmodel_weapon(ps: &T6WeaponPs, facts: &FactsTable) -> u32 {
 pub struct ViewmodelWeaponInputs {
     /// PWF_USING_OFFHAND is set.
     pub using_offhand: bool,
-    pub weaponstate: i32,
+    pub gun_phase: i32,
     pub weapon: u32,
     pub off_hand_weapon: u32,
     pub melee_weapon: u32,
@@ -71,7 +71,7 @@ pub struct ViewmodelWeaponInputs {
 
 /// [`viewmodel_weapon`]'s rule (`BG_GetViewmodelWeaponIndex`) on plain values.
 pub fn viewmodel_weapon_of(i: &ViewmodelWeaponInputs) -> u32 {
-    let st = i.weaponstate;
+    let st = i.gun_phase;
     if i.using_offhand && (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&st) {
         return i.off_hand_weapon;
     }
@@ -147,7 +147,7 @@ impl Pm<'_> {
     }
 
     /// `BG_AddPredictableEventToPlayerstate`.
-    pub fn add_predictable_event(&mut self, id: u16, parm: u32) {
+    pub fn queue_forecast_happening(&mut self, id: u16, parm: u32) {
         self.out.events.push(Event {
             id,
             parm,
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn viewmodel_weapon_of_follows_bo2() {
         let base = ViewmodelWeaponInputs {
-            weaponstate: state::READY,
+            gun_phase: state::READY,
             weapon: 5,
             off_hand_weapon: 9,
             melee_weapon: 7,
@@ -180,13 +180,13 @@ mod tests {
         let offhand = ViewmodelWeaponInputs { using_offhand: true, ..base };
         assert_eq!(viewmodel_weapon_of(&offhand), 5, "offhand bit outside the offhand states");
         for st in [state::OFFHAND_INIT, state::OFFHAND_END] {
-            assert_eq!(viewmodel_weapon_of(&ViewmodelWeaponInputs { weaponstate: st, ..offhand }), 9);
+            assert_eq!(viewmodel_weapon_of(&ViewmodelWeaponInputs { gun_phase: st, ..offhand }), 9);
         }
         for st in [state::MELEE_INIT, state::MELEE_FIRE] {
-            let swing = ViewmodelWeaponInputs { weaponstate: st, ..base };
+            let swing = ViewmodelWeaponInputs { gun_phase: st, ..base };
             assert_eq!(viewmodel_weapon_of(&swing), 7);
             assert_eq!(viewmodel_weapon_of(&ViewmodelWeaponInputs { weapon_is_melee: true, ..swing }), 5);
         }
-        assert_eq!(viewmodel_weapon_of(&ViewmodelWeaponInputs { weaponstate: state::MELEE_END, ..base }), 5);
+        assert_eq!(viewmodel_weapon_of(&ViewmodelWeaponInputs { gun_phase: state::MELEE_END, ..base }), 5);
     }
 }

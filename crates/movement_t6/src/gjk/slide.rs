@@ -17,15 +17,25 @@
 //!   the velocity it had; BO2 leaves its output unset.
 //! - Nothing is glass here, so glass is never touched.
 
+use crate::bridge::TickLocals;
 use alloc::vec::Vec;
-use crate::bridge::Pml;
-use playerstate_t6::game::{PlayerState, pm_flags};
-use trace_t6::{ENTITYNUM_WORLD, Trace, TraceHitType};
+use playerstate_t6::game::{AvatarState, movement_state_bits};
+use trace_t6::ENTITYNUM_WORLD;
+use trace_t6::Trace;
+use trace_t6::TraceHitType;
 
 use super::hull::{MAX_PLANES, SolvePlane, project};
 use super::hull::{Mover, MoverBrush};
-use super::trace::{Hit, TraceInput, gjk_collide, gjk_trace, hit_walkable, mover_trace_info, player_mover};
-use super::{Bo2Collision, Geom, add, dot, len_sq, scale, sub};
+use super::trace::{
+    Hit, TraceInput, gjk_collide, gjk_trace, hit_walkable, mover_trace_info, player_mover,
+};
+use super::Bo2Collision;
+use super::Geom;
+use super::add;
+use super::dot;
+use super::magnitude_squared;
+use super::scale;
+use super::sub;
 use crate::project::project_velocity;
 
 /// A sixtieth of a second: hits this close after the first are taken with
@@ -70,14 +80,14 @@ const PUSH_OUT_BUMPS: u32 = 4;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SlideInput {
     pub position: [f32; 3],
-    pub velocity: [f32; 3],
-    pub gravity: f32,
+    pub vel: [f32; 3],
+    pub fall_accel: f32,
     /// Gravity pulls during the move (in the air).
     pub has_gravity: bool,
     /// What slides: the player's body or a vehicle's brush.
     pub mover: Mover,
-    pub mask: u32,
-    pub frametime: f32,
+    pub solid_mask: u32,
+    pub step_millis_elapsed: f32,
     /// Drop onto ground below at the end (walking).
     pub do_step_down: bool,
 }
@@ -86,15 +96,15 @@ pub(crate) struct SlideInput {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SlideOutput {
     pub position: [f32; 3],
-    pub velocity: [f32; 3],
+    pub vel: [f32; 3],
     pub bumped: bool,
 }
 
 /// BO2's geom_plane: a shape the body met, as a plane through the contact.
 #[derive(Clone, Copy, Debug)]
 struct Plane<'a> {
-    geom: Geom<'a>,
-    normal: [f32; 3],
+    shape_data: Geom<'a>,
+    plane_dir: [f32; 3],
     /// The contact on the body, from its origin.
     arm: [f32; 3],
     /// The plane's distance (through the contact on the shape).
@@ -104,26 +114,34 @@ struct Plane<'a> {
 }
 
 impl<'a> Plane<'a> {
-    fn from_hit(hit: &Hit<'a>) -> Self {
+    fn from_hit(strike: &Hit<'a>) -> Self {
+        let Hit {
+            shape_data,
+            arm,
+            hit_point,
+            facing: normal,
+            ..
+        } = *strike;
         Plane {
-            geom: hit.geom,
-            normal: hit.normal,
-            arm: hit.arm,
-            d: dot(hit.normal, hit.hit_point),
-            walkable: hit_walkable(hit),
-            no_push_out: hit.geom.no_push_out,
+            d: dot(normal, hit_point),
+            walkable: hit_walkable(strike),
+            no_push_out: shape_data.no_push_out,
+            shape_data,
+            plane_dir: normal,
+            arm,
         }
     }
 
     /// How far the body's contact is out of the plane with its origin at
     /// `pos` (below zero: in it).
     fn gap(&self, pos: [f32; 3]) -> f32 {
-        dot(self.normal, add(self.arm, pos)) - self.d
+        dot(self.plane_dir, add(self.arm, pos)) - self.d
     }
 }
 
 /// The planes of one slide or push-out, and the shapes already met (the
 /// traces skip them).
+#[derive(Default)]
 struct Planes<'a> {
     list: Vec<Plane<'a>>,
     solve: Vec<SolvePlane>,
@@ -131,18 +149,18 @@ struct Planes<'a> {
 }
 
 impl<'a> Planes<'a> {
-    fn new() -> Self {
-        Planes { list: Vec::new(), solve: Vec::new(), skip: Vec::new() }
-    }
-
     /// BO2's add_hit_info.
-    fn add(&mut self, hit: &Hit<'a>) {
+    fn note_hit(&mut self, strike: &Hit<'a>) {
         if self.list.len() >= MAX_PLANES {
             return;
         }
-        self.list.push(Plane::from_hit(hit));
-        self.solve.push(SolvePlane { normal: hit.normal, rs: 0.0, active: true });
-        self.skip.push(hit.geom.key);
+        self.list.push(Plane::from_hit(strike));
+        self.solve.push(SolvePlane {
+            facing: strike.facing,
+            rs: 0.0,
+            engaged: true,
+        });
+        self.skip.push(strike.shape_data.key);
     }
 
     /// Each plane's push for the body at `pos`: how far in it is. A plane
@@ -171,59 +189,78 @@ impl<'a> Planes<'a> {
 
     /// The push-out's failure: a plane still more than 5 in after the
     /// solve.
-    fn stuck(&self, delta: [f32; 3]) -> bool {
-        self.solve.iter().any(|s| dot(s.normal, delta) - s.rs < PUSH_OUT_FAIL)
+    fn stuck(&self, step: [f32; 3]) -> bool {
+        self.solve
+            .iter()
+            .any(|s| dot(s.facing, step) - s.rs < PUSH_OUT_FAIL)
     }
 }
 
 /// PM_AddTouchEnt for a hit (the world is never touched).
-fn touch<C: Bo2Collision>(collision: &C, hit: &Hit) {
-    if hit.geom.hit_id != ENTITYNUM_WORLD {
-        // The hit as a trace: the entity, how far along and the contact.
-        let trace = Trace {
-            fraction: hit.hit_time,
-            normal: hit.normal,
-            hit_type: TraceHitType::Entity,
-            hit_id: hit.geom.hit_id,
-            ..Trace::default()
-        };
-        collision.touch_entity(&trace, hit.hit_point);
+fn touch<C: Bo2Collision>(solids: &C, strike: &Hit) {
+    let entity = strike.shape_data.struck_entity_num;
+    if entity == ENTITYNUM_WORLD {
+        return;
     }
+    // Hand the contact over as an entity trace stopped at the hit.
+    let Hit {
+        hit_time,
+        facing: normal,
+        hit_point,
+        ..
+    } = *strike;
+    let mut as_trace = Trace::new();
+    as_trace.impact_category = TraceHitType::Entity;
+    as_trace.struck_entity_num = entity;
+    (as_trace.fraction, as_trace.normal) = (hit_time, normal);
+    solids.brush_against(&as_trace, hit_point);
 }
 
 /// BO2's gjk_slide_move1. `no_push`: never push out of anything. None: the
 /// slide went too far.
-fn slide_move1<C: Bo2Collision>(collision: &C, input: &SlideInput, no_push: bool) -> Option<SlideOutput> {
-    let ft = input.frametime;
+fn slide_move1<C: Bo2Collision>(
+    solids: &C,
+    input: &SlideInput,
+    no_push: bool,
+) -> Option<SlideOutput> {
+    let ft = input.step_millis_elapsed;
     let p0 = input.position;
-    let v = input.velocity;
-    let v_end_z = if input.has_gravity { v[2] - input.gravity * ft } else { v[2] };
+    let v = input.vel;
+    let v_end_z = if input.has_gravity {
+        v[2] - input.fall_accel * ft
+    } else {
+        v[2]
+    };
     let half = ft * 0.5;
     let end = [
         p0[0] + (v[0] + v[0]) * half,
         p0[1] + (v[1] + v[1]) * half,
         p0[2] + (v[2] + v_end_z) * half,
     ];
-    let mut trace = mover_trace_info(input.mover, p0, end, input.mask);
+    let mut trace = mover_trace_info(input.mover, p0, end, input.solid_mask);
     trace.exit_on_penetration = false;
 
     let mut trans_left = sub(end, p0);
     let mut vel_want = [v[0] * ft, v[1] * ft, v_end_z * ft];
-    let far_sq = (FAR_SCALE_SQ * len_sq(trans_left)).max(FAR_MIN_SQ);
+    let far_sq = (FAR_SCALE_SQ * magnitude_squared(trans_left)).max(FAR_MIN_SQ);
 
-    let mut planes = Planes::new();
+    let mut planes = Planes::default();
     let mut pos = p0;
     let mut time_used = 0.0f32;
     let mut vel_out = vel_want;
     let mut cur = trans_left;
     let mut rounds = 0;
     loop {
-        trace.start = pos;
+        trace.from_pt = pos;
         trace.translation = cur;
         let remaining = ft - time_used;
-        trace.extra_time = if CONTACT_TIME <= remaining { CONTACT_TIME / remaining } else { 1.0 };
+        trace.extra_time = if CONTACT_TIME <= remaining {
+            CONTACT_TIME / remaining
+        } else {
+            1.0
+        };
         trace.skip_sentients = false;
-        let hits = gjk_trace(collision, &trace, &planes.skip);
+        let hits = gjk_trace(solids, &trace, &planes.skip);
         let Some(first) = hits.first else {
             pos = add(pos, cur);
             break;
@@ -239,28 +276,28 @@ fn slide_move1<C: Bo2Collision>(collision: &C, input: &SlideInput, no_push: bool
             time_used += t_hit;
             advanced = t_hit;
         }
-        for hit in &hits.list {
-            if hit.hit_time * remaining - advanced > CONTACT_TIME {
+        for strike in &hits.list {
+            if strike.hit_time * remaining - advanced > CONTACT_TIME {
                 continue;
             }
-            let mut hit = *hit;
-            if no_push && hit.hit_dist < 0.0 {
+            let mut strike = *strike;
+            if no_push && strike.hit_dist < 0.0 {
                 // Take the body as it is: the plane through where it sits.
-                hit.hit_point = add(scale(hit.normal, hit.hit_dist), hit.hit_point);
-                hit.hit_dist = 0.0;
+                strike.hit_point = add(scale(strike.facing, strike.hit_dist), strike.hit_point);
+                strike.hit_dist = 0.0;
             }
-            planes.add(&hit);
-            touch(collision, &hit);
+            planes.note_hit(&strike);
+            touch(solids, &strike);
         }
         planes.set_rs(pos, |p| no_push || p.no_push_out);
         cur = planes.project(trans_left);
-        if len_sq(sub(add(cur, pos), p0)) > far_sq {
+        if magnitude_squared(sub(add(cur, pos), p0)) > far_sq {
             return None;
         }
         // The velocity is only ever slid, never pushed.
         planes.hold_all();
         vel_out = planes.project(vel_want);
-        if len_sq(cur) < MIN_MOVE_SQ {
+        if magnitude_squared(cur) < MIN_MOVE_SQ {
             break;
         }
         rounds += 1;
@@ -273,16 +310,20 @@ fn slide_move1<C: Bo2Collision>(collision: &C, input: &SlideInput, no_push: bool
     if DO_STEP_DOWN && input.do_step_down {
         step_down(&mut planes, &mut pos, &mut velocity);
     }
-    Some(SlideOutput { position: pos, velocity, bumped: !planes.list.is_empty() })
+    Some(SlideOutput {
+        position: pos,
+        vel: velocity,
+        bumped: !planes.list.is_empty(),
+    })
 }
 
 /// The end of gjk_slide_move1 when walking: if the slide left the body
 /// above the ground it met (more than 0.1 off the nearest walkable plane),
 /// sweep it down up to 30 along the planes until it lands on one, and lay
 /// the velocity along that ground.
-fn step_down(planes: &mut Planes, pos: &mut [f32; 3], velocity: &mut [f32; 3]) {
-    for s in &mut planes.solve {
-        s.active = false;
+fn step_down(planes: &mut Planes, pos: &mut [f32; 3], vel: &mut [f32; 3]) {
+    for slot in &mut planes.solve {
+        slot.engaged = false;
     }
     let nearest = planes
         .list
@@ -298,25 +339,28 @@ fn step_down(planes: &mut Planes, pos: &mut [f32; 3], velocity: &mut [f32; 3]) {
     let mut tries = 0;
     loop {
         // The first plane the sweep reaches.
-        let mut best = None;
-        let mut best_t = 1.0f32;
-        for (i, (s, p)) in planes.solve.iter().zip(&planes.list).enumerate() {
-            if s.active {
-                continue;
+        let reachable = planes
+            .solve
+            .iter()
+            .zip(&planes.list)
+            .enumerate()
+            .filter_map(|(k, (slot, p))| {
+                let facing = dot(sweep, p.plane_dir);
+                (!slot.engaged && libm::fabsf(facing) > SWEEP_PARALLEL)
+                    .then(|| (k, p.gap(*pos) * (-1.0 / facing)))
+            });
+        // Earliest wins; a tie keeps the lower index.
+        let (first_met, best_t) = reachable.fold((None, 1.0f32), |(kept, kept_t), (i, t)| {
+            if t < kept_t {
+                (Some(i), t)
+            } else {
+                (kept, kept_t)
             }
-            let nd = dot(sweep, p.normal);
-            if libm::fabsf(nd) > SWEEP_PARALLEL {
-                let t = p.gap(*pos) * (-1.0 / nd);
-                if t < best_t {
-                    best = Some(i);
-                    best_t = t;
-                }
-            }
-        }
-        let Some(best) = best else {
+        });
+        let Some(best) = first_met else {
             return;
         };
-        planes.solve[best].active = true;
+        planes.solve[best].engaged = true;
         let cand = add(scale(sweep, best_t), *pos);
         let landing = if planes.list[best].walkable {
             Some(best)
@@ -338,7 +382,7 @@ fn step_down(planes: &mut Planes, pos: &mut [f32; 3], velocity: &mut [f32; 3]) {
         if let Some(l) = landing {
             if 0.0 < best_t {
                 *pos = cand;
-                project_velocity(velocity, &planes.list[l].normal);
+                project_velocity(vel, &planes.list[l].plane_dir);
             }
             return;
         }
@@ -354,33 +398,37 @@ fn step_down(planes: &mut Planes, pos: &mut [f32; 3], velocity: &mut [f32; 3]) {
 /// BO2's gjk_push_out: from inside something, the shortest way out of
 /// everything the body overlaps, measured again as it moves, a few times.
 /// `skip_sentients`: pass through other players. None: no way out.
-fn push_out<C: Bo2Collision>(collision: &C, input: &SlideInput, skip_sentients: bool) -> Option<[f32; 3]> {
+fn push_out<C: Bo2Collision>(
+    solids: &C,
+    input: &SlideInput,
+    skip_sentients: bool,
+) -> Option<[f32; 3]> {
     let base = input.position;
     let mut cur = base;
-    let mut trace = mover_trace_info(input.mover, base, base, input.mask);
+    let mut trace = mover_trace_info(input.mover, base, base, input.solid_mask);
     trace.extra_time = 1.0;
     trace.skip_sentients = skip_sentients;
     trace.keep_all = true;
     trace.exit_on_penetration = false;
-    let mut planes = Planes::new();
+    let mut planes = Planes::default();
     let mut bumps = 0;
     loop {
-        trace.start = base;
+        trace.from_pt = base;
         trace.translation = sub(cur, base);
-        let hits = gjk_trace(collision, &trace, &planes.skip);
+        let hits = gjk_trace(solids, &trace, &planes.skip);
         if hits.first.is_none() {
             return Some(cur);
         }
-        for hit in &hits.list {
-            planes.add(hit);
-            touch(collision, hit);
+        for strike in &hits.list {
+            planes.note_hit(strike);
+            touch(solids, strike);
         }
         planes.set_rs(base, |p| p.no_push_out);
         let mut delta = planes.project([0.0; 3]);
         if planes.stuck(delta) {
             return None;
         }
-        let len = libm::sqrtf(len_sq(delta));
+        let len = libm::sqrtf(magnitude_squared(delta));
         if len <= PUSH_OUT_DONE {
             return Some(cur);
         }
@@ -390,12 +438,17 @@ fn push_out<C: Bo2Collision>(collision: &C, input: &SlideInput, skip_sentients: 
         let sep = len + PUSH_OUT_SEP;
         let mut rounds = 0;
         loop {
-            let at = TraceInput { start: cur, translation: [0.0; 3], keep_all: true, ..trace };
-            for (s, p) in planes.solve.iter_mut().zip(planes.list.iter_mut()) {
-                if let Some(hit) = gjk_collide(&at, &p.geom, 0.0, 1.0, sep) {
-                    *p = Plane::from_hit(&hit);
-                    s.normal = hit.normal;
-                    s.active = true;
+            let at = TraceInput {
+                from_pt: cur,
+                translation: [0.0; 3],
+                keep_all: true,
+                ..trace
+            };
+            for (slot, p) in planes.solve.iter_mut().zip(planes.list.iter_mut()) {
+                if let Some(strike) = gjk_collide(&at, &p.shape_data, 0.0, 1.0, sep) {
+                    *p = Plane::from_hit(&strike);
+                    slot.facing = strike.facing;
+                    slot.engaged = true;
                 }
             }
             planes.set_rs(base, |p| p.no_push_out);
@@ -405,7 +458,7 @@ fn push_out<C: Bo2Collision>(collision: &C, input: &SlideInput, skip_sentients: 
                 return None;
             }
             cur = add(base, delta);
-            if len_sq(sub(delta, prev)) <= SETTLE_SQ {
+            if magnitude_squared(sub(delta, prev)) <= SETTLE_SQ {
                 break;
             }
             rounds += 1;
@@ -423,16 +476,25 @@ fn push_out<C: Bo2Collision>(collision: &C, input: &SlideInput, skip_sentients: 
 /// BO2's gjk_slide_move: the slide, or when it went too far (the body
 /// started inside something) the push-out, through other players if need
 /// be, and failing both the slide that pushes out of nothing.
-pub(crate) fn gjk_slide_move<C: Bo2Collision>(collision: &C, input: &SlideInput) -> SlideOutput {
-    if let Some(out) = slide_move1(collision, input, false) {
+pub(crate) fn gjk_slide_move<C: Bo2Collision>(solids: &C, input: &SlideInput) -> SlideOutput {
+    if let Some(out) = slide_move1(solids, input, false) {
         return out;
     }
-    let stay = SlideOutput { position: input.position, velocity: input.velocity, bumped: true };
-    if let Some(position) = push_out(collision, input, false).or_else(|| push_out(collision, input, true)) {
+    let stay = SlideOutput {
+        position: input.position,
+        vel: input.vel,
+        bumped: true,
+    };
+    if let Some(position) =
+        push_out(solids, input, false).or_else(|| push_out(solids, input, true))
+    {
         return SlideOutput { position, ..stay };
     }
-    match slide_move1(collision, input, true) {
-        Some(out) => SlideOutput { bumped: true, ..out },
+    match slide_move1(solids, input, true) {
+        Some(out) => SlideOutput {
+            bumped: true,
+            ..out
+        },
         None => stay,
     }
 }
@@ -442,62 +504,63 @@ pub(crate) fn gjk_slide_move<C: Bo2Collision>(collision: &C, input: &SlideInput)
 /// onto ground below when not (walking on ground, off a ladder). True when
 /// it met anything.
 pub(crate) fn slide_move<C: Bo2Collision>(
-    ps: &mut PlayerState,
-    pml: &Pml,
-    collision: &C,
-    mins: [f32; 3],
-    maxs: [f32; 3],
+    avatar: &mut AvatarState,
+    tick_vars: &TickLocals,
+    solids: &C,
+    box_lo: [f32; 3],
+    box_hi: [f32; 3],
     mask: u32,
     gravity: bool,
 ) -> bool {
+    let on_ladder = avatar.movement_state_bits & movement_state_bits::LADDER != 0;
     let input = SlideInput {
-        position: ps.origin,
-        velocity: ps.velocity,
-        gravity: ps.gravity as f32,
+        do_step_down: !gravity && tick_vars.standing_on_floor != 0 && !on_ladder,
         has_gravity: gravity,
-        mover: player_mover(mins, maxs),
-        mask,
-        frametime: pml.frametime,
-        do_step_down: !gravity && pml.ground_plane != 0 && ps.pm_flags & pm_flags::LADDER == 0,
+        fall_accel: avatar.gravity as f32,
+        step_millis_elapsed: tick_vars.step_millis_elapsed,
+        mover: player_mover(box_lo, box_hi),
+        position: avatar.origin,
+        vel: avatar.velocity,
+        solid_mask: mask,
     };
-    let out = gjk_slide_move(collision, &input);
-    ps.origin = out.position;
-    ps.velocity = out.velocity;
+    let out = gjk_slide_move(solids, &input);
+    avatar.origin = out.position;
+    avatar.velocity = out.vel;
     out.bumped
 }
 
 /// BO2's vehicle slide with a collision map (setup_gjkcc_input, then
-/// gjk_slide_move): the vehicle's brush, never turned, slid from `position`
-/// along `velocity` for `frametime` through what `collision` holds, never
-/// stepping down; `gravity` pulls when set. Where it ends up, its velocity,
+/// gjk_slide_move): the vehicle's brush, never turned, slid from `start`
+/// along `moving` for `step_millis_elapsed` through what `hull_hits` holds, never
+/// stepping down; `pull` is gravity when set. Where it ends up, its velocity,
 /// and whether it met anything.
 pub fn vehicle_slide_move<C: Bo2Collision>(
-    collision: &C,
+    solids: &C,
     brush: &MoverBrush,
-    position: [f32; 3],
-    velocity: [f32; 3],
+    from_pt: [f32; 3],
+    moving: [f32; 3],
     mask: u32,
-    frametime: f32,
-    gravity: Option<f32>,
+    step_millis_elapsed: f32,
+    pull: Option<f32>,
 ) -> ([f32; 3], [f32; 3], bool) {
     let input = SlideInput {
-        position,
-        velocity,
-        gravity: gravity.unwrap_or(0.0),
-        has_gravity: gravity.is_some(),
+        position: from_pt,
+        vel: moving,
+        fall_accel: pull.unwrap_or(0.0),
+        has_gravity: pull.is_some(),
         mover: Mover::Brush(*brush),
-        mask,
-        frametime,
+        solid_mask: mask,
+        step_millis_elapsed,
         do_step_down: false,
     };
-    let out = gjk_slide_move(collision, &input);
-    (out.position, out.velocity, out.bumped)
+    let out = gjk_slide_move(solids, &input);
+    (out.position, out.vel, out.bumped)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::testkit::{MASK, MAXS, MINS, World, block, floor, other_player};
-    use super::super::trace::{ground_trace, player_trace};
+    use super::super::trace::{floor_probe, player_trace};
     use super::super::{IDENTITY, Shape};
     use super::*;
 
@@ -507,15 +570,15 @@ mod tests {
     /// The ring's corner out in front, with the skin.
     const REACH: f32 = 14.625 / 0.965_925_8 + 0.5;
 
-    fn input(position: [f32; 3], velocity: [f32; 3], in_air: bool) -> SlideInput {
+    fn input(spot: [f32; 3], speed_vec: [f32; 3], in_air: bool) -> SlideInput {
         SlideInput {
-            position,
-            velocity,
-            gravity: 800.0,
+            position: spot,
+            vel: speed_vec,
+            fall_accel: 800.0,
             has_gravity: in_air,
             mover: player_mover(MINS, MAXS),
-            mask: MASK,
-            frametime: 0.05,
+            solid_mask: MASK,
+            step_millis_elapsed: 0.05,
             do_step_down: !in_air,
         }
     }
@@ -529,7 +592,7 @@ mod tests {
         let world = World::new(alloc::vec![]);
         let out = gjk_slide_move(&world, &input([0.0, 0.0, 50.0], [100.0, -40.0, 0.0], false));
         assert_eq!(out.position, [5.0, -2.0, 50.0]);
-        assert_eq!(out.velocity, [100.0, -40.0, 0.0]);
+        assert_eq!(out.vel, [100.0, -40.0, 0.0]);
         assert!(!out.bumped);
     }
 
@@ -540,21 +603,27 @@ mod tests {
         let out = gjk_slide_move(&world, &input([0.0, 0.0, 100.0], [0.0, 0.0, 0.0], true));
         // 800 over 50 ms: ends at -40, moved -20 * 0.05.
         assert!(near(out.position[2], 99.0, 1e-4), "{out:?}");
-        assert!(near(out.velocity[2], -40.0, 1e-3), "{out:?}");
+        assert!(near(out.vel[2], -40.0, 1e-3), "{out:?}");
     }
 
     /// Running diagonally into a wall: stopped at it across, slid the whole
     /// way along it, the speed into it gone.
     #[test]
     fn sliding_along_a_wall() {
-        let world = World::new(alloc::vec![block([20.0, -256.0, -64.0], [36.0, 256.0, 256.0])]);
-        let out = gjk_slide_move(&world, &input([-10.0, 0.0, 10.0], [400.0, 400.0, 0.0], false));
+        let world = World::new(alloc::vec![block(
+            [20.0, -256.0, -64.0],
+            [36.0, 256.0, 256.0]
+        )]);
+        let out = gjk_slide_move(
+            &world,
+            &input([-10.0, 0.0, 10.0], [400.0, 400.0, 0.0], false),
+        );
         assert!(out.bumped);
         assert!(near(out.position[0], 20.0 - REACH, 0.05), "{out:?}");
         assert!(near(out.position[1], 20.0, 0.05), "{out:?}");
         assert!(near(out.position[2], 10.0, 1e-4), "{out:?}");
-        assert!(near(out.velocity[0], 0.0, 0.01), "{out:?}");
-        assert!(near(out.velocity[1], 400.0, 0.01), "{out:?}");
+        assert!(near(out.vel[0], 0.0, 0.01), "{out:?}");
+        assert!(near(out.vel[1], 400.0, 0.01), "{out:?}");
     }
 
     /// Falling onto a floor: on it, the fall stopped.
@@ -564,8 +633,8 @@ mod tests {
         let out = gjk_slide_move(&world, &input([0.0, 0.0, 30.0], [50.0, 0.0, -600.0], true));
         assert!(out.bumped);
         assert!(near(out.position[2], REST_Z, 0.01), "{out:?}");
-        assert!(near(out.velocity[2], 0.0, 0.01), "{out:?}");
-        assert!(near(out.velocity[0], 50.0, 0.01), "{out:?}");
+        assert!(near(out.vel[2], 0.0, 0.01), "{out:?}");
+        assert!(near(out.vel[0], 50.0, 0.01), "{out:?}");
     }
 
     /// A floor met in the frame's last sixtieth of a second: the body ends
@@ -576,23 +645,33 @@ mod tests {
         let world = World::new(alloc::vec![floor()]);
         let out = gjk_slide_move(&world, &input([0.0, 0.0, 5.0], [50.0, 0.0, -300.0], true));
         assert!(near(out.position[2], REST_Z, 0.01), "{out:?}");
-        assert!(near(out.velocity[2], (REST_Z - 5.0) / 0.05, 0.01), "{out:?}");
+        assert!(
+            near(out.vel[2], (REST_Z - 5.0) / 0.05, 0.01),
+            "{out:?}"
+        );
     }
 
     /// A slope down toward +x, 20 degrees, through the origin.
     fn ramp() -> Geom<'static> {
-        let (s, c) = (libm::sinf(20f32.to_radians()), libm::cosf(20f32.to_radians()));
+        let (s, c) = (
+            libm::sinf(20f32.to_radians()),
+            libm::cosf(20f32.to_radians()),
+        );
         let mut g = block([-1.0; 3], [1.0; 3]);
-        g.shape = Shape::Box { center: [0.0, 0.0, -16.0], half: [256.0, 256.0, 16.0], brush: true };
+        g.shape = Shape::Box {
+            center: [0.0, 0.0, -16.0],
+            half: [256.0, 256.0, 16.0],
+            brush: true,
+        };
         g.axis = [[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]];
-        g.mins = [-300.0, -300.0, -200.0];
-        g.maxs = [300.0, 300.0, 200.0];
+        g.lo_corner = [-300.0, -300.0, -200.0];
+        g.hi_corner = [300.0, 300.0, 200.0];
         g
     }
 
     /// How far the body at `pos` is above what is under it (to 4 units).
     fn height_above(world: &World, pos: [f32; 3]) -> f32 {
-        let t = ground_trace(world, pos, [pos[0], pos[1], pos[2] - 4.0], MINS, MAXS, MASK);
+        let t = floor_probe(world, pos, [pos[0], pos[1], pos[2] - 4.0], MINS, MAXS, MASK);
         4.0 * t.fraction
     }
 
@@ -603,30 +682,42 @@ mod tests {
     fn the_step_down_keeps_the_body_on_a_slope() {
         let world = World::new(alloc::vec![ramp()]);
         let (high, low) = ([0.0, 0.0, 20.0], [0.0, 0.0, -20.0]);
-        let top = ground_trace(&world, high, low, MINS, MAXS, MASK).end_pos(high, low);
+        let top = floor_probe(&world, high, low, MINS, MAXS, MASK).finish_location(high, low);
         let start = [top[0], top[1], top[2] - 0.3];
         let walk = input(start, [300.0, 0.0, 0.0], false);
         let out = gjk_slide_move(&world, &walk);
         assert!(out.bumped);
         assert!(height_above(&world, out.position) < 0.2, "{out:?}");
         assert!(out.position[2] < start[2] - 4.0, "{out:?}");
-        assert!(out.velocity[2] < -50.0, "{out:?}");
+        assert!(out.vel[2] < -50.0, "{out:?}");
 
-        let floating = gjk_slide_move(&world, &SlideInput { do_step_down: false, ..walk });
-        assert!(height_above(&world, floating.position) > 3.0, "{floating:?}");
-        assert!(near(floating.velocity[2], 0.0, 1e-3), "{floating:?}");
+        let floating = gjk_slide_move(
+            &world,
+            &SlideInput {
+                do_step_down: false,
+                ..walk
+            },
+        );
+        assert!(
+            height_above(&world, floating.position) > 3.0,
+            "{floating:?}"
+        );
+        assert!(near(floating.vel[2], 0.0, 1e-3), "{floating:?}");
     }
 
     /// Standing a little into a wall: the slide pushes the body straight
     /// out.
     #[test]
     fn a_small_overlap_is_pushed_out() {
-        let world = World::new(alloc::vec![block([10.0, -256.0, -64.0], [50.0, 256.0, 256.0])]);
+        let world = World::new(alloc::vec![block(
+            [10.0, -256.0, -64.0],
+            [50.0, 256.0, 256.0]
+        )]);
         let x = 10.0 - REACH + 1.5;
         let out = gjk_slide_move(&world, &input([x, 0.0, 10.0], [0.0; 3], false));
         assert!(out.bumped);
         assert!(near(out.position[0], 10.0 - REACH, 0.05), "{out:?}");
-        assert_eq!(out.velocity, [0.0; 3]);
+        assert_eq!(out.vel, [0.0; 3]);
     }
 
     /// Deep in a thin wall (more than 20 units from either face): too far
@@ -634,14 +725,17 @@ mod tests {
     /// the velocity kept, the frame's move not made.
     #[test]
     fn deep_in_a_wall_is_pushed_out() {
-        let world = World::new(alloc::vec![block([-6.0, -256.0, -64.0], [8.0, 256.0, 256.0])]);
+        let world = World::new(alloc::vec![block(
+            [-6.0, -256.0, -64.0],
+            [8.0, 256.0, 256.0]
+        )]);
         let out = gjk_slide_move(&world, &input([0.0, 0.0, 10.0], [0.0, 20.0, 0.0], false));
         assert!(out.bumped);
         assert!(near(out.position[0], -6.0 - REACH, 0.1), "{out:?}");
         assert!(near(out.position[1], 0.0, 0.01), "{out:?}");
-        assert_eq!(out.velocity, [0.0, 20.0, 0.0]);
+        assert_eq!(out.vel, [0.0, 20.0, 0.0]);
         let t = player_trace(&world, out.position, out.position, MINS, MAXS, MASK);
-        assert!(!t.startsolid, "{t:?}");
+        assert!(!t.starts_inside, "{t:?}");
     }
 
     /// Running into another player: stopped at them (never pushed out of
@@ -649,11 +743,14 @@ mod tests {
     #[test]
     fn running_into_another_player() {
         let world = World::new(alloc::vec![floor(), other_player([40.0, 0.0, REST_Z], 3)]);
-        let out = gjk_slide_move(&world, &input([-20.0, 0.0, REST_Z], [600.0, 0.0, 0.0], false));
+        let out = gjk_slide_move(
+            &world,
+            &input([-20.0, 0.0, REST_Z], [600.0, 0.0, 0.0], false),
+        );
         assert!(out.bumped);
         let gap = 40.0 - (14.625 + 0.5) - REACH;
         assert!(near(out.position[0], gap, 0.1), "{out:?}");
-        assert!(near(out.velocity[0], 0.0, 0.01), "{out:?}");
+        assert!(near(out.vel[0], 0.0, 0.01), "{out:?}");
         assert_eq!(*world.touched.borrow(), alloc::vec![3]);
     }
 
@@ -675,7 +772,7 @@ mod tests {
     #[test]
     fn a_vehicle_brush_keeps_each_corner_once() {
         let brush = drone_brush();
-        assert_eq!(brush.verts().len(), 16);
+        assert_eq!(brush.vertex_points().len(), 16);
         assert_eq!(brush.bounds(), ([-16.0, -16.0, -15.5], [16.0, 16.0, 9.5]));
         assert!(MoverBrush::new(&[]).is_none());
         let too_many: alloc::vec::Vec<[f32; 3]> = (0..40).map(|i| [i as f32, 0.0, 0.0]).collect();
@@ -690,18 +787,34 @@ mod tests {
     #[test]
     fn a_vehicle_brush_stops_on_a_floor() {
         let world = World::new(alloc::vec![floor()]);
-        let (pos, vel, bumped) = vehicle_slide_move(&world, &drone_brush(), [0.0, 0.0, 30.0], [50.0, 0.0, -600.0], MASK, 0.05, None);
+        let (pos, motion_vec, bumped) = vehicle_slide_move(
+            &world,
+            &drone_brush(),
+            [0.0, 0.0, 30.0],
+            [50.0, 0.0, -600.0],
+            MASK,
+            0.05,
+            None,
+        );
         assert!(bumped);
         assert!(near(pos[2], 15.5, 1e-3), "{pos:?}");
-        assert!(near(vel[2], -14.5 / 0.05, 0.01), "{vel:?}");
-        assert!(near(vel[0], 50.0, 0.01), "{vel:?}");
+        assert!(near(motion_vec[2], -14.5 / 0.05, 0.01), "{motion_vec:?}");
+        assert!(near(motion_vec[0], 50.0, 0.01), "{motion_vec:?}");
         assert!(near(pos[0], 2.5, 0.01), "{pos:?}");
         let mut pos = pos;
         for frame in 2..6 {
-            let (p, vel, bumped) = vehicle_slide_move(&world, &drone_brush(), pos, [50.0, 0.0, -600.0], MASK, 0.05, None);
+            let (p, motion_vec, bumped) = vehicle_slide_move(
+                &world,
+                &drone_brush(),
+                pos,
+                [50.0, 0.0, -600.0],
+                MASK,
+                0.05,
+                None,
+            );
             assert!(bumped);
             assert!(near(p[2], 15.5, 1e-3), "{frame} {p:?}");
-            assert!(near(vel[2], 0.0, 0.01), "{frame} {vel:?}");
+            assert!(near(motion_vec[2], 0.0, 0.01), "{frame} {motion_vec:?}");
             assert!(near(p[0], pos[0] + 2.5, 0.01), "{frame} {p:?}");
             pos = p;
         }
@@ -712,22 +825,41 @@ mod tests {
     /// it has no speed into the wall and the move along it goes on.
     #[test]
     fn a_vehicle_brush_slides_along_a_wall() {
-        let world = World::new(alloc::vec![block([30.0, -256.0, -64.0], [46.0, 256.0, 256.0])]);
-        let (pos, vel, bumped) = vehicle_slide_move(&world, &drone_brush(), [0.0, 0.0, 50.0], [400.0, 400.0, 0.0], MASK, 0.05, None);
+        let world = World::new(alloc::vec![block(
+            [30.0, -256.0, -64.0],
+            [46.0, 256.0, 256.0]
+        )]);
+        let (pos, motion_vec, bumped) = vehicle_slide_move(
+            &world,
+            &drone_brush(),
+            [0.0, 0.0, 50.0],
+            [400.0, 400.0, 0.0],
+            MASK,
+            0.05,
+            None,
+        );
         assert!(bumped);
         assert!(near(pos[0], 14.0, 1e-3), "{pos:?}");
         assert!(near(pos[1], 20.0, 1e-3), "{pos:?}");
         assert!(near(pos[2], 50.0, 1e-4), "{pos:?}");
-        assert!(near(vel[0], 14.0 / 0.05, 0.01), "{vel:?}");
-        assert!(near(vel[1], 400.0, 0.01), "{vel:?}");
+        assert!(near(motion_vec[0], 14.0 / 0.05, 0.01), "{motion_vec:?}");
+        assert!(near(motion_vec[1], 400.0, 0.01), "{motion_vec:?}");
         let mut pos = pos;
         for frame in 2..6 {
-            let (p, vel, bumped) = vehicle_slide_move(&world, &drone_brush(), pos, [400.0, 400.0, 0.0], MASK, 0.05, None);
+            let (p, motion_vec, bumped) = vehicle_slide_move(
+                &world,
+                &drone_brush(),
+                pos,
+                [400.0, 400.0, 0.0],
+                MASK,
+                0.05,
+                None,
+            );
             assert!(bumped);
             assert!(near(p[0], 14.0, 1e-3), "{frame} {p:?}");
             assert!(near(p[1], pos[1] + 20.0, 1e-3), "{frame} {p:?}");
-            assert!(near(vel[0], 0.0, 0.01), "{frame} {vel:?}");
-            assert!(near(vel[1], 400.0, 0.01), "{frame} {vel:?}");
+            assert!(near(motion_vec[0], 0.0, 0.01), "{frame} {motion_vec:?}");
+            assert!(near(motion_vec[1], 400.0, 0.01), "{frame} {motion_vec:?}");
             pos = p;
         }
     }
@@ -736,12 +868,28 @@ mod tests {
     #[test]
     fn a_vehicle_brush_falls_only_with_gravity() {
         let world = World::new(alloc::vec::Vec::new());
-        let (pos, vel, bumped) = vehicle_slide_move(&world, &drone_brush(), [0.0, 0.0, 100.0], [0.0; 3], MASK, 0.05, None);
+        let (pos, motion_vec, bumped) = vehicle_slide_move(
+            &world,
+            &drone_brush(),
+            [0.0, 0.0, 100.0],
+            [0.0; 3],
+            MASK,
+            0.05,
+            None,
+        );
         assert!(!bumped);
-        assert_eq!((pos, vel), ([0.0, 0.0, 100.0], [0.0; 3]));
-        let (pos, vel, _) = vehicle_slide_move(&world, &drone_brush(), [0.0, 0.0, 100.0], [0.0; 3], MASK, 0.05, Some(800.0));
+        assert_eq!((pos, motion_vec), ([0.0, 0.0, 100.0], [0.0; 3]));
+        let (pos, motion_vec, _) = vehicle_slide_move(
+            &world,
+            &drone_brush(),
+            [0.0, 0.0, 100.0],
+            [0.0; 3],
+            MASK,
+            0.05,
+            Some(800.0),
+        );
         assert!(near(pos[2], 99.0, 1e-4), "{pos:?}");
-        assert!(near(vel[2], -40.0, 1e-3), "{vel:?}");
+        assert!(near(motion_vec[2], -40.0, 1e-3), "{motion_vec:?}");
     }
 
     /// The world is never touched.
@@ -755,8 +903,8 @@ mod tests {
     #[test]
     fn plane_gap() {
         let p = Plane {
-            geom: block([0.0; 3], [1.0; 3]),
-            normal: [0.0, 0.0, 1.0],
+            shape_data: block([0.0; 3], [1.0; 3]),
+            plane_dir: [0.0_f32, 0.0, 1.0],
             arm: [0.0, 0.0, -0.125],
             d: 0.0,
             walkable: true,

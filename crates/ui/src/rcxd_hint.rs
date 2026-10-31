@@ -8,12 +8,12 @@
 //! (`button_left_mouse`, BO2's `^BBUTTON_MOUSE_LEFT^`).
 
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
-use frame::{ClientSet, HudInputView};
-use net::{LocalPresentClient, PresentedSnapshot};
+use frame::{ClientStep, OverlayControlSnapshot};
+use net::{HostViewClient, ShownWorldFrame};
 use std::collections::HashMap;
 
-use crate::layers::{UiLayer, UiLayerVisibility};
+use crate::{MainWindow, covering_node, pinned_node};
+use crate::tiers::{OverlayTier, OverlayStackShown};
 
 /// The menu's lines' centres in its 480-high screen (the real game's shot:
 /// 391, 410 and 429 of 455), and their left edge.
@@ -40,35 +40,41 @@ struct RcxdHintRoot {
 struct Pictures(HashMap<&'static str, Handle<Image>>);
 
 /// The picture BO2 draws for a mouse key, and its FontIcon name.
-fn mouse_picture(key: &str) -> Option<(&'static str, &'static str)> {
-    Some(match key {
+struct MousePicture {
+    image: &'static str,
+    font_icon: &'static str,
+}
+
+fn mouse_picture(key: &str) -> Option<MousePicture> {
+    let (image, font_icon) = match key {
         "MOUSE1" => ("button_left_mouse", "BUTTON_MOUSE_LEFT"),
         "MOUSE2" => ("button_right_mouse", "BUTTON_MOUSE_RIGHT"),
         "MOUSE3" => ("button_middle_mouse", "BUTTON_MOUSE_MIDDLE"),
         _ => return None,
-    })
+    };
+    Some(MousePicture { image, font_icon })
 }
 
 /// A FontIcon entry's size scales (`bo2mp/fonticon.csv`: name, hash,
 /// material, size, xScale, yScale).
 fn icon_scale(ui: &assets::T6Ui, name: &str) -> Option<(f32, f32)> {
     let (_, cols, _, cells) = ui.tables.iter().find(|t| t.0 == "bo2mp/fonticon.csv")?;
-    let row = cells.chunks((*cols).max(1)).find(|r| r.first().is_some_and(|n| n.eq_ignore_ascii_case(name)))?;
-    Some((row.get(4)?.parse().ok()?, row.get(5)?.parse().ok()?))
+    let line = cells.chunks((*cols).max(1)).find(|r| r.first().is_some_and(|n| n.eq_ignore_ascii_case(name)))?;
+    Some((line.get(4)?.parse().ok()?, line.get(5)?.parse().ok()?))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn update(
     mut commands: Commands,
     roots: Query<(Entity, &RcxdHintRoot)>,
-    window: Query<&Window, With<PrimaryWindow>>,
-    presented: Option<Res<PresentedSnapshot>>,
-    local: Option<Res<LocalPresentClient>>,
+    window: MainWindow,
+    presented: Option<Res<ShownWorldFrame>>,
+    local: Option<Res<HostViewClient>>,
     ui: Option<Res<assets::T6Ui>>,
     icons: Option<Res<assets::T6HudIcons>>,
-    keys: Option<Res<HudInputView>>,
+    keys: Option<Res<OverlayControlSnapshot>>,
     fonts: Option<Res<crate::bo2_font::Bo2Fonts>>,
-    mut images: ResMut<Assets<Image>>,
+    mut pics: ResMut<Assets<Image>>,
     mut pictures: Local<Pictures>,
 ) {
     let riding = (|| {
@@ -77,7 +83,7 @@ fn update(
         v.split(' ').next().is_some_and(|k| k.to_ascii_lowercase().starts_with("rc_car")).then_some(())
     })()
     .is_some();
-    let (true, Some(ui), Ok(win), Some(fonts)) = (riding, ui.as_deref(), window.single(), fonts.as_deref()) else {
+    let (true, Some(ui), Some(win), Some(fonts)) = (riding, ui.as_deref(), window.shown(), fonts.as_deref()) else {
         for (e, _) in &roots {
             commands.entity(e).try_despawn();
         }
@@ -87,8 +93,8 @@ fn update(
         && let Some(icons) = icons.as_deref()
     {
         for name in ["button_left_mouse", "button_right_mouse", "button_middle_mouse"] {
-            if let Some((_, image)) = icons.0.iter().find(|(n, _)| n == name) {
-                pictures.0.insert(name, images.add((**image).clone()));
+            if let Some(image) = crate::hud_picture(icons, name) {
+                pictures.0.insert(name, pics.add((**image).clone()));
             }
         }
     }
@@ -125,58 +131,50 @@ fn update(
     commands
         .spawn((
             RcxdHintRoot { shows },
-            UiLayer::Hud,
-            UiLayerVisibility,
-            Node {
-                position_type: PositionType::Absolute,
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                ..default()
-            },
+            OverlayTier::Hud,
+            OverlayStackShown,
+            covering_node(),
         ))
-        .with_children(|root| {
+        .with_children(|outer| {
             for (i, (before, key, after)) in lines.iter().enumerate() {
                 let y = (FIRST_Y + LINE_STEP * i as f32) * scale;
-                root.spawn(Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(LEFT_X * scale),
-                    top: Val::Px(y - px * 0.6),
+                outer.spawn(Node {
                     flex_direction: FlexDirection::Row,
                     align_items: AlignItems::Center,
-                    ..default()
+                    ..pinned_node(LEFT_X * scale, y - px * 0.6)
                 })
-                .with_children(|row| {
-                    let text = |row: &mut ChildSpawnerCommands, t: &str| {
+                .with_children(|line| {
+                    let text = |line: &mut ChildSpawnerCommands, t: &str| {
                         let runs = crate::zm_hud::hint_runs_with(t, &keys, false);
                         if !runs.is_empty() {
-                            fonts.spawn_line_shadowed(row, "Default", &runs, px, shadow, 1.0);
+                            fonts.spawn_line_shadowed(line, "Default", &runs, px, shadow, 1.0);
                         }
                     };
-                    match mouse_picture(key).and_then(|(m, n)| Some((pictures.0.get(m)?.clone(), n))) {
-                        Some((handle, name)) => {
-                            text(row, before);
+                    match mouse_picture(key).and_then(|p| Some((pictures.0.get(p.image)?.clone(), p.font_icon))) {
+                        Some((icon, name)) => {
+                            text(line, before);
                             let (xs, ys) = icon_scale(ui, name).unwrap_or((1.0, 1.0));
-                            row.spawn((
+                            line.spawn((
                                 Node {
                                     width: Val::Px(px * xs),
                                     height: Val::Px(px * ys),
                                     ..default()
                                 },
-                                ImageNode::new(handle),
+                                ImageNode::new(icon),
                             ));
-                            text(row, after);
+                            text(line, after);
                         }
                         // A key's name keeps the line's colour codes (the
                         // key in yellow).
-                        None => text(row, &format!("{before}{key}{after}")),
+                        None => text(line, &format!("{before}{key}{after}")),
                     }
                 });
             }
         });
 }
 
-pub(crate) fn register(app: &mut App) {
-    app.add_systems(Update, update.after(crate::bo2_font::load_bo2_fonts).in_set(ClientSet::Ui));
+pub(crate) fn register(host: &mut App) {
+    host.add_systems(Update, update.after(crate::bo2_font::load_bo2_fonts).in_set(ClientStep::Ui));
 }
 
 #[cfg(test)]
@@ -185,8 +183,8 @@ mod tests {
 
     #[test]
     fn mouse_keys_draw_their_pictures() {
-        assert_eq!(mouse_picture("MOUSE1").map(|p| p.0), Some("button_left_mouse"));
-        assert_eq!(mouse_picture("MOUSE2").map(|p| p.0), Some("button_right_mouse"));
+        assert_eq!(mouse_picture("MOUSE1").map(|p| p.image), Some("button_left_mouse"));
+        assert_eq!(mouse_picture("MOUSE2").map(|p| p.image), Some("button_right_mouse"));
         assert!(mouse_picture("4").is_none());
     }
 }

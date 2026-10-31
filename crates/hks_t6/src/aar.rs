@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 use crate::host::Host;
 use crate::mp::{BoardRow, Mp};
-use crate::value::{Table, Value};
+use crate::value::{LuaTable, Value};
 
 /// The last match's final scoreboard: its game type, the scoreboard's
 /// columns (`score`, `kills`, ...) and every player's row. His own row is
@@ -72,12 +72,12 @@ fn medals() -> Vec<(i32, u32)> {
 /// GetRecentMedals' answer: `{{row, value}}`, a medal's row and its count
 /// (the report shows "x<count>" past one, and sorts them itself).
 fn medals_table(medals: &[(i32, u32)]) -> Value {
-    let t = Table::new_ref();
+    let t = LuaTable::new_ref();
     for (n, (row, count)) in medals.iter().enumerate() {
-        let e = Table::new_ref();
+        let e = LuaTable::new_ref();
         e.borrow_mut().set_str("row", Value::Num(*row as f32));
         e.borrow_mut().set_str("value", Value::Num(*count as f32));
-        t.borrow_mut().set(Value::Num((n + 1) as f32), Value::Table(e));
+        t.borrow_mut().store(Value::Num((n + 1) as f32), Value::Table(e));
     }
     Value::Table(t)
 }
@@ -97,21 +97,21 @@ pub fn install(host: &mut Host, mp: &Mp) {
     // isSelf, team, clientNum, scoreBoardColumn1..N}}}.
     host.bind("Engine", "GetAARScoreboard", |_, _| {
         let last = last_match();
-        let t = Table::new_ref();
-        let members = Table::new_ref();
+        let t = LuaTable::new_ref();
+        let members = LuaTable::new_ref();
         for (n, row) in last.rows.iter().enumerate() {
-            let m = Table::new_ref();
+            let m = LuaTable::new_ref();
             {
                 let mut m = m.borrow_mut();
                 m.set_str("name", Value::str(&row.name));
-                m.set_str("isSelf", Value::Bool(row.client == 0));
+                m.set_str("isSelf", Value::Boolean(row.client == 0));
                 m.set_str("team", Value::Num(row.team as f32));
                 m.set_str("clientNum", Value::Num(row.client as f32));
                 for (i, v) in row.cols.iter().enumerate() {
                     m.set_str(&format!("scoreBoardColumn{}", i + 1), Value::Num(*v));
                 }
             }
-            members.borrow_mut().set(Value::Num((n + 1) as f32), Value::Table(m));
+            members.borrow_mut().store(Value::Num((n + 1) as f32), Value::Table(m));
         }
         {
             let mut t = t.borrow_mut();
@@ -129,7 +129,7 @@ pub fn install(host: &mut Host, mp: &Mp) {
     // GetRecentMedals(controller, the game type's XP column): his medals of
     // the match (each one he was shown carried XP in it).
     host.bind("Engine", "GetRecentMedals", |_, _| Ok(vec![medals_table(&medals())]));
-    host.bind("Engine", "GetRecentChallenges", |_, _| Ok(vec![Value::Table(Table::new_ref())]));
+    host.bind("Engine", "GetRecentChallenges", |_, _| Ok(vec![Value::Table(LuaTable::new_ref())]));
     host.bind("UIExpression", "IsSuperUser", |_, _| Ok(vec![Value::Num(0.0)]));
     // GetRecentlyUnlockedItems(controller): the items his new ranks
     // unlocked ({itemIndex, itemImage, itemName, itemDesc}: the cards the
@@ -137,14 +137,14 @@ pub fn install(host: &mut Host, mp: &Mp) {
     // (Create-a-Class, scorestreaks...).
     let m = mp.clone();
     host.bind("Engine", "GetRecentlyUnlockedItems", move |_, _| {
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         for (n, (index, image, name, desc, _)) in m.borrow().recent_unlocks().into_iter().enumerate() {
-            let e = Table::new_ref();
+            let e = LuaTable::new_ref();
             e.borrow_mut().set_str("itemIndex", Value::Num(index as f32));
             e.borrow_mut().set_str("itemImage", Value::str(&image));
             e.borrow_mut().set_str("itemName", Value::str(&name));
             e.borrow_mut().set_str("itemDesc", Value::str(&desc));
-            t.borrow_mut().set(Value::Num((n + 1) as f32), Value::Table(e));
+            t.borrow_mut().store(Value::Num((n + 1) as f32), Value::Table(e));
         }
         Ok(vec![Value::Table(t)])
     });
@@ -212,7 +212,7 @@ mod tests {
         record_medal(40);
         record_medal(12);
         let Value::Table(t) = medals_table(&medals()) else { panic!("not a table") };
-        let entry = |n: f32| match t.borrow().get(&Value::Num(n)) {
+        let entry = |n: f32| match t.borrow().read_key(&Value::Num(n)) {
             Value::Table(e) => {
                 let e = e.borrow();
                 (e.get_str("row").as_num(), e.get_str("value").as_num())

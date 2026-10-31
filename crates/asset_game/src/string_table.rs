@@ -3,35 +3,35 @@
 /// A string table as stored in a zone: `rows` by `columns` text cells, row
 /// by row. The first column is the row's key.
 #[derive(Clone, Debug, Default)]
-pub struct CapturedStringTable {
+pub struct SnapshotStringTable {
     pub name: String,
-    pub columns: usize,
-    pub rows: usize,
+    pub col_count: usize,
+    pub height: usize,
     /// `rows * columns` cells, one row after another.
-    pub cells: Vec<String>,
+    pub grid: Vec<String>,
 }
 
-impl CapturedStringTable {
+impl SnapshotStringTable {
     /// The text at `row`, `col`. Anything out of range, negative included,
     /// reads as empty text.
     #[must_use]
-    pub fn cell(&self, row: i32, col: i32) -> &str {
-        let (Ok(row), Ok(col)) = (usize::try_from(row), usize::try_from(col)) else {
+    pub fn cell(&self, r_ix: i32, c_ix: i32) -> &str {
+        let (Ok(row), Ok(col)) = (usize::try_from(r_ix), usize::try_from(c_ix)) else {
             return "";
         };
-        if row >= self.rows || col >= self.columns {
+        if row >= self.height || col >= self.col_count {
             return "";
         }
-        let index = row.saturating_mul(self.columns).saturating_add(col);
-        self.cells.get(index).map_or("", String::as_str)
+        let index = row.saturating_mul(self.col_count).saturating_add(col);
+        self.grid.get(index).map_or("", String::as_str)
     }
 
     /// The first row whose `col` cell equals `key`, ignoring ASCII case.
     #[must_use]
-    pub fn lookup_row_in_col(&self, col: i32, key: &str) -> Option<i32> {
-        (0..self.rows)
+    pub fn row_where_cell(&self, col: i32, wanted: &str) -> Option<i32> {
+        (0..self.height)
             .map(|row| row as i32)
-            .find(|&row| self.cell(row, col).eq_ignore_ascii_case(key))
+            .find(|&row| self.cell(row, col).eq_ignore_ascii_case(wanted))
     }
 }
 
@@ -39,12 +39,12 @@ impl CapturedStringTable {
 mod tests {
     use super::*;
 
-    fn table() -> CapturedStringTable {
-        CapturedStringTable {
+    fn table() -> SnapshotStringTable {
+        SnapshotStringTable {
             name: "stats".into(),
-            columns: 2,
-            rows: 2,
-            cells: ["ak47", "AK-47", "m16", "M16A4"].map(String::from).to_vec(),
+            col_count: 2,
+            height: 2,
+            grid: ["ak47", "AK-47", "m16", "M16A4"].map(String::from).to_vec(),
         }
     }
 
@@ -67,8 +67,8 @@ mod tests {
     #[test]
     fn a_key_matches_without_regard_to_case() {
         let table = table();
-        assert_eq!(table.lookup_row_in_col(0, "M16"), Some(1));
-        assert_eq!(table.lookup_row_in_col(1, "ak-47"), Some(0));
-        assert_eq!(table.lookup_row_in_col(0, "ppsh"), None);
+        assert_eq!(table.row_where_cell(0, "M16"), Some(1));
+        assert_eq!(table.row_where_cell(1, "ak-47"), Some(0));
+        assert_eq!(table.row_where_cell(0, "ppsh"), None);
     }
 }

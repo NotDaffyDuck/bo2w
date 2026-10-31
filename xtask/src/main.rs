@@ -1,13 +1,12 @@
 //! `cargo xtask <command>`. Everything except `bundle-zip` reads `.env` at the
 //! workspace root for hosts, keys and paths.
 
-use std::process::ExitCode;
+use std::path::Path;
 
-use xtask::dotenv::Env;
-use xtask::shell::Res;
-use xtask::{bundle_zip, certs, master, provision, publish, release, repo_root, windows};
+use xtask::dot_vars::DotVars;
+use xtask::{certs, host_setup, lobby_host, publish, release, windows, zip_pack};
 
-const USAGE: &str = "usage: cargo xtask <command>
+const HELP_BANNER: &str = "usage: cargo xtask <command>
   windows [build|setup]
   certs <host>
   release <prod|dev|bundles>
@@ -17,53 +16,77 @@ const USAGE: &str = "usage: cargo xtask <command>
   master <install|update|status|logs|uninstall> user@host [--channel prod] [--since 10min]
   bundle-zip ARCHIVE FILE...";
 
-/// Commands that need `.env` before they can do anything.
-const NEEDS_ENV: [&str; 7] = [
-    "windows",
-    "certs",
-    "release",
-    "publish",
-    "provision",
-    "logs",
-    "master",
+/// Commands that need `.env` before they can do anything, and who runs them.
+const WITH_ENV: [(&str, fn(&Path, &DotVars, &[String]) -> Result<(), String>); 7] = [
+    ("windows", |_, dot_conf, cli_words| windows::dispatch_subcommand(dot_conf, cli_words)),
+    ("certs", |_, dot_conf, cli_words| certs::dispatch_subcommand(dot_conf, cli_words)),
+    ("release", release::dispatch_subcommand),
+    ("publish", publish::dispatch_subcommand),
+    ("provision", host_setup::dispatch_subcommand),
+    ("logs", |_, dot_conf, cli_words| publish::tail_logs(dot_conf, cli_words)),
+    ("master", lobby_host::dispatch_subcommand),
 ];
 
-fn main() -> ExitCode {
-    let mut argv = std::env::args().skip(1);
-    let Some(command) = argv.next() else {
-        println!("{USAGE}");
-        return ExitCode::SUCCESS;
+fn main() -> std::process::ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let ending = match argv.split_first() {
+        None => {
+            println!("{HELP_BANNER}");
+            Ok(())
+        }
+        Some((command, cli_words)) => {
+            dispatch(command, cli_words).map_err(|why| format!("{command}: {why}"))
+        }
     };
-    let args: Vec<String> = argv.collect();
-    match dispatch(&command, &args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(why) => {
-            eprintln!("{command}: {why}");
-            ExitCode::FAILURE
+    match ending {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::ExitCode::FAILURE
         }
     }
 }
 
-fn dispatch(command: &str, args: &[String]) -> Res<()> {
-    if matches!(command, "help" | "-h" | "--help") {
-        println!("{USAGE}");
-        return Ok(());
+fn dispatch(command: &str, cli_words: &[String]) -> Result<(), String> {
+    let route = WITH_ENV.iter().find(|(title, _)| *title == command);
+    match (command, route) {
+        ("help" | "-h" | "--help", _) => {
+            println!("{HELP_BANNER}");
+            Ok(())
+        }
+        ("bundle-zip", _) => zip_pack::launch(cli_words.to_vec()),
+        (_, Some((_, handler))) => {
+            let repo_root = xtask::workspace_top_dir();
+            handler(&repo_root, &DotVars::load(&repo_root)?, cli_words)
+        }
+        (_, None) => Err(format!("unknown command\n{HELP_BANNER}")),
     }
-    if command == "bundle-zip" {
-        return bundle_zip::run(args.to_vec());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_command_with_an_env_is_in_the_usage_text() {
+        for (title, _) in WITH_ENV {
+            assert!(HELP_BANNER.contains(&format!("\n  {title} ")) || HELP_BANNER.contains(&format!("\n  {title}\n")), "{title}");
+        }
+        assert!(HELP_BANNER.contains("\n  bundle-zip ARCHIVE FILE..."));
     }
-    if !NEEDS_ENV.contains(&command) {
-        return Err(format!("unknown command\n{USAGE}"));
+
+    #[test]
+    fn unknown_commands_get_the_usage() {
+        let error = dispatch("nonsense", &[]).unwrap_err();
+        assert!(error.starts_with("unknown command\nusage: cargo xtask <command>"), "{error}");
     }
-    let root = repo_root();
-    let env = Env::load(&root)?;
-    match command {
-        "windows" => windows::run_cli(&env, args),
-        "certs" => certs::run_cli(&env, args),
-        "release" => release::run_cli(&root, &env, args),
-        "publish" => publish::run_cli(&root, &env, args),
-        "provision" => provision::run_cli(&root, &env, args),
-        "logs" => publish::logs(&env, args),
-        _ => master::run_cli(&root, &env, args),
+
+    #[test]
+    fn help_and_bundle_zip_need_no_env() {
+        for word in ["help", "-h", "--help"] {
+            assert!(dispatch(word, &[]).is_ok());
+        }
+        let error = dispatch("bundle-zip", &[]).unwrap_err();
+        assert_eq!(error, "usage: cargo xtask bundle-zip ARCHIVE FILE...");
     }
 }

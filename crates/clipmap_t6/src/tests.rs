@@ -1,5 +1,5 @@
 use super::*;
-use trace_t6::{TraceExtents, trace_through_brush};
+use trace_t6::{SweepBoxSize, trace_through_brush};
 
 // A small map: the plane x = 0 splits leaf 0 (x >= 0), which holds a box
 // brush, from leaf 1 (x < 0), which holds a two-triangle floor at z = 0.
@@ -16,29 +16,29 @@ const WALKABLE: [u8; 1] = [0xff];
 
 fn brush_leaf() -> Leaf {
     Leaf {
-        brush_contents: 1,
+        solid_content_flags: 1,
         mins: [0.0, -1000.0, -1000.0],
         maxs: [1000.0, 1000.0, 1000.0],
-        leaf_brush_node: 1,
+        brush_leaf_link: 1,
         ..Leaf::default()
     }
 }
 
 fn with_map<R>(f: impl FnOnce(&ClipMap<'_>, &mut CheckCount<'_>) -> R) -> R {
     let brushes = [Brush {
-        mins: [16.0, -16.0, 0.0],
-        maxs: [48.0, 16.0, 32.0],
+        lower: [16.0, -16.0, 0.0],
+        upper: [48.0, 16.0, 32.0],
         contents: 1,
         ..Brush::default()
     }];
     let nodes = [Node {
-        plane: CPlane::new([1.0, 0.0, 0.0], 0.0),
+        plane: PlaneEquation::new([1.0, 0.0, 0.0], 0.0),
         children: [-1, -2],
     }];
     let leafs = [
         brush_leaf(),
         Leaf {
-            coll_aabb_count: 1,
+            collision_box_total: 1,
             terrain_contents: 1,
             mins: [-1000.0, -1000.0, -1000.0],
             maxs: [0.0, 1000.0, 1000.0],
@@ -48,7 +48,7 @@ fn with_map<R>(f: impl FnOnce(&ClipMap<'_>, &mut CheckCount<'_>) -> R) -> R {
     let leaf_brush_nodes = [
         LeafBrushNode::default(),
         LeafBrushNode {
-            leaf_brush_count: 1,
+            leaf_solid_total: 1,
             contents: 1,
             brushes: &BRUSH_LIST,
             ..LeafBrushNode::default()
@@ -56,7 +56,7 @@ fn with_map<R>(f: impl FnOnce(&ClipMap<'_>, &mut CheckCount<'_>) -> R) -> R {
     ];
     let materials = [ClipMaterial {
         surface_flags: 0x123,
-        content_flags: 1,
+        pack_presence_bits: 1,
     }];
     let aabb_trees = [AabbTree {
         origin: [-64.0, 0.0, 0.0],
@@ -64,8 +64,8 @@ fn with_map<R>(f: impl FnOnce(&ClipMap<'_>, &mut CheckCount<'_>) -> R) -> R {
         ..AabbTree::default()
     }];
     let partitions = [Partition {
-        tri_count: 2,
-        first_tri: 0,
+        tri_tally: 2,
+        leading_triangle: 0,
     }];
     let cmodels = [
         CModel::default(),
@@ -82,7 +82,7 @@ fn with_map<R>(f: impl FnOnce(&ClipMap<'_>, &mut CheckCount<'_>) -> R) -> R {
         materials: &materials,
         aabb_trees: &aabb_trees,
         partitions: &partitions,
-        verts: &VERTS,
+        vertex_points: &VERTS,
         tri_indices: &TRIS,
         tri_edge_is_walkable: &WALKABLE,
         cmodels: &cmodels,
@@ -100,7 +100,7 @@ fn a_point_dropped_on_the_floor_stops_on_it() {
     let t = with_map(|map, check| map.box_trace(check, [-40.0, -30.0, 64.0], [-40.0, -30.0, -64.0], POINT, POINT, 0, 1));
     assert_eq!(t.fraction, 0.5);
     assert_eq!(t.normal, [0.0, 0.0, 1.0]);
-    assert!(t.walkable && !t.startsolid);
+    assert!(t.walkable && !t.starts_inside);
     assert_eq!((t.sflags, t.cflags, t.hit_partition), (0x123, 1, 0));
     assert_eq!(t.bone_index, 0xfe);
 }
@@ -111,7 +111,7 @@ fn a_player_capsule_lands_on_the_floor() {
     let t = with_map(|map, check| map.box_trace(check, [-64.0, 0.0, 100.0], [-64.0, 0.0, -100.0], mins, maxs, 0, 1));
     assert!((t.fraction - 99.875 / 200.0).abs() < 1e-5, "{}", t.fraction);
     assert_eq!(t.normal, [0.0, 0.0, 1.0]);
-    assert!(t.walkable && !t.startsolid);
+    assert!(t.walkable && !t.starts_inside);
 }
 
 #[test]
@@ -154,11 +154,11 @@ fn a_box_inside_the_brush_is_all_solid() {
     let b = [1.0; 3];
     let nb = [-1.0; 3];
     let t = with_map(|map, check| map.box_trace(check, [32.0, 0.0, 16.0], [32.0, 0.0, 16.0], nb, b, 0, 1));
-    assert!(t.allsolid && t.startsolid);
+    assert!(t.fully_embedded && t.starts_inside);
     let t = with_map(|map, check| map.box_trace(check, [200.0, 0.0, 16.0], [200.0, 0.0, 16.0], nb, b, 0, 1));
-    assert!(!t.allsolid && !t.startsolid);
+    assert!(!t.fully_embedded && !t.starts_inside);
     let t = with_map(|map, check| map.box_trace(check, [32.0, 0.0, 16.0], [32.0, 0.0, 16.0], nb, b, 1, 1));
-    assert!(t.allsolid);
+    assert!(t.fully_embedded);
 }
 
 #[test]
@@ -166,15 +166,15 @@ fn a_capsule_sunk_into_the_floor_is_all_solid() {
     let (mins, maxs) = ([-15.0, -15.0, 0.0], [15.0, 15.0, 72.0]);
     let at = [-64.0, 0.0, -10.0];
     let t = with_map(|map, check| map.box_trace(check, at, at, mins, maxs, 0, 1));
-    assert!(t.allsolid && t.startsolid);
+    assert!(t.fully_embedded && t.starts_inside);
     assert_eq!(t.sflags, 0x123);
     let at = [-64.0, 0.0, 10.0];
     let t = with_map(|map, check| map.box_trace(check, at, at, mins, maxs, 0, 1));
-    assert!(!t.allsolid);
+    assert!(!t.fully_embedded);
     // A sphere (no height) sunk into it.
     let at = [-64.0, 0.0, 5.0];
     let t = with_map(|map, check| map.box_trace(check, at, at, [-8.0; 3], [8.0; 3], 0, 1));
-    assert!(t.allsolid);
+    assert!(t.fully_embedded);
 }
 
 #[test]
@@ -205,9 +205,9 @@ fn point_contents_finds_the_brush() {
 #[test]
 fn leaf_lookups() {
     with_map(|map, _| {
-        assert_eq!(point_leafnum(map, [5.0, 0.0, 0.0]), 0);
-        assert_eq!(point_leafnum(map, [-5.0, 0.0, 0.0]), 1);
-        assert_eq!(point_leafnum(map, [0.0, 0.0, 0.0]), 0);
+        assert!(core::ptr::eq(map.leaf_holding([5.0, 0.0, 0.0]), &map.leafs[0]));
+        assert!(core::ptr::eq(map.leaf_holding([-5.0, 0.0, 0.0]), &map.leafs[1]));
+        assert!(core::ptr::eq(map.leaf_holding([0.0, 0.0, 0.0]), &map.leafs[0]));
         let mut buf = [0u16; 4];
         let mut ll = LeafList::new(&mut buf, [-1.0; 3], [1.0; 3]);
         box_leafnums(map, &mut ll, 0);
@@ -221,9 +221,9 @@ fn leaf_lookups() {
         box_leafnums(map, &mut ll, 0);
         assert_eq!((ll.leafs(), ll.overflowed), (&[0u16][..], true));
     });
-    let plane = CPlane::new([0.0, -1.0, 0.0], 2.0);
+    let plane = PlaneEquation::new([0.0, -1.0, 0.0], 2.0);
     assert_eq!((plane.kind, plane.signbits), (3, 2));
-    assert_eq!(CPlane::new([0.0, 0.0, 1.0], 0.0).kind, 2);
+    assert_eq!(PlaneEquation::new([0.0, 0.0, 1.0], 0.0).kind, 2);
     assert_eq!(box_on_plane_side([0.0, -9.0, 0.0], [1.0, -3.0, 1.0], &plane), 1);
     assert_eq!(box_on_plane_side([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], &plane), 2);
     assert_eq!(box_on_plane_side([0.0, -3.0, 0.0], [1.0, 0.0, 1.0], &plane), 3);
@@ -268,11 +268,11 @@ fn segment_distances() {
 
 #[test]
 fn extents_against_a_box() {
-    let ext = TraceExtents::new([0.0; 3], [10.0, 0.0, 0.0]);
+    let ext = SweepBoxSize::new([0.0; 3], [10.0, 0.0, 0.0]);
     let (mins, maxs) = ([4.0, -1.0, -1.0], [6.0, 1.0, 1.0]);
     assert!(intersect_extents_aabb(&ext, mins, maxs, 1.0));
     assert!(!intersect_extents_aabb(&ext, mins, maxs, 0.3));
-    let off = TraceExtents::new([0.0, 5.0, 0.0], [10.0, 5.0, 0.0]);
+    let off = SweepBoxSize::new([0.0, 5.0, 0.0], [10.0, 5.0, 0.0]);
     assert!(!intersect_extents_aabb(&off, mins, maxs, 1.0));
 }
 
@@ -362,8 +362,8 @@ fn the_temporary_box_blocks_sight() {
 #[test]
 fn the_temporary_brushes_block_sight() {
     static BRUSHES: [Brush<'static>; 1] = [Brush {
-        mins: [16.0, -16.0, 0.0],
-        maxs: [48.0, 16.0, 32.0],
+        lower: [16.0, -16.0, 0.0],
+        upper: [48.0, 16.0, 32.0],
         contents: 1,
         sides: &[],
         axial_cflags: [[1; 3]; 2],
@@ -405,7 +405,7 @@ impl LinkedEntities for Game {
 
 fn sector_models() -> [CModel; 2] {
     let leaf = Leaf {
-        brush_contents: 1,
+        solid_content_flags: 1,
         ..Leaf::default()
     };
     [
@@ -434,15 +434,15 @@ fn with_world<R>(f: impl FnOnce(&ClipMap<'_>, &mut World) -> R) -> R {
 }
 
 /// Link entity `num` with model 1 over `absmin`..`absmax`.
-fn link(cm: &ClipMap<'_>, world: &mut World, game: &mut Game, num: usize, absmin: [f32; 3], absmax: [f32; 3]) {
+fn link(cm: &ClipMap<'_>, scene: &mut World, game: &mut Game, num: usize, absmin: [f32; 3], absmax: [f32; 3]) {
     game.bounds[num] = (absmin, absmax);
-    world.link_entity(cm, &*game, &mut [], num, absmin, absmax, 1);
+    scene.link_entity(cm, &*game, &mut [], num, absmin, absmax, 1);
 }
 
 #[test]
 fn clearing_the_world_splits_the_root_across_its_longer_side() {
     with_world(|_, world| {
-        assert_eq!(world.free_head, 2);
+        assert_eq!(world.vacant_list_front, 2);
         assert_eq!(world.sectors[1].axis, 0);
         assert_eq!(world.sectors[1].dist, 0.0);
         assert_eq!(world.sectors[2].parent, 3);
@@ -464,15 +464,15 @@ fn an_entity_on_one_side_moves_into_a_new_child() {
         assert_eq!(world.entities[3].world_sector, 2);
         assert_eq!(world.sectors[2].entities, 4);
         assert_eq!(world.sectors[1].entities, 0);
-        assert_eq!(world.free_head, 3);
-        assert_eq!(world.sectors[1].contents_entities, 1);
+        assert_eq!(world.vacant_list_front, 3);
+        assert_eq!(world.sectors[1].solid_ents, 1);
 
         world.unlink_entity(&game, 3);
         assert_eq!(world.entities[3].world_sector, 0);
         assert_eq!(world.sectors[1].children, [0; 2]);
-        assert_eq!(world.free_head, 2);
+        assert_eq!(world.vacant_list_front, 2);
         assert_eq!(world.sectors[2].parent, 3);
-        assert_eq!(world.sectors[1].contents_entities, 0);
+        assert_eq!(world.sectors[1].solid_ents, 0);
     });
 }
 
@@ -484,13 +484,13 @@ fn entities_across_the_split_stay_in_entity_order() {
             link(cm, world, &mut game, num, [-10.0; 3], [10.0; 3]);
         }
         assert_eq!(world.sectors[1].entities, 3);
-        assert_eq!(world.entities[2].next_entity_in_world_sector, 6);
-        assert_eq!(world.entities[5].next_entity_in_world_sector, 10);
-        assert_eq!(world.entities[9].next_entity_in_world_sector, 0);
+        assert_eq!(world.entities[2].following_sector_entity, 6);
+        assert_eq!(world.entities[5].following_sector_entity, 10);
+        assert_eq!(world.entities[9].following_sector_entity, 0);
         assert_eq!(world.sectors[1].children, [0; 2]);
 
         world.unlink_entity(&game, 5);
-        assert_eq!(world.entities[2].next_entity_in_world_sector, 10);
+        assert_eq!(world.entities[2].following_sector_entity, 10);
     });
 }
 
@@ -574,9 +574,9 @@ fn static_models_are_filed_on_their_side() {
     ];
     let mut world = World::new();
     world.link_world(&cm, &Game::new(), &mut models);
-    assert_eq!(world.sectors[1].static_models, 2);
+    assert_eq!(world.sectors[1].prop_set, 2);
     assert_eq!(world.sectors[1].children, [0, 2]);
-    assert_eq!(world.sectors[2].static_models, 1);
+    assert_eq!(world.sectors[2].prop_set, 1);
     assert_eq!(world.sectors[1].contents_static_models, 5);
     assert_eq!(world.sectors[2].contents_static_models, 1);
     assert_eq!(models[0].next_model_in_world_sector, 0);
@@ -584,36 +584,36 @@ fn static_models_are_filed_on_their_side() {
 
 // Static models. A floor triangle at local z = 0 over (0,0)-(10,0)-(0,10),
 // and a wall triangle at local x = 0 facing -x over y and z 0 to 10.
-const FLOOR_TRI: [XModelCollTri; 1] = [XModelCollTri {
+const FLOOR_TRI: [ModelHitTriangle; 1] = [ModelHitTriangle {
     plane: [0.0, 0.0, 1.0, 0.0],
-    svec: [0.1, 0.0, 0.0, 0.0],
-    tvec: [0.0, 0.1, 0.0, 0.0],
+    surface_tangent: [0.1, 0.0, 0.0, 0.0],
+    surface_bitangent: [0.0, 0.1, 0.0, 0.0],
 }];
-const WALL_TRI: [XModelCollTri; 1] = [XModelCollTri {
+const WALL_TRI: [ModelHitTriangle; 1] = [ModelHitTriangle {
     plane: [-1.0, 0.0, 0.0, 0.0],
-    svec: [0.0, 0.1, 0.0, 0.0],
-    tvec: [0.0, 0.0, 0.1, 0.0],
+    surface_tangent: [0.0, 0.1, 0.0, 0.0],
+    surface_bitangent: [0.0, 0.0, 0.1, 0.0],
 }];
 
-fn coll_surf(tris: &[XModelCollTri]) -> XModelCollSurf<'_> {
+fn coll_surf(triangle_list: &[ModelHitTriangle]) -> XModelCollSurf<'_> {
     XModelCollSurf {
-        tris,
+        triangle_list,
         mins: [-1.0, -1.0, -1.0],
         maxs: [10.0, 10.0, 10.0],
-        bone_idx: 3,
+        joint_position: 3,
         contents: 1,
-        surf_flags: 0x50,
+        face_property_bits: 0x50,
     }
 }
 
-fn placed<'a>(xmodel: &'a XModelColl<'a>, origin: [f32; 3], yaw: f32) -> StaticModel<'a> {
+fn placed<'a>(xmodel: &'a XModelColl<'a>, base_at: [f32; 3], yaw: f32) -> StaticModel<'a> {
     StaticModel {
         xmodel: Some(xmodel),
         contents: 1,
-        origin,
-        inv_scaled_axis: inv_scaled_axis([0.0, yaw, 0.0], 1.0),
-        absmin: [origin[0] - 12.0, origin[1] - 12.0, origin[2] - 12.0],
-        absmax: [origin[0] + 12.0, origin[1] + 12.0, origin[2] + 12.0],
+        origin: base_at,
+        reverse_scaled_basis: reverse_scaled_basis([0.0, yaw, 0.0], 1.0),
+        absmin: [base_at[0] - 12.0, base_at[1] - 12.0, base_at[2] - 12.0],
+        absmax: [base_at[0] + 12.0, base_at[1] + 12.0, base_at[2] + 12.0],
         ..StaticModel::default()
     }
 }
@@ -621,7 +621,7 @@ fn placed<'a>(xmodel: &'a XModelColl<'a>, origin: [f32; 3], yaw: f32) -> StaticM
 #[test]
 fn a_line_onto_a_collision_triangle_stops_short_of_it() {
     let surfs = [coll_surf(&FLOOR_TRI)];
-    let model = XModelColl { coll_lod: 0, surfs: &surfs };
+    let model = XModelColl { collision_detail_tier: 0, surfs: &surfs };
     let mut trace = Trace::new();
     assert_eq!(model.trace_line(&mut trace, [2.0, 2.0, 10.0], [2.0, 2.0, -10.0], 1), 3);
     assert_eq!(trace.fraction, (10.0 - XMODEL_TRACE_SKIN) / 20.0);
@@ -633,7 +633,7 @@ fn a_line_onto_a_collision_triangle_stops_short_of_it() {
     assert_eq!(model.trace_line(&mut trace, [9.0, 9.0, 10.0], [9.0, 9.0, -10.0], 1), -1);
     assert_eq!(model.trace_line(&mut trace, [2.0, 2.0, -10.0], [2.0, 2.0, 10.0], 1), -1);
     assert_eq!(model.trace_line(&mut trace, [2.0, 2.0, 10.0], [2.0, 2.0, -10.0], 2), -1);
-    let none = XModelColl { coll_lod: -1, surfs: &surfs };
+    let none = XModelColl { collision_detail_tier: -1, surfs: &surfs };
     assert_eq!(none.trace_line(&mut trace, [2.0, 2.0, 10.0], [2.0, 2.0, -10.0], 1), -1);
     assert_eq!(trace.fraction, 1.0);
 }
@@ -641,13 +641,13 @@ fn a_line_onto_a_collision_triangle_stops_short_of_it() {
 #[test]
 fn a_turned_static_model_hits_in_its_own_space_and_reports_the_world_normal() {
     let surfs = [coll_surf(&WALL_TRI)];
-    let xmodel = XModelColl { coll_lod: 0, surfs: &surfs };
+    let xmodel = XModelColl { collision_detail_tier: 0, surfs: &surfs };
     // Turned 90 degrees: its -x face looks down -y, across x 0 to -10.
     let model = placed(&xmodel, [50.0, 0.0, 0.0], 90.0);
     let mut trace = Trace::new();
     model.trace(7, &mut trace, [48.0, -20.0, 2.0], [48.0, 20.0, 2.0], 1);
     assert_eq!(trace.static_model, Some(7));
-    assert_eq!((trace.hit_type, trace.hit_id), (trace_t6::TraceHitType::Entity, trace_t6::ENTITYNUM_WORLD));
+    assert_eq!((trace.impact_category, trace.struck_entity_num), (trace_t6::TraceHitType::Entity, trace_t6::ENTITYNUM_WORLD));
     assert!((trace.fraction - (20.0 - XMODEL_TRACE_SKIN) / 40.0).abs() < 1e-5);
     assert!((trace.normal[1] + 1.0).abs() < 1e-5 && trace.normal[0].abs() < 1e-5);
     assert!(!model.trace_complete([48.0, -20.0, 2.0], [48.0, 20.0, 2.0], 1));
@@ -662,7 +662,7 @@ fn point_traces_walk_the_sectors_to_the_nearest_static_model() {
         ..ClipMap::default()
     };
     let surfs = [coll_surf(&WALL_TRI)];
-    let xmodel = XModelColl { coll_lod: 0, surfs: &surfs };
+    let xmodel = XModelColl { collision_detail_tier: 0, surfs: &surfs };
     // One each side of the root split at x = 0.
     let mut models = [placed(&xmodel, [200.0, 0.0, 0.0], 0.0), placed(&xmodel, [-100.0, 0.0, 0.0], 0.0)];
     let mut world = World::new();

@@ -46,33 +46,32 @@ impl Manifest {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let manifest: Self =
             serde_json::from_slice(bytes).map_err(|error| format!("manifest parse: {error}"))?;
-        manifest.check()?;
-        Ok(manifest)
+        manifest.check().map(|()| manifest)
     }
 
     fn check(&self) -> Result<(), String> {
         if self.channel.trim().is_empty() || self.git.trim().is_empty() || self.protocol == 0 {
-            return Err("manifest identity is incomplete".to_owned());
+            return Err("the manifest identity is incomplete".to_owned());
         }
-        for required in [GAME_FILE, CA_FILE] {
-            if !self.files.iter().any(|entry| entry.path == required) {
-                return Err(format!("manifest has no {required}"));
+        for name in [GAME_FILE, CA_FILE] {
+            if !self.files.iter().any(|entry| entry.path == name) {
+                return Err(format!("manifest has no {name}"));
             }
         }
-        for entry in &self.files {
-            plain_name(&entry.path)?;
-            plain_name(entry.remote_name())?;
-            hash_digits(&entry.sha256)?;
-            if let Some(hash) = &entry.download_sha256 {
+        for file in &self.files {
+            plain_name(&file.path)?;
+            plain_name(file.remote_name())?;
+            hash_digits(&file.sha256)?;
+            if let Some(hash) = &file.download_sha256 {
                 hash_digits(hash)?;
             }
         }
-        for (name, value) in &self.env {
-            if !name.starts_with("BO2MP_") || name.contains(['=', '\0']) {
-                return Err(format!("manifest contains invalid env name `{name}`"));
+        for (key, setting) in &self.env {
+            if !key.starts_with("BO2MP_") || key.contains(['=', '\0']) {
+                return Err(format!("manifest has an invalid env name `{key}`"));
             }
-            if value.contains(['\r', '\n', '\0']) {
-                return Err(format!("manifest contains invalid env value for `{name}`"));
+            if setting.contains(['\r', '\n', '\0']) {
+                return Err(format!("manifest has an invalid env value for `{key}`"));
             }
         }
         Ok(())
@@ -82,13 +81,12 @@ impl Manifest {
 /// `name` if it is a bare file name: it is joined onto the install folder and
 /// onto the channel's address, so it must not point anywhere else.
 pub fn plain_name(name: &str) -> Result<&str, String> {
-    let bare = std::path::Path::new(name)
-        .file_name()
-        .is_some_and(|file| file == name);
+    let path = std::path::Path::new(name);
+    let bare = path.file_name().is_some_and(|file| file == name);
     if bare && !name.contains(['\\', '/', ':']) {
         Ok(name)
     } else {
-        Err(format!("manifest name must be a file name: `{name}`"))
+        Err(format!("manifest name must be a bare file name: `{name}`"))
     }
 }
 
@@ -104,7 +102,8 @@ pub fn hash_digits(text: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{Value, json};
+    use serde_json::json;
+    use serde_json::Value;
 
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 

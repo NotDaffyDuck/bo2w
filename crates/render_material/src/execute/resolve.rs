@@ -1,264 +1,292 @@
 //! Finding the material, technique set and prepared technique for a draw.
 
-use dpvs_t6::GfxDrawSurf;
+use dpvs_t6::SortedDraw;
 
-use super::refusal::MaterialRefusal;
+use super::refusal::MaterialExecutionDenial;
 use crate::decl_table;
-use crate::prepared::{PreparedMaterialTable, PreparedTechnique};
+use crate::catalog::LiveTechniqueBundle;
+use crate::prepared::{StagedMaterialTable, ResolvedShadingRecipe};
 use crate::{
-    MaterialAssetId, RemapResolution, RuntimeMaterial, RuntimeMaterialCatalog,
-    RuntimeSortedMaterialTable, RuntimeTechnique, RuntimeTechniqueSetId, TechType,
+    MaterialAssetKey, MaterialRemapOutcome, LiveMaterial, LiveMaterialLedger,
+    LiveSortedMaterialTable, LiveShadingTechnique, LiveTechniqueBundleKey, MethodType,
+
 };
 
 /// A sorted draw's material: either named directly by asset id or by its
 /// ordinal in the sorted table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct MaterialDrawKey {
-    pub material_id: Option<MaterialAssetId>,
+pub struct SurfaceSortKeyPair {
+    pub named_asset: Option<MaterialAssetKey>,
     pub packed: u64,
-    pub rank: u32,
+    pub sort_rank: u32,
 }
 
-impl MaterialDrawKey {
-    pub const fn new(packed: u64, rank: u32) -> Self {
+impl SurfaceSortKeyPair {
+    pub const fn new(key_bits: u64, sort_rank: u32) -> Self {
         Self {
-            material_id: None,
-            packed,
-            rank,
+            named_asset: None,
+            packed: key_bits,
+            sort_rank,
         }
     }
 
-    pub const fn with_material_id(mut self, material_id: Option<MaterialAssetId>) -> Self {
-        self.material_id = material_id;
-        self
+    pub const fn with_material_id(self, asset: Option<MaterialAssetKey>) -> Self {
+        let mut key = self;
+        key.named_asset = asset;
+        key
     }
 
-    pub const fn draw_surf(self) -> GfxDrawSurf {
-        GfxDrawSurf {
+    pub const fn facet_draw(self) -> SortedDraw {
+        SortedDraw {
             packed: self.packed,
         }
     }
 }
 
-pub fn resolve_sorted_material(
-    catalog: &RuntimeMaterialCatalog,
-    key: MaterialDrawKey,
-) -> Result<&RuntimeMaterial, MaterialRefusal> {
-    if let Some(id) = key.material_id {
-        return match catalog.materials.get(usize::from(id.0)) {
-            Some(material) if material.asset_id == id => Ok(material),
-            _ => Err(MaterialRefusal::MaterialOutOfRange { material: id }),
-        };
-    }
-    let id = match &catalog.sorted_materials {
-        RuntimeSortedMaterialTable::Missing => {
-            return Err(MaterialRefusal::SortedMaterialTableMissing);
-        }
-        RuntimeSortedMaterialTable::BuildFailed(cause) => {
-            return Err(MaterialRefusal::SortedMaterialBuildFailed {
-                cause: cause.clone(),
-            });
-        }
-        RuntimeSortedMaterialTable::Ready {
-            asset_ids_by_ordinal,
-            ..
-        } => match asset_ids_by_ordinal.get(key.rank as usize) {
-            Some(&id) => id,
-            None => {
-                return Err(MaterialRefusal::SortedMaterialOrdinalOutOfRange {
-                    ordinal: key.rank,
-                    table_len: asset_ids_by_ordinal.len(),
-                });
-            }
-        },
+/// The material a draw key names, by asset id or by sorted ordinal.
+pub fn lookup_ordered_material(
+    catalog: &LiveMaterialLedger,
+    key: SurfaceSortKeyPair,
+) -> Result<&LiveMaterial, MaterialExecutionDenial> {
+    let by_id = |id: MaterialAssetKey| {
+        let row_at = usize::from(id.0);
+        catalog
+            .materials
+            .get(row_at)
+            .ok_or(MaterialExecutionDenial::SurfaceSlotBeyondTable { material: id })
     };
-    catalog
-        .materials
-        .get(usize::from(id.0))
-        .ok_or(MaterialRefusal::MaterialOutOfRange { material: id })
+    if let Some(id) = key.named_asset {
+        return by_id(id).and_then(|found| {
+            (found.asset_id == id)
+                .then_some(found)
+                .ok_or(MaterialExecutionDenial::SurfaceSlotBeyondTable { material: id })
+        });
+    }
+    match &catalog.ranked_materials {
+        LiveSortedMaterialTable::Missing => Err(MaterialExecutionDenial::OrderedMaterialTableAbsent),
+        LiveSortedMaterialTable::BuildFailed(cause) => {
+            Err(MaterialExecutionDenial::OrderedMaterialConstructionFailed {
+                cause: Clone::clone(cause),
+            })
+        }
+        LiveSortedMaterialTable::Ready {
+            asset_ids_by_ordinal: ids,
+            ..
+        } => {
+            let id = ids.get(key.sort_rank as usize).copied().ok_or(
+                MaterialExecutionDenial::OrderedMaterialRankBeyondTable {
+                    sorted_pos: key.sort_rank,
+                    table_size: ids.len(),
+                },
+            )?;
+            by_id(id)
+        }
+    }
 }
 
-/// The technique set a material draws from, after following its remap.
-fn technique_set_id(material: &RuntimeMaterial) -> Result<RuntimeTechniqueSetId, MaterialRefusal> {
-    match material.remap {
-        RemapResolution::SelfSet => Ok(material.local_technique_set),
-        RemapResolution::Resolved(set) => Ok(set),
-        RemapResolution::Missing { pointer_identity } => {
-            Err(MaterialRefusal::RemapMissing { pointer_identity })
+/// A resolved material together with the catalog it came from, so the
+/// technique set and technique behind it can be walked to step by step.
+struct Located<'c> {
+    catalog: &'c LiveMaterialLedger,
+    material: &'c LiveMaterial,
+}
+
+impl<'c> Located<'c> {
+    fn find(
+        catalog: &'c LiveMaterialLedger,
+        key: SurfaceSortKeyPair,
+    ) -> Result<Self, MaterialExecutionDenial> {
+        let material = lookup_ordered_material(catalog, key)?;
+        Ok(Self { catalog, material })
+    }
+
+    /// The technique set the material's remap leads to.
+    fn technique_set_ident(&self) -> Result<LiveTechniqueBundleKey, MaterialExecutionDenial> {
+        let material = self.material;
+        match material.remap {
+            MaterialRemapOutcome::SelfSet => Ok(material.local_technique_set),
+            MaterialRemapOutcome::Resolved(set) => Ok(set),
+            MaterialRemapOutcome::Missing { address_fingerprint } => {
+                Err(MaterialExecutionDenial::SubstitutionTargetAbsent { address_fingerprint })
+            }
+            MaterialRemapOutcome::Cycle { first_set } => Err(MaterialExecutionDenial::SubstitutionLoop { first_set }),
         }
-        RemapResolution::Cycle { first_set } => Err(MaterialRefusal::RemapCycle { first_set }),
+    }
+
+    /// The set when the remap resolves and the catalog holds it.
+    fn set_if_present(&self) -> Option<&'c LiveTechniqueBundle> {
+        let id = self.technique_set_ident().ok()?;
+        self.catalog.technique_sets.get(id.0 as usize)
+    }
+
+    /// The set, refusing when it is out of range or from another namespace.
+    fn set(&self) -> Result<&'c LiveTechniqueBundle, MaterialExecutionDenial> {
+        let id = self.technique_set_ident()?;
+        let held = self.catalog.technique_sets.get(id.0 as usize).ok_or_else(|| {
+            if matches!(self.material.remap, MaterialRemapOutcome::SelfSet) {
+                MaterialExecutionDenial::OwnRecipeSetBeyondTable { set: id }
+            } else {
+                MaterialExecutionDenial::SubstitutedRecipeSetBeyondTable { set: id }
+            }
+        })?;
+        match held.namespace == self.material.namespace {
+            true => Ok(held),
+            false => Err(MaterialExecutionDenial::SetNamespaceDiffers {
+                want: self.material.namespace,
+                got: held.namespace,
+            }),
+        }
+    }
+
+    fn technique(&self, shading_technique_kind: MethodType) -> Result<&'c LiveShadingTechnique, MaterialExecutionDenial> {
+        let technique = self
+            .set()?
+            .recipe_for(shading_technique_kind)
+            .ok_or(MaterialExecutionDenial::RenderTechniqueNotFound { shading_technique_kind })?;
+        match technique.passes.is_empty() {
+            true => Err(MaterialExecutionDenial::RecipeHasNoPasses { shading_technique_kind }),
+            false => Ok(technique),
+        }
+    }
+
+    /// The world vertex type the technique's own declaration names.
+    fn authored_vertex_type(&self, technique: &LiveShadingTechnique) -> u8 {
+        self.set_if_present().map_or(decl_table::WORLD_VERTEX_LAYOUT_ID, |set| {
+            decl_table::world_decl_kind(technique.flags, set.level_format)
+        })
+    }
+
+    /// Whether the first pass's vertex declaration routes a source past the
+    /// plain world layout (a stream element at slot 5 or above).
+    fn first_pass_routes_extra(&self, technique: &LiveShadingTechnique) -> bool {
+        let first = technique.passes.first();
+        let decl = first
+            .and_then(|pass| pass.stage_program_duo)
+            .and_then(|pair| self.catalog.decl_for(pair.vertex_format_slot));
+        decl.is_some_and(|decl| decl.route_rows().iter().any(|route| route[0] >= 5))
     }
 }
 
 /// Anything that cannot be resolved counts as "has the technique": the
 /// caller only wants to skip draws that are known to lack it.
-pub fn add_surf_has_technique(
-    catalog: &RuntimeMaterialCatalog,
-    key: MaterialDrawKey,
-    tech_type: TechType,
+pub fn surface_add_gains_technique(
+    catalog: &LiveMaterialLedger,
+    key: SurfaceSortKeyPair,
+    shading_technique_kind: MethodType,
 ) -> bool {
-    let Ok(material) = resolve_sorted_material(catalog, key) else {
-        return true;
-    };
-    let Ok(set_id) = technique_set_id(material) else {
-        return true;
-    };
-    match catalog.technique_sets.get(set_id.0 as usize) {
-        Some(set) => set.technique(tech_type).is_some(),
-        None => true,
-    }
+    Located::find(catalog, key)
+        .ok()
+        .and_then(|found| found.set_if_present())
+        .is_none_or(|set| set.recipe_for(shading_technique_kind).is_some())
 }
 
-pub fn resolve_material_technique(
-    catalog: &RuntimeMaterialCatalog,
-    key: MaterialDrawKey,
-    tech_type: TechType,
-) -> Result<(&RuntimeMaterial, &RuntimeTechnique), MaterialRefusal> {
-    let material = resolve_sorted_material(catalog, key)?;
-    let set_id = technique_set_id(material)?;
-    let Some(set) = catalog.technique_sets.get(set_id.0 as usize) else {
-        return Err(if matches!(material.remap, RemapResolution::SelfSet) {
-            MaterialRefusal::LocalTechniqueSetOutOfRange { set: set_id }
-        } else {
-            MaterialRefusal::RemappedTechniqueSetOutOfRange { set: set_id }
-        });
-    };
-    if set.namespace != material.namespace {
-        return Err(MaterialRefusal::TechniqueSetNamespaceMismatch {
-            want: material.namespace,
-            got: set.namespace,
-        });
-    }
-    let technique = set
-        .technique(tech_type)
-        .ok_or(MaterialRefusal::TechniqueAbsent { tech_type })?;
-    if technique.passes.is_empty() {
-        return Err(MaterialRefusal::EmptyTechnique { tech_type });
-    }
-    Ok((material, technique))
+pub fn select_material_technique(
+    catalog: &LiveMaterialLedger,
+    key: SurfaceSortKeyPair,
+    shading_technique_kind: MethodType,
+) -> Result<(&LiveMaterial, &LiveShadingTechnique), MaterialExecutionDenial> {
+    let found = Located::find(catalog, key)?;
+    let chosen = found.technique(shading_technique_kind)?;
+    Ok((found.material, chosen))
 }
 
-/// The vertex type the technique's authored world-vertex declaration names.
-fn authored_world_vertex_type(
-    catalog: &RuntimeMaterialCatalog,
-    material: &RuntimeMaterial,
-    technique: &RuntimeTechnique,
+pub fn tess_vertex_kind(
+    catalog: &LiveMaterialLedger,
+    key: SurfaceSortKeyPair,
+    shading_technique_kind: MethodType,
 ) -> u8 {
-    let Ok(set_id) = technique_set_id(material) else {
-        return decl_table::WORLD_VERTEX_TYPE;
+    let world = decl_table::WORLD_VERTEX_LAYOUT_ID;
+    let resolved = Located::find(catalog, key).and_then(|found| {
+        let tech = found.technique(shading_technique_kind)?;
+        Ok((found, tech))
+    });
+    let Ok((found, tech)) = resolved else {
+        return world;
     };
-    match catalog.technique_sets.get(set_id.0 as usize) {
-        Some(set) => decl_table::world_vert_decl_type(technique.flags, set.world_vert_format),
-        None => decl_table::WORLD_VERTEX_TYPE,
+    match found.authored_vertex_type(tech) {
+        authored if authored == world && found.first_pass_routes_extra(tech) => {
+            world.saturating_add(1)
+        }
+        authored => authored,
     }
 }
 
-/// Whether the first pass's vertex declaration routes a source past the
-/// plain world layout (a stream element at slot 5 or above).
-fn first_pass_routes_extra_source(
-    catalog: &RuntimeMaterialCatalog,
-    technique: &RuntimeTechnique,
-) -> bool {
-    technique
-        .passes
-        .first()
-        .and_then(|pass| pass.shader_pair)
-        .and_then(|pair| catalog.vertex_decl(pair.vertex_decl_slot))
-        .is_some_and(|decl| decl.routed().iter().any(|route| route[0] >= 5))
+pub fn level_stitch_vertex_type_designer(
+    catalog: &LiveMaterialLedger,
+    key: SurfaceSortKeyPair,
+    shading_technique_kind: MethodType,
+) -> u8 {
+    let authored = Located::find(catalog, key).and_then(|found| {
+        let technique = found.technique(shading_technique_kind)?;
+        Ok(found.authored_vertex_type(technique))
+    });
+    authored.unwrap_or(decl_table::WORLD_VERTEX_LAYOUT_ID)
 }
 
-pub fn world_tess_vertex_type(
-    catalog: &RuntimeMaterialCatalog,
-    key: MaterialDrawKey,
-    tech_type: TechType,
-) -> u8 {
-    let Ok((material, technique)) = resolve_material_technique(catalog, key, tech_type) else {
-        return decl_table::WORLD_VERTEX_TYPE;
-    };
-    let authored = authored_world_vertex_type(catalog, material, technique);
-    if authored == decl_table::WORLD_VERTEX_TYPE
-        && first_pass_routes_extra_source(catalog, technique)
-    {
-        decl_table::WORLD_VERTEX_TYPE.saturating_add(1)
+pub fn smodel_tess_vertex_type(stream: Option<lighting_t6::PropFacetPath>) -> u8 {
+    use lighting_t6::PropFacetPath::{Cached, Pretess};
+    if matches!(stream, Some(Cached | Pretess)) {
+        decl_table::STATIC_CACHE_VERTEX_LAYOUT_ID
     } else {
-        authored
-    }
-}
-
-pub fn world_tess_vertex_type_authored(
-    catalog: &RuntimeMaterialCatalog,
-    key: MaterialDrawKey,
-    tech_type: TechType,
-) -> u8 {
-    match resolve_material_technique(catalog, key, tech_type) {
-        Ok((material, technique)) => authored_world_vertex_type(catalog, material, technique),
-        Err(_) => decl_table::WORLD_VERTEX_TYPE,
-    }
-}
-
-pub fn smodel_tess_vertex_type(stream: Option<lighting_t6::SmodelSurfPath>) -> u8 {
-    use lighting_t6::SmodelSurfPath::{Cached, Pretess};
-    match stream {
-        Some(Cached | Pretess) => decl_table::STATICMODELCACHE_VERTEX_TYPE,
-        _ => decl_table::PACKED_VERTEX_TYPE,
+        decl_table::COMPRESSED_VERTEX_KIND
     }
 }
 
 /// The refusal that explains why a resolved technique has no prepared form.
 pub(super) fn missing_prepared_technique(
-    material: &RuntimeMaterial,
-    technique: &RuntimeTechnique,
-    tech_type: TechType,
-) -> MaterialRefusal {
-    let Some(entries) = material.state_bits_entry.as_ref() else {
-        return MaterialRefusal::StateEntriesMissing;
+    material: &LiveMaterial,
+    technique: &LiveShadingTechnique,
+    shading_technique_kind: MethodType,
+) -> MaterialExecutionDenial {
+    let Some(entries) = &material.state_row_for else {
+        return MaterialExecutionDenial::RenderStateRecordsAbsent;
     };
-    match entries.get(usize::from(tech_type.0)) {
-        None => MaterialRefusal::StateEntryOutOfRange { tech_type },
-        Some(0xff) => MaterialRefusal::TechniqueAbsent { tech_type },
-        Some(_) => {
-            let first_pair = technique.passes.first().and_then(|pass| pass.shader_pair);
-            match first_pair {
-                Some(pair) => MaterialRefusal::UnsupportedShaderPair {
-                    pass_index: 0,
-                    pair,
-                },
-                None => MaterialRefusal::ShaderProgramMissing { pass_index: 0 },
-            }
-        }
+    let Some(&row) = entries.get(usize::from(shading_technique_kind.0)) else {
+        return MaterialExecutionDenial::RenderStateRecordBeyondBounds { shading_technique_kind };
+    };
+    if row == 0xff {
+        return MaterialExecutionDenial::RenderTechniqueNotFound { shading_technique_kind };
     }
+    let pair = technique.passes.first().and_then(|pass| pass.stage_program_duo);
+    pair.map_or(
+        MaterialExecutionDenial::ShaderProgramAbsent { technique_pass_ordinal: 0 },
+        |pair| MaterialExecutionDenial::UnhandledShaderCombination {
+            technique_pass_ordinal: 0,
+            pair,
+        },
+    )
 }
 
-pub fn prepared_draw_technique<'a>(
-    catalog: &'a RuntimeMaterialCatalog,
-    prepared: &'a PreparedMaterialTable,
-    key: MaterialDrawKey,
-    tech_type: TechType,
-) -> Result<(&'a RuntimeMaterial, &'a PreparedTechnique), MaterialRefusal> {
-    let (material, technique) = resolve_material_technique(catalog, key, tech_type)?;
-    match prepared.technique(material.asset_id, tech_type) {
-        Some(found) => Ok((material, found)),
-        None => Err(missing_prepared_technique(material, technique, tech_type)),
-    }
+pub fn resolved_draw_technique<'a>(
+    catalog: &'a LiveMaterialLedger,
+    prepared: &'a StagedMaterialTable,
+    key: SurfaceSortKeyPair,
+    shading_technique_kind: MethodType,
+) -> Result<(&'a LiveMaterial, &'a ResolvedShadingRecipe), MaterialExecutionDenial> {
+    let (picked, technique) = select_material_technique(catalog, key, shading_technique_kind)?;
+    prepared
+        .recipe_for(picked.asset_id, shading_technique_kind)
+        .map(|found| (picked, found))
+        .ok_or_else(|| missing_prepared_technique(picked, technique, shading_technique_kind))
 }
 
-pub fn draw_code_sampler_mask(
-    catalog: &RuntimeMaterialCatalog,
-    prepared: &PreparedMaterialTable,
-    key: MaterialDrawKey,
-    tech_type: TechType,
+pub fn draw_engine_sampler_bits(
+    catalog: &LiveMaterialLedger,
+    prepared: &StagedMaterialTable,
+    key: SurfaceSortKeyPair,
+    shading_technique_kind: MethodType,
 ) -> u64 {
-    prepared_draw_technique(catalog, prepared, key, tech_type)
-        .map_or(0, |(_, found)| found.code_sampler_mask)
+    resolved_draw_technique(catalog, prepared, key, shading_technique_kind)
+        .map_or(0, |(_, found)| found.engine_sampler_bitmask)
 }
 
-pub fn draw_binds_code_texture(
-    catalog: &RuntimeMaterialCatalog,
-    prepared: &PreparedMaterialTable,
-    key: MaterialDrawKey,
-    tech_type: TechType,
+pub fn draw_uses_engine_texture(
+    catalog: &LiveMaterialLedger,
+    prepared: &StagedMaterialTable,
+    key: SurfaceSortKeyPair,
+    shading_technique_kind: MethodType,
     index: u32,
 ) -> bool {
-    prepared_draw_technique(catalog, prepared, key, tech_type)
-        .is_ok_and(|(_, found)| found.binds_code_texture(index))
+    resolved_draw_technique(catalog, prepared, key, shading_technique_kind)
+        .is_ok_and(|pair| pair.1.uses_engine_texture(index))
 }

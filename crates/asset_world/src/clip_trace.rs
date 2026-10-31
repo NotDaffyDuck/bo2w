@@ -3,18 +3,18 @@
 use std::cell::RefCell;
 
 use crate::clip_flags::t5_surface_flags;
-use crate::clip_tables::ClipCollision;
+use crate::clip_tables::CollisionClipData;
 
 /// Where a swept box ended up.
 #[derive(Clone, Copy, Debug)]
-pub struct ClipSweepHit {
+pub struct SolidsTraceContact {
     /// How much of the move got through, 0 to 1.
     pub fraction: f32,
     pub normal: [f32; 3],
-    pub endpos: [f32; 3],
-    pub startsolid: bool,
-    pub allsolid: bool,
-    pub surface_flags: u32,
+    pub finish_point: [f32; 3],
+    pub began_inside: bool,
+    pub fully_embedded: bool,
+    pub face_bits: u32,
 }
 
 /// The visit marks a clip map's trace keeps so it looks at a partition only
@@ -29,78 +29,65 @@ struct VisitMarks {
 }
 
 impl VisitMarks {
-    fn fit_to(&mut self, table: usize, len: usize) {
-        if self.table != table || self.seen.len() != len {
+    fn fit_to(&mut self, table: usize, width: usize) {
+        if self.table != table || self.seen.len() != width {
             self.table = table;
             self.counter = 0;
             self.seen.clear();
-            self.seen.resize(len, 0);
+            self.seen.resize(width, 0);
         }
     }
 }
 
-thread_local! {
+std::thread_local! {
     static VISIT_MARKS: RefCell<VisitMarks> = RefCell::default();
 }
 
-fn lerp(from: [f32; 3], to: [f32; 3], t: f32) -> [f32; 3] {
-    std::array::from_fn(|axis| from[axis] + (to[axis] - from[axis]) * t)
+fn lerp(from: [f32; 3], dest: [f32; 3], share: f32) -> [f32; 3] {
+    std::array::from_fn(|axis| from[axis] + (dest[axis] - from[axis]) * share)
 }
 
-impl ClipCollision {
+impl CollisionClipData {
     /// Sweeps a box through the map's world. A collision with no clip map
     /// stops nothing: the whole move gets through.
-    fn trace_world(
-        &self,
-        start: [f32; 3],
-        end: [f32; 3],
-        mins: [f32; 3],
-        maxs: [f32; 3],
-        mask: u32,
-    ) -> trace_t6::Trace {
+    fn world_trace(&self, from: [f32; 3], dest: [f32; 3], lo: [f32; 3], hi: [f32; 3], mask: u32) -> trace_t6::Trace {
         let Some(map) = self.t6 else {
-            return trace_t6::Trace {
-                fraction: 1.0,
-                ..trace_t6::Trace::default()
-            };
+            return trace_t6::Trace { fraction: 1.0, ..Default::default() };
         };
+        let (table, len) = (map.partitions.as_ptr() as usize, map.partitions.len());
         VISIT_MARKS.with_borrow_mut(|marks| {
-            marks.fit_to(map.partitions.as_ptr() as usize, map.partitions.len());
-            let mut check = clipmap_t6::CheckCount {
-                global: marks.counter,
-                partitions: &mut marks.seen,
-            };
-            let trace = map.box_trace(&mut check, start, end, mins, maxs, 0, mask);
-            let counter = check.global;
-            marks.counter = counter;
-            trace
+            marks.fit_to(table, len);
+            let mut check = clipmap_t6::CheckCount { global: marks.counter, partitions: &mut marks.seen };
+            let found = map.box_trace(&mut check, from, dest, lo, hi, 0, mask);
+            marks.counter = check.global;
+            found
         })
     }
 
     /// Whether a point can see along the line to another: nothing solid
     /// under `mask` between them, and the start not inside something.
-    pub fn box_sight_clear(&self, start: [f32; 3], end: [f32; 3], mask: u32) -> bool {
-        let trace = self.trace_world(start, end, [0.0; 3], [0.0; 3], mask);
-        trace.fraction >= 1.0 && !trace.startsolid
+    pub fn box_sight_clear(&self, eye: [f32; 3], aim: [f32; 3], solid_mask: u32) -> bool {
+        let found = self.world_trace(eye, aim, [0.0; 3], [0.0; 3], solid_mask);
+        !found.starts_inside && found.fraction >= 1.0
     }
 
     /// Moves a box from `start` toward `end` and reports where it stops.
-    pub fn sweep_box(
-        &self,
-        start: [f32; 3],
-        end: [f32; 3],
-        mins: [f32; 3],
-        maxs: [f32; 3],
-        mask: u32,
-    ) -> ClipSweepHit {
-        let trace = self.trace_world(start, end, mins, maxs, mask);
-        ClipSweepHit {
-            fraction: trace.fraction,
-            normal: trace.normal,
-            endpos: lerp(start, end, trace.fraction),
-            startsolid: trace.startsolid,
-            allsolid: trace.allsolid,
-            surface_flags: t5_surface_flags(trace.sflags),
+    pub fn sweep_box(&self, from: [f32; 3], dest: [f32; 3], lo: [f32; 3], hi: [f32; 3], mask: u32) -> SolidsTraceContact {
+        SolidsTraceContact::along(&self.world_trace(from, dest, lo, hi, mask), from, dest)
+    }
+}
+
+impl SolidsTraceContact {
+    /// The report for `trace` on a move from `from` to `to`.
+    fn along(trace: &trace_t6::Trace, from: [f32; 3], dest: [f32; 3]) -> Self {
+        let trace_t6::Trace { fraction, normal, starts_inside: startsolid, fully_embedded, sflags, .. } = *trace;
+        Self {
+            fraction,
+            normal,
+            finish_point: lerp(from, dest, fraction),
+            began_inside: startsolid,
+            fully_embedded,
+            face_bits: t5_surface_flags(sflags),
         }
     }
 }
@@ -119,12 +106,12 @@ mod tests {
 
     #[test]
     fn a_map_with_no_clip_map_lets_every_move_through() {
-        let map = ClipCollision::default();
+        let map = CollisionClipData::default();
         let (start, end) = ([0.0; 3], [100.0, 0.0, 50.0]);
         let hit = map.sweep_box(start, end, [-8.0; 3], [8.0; 3], u32::MAX);
         assert_eq!(hit.fraction, 1.0);
-        assert_eq!(hit.endpos, end);
-        assert!(!hit.startsolid && !hit.allsolid);
+        assert_eq!(hit.finish_point, end);
+        assert!(!hit.began_inside && !hit.fully_embedded);
         assert!(map.box_sight_clear(start, end, u32::MAX));
     }
 

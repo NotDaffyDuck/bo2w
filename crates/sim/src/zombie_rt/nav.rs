@@ -1,0 +1,655 @@
+//! The map's AI navigation graph: Black Ops II's own path nodes and links
+//! (GameWorldMp path data, baked by the map compiler), nearest-node lookup
+//! and A* over the links. Negotiation links (jumps, climbs, mantles) join a
+//! begin node to its end node; the begin node names the traverse animscript.
+
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+
+use super::{Closest, T6PathNode, T6PathTables};
+
+pub(crate) const NODE_NEGOTIATION_BEGIN: u32 = 17;
+const NODE_NEGOTIATION_END: u32 = 18;
+
+/// The begin-node bits that make a link a "negotiation hint" (jump, ladder,
+/// drop and the like: Path_IsNodeNegotiationHint's mask), one a player's own
+/// moves can take.
+const NEGOTIATION_HINTS: u32 = 0x3c0_0000;
+
+/// BO2's names for the node kinds (by kind), as the scripts read
+/// `node.type`.
+pub(crate) const NODE_TYPE_NAMES: [&str; 21] = [
+    "BAD NODE",
+    "Path",
+    "Cover Stand",
+    "Cover Crouch",
+    "Cover Crouch Window",
+    "Cover Prone",
+    "Cover Right",
+    "Cover Left",
+    "Cover Pillar",
+    "Ambush",
+    "Exposed",
+    "Conceal Stand",
+    "Conceal Crouch",
+    "Conceal Prone",
+    "Reacquire",
+    "Balcony",
+    "Scripted",
+    "Begin",
+    "End",
+    "Turret",
+    "Guard",
+];
+
+/// The kinds a script's "Cover" means (a bit per kind): the cover and
+/// concealment kinds, exposed and turret nodes; not ambush ones.
+pub(crate) const NODE_COVER_KINDS: u32 = 0x83dfc;
+/// Spawnflag of a node placed on a mover, its `target` naming the entity
+/// (Die Rise's elevator cars and escape pod): it moves with it.
+pub(crate) const NODE_ON_MOVER: u32 = 0x100;
+
+const CELL: f32 = 256.0;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Nav {
+    pub graph: Vec<T6PathNode>,
+    grid: HashMap<(i32, i32), Vec<u32>>,
+    /// Links an entity's `disconnectpaths` cut (a closed door, a debris
+    /// pile), by entity, until its `connectpaths`; both directions.
+    cut_by: HashMap<u32, Vec<(u32, u32)>>,
+    cut: HashSet<(u32, u32)>,
+    pub baked: Baked,
+    /// Nodes on movers.
+    movers: Vec<NodeOnMover>,
+}
+
+/// A node on a mover: the node, the entity, and its place in the entity's own
+/// space once first seen.
+#[derive(Clone, Copy, Debug)]
+struct NodeOnMover {
+    node: u32,
+    ent: u32,
+    local: Option<[f32; 3]>,
+}
+
+impl Nav {
+    /// The nav with the map compiler's node tables.
+    pub(crate) fn with_baked(mut self, baked: Baked) -> Self {
+        self.baked = baked;
+        self
+    }
+}
+
+/// The map compiler's node tables, where the map has them and their size
+/// fits: which node pairs see each other (`vis`, a `vis_n` square, bit
+/// `vis_n * i + j` for i < j) and which a straight walk joins (`smooth`,
+/// bit `smooth_n * i + j`), as BO2's `Path_NodesVisible` and
+/// `Path_NodesSmooth` read them.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Baked {
+    vis_n: usize,
+    vis: Vec<u8>,
+    smooth_n: usize,
+    smooth: Vec<u8>,
+}
+
+impl Baked {
+    /// The tables as the map gave them: each one's side is the node count
+    /// its byte count fits (the map's nodes, or its compiled ones). The
+    /// sight table holds only pairs i < j, so it ends at bit
+    /// n * (n - 2) + n - 1: n * (n - 1) bits; the smooth table is the
+    /// whole n * n square.
+    pub(crate) fn new(t: &T6PathTables, nodes: usize) -> Self {
+        let side = |bytes: &[u8], bits: fn(usize) -> usize| {
+            let counts = [t.node_count as usize, t.original_count as usize];
+            let fits = |d: usize| d > 0 && d <= nodes;
+            counts
+                .into_iter()
+                .filter(|&d| fits(d))
+                .find(|&d| bytes.len() == bits(d).div_ceil(8))
+                .or_else(|| {
+                    counts
+                        .into_iter()
+                        .filter(|&d| fits(d) && bytes.len() * 8 >= bits(d))
+                        .max()
+                })
+                .unwrap_or(0)
+        };
+        let (vis_n, smooth_n) = (side(&t.vis, |d| d * (d - 1)), side(&t.smooth, |d| d * d));
+        Self {
+            vis_n,
+            vis: if vis_n > 0 { t.vis.clone() } else { Vec::new() },
+            smooth_n,
+            smooth: if smooth_n > 0 { t.smooth.clone() } else { Vec::new() },
+        }
+    }
+
+    pub(crate) fn sides(&self) -> (usize, usize) {
+        (self.vis_n, self.smooth_n)
+    }
+
+    /// Do the two nodes see each other (BO2's `Path_NodesVisible`)? None
+    /// past the table (a node added at run time, or a map without one).
+    pub(crate) fn visible(&self, i: u32, j: u32) -> Option<bool> {
+        let (i, j, n) = (i as usize, j as usize, self.vis_n);
+        if i >= n || j >= n {
+            return None;
+        }
+        if i == j {
+            return Some(true);
+        }
+        let k = n * i.min(j) + i.max(j);
+        Some(self.vis[k >> 3] & (1 << (k & 7)) != 0)
+    }
+
+    /// Does a straight walk join the two (BO2's `Path_NodesSmooth`)? No
+    /// past the table.
+    pub(crate) fn smooth(&self, i: u32, j: u32) -> bool {
+        let (i, j, n) = (i as usize, j as usize, self.smooth_n);
+        if i >= n || j >= n {
+            return false;
+        }
+        let k = n * i + j;
+        self.smooth[k >> 3] & (1 << (k & 7)) != 0
+    }
+}
+
+/// Does the segment a -> b pass through the box?
+fn segment_hits_box(a: [f32; 3], b: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> bool {
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for i in 0..3 {
+        let d = b[i] - a[i];
+        if d.abs() < 1e-6 {
+            if a[i] < lo[i] || a[i] > hi[i] {
+                return false;
+            }
+            continue;
+        }
+        let (mut close_by, mut far) = ((lo[i] - a[i]) / d, (hi[i] - a[i]) / d);
+        if close_by > far {
+            std::mem::swap(&mut close_by, &mut far);
+        }
+        t0 = t0.max(close_by);
+        t1 = t1.min(far);
+        if t0 > t1 {
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Open {
+    f: f32,
+    node: u32,
+}
+
+impl Eq for Open {}
+
+impl Ord for Open {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal)
+    }
+}
+
+impl PartialOrd for Open {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+}
+
+fn cell(p: [f32; 3]) -> (i32, i32) {
+    ((p[0] / CELL).floor() as i32, (p[1] / CELL).floor() as i32)
+}
+
+impl Nav {
+    pub(crate) fn new(nodes: Vec<T6PathNode>) -> Self {
+        dump(&nodes);
+        let mut grid: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+        for (i, n) in nodes.iter().enumerate() {
+            grid.entry(cell(n.origin)).or_default().push(i as u32);
+        }
+        Self {
+            graph: nodes,
+            grid,
+            ..Default::default()
+        }
+    }
+
+    /// `disconnectpaths`: every link crossing the box (an entity's brush in
+    /// the world) is cut until `connect` for that entity.
+    pub(crate) fn disconnect(&mut self, ent: u32, lo: [f32; 3], hi: [f32; 3]) {
+        self.connect(ent);
+        let centre = std::array::from_fn(|i| (lo[i] + hi[i]) * 0.5);
+        let half = dist(lo, hi) * 0.5;
+        let mut cut = Vec::new();
+        for (a, _) in self.within(centre, half + 512.0) {
+            let pa = self.graph[a as usize].origin;
+            for &(b, _, _) in &self.graph[a as usize].links {
+                let b = u32::from(b);
+                let Some(nb) = self.graph.get(b as usize) else {
+                    continue;
+                };
+                // Raised a little off the floor: links run between nodes on
+                // the ground, the door stands on it.
+                let lift = |p: [f32; 3]| [p[0], p[1], p[2] + 24.0];
+                if segment_hits_box(lift(pa), lift(nb.origin), lo, hi) {
+                    cut.push((a, b));
+                    cut.push((b, a));
+                }
+            }
+        }
+        for &l in &cut {
+            self.cut.insert(l);
+        }
+        self.cut_by.insert(ent, cut);
+    }
+
+    /// `connectpaths`: the entity's cut links join again.
+    pub(crate) fn connect(&mut self, ent: u32) {
+        if self.cut_by.remove(&ent).is_some() {
+            self.cut = self.cut_by.values().flatten().copied().collect();
+        }
+    }
+
+    /// Links cut now (both directions).
+    pub(crate) fn cut_count(&self) -> usize {
+        self.cut.len()
+    }
+
+    /// The closest node to `p` (searching rings of cells outward), giving
+    /// height a heavier weight so a node on the floor above loses.
+    pub(crate) fn nearest(&self, p: [f32; 3]) -> Option<u32> {
+        if self.graph.is_empty() {
+            return None;
+        }
+        let (cx, cy) = cell(p);
+        let mut pick = Closest::new();
+        for ring in 0i32..12 {
+            for step_along_x in -ring..=ring {
+                for dy in -ring..=ring {
+                    if step_along_x.abs() != ring && dy.abs() != ring {
+                        continue;
+                    }
+                    let Some(list) = self.grid.get(&(cx + step_along_x, cy + dy)) else {
+                        continue;
+                    };
+                    for &ix in list {
+                        let o = self.graph[ix as usize].origin;
+                        let d = [o[0] - p[0], o[1] - p[1], (o[2] - p[2]) * 3.0];
+                        let points = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                        pick.offer(points, ix);
+                    }
+                }
+            }
+            // A ring further out can't beat a hit closer than its inner edge.
+            if let Some(points) = pick.score()
+                && points < ring as f32 * CELL
+            {
+                break;
+            }
+        }
+        pick.into_item()
+    }
+
+    /// BO2's candidates for a place's nearest node (Path_NearestNode with
+    /// its height check): the nodes within 192 units across and from 120
+    /// below to 64 above it, closest across first; nodes with no links after
+    /// the rest.
+    pub(crate) fn near_cylinder(&self, p: [f32; 3]) -> Vec<(u32, [f32; 3])> {
+        let (cx, cy) = cell(p);
+        let mut dest: Vec<(bool, f32, u32)> = Vec::new();
+        for step_along_x in -1..=1 {
+            for dy in -1..=1 {
+                let Some(list) = self.grid.get(&(cx + step_along_x, cy + dy)) else {
+                    continue;
+                };
+                for &i in list {
+                    let n = &self.graph[i as usize];
+                    let o = n.origin;
+                    let d2 = (o[0] - p[0]).powi(2) + (o[1] - p[1]).powi(2);
+                    if d2 <= 192.0 * 192.0 && (-120.0..=64.0).contains(&(o[2] - p[2])) {
+                        dest.push((n.links.is_empty(), d2, i));
+                    }
+                }
+            }
+        }
+        dest.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then(lhs.1.partial_cmp(&rhs.1).unwrap_or(Ordering::Equal)));
+        dest.into_iter().map(|(_, _, i)| (i, self.graph[i as usize].origin)).collect()
+    }
+
+    /// Nodes within `radius` of `p` (by straight distance), nearest first.
+    pub(crate) fn within(&self, p: [f32; 3], radius: f32) -> Vec<(u32, f32)> {
+        let (cx, cy) = cell(p);
+        let reach = (radius / CELL).ceil() as i32;
+        let mut dest = Vec::new();
+        for step_along_x in -reach..=reach {
+            for dy in -reach..=reach {
+                let Some(list) = self.grid.get(&(cx + step_along_x, cy + dy)) else {
+                    continue;
+                };
+                for &i in list {
+                    let d = dist(self.graph[i as usize].origin, p);
+                    if d <= radius {
+                        dest.push((i, d));
+                    }
+                }
+            }
+        }
+        dest.sort_by(|lhs, rhs| lhs.1.partial_cmp(&rhs.1).unwrap_or(Ordering::Equal));
+        dest
+    }
+
+    /// A* from `from` to `to` over the links: the node list, both ends
+    /// included, or `None` when no path joins them.
+    pub(crate) fn path(&self, from: u32, to: u32) -> Option<Vec<u32>> {
+        self.path_from(&[(from, 0.0)], to)
+    }
+
+    /// A* from any of `seeds` (node, cost to reach it) to `to`.
+    pub(crate) fn path_from(&self, seeds: &[(u32, f32)], to: u32) -> Option<Vec<u32>> {
+        self.path_from_avoiding(seeds, to, &[])
+    }
+
+    /// A bot's path (Bot_GetPathToGoal): BO2 searches it with negotiation
+    /// hints allowed and plain negotiation links not, so a bot never takes a
+    /// begin-to-end link that has no jump, ladder or drop bit (an animscript
+    /// traverse only an AI can play).
+    pub(crate) fn bot_path(&self, from: u32, to: u32) -> Option<Vec<u32>> {
+        self.search(&[(from, 0.0)], to, &[], false)
+    }
+
+    /// `path_from` not going through the `avoid` nodes (`to` excepted).
+    pub(crate) fn path_from_avoiding(
+        &self,
+        seeds: &[(u32, f32)],
+        to: u32,
+        avoid: &[u32],
+    ) -> Option<Vec<u32>> {
+        self.search(seeds, to, avoid, true)
+    }
+
+    /// The A* itself. Without `allow_links`, a step from a begin node with no
+    /// hint bit to an end node is refused (Path_AStarAlgorithm's
+    /// bAllowNegotiationLinks test).
+    fn search(
+        &self,
+        seeds: &[(u32, f32)],
+        to: u32,
+        avoid: &[u32],
+        allow_links: bool,
+    ) -> Option<Vec<u32>> {
+        let n = self.graph.len();
+        if to as usize >= n || seeds.iter().any(|s| s.0 as usize >= n) {
+            return None;
+        }
+        if let Some(s) = seeds.iter().find(|s| s.0 == to) {
+            return Some(vec![s.0]);
+        }
+        let goal = self.graph[to as usize].origin;
+        let mut g = vec![f32::INFINITY; n];
+        let mut parent = vec![u32::MAX; n];
+        let mut closed = vec![false; n];
+        for &a in avoid {
+            if a != to && (a as usize) < n {
+                closed[a as usize] = true;
+            }
+        }
+        let mut open = BinaryHeap::new();
+        for &(from, cost) in seeds {
+            if closed[from as usize] {
+                continue;
+            }
+            if cost < g[from as usize] {
+                g[from as usize] = cost;
+                open.push(Open {
+                    f: cost + dist(self.graph[from as usize].origin, goal),
+                    node: from,
+                });
+            }
+        }
+        let mut expanded = 0;
+        while let Some(Open { node, .. }) = open.pop() {
+            if closed[node as usize] {
+                continue;
+            }
+            if node == to {
+                let mut out = vec![to];
+                let mut at = to;
+                while parent[at as usize] != u32::MAX {
+                    at = parent[at as usize];
+                    out.push(at);
+                }
+                out.reverse();
+                return Some(out);
+            }
+            closed[node as usize] = true;
+            expanded += 1;
+            if expanded > 4096 {
+                return None;
+            }
+            let here = &self.graph[node as usize];
+            let plain_begin = here.ty == NODE_NEGOTIATION_BEGIN && here.spawnflags & NEGOTIATION_HINTS == 0;
+            for &(next, d, _neg) in &here.links {
+                let next = u32::from(next);
+                if next as usize >= n || closed[next as usize] || self.cut.contains(&(node, next)) {
+                    continue;
+                }
+                if !allow_links && plain_begin && self.graph[next as usize].ty == NODE_NEGOTIATION_END {
+                    continue;
+                }
+                let cost = g[node as usize] + d.max(1.0);
+                if cost < g[next as usize] {
+                    g[next as usize] = cost;
+                    parent[next as usize] = node;
+                    open.push(Open {
+                        f: cost + dist(self.graph[next as usize].origin, goal),
+                        node: next,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// `nodesarelinked`: is there a link `a -> b`?
+    pub(crate) fn linked(&self, a: u32, b: u32) -> bool {
+        self.graph
+            .get(a as usize)
+            .is_some_and(|n| n.links.iter().any(|l| u32::from(l.0) == b))
+    }
+
+    /// `linknodes`: a one-way link `a -> b` (Die Rise's escape pod doors).
+    pub(crate) fn link(&mut self, a: u32, b: u32) {
+        if self.linked(a, b) || b as usize >= self.graph.len() || b > u32::from(u16::MAX) {
+            return;
+        }
+        let d = dist(self.graph[a as usize].origin, self.graph[b as usize].origin);
+        self.graph[a as usize].links.push((b as u16, d, false));
+    }
+
+    /// `unlinknodes`: drop the link `a -> b`.
+    pub(crate) fn unlink(&mut self, a: u32, b: u32) {
+        if let Some(n) = self.graph.get_mut(a as usize) {
+            n.links.retain(|l| u32::from(l.0) != b);
+        }
+    }
+
+    /// `deletepathnode`: no link leads to or from `n` any more.
+    pub(crate) fn delete(&mut self, n: u32) {
+        for (i, node) in self.graph.iter_mut().enumerate() {
+            if i as u32 == n {
+                node.links.clear();
+            } else {
+                node.links.retain(|l| u32::from(l.0) != n);
+            }
+        }
+    }
+
+    /// The nodes on the mover `targetname` (spawned as entity `ent`) are
+    /// carried by it from now on (`follow_movers`).
+    pub(crate) fn attach_movers(&mut self, target_name: &str, en: u32) {
+        for (i, n) in self.graph.iter().enumerate() {
+            if n.spawnflags & NODE_ON_MOVER != 0 && n.target.eq_ignore_ascii_case(target_name) {
+                self.movers.push(NodeOnMover { node: i as u32, ent: en, local: None });
+            }
+        }
+    }
+
+    /// Each tick: nodes on movers follow their entity's pose (kept at the
+    /// place in its own space they had when first seen), so the AI paths
+    /// into a car or the escape pod where it is now. Gives the nodes that
+    /// moved, with their new place.
+    pub(crate) fn follow_movers(
+        &mut self,
+        pose: impl Fn(u32) -> Option<([f32; 3], [f32; 3])>,
+    ) -> Vec<(u32, [f32; 3])> {
+        let mut moved = Vec::new();
+        for k in 0..self.movers.len() {
+            let NodeOnMover { node, ent, local } = self.movers[k];
+            let Some((o, a)) = pose(ent) else {
+                continue;
+            };
+            let p = self.graph[node as usize].origin;
+            let (f, r, u) = gsc_t6::math::facing_axes(a);
+            let l = local.unwrap_or_else(|| {
+                let d = gsc_t6::math::sub(p, o);
+                [
+                    gsc_t6::math::dot(d, f),
+                    gsc_t6::math::dot(d, r),
+                    gsc_t6::math::dot(d, u),
+                ]
+            });
+            self.movers[k].local = Some(l);
+            let to: [f32; 3] =
+                std::array::from_fn(|i| o[i] + f[i] * l[0] + r[i] * l[1] + u[i] * l[2]);
+            if dist(to, p) < 0.01 {
+                continue;
+            }
+            let (c0, c1) = (cell(p), cell(to));
+            if c0 != c1 {
+                if let Some(list) = self.grid.get_mut(&c0) {
+                    list.retain(|&i| i != node);
+                }
+                self.grid.entry(c1).or_default().push(node);
+            }
+            self.graph[node as usize].origin = to;
+            moved.push((node, to));
+        }
+        moved
+    }
+
+    /// Is `a -> b` a negotiation link (a traversal)?
+    pub(crate) fn negotiation(&self, a: u32, b: u32) -> bool {
+        self.graph
+            .get(a as usize)
+            .is_some_and(|n| n.links.iter().any(|l| u32::from(l.0) == b && l.2))
+    }
+}
+
+/// BO2MP_T6_NAVDUMP=<file>: every path node as loaded, one line each
+/// (`index type spawnflags x y z targetname target | links @ animscript`), for reading
+/// the map's paths offline.
+fn dump(nodes: &[T6PathNode]) {
+    let Some(path) = std::env::var_os("BO2MP_T6_NAVDUMP") else {
+        return;
+    };
+    let mut out = String::new();
+    for (i, n) in nodes.iter().enumerate() {
+        let links: Vec<String> = n.links.iter().map(|l| l.0.to_string()).collect();
+        out += &format!(
+            "{i} {} {:#x} {:.0} {:.0} {:.0} {} {} | {} @ {}
+",
+            n.ty,
+            n.spawnflags,
+            n.origin[0],
+            n.origin[1],
+            n.origin[2],
+            if n.target_key.is_empty() {
+                "-"
+            } else {
+                &n.target_key
+            },
+            if n.target.is_empty() { "-" } else { &n.target },
+            links.join(" "),
+            if n.animscript.is_empty() {
+                "-"
+            } else {
+                &n.animscript
+            }
+        );
+    }
+    let _ = std::fs::write(path, out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(ty: u32, spawnflags: u32, origin: [f32; 3], links: &[u16]) -> T6PathNode {
+        T6PathNode {
+            ty,
+            spawnflags,
+            origin,
+            links: links.iter().map(|&l| (l, 10.0, false)).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Two ways over a wall: a short plain link (no hint bit, Dig HQ's
+    /// 0x308000) and a longer jump link (0xa08000). The AI search takes the
+    /// short one; a bot's search, like Bot_GetPathToGoal's, only the jump.
+    #[test]
+    fn bot_path_skips_plain_negotiation_links() {
+        let nav = Nav::new(vec![
+            node(0, 0, [0.0, 0.0, 0.0], &[1, 4]),
+            node(NODE_NEGOTIATION_BEGIN, 0x30_8000, [10.0, 0.0, 0.0], &[2]),
+            node(NODE_NEGOTIATION_END, 0, [20.0, 0.0, 0.0], &[3]),
+            node(0, 0, [30.0, 0.0, 0.0], &[]),
+            node(NODE_NEGOTIATION_BEGIN, 0xa0_8000, [10.0, 100.0, 0.0], &[5]),
+            node(NODE_NEGOTIATION_END, 0, [20.0, 100.0, 0.0], &[3]),
+        ]);
+        assert_eq!(nav.path(0, 3), Some(vec![0, 1, 2, 3]));
+        assert_eq!(nav.bot_path(0, 3), Some(vec![0, 4, 5, 3]));
+    }
+
+    /// Frostbite's ledges at (450,-700) and (-100,850), 36 and 64 units
+    /// high, are jump links in the map's own path data (begin nodes 537 and
+    /// 511, flags 0x908000 and 0xb08000), and a bot's path crosses them as
+    /// such, not as plain edges. Needs T6_ZONE_DIR (BO2's zone/all).
+    #[test]
+    fn frostbite_ledges_are_jump_links_on_the_bot_path() {
+        let Ok(dir) = std::env::var("T6_ZONE_DIR") else {
+            return;
+        };
+        let capture = asset_t6::capture_zone(&std::path::Path::new(&dir).join("mp_frostbite.ff")).expect("zone");
+        let nav = Nav::new(
+            capture
+                .path_nodes
+                .iter()
+                .map(|n| T6PathNode {
+                    ty: n.ty,
+                    spawnflags: n.spawnflags,
+                    origin: n.origin,
+                    links: n.links.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        for (begin, end, after, at) in [(537, 538, 609, [423.0, -694.0]), (511, 512, 513, [-102.0, 826.0])] {
+            let node = &nav.graph[begin as usize];
+            assert_eq!(node.ty, NODE_NEGOTIATION_BEGIN);
+            assert!(dist([node.origin[0], node.origin[1], 0.0], [at[0], at[1], 0.0]) < 1.0, "node {begin} moved");
+            assert_ne!(node.spawnflags & 0x80_0000, 0, "node {begin} is no jump");
+            assert_eq!(nav.graph[end as usize].ty, NODE_NEGOTIATION_END);
+            assert!(nav.negotiation(begin, end), "{begin} -> {end} is a plain edge");
+            assert_eq!(nav.bot_path(begin, after), Some(vec![begin, end, after]));
+        }
+    }
+}

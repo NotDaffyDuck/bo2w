@@ -6,10 +6,10 @@
 use std::process::ExitCode;
 
 use weapon_t6::facts::FactsTable;
-use weapon_t6::trace::{Runner, demo_facts};
+use weapon_t6::trace::{ScenarioDriver, demo_facts};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
     let Some(script_path) = args.first() else {
         eprintln!("usage: gun_trace SCRIPT [FACTS_DUMP]");
         return ExitCode::from(2);
@@ -32,9 +32,9 @@ fn main() -> ExitCode {
         },
         None => demo_facts(),
     };
-    match Runner::new(&facts).run_script(&script) {
+    match ScenarioDriver::new(&facts).run_script(&script) {
         Ok(r) => {
-            for l in &r.lines {
+            for l in &r.log_rows {
                 println!("{l}");
             }
             println!("{} expect failure(s)", r.failures);

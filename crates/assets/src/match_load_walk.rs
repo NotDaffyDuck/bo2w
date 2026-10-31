@@ -2,182 +2,215 @@
 //! resources, watching it, and settling it into a result, or into nothing if
 //! the player gave up on it.
 
-use asset_transport::progress::LoadProgress;
+use asset_transport::progress::LoadCompletion;
 use bevy::prelude::*;
 use bevy::tasks::{Task, futures_lite::future};
-use frame::ClientSet;
+use frame::ClientStep;
 
 use crate::load_process::MapLoadProcess;
 use crate::match_load_admit::approve_map_load;
 use crate::match_load_state::{
-    MapLoadApproval, MatchLoadAbort, MatchLoadAccepted, MatchLoadBusy, MatchLoadDispatch,
-    MatchLoadRequest, PreparedMatchReady, PreparedMatchSound,
+    MapLoadApproval, SessionLoadCancel, SessionLoadApproved, SessionLoadOccupied, MatchLoadDispatch,
+    SessionLoadOrder, ReadiedSessionSignal, PreparedMatchSound,
 };
-use crate::session_load::{MatchLoadOutcome, load_pool, load_prepared_match};
+use crate::load_stages::{MatchLoadOutcome, loader_pool, read_staged_round};
 
-/// The walk in flight. `None` when it was cancelled.
+/// A walk that has been started and not yet collected. It yields `None`
+/// when the player cancelled it part-way.
 #[derive(Resource)]
-struct MatchLoadTask {
-    walk: Task<Option<PreparedMatchReady>>,
-    request_id: u64,
-    progress: LoadProgress,
+struct WalkInFlight {
+    id: u64,
+    cancel: LoadCompletion,
+    job: Task<Option<ReadiedSessionSignal>>,
 }
 
-fn start_match_load(
-    mut commands: Commands,
-    request: Option<Res<MatchLoadRequest>>,
-    running: Option<Res<MatchLoadTask>>,
-    retiring: Option<Res<frame::Retiring>>,
-    abort: Option<Res<MatchLoadAbort>>,
-    mut parked_on: Local<Option<u64>>,
-    mut busy: ResMut<MatchLoadBusy>,
-) {
-    let Some(request) = request else {
-        return;
-    };
-    let id = request.request_id;
+/// What the starter does with the queued request on this frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verdict {
+    /// The player aborted it: throw it away unstarted.
+    Discard,
+    /// Another walk still runs; ask again next frame.
+    Wait,
+    /// The previous session is still handing its resources back.
+    Park,
+    /// Nothing is in the way: start the walk.
+    Launch,
+}
 
-    if MatchLoadAbort::covers(abort.as_deref(), id) {
-        *parked_on = None;
-        commands.remove_resource::<MatchLoadRequest>();
+fn verdict(aborted: bool, walk_running: bool, retiring: bool) -> Verdict {
+    match (aborted, walk_running, retiring) {
+        (true, _, _) => Verdict::Discard,
+        (false, true, _) => Verdict::Wait,
+        (false, false, true) => Verdict::Park,
+        (false, false, false) => Verdict::Launch,
+    }
+}
+
+/// Queues the removal of resource `R`.
+fn retire<R: Resource>(commands: &mut Commands) {
+    commands.remove_resource::<R>();
+}
+
+fn begin_walk(
+    mut commands: Commands,
+    request: Option<Res<SessionLoadOrder>>,
+    running: Option<Res<WalkInFlight>>,
+    retiring: Option<Res<frame::Retiring>>,
+    abort: Option<Res<SessionLoadCancel>>,
+    mut parked_on: Local<Option<u64>>,
+    mut busy: ResMut<SessionLoadOccupied>,
+) {
+    let Some(queued) = request.as_deref() else { return };
+    let ticket = queued.ticket;
+    let retired_busy = retiring.as_deref().map_or(false, frame::Retiring::busy);
+    let call = verdict(SessionLoadCancel::covers(abort.as_deref(), ticket), running.is_some(), retired_busy);
+
+    if call == Verdict::Discard {
+        parked_on.take();
+        retire::<SessionLoadOrder>(&mut commands);
+        // A walk that is still going keeps the flag up until it is collected.
         if running.is_none() {
             busy.0 = false;
         }
-        diag::info!(World, "match load: request #{id} aborted before its walk started");
-        return;
-    }
-    if running.is_some() {
-        return;
-    }
-    if retiring.is_some_and(|retiring| retiring.busy()) {
-        if *parked_on != Some(id) {
-            diag::info!(World, "match load: request #{id} waits for retired resources");
-            *parked_on = Some(id);
+        diag::info!(World, "match load: request #{ticket} aborted before its walk started");
+    } else if call == Verdict::Park {
+        let before = parked_on.replace(ticket);
+        if before != Some(ticket) {
+            diag::info!(World, "match load: request #{ticket} waits for retired resources");
         }
-        return;
+    } else if call == Verdict::Launch {
+        let resumed = *parked_on == Some(ticket);
+        *parked_on = None;
+        if resumed {
+            diag::info!(World, "match load: request #{ticket} goes on after the retirement");
+        }
+        launch_walk(&mut commands, queued);
+        busy.0 = true;
     }
-    if parked_on.take() == Some(id) {
-        diag::info!(World, "match load: request #{id} goes on after the retirement");
-    }
+}
 
-    let MatchLoadRequest {
-        load_key,
-        zone,
-        zone_ff,
-        common_mp,
-        progress,
-        ..
-    } = &*request;
-    let (load_key, zone) = (*load_key, zone.clone());
+/// Opens the process record, announces the request as taken, and hands the
+/// walk to the load pool.
+fn launch_walk(commands: &mut Commands, queued: &SessionLoadOrder) {
+    let load_req_id = queued.ticket;
+    let decrypt_secret = queued.decrypt_secret;
+    let tracker = queued.progress.clone();
     // The process outlives the overlay and every task started here: the table
     // reads it, admission finishes it, and the bench still has it after the
     // screen is gone.
-    commands.insert_resource(MapLoadProcess::new(id, load_key, zone.clone(), progress.clone()));
-    commands.insert_resource(MatchLoadAccepted {
-        request_id: id,
-        load_key,
-        zone: zone.clone(),
-    });
+    let process = MapLoadProcess::new(load_req_id, decrypt_secret, queued.zone.clone(), tracker.clone());
+    commands.insert_resource(process);
+    let wanted_zone = queued.zone.clone();
+    commands.insert_resource(SessionLoadApproved { ticket: load_req_id, decrypt_secret, zone: wanted_zone.clone() });
 
-    let (zone_ff, common_mp, walk_progress) = (zone_ff.clone(), common_mp.clone(), progress.clone());
-    let walk = load_pool().spawn(async move {
-        match load_prepared_match(zone_ff, common_mp, walk_progress).await {
-            MatchLoadOutcome::Ready(prepared) => Some(PreparedMatchReady {
-                request_id: id,
-                load_key,
-                zone,
-                prepared,
-            }),
-            MatchLoadOutcome::Canceled => None,
-        }
+    let inputs = (queued.zone_archive_file.clone(), queued.common_zone.clone(), tracker.clone());
+    let job = loader_pool().spawn(async move {
+        let (map_zone, common_zone, walk_tracker) = inputs;
+        let outcome = read_staged_round(map_zone, common_zone, walk_tracker).await;
+        let MatchLoadOutcome::Ready(prepared) = outcome else { return None };
+        Some(ReadiedSessionSignal { ticket: load_req_id, decrypt_secret, zone: wanted_zone, prepared })
     });
-    commands.insert_resource(MatchLoadTask {
-        walk,
-        request_id: id,
-        progress: progress.clone(),
-    });
-    commands.remove_resource::<MatchLoadRequest>();
-    busy.0 = true;
+    commands.insert_resource(WalkInFlight { id: load_req_id, cancel: tracker, job });
+    retire::<SessionLoadOrder>(commands);
 }
 
-fn poll_match_load(
+fn collect_walk(
     mut commands: Commands,
-    task: Option<ResMut<MatchLoadTask>>,
-    mut busy: ResMut<MatchLoadBusy>,
-    abort: Option<Res<MatchLoadAbort>>,
+    task: Option<ResMut<WalkInFlight>>,
+    mut busy: ResMut<SessionLoadOccupied>,
+    abort: Option<Res<SessionLoadCancel>>,
 ) {
-    let Some(mut task) = task else {
-        return;
-    };
-    let id = task.request_id;
+    let Some(mut flight) = task else { return };
+    let aborted = |ticket: u64| SessionLoadCancel::covers(abort.as_deref(), ticket);
 
-    if MatchLoadAbort::covers(abort.as_deref(), id) && !task.progress.is_canceled() {
-        task.progress.cancel();
+    let ticket = flight.id;
+    if aborted(ticket) && !flight.cancel.was_aborted() {
+        flight.cancel.cancel();
         diag::info!(
             World,
-            "match load: cancelling the walk of request #{id}; it stops at its next checkpoint"
+            "match load: cancelling the walk of request #{ticket}; it stops at its next checkpoint"
         );
     }
-    let Some(finished) = future::block_on(future::poll_once(&mut task.walk)) else {
-        return;
-    };
+    let polled = future::block_on(future::poll_once(&mut flight.job));
+    let Some(finished) = polled else { return };
+
     busy.0 = false;
-    commands.remove_resource::<MatchLoadTask>();
-    commands.remove_resource::<MatchLoadAccepted>();
-
-    let Some(mut ready) = finished else {
-        diag::info!(World, "match load: the walk of request #{id} was cancelled; nothing prepared");
-        return;
-    };
-    if MatchLoadAbort::covers(abort.as_deref(), ready.request_id) {
-        diag::info!(
-            World,
-            "match load: dropped the walk of aborted request #{} (`{}`)",
-            ready.request_id,
-            ready.zone
-        );
-        return;
+    retire::<WalkInFlight>(&mut commands);
+    retire::<SessionLoadApproved>(&mut commands);
+    match finished {
+        None => {
+            diag::info!(World, "match load: the walk of request #{ticket} was cancelled; nothing prepared");
+        }
+        Some(done) if aborted(done.ticket) => {
+            let (dropped, zone) = (done.ticket, &done.zone);
+            diag::info!(World, "match load: dropped the walk of aborted request #{dropped} (`{zone}`)");
+        }
+        Some(done) => publish(&mut commands, done),
     }
-    commands.insert_resource(PreparedMatchSound {
-        load_key: ready.load_key,
-        zone: ready.zone.clone(),
-        common_profile_id: ready.prepared.materials.common_profile_id,
-        products_id: ready.prepared.materials.products_id,
-        sound: ready
-            .prepared
-            .sound
-            .take()
-            .unwrap_or_else(|| Err("the map zone never opened".to_owned())),
-    });
-    commands.insert_resource(ready);
+}
+
+/// Splits the sound catalog off a finished walk and publishes both halves.
+fn publish(commands: &mut Commands, mut done: ReadiedSessionSignal) {
+    let sound = done.prepared.sound.take();
+    let materials = &done.prepared.materials;
+    let half = PreparedMatchSound {
+        sound: sound.unwrap_or_else(|| Err("the map zone never opened".to_owned())),
+        products_id: materials.products_id,
+        common_profile_id: materials.common_profile_id,
+        zone: done.zone.clone(),
+        decrypt_secret: done.decrypt_secret,
+    };
+    commands.insert_resource(half);
+    commands.insert_resource(done);
 }
 
 /// An abort has done its work once no walk, request or result is left for it.
-fn expire_match_load_abort(
+fn retire_spent_abort(
     mut commands: Commands,
-    abort: Option<Res<MatchLoadAbort>>,
-    task: Option<Res<MatchLoadTask>>,
-    request: Option<Res<MatchLoadRequest>>,
-    ready: Option<Res<PreparedMatchReady>>,
+    abort: Option<Res<SessionLoadCancel>>,
+    task: Option<Res<WalkInFlight>>,
+    request: Option<Res<SessionLoadOrder>>,
+    ready: Option<Res<ReadiedSessionSignal>>,
 ) {
-    let leftover = task.is_some() || request.is_some() || ready.is_some();
-    if abort.is_some() && !leftover {
-        commands.remove_resource::<MatchLoadAbort>();
+    let settled = [task.is_none(), request.is_none(), ready.is_none()].into_iter().all(|gone| gone);
+    if settled && abort.is_some() {
+        retire::<SessionLoadCancel>(&mut commands);
     }
 }
 
-pub fn register_match_load_systems(app: &mut App) {
-    let dispatch = (
-        start_match_load,
-        poll_match_load.after(start_match_load),
-        expire_match_load_abort.after(poll_match_load),
-    )
+pub fn add_match_load_systems(app: &mut App) {
+    // `chain` orders the three exactly as `after` did, with the same sync
+    // points between them, so each sees the previous one's commands.
+    let walk = (begin_walk, collect_walk, retire_spent_abort)
+        .chain()
         .in_set(MatchLoadDispatch)
         .after(MapLoadApproval);
-    app.init_resource::<MatchLoadBusy>().add_systems(
+    let approve = approve_map_load.in_set(MapLoadApproval);
+    app.init_resource::<SessionLoadOccupied>();
+    app.add_systems(
         Update,
-        (approve_map_load.in_set(MapLoadApproval), dispatch)
-            .after(frame::SessionSwapApplied)
-            .in_set(ClientSet::Load),
+        (approve, walk).after(frame::MatchSwapDone).in_set(ClientStep::Load),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Verdict, verdict};
+
+    #[test]
+    fn an_abort_wins_over_everything() {
+        for running in [false, true] {
+            for retiring in [false, true] {
+                assert_eq!(verdict(true, running, retiring), Verdict::Discard);
+            }
+        }
+    }
+
+    #[test]
+    fn a_running_walk_comes_before_retirement() {
+        assert_eq!(verdict(false, true, true), Verdict::Wait);
+        assert_eq!(verdict(false, true, false), Verdict::Wait);
+        assert_eq!(verdict(false, false, true), Verdict::Park);
+        assert_eq!(verdict(false, false, false), Verdict::Launch);
+    }
 }

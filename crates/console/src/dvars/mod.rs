@@ -4,13 +4,14 @@
 
 use std::{fmt, ops::DerefMut};
 
-use bevy::{
-    ecs::{component::Mutable, schedule::ScheduleConfigs, system::ScheduleSystem},
-    prelude::*,
-};
+use bevy::{ecs::component::Mutable, ecs::schedule::ScheduleConfigs, ecs::system::ScheduleSystem};
+use bevy::{ecs::message::MessageReader, ecs::resource::Resource, ecs::system::ResMut};
+use bevy::ecs::schedule::IntoScheduleConfigs;
 
-use crate::feature_dispatch::ConsoleEcho;
-use crate::{CommandSpec, ConsoleCommand, ConsoleRegistry};
+use crate::tool_cmds::PromptReplyWriter;
+use crate::OrderBlueprint;
+use crate::TypedOrder;
+use crate::OrderCatalog;
 
 mod sets;
 
@@ -100,14 +101,14 @@ impl Kind {
     fn domain(self) -> String {
         match self {
             Self::Range(low, high) => format!(" (domain {low}..{high})"),
-            _ => String::new(),
+            _other => String::new(),
         }
     }
 }
 
 /// One console variable of a resource `R`.
 pub(crate) struct Dvar<R: 'static> {
-    name: &'static str,
+    dvar_name: &'static str,
     about: &'static str,
     kind: Kind,
     get: fn(&R) -> Reading,
@@ -116,19 +117,19 @@ pub(crate) struct Dvar<R: 'static> {
 }
 
 fn no_note<R>(_: &R) -> String {
-    String::new()
+    String::default()
 }
 
 impl<R> Dvar<R> {
     const fn new(
-        name: &'static str,
+        dvar_name: &'static str,
         about: &'static str,
         kind: Kind,
         get: fn(&R) -> Reading,
         set: fn(&mut R, f32),
     ) -> Self {
         Self {
-            name,
+            dvar_name,
             about,
             kind,
             get,
@@ -138,42 +139,42 @@ impl<R> Dvar<R> {
     }
 
     pub(crate) const fn toggle(
-        name: &'static str,
+        dvar_name: &'static str,
         about: &'static str,
         get: fn(&R) -> Reading,
         set: fn(&mut R, f32),
     ) -> Self {
-        Self::new(name, about, Kind::Toggle, get, set)
+        Self::new(dvar_name, about, Kind::Toggle, get, set)
     }
 
     pub(crate) const fn range(
-        name: &'static str,
+        dvar_name: &'static str,
         about: &'static str,
         (low, high): (f32, f32),
         get: fn(&R) -> Reading,
         set: fn(&mut R, f32),
     ) -> Self {
-        Self::new(name, about, Kind::Range(low, high), get, set)
+        Self::new(dvar_name, about, Kind::Range(low, high), get, set)
     }
 
     pub(crate) const fn at_least(
-        name: &'static str,
+        dvar_name: &'static str,
         about: &'static str,
         low: f32,
         get: fn(&R) -> Reading,
         set: fn(&mut R, f32),
     ) -> Self {
-        Self::new(name, about, Kind::AtLeast(low), get, set)
+        Self::new(dvar_name, about, Kind::AtLeast(low), get, set)
     }
 
     pub(crate) const fn free(
-        name: &'static str,
+        dvar_name: &'static str,
         about: &'static str,
         unit: &'static str,
         get: fn(&R) -> Reading,
         set: fn(&mut R, f32),
     ) -> Self {
-        Self::new(name, about, Kind::Free(unit), get, set)
+        Self::new(dvar_name, about, Kind::Free(unit), get, set)
     }
 
     /// Adds a line of explanation to every answer.
@@ -183,15 +184,15 @@ impl<R> Dvar<R> {
     }
 
     fn usage(&self) -> String {
-        format!("{} [{}] — {}", self.name, self.kind.argument(), self.about)
+        format!("{} [{}] — {}", self.dvar_name, self.kind.argument(), self.about)
     }
 
     fn refusal(&self) -> String {
-        format!("usage: {} [{}]", self.name, self.kind.argument())
+        format!("usage: {} [{}]", self.dvar_name, self.kind.argument())
     }
 
     fn show(&self, target: &R, domain: bool) -> String {
-        let mut line = format!("{} = {}", self.name, (self.get)(target));
+        let mut line = format!("{} = {}", self.dvar_name, (self.get)(target));
         if domain {
             line.push_str(&self.kind.domain());
         }
@@ -203,14 +204,14 @@ impl<R> Dvar<R> {
         line
     }
 
-    /// Answers `args`. Only a value that is accepted touches the resource, so
+    /// Answers `given`. Only a value that is accepted touches the resource, so
     /// a question leaves its change flag alone.
-    fn answer<T: DerefMut<Target = R>>(&self, args: &[String], target: &mut T) -> String {
-        match args {
+    fn answer<T: DerefMut<Target = R>>(&self, given: &[String], target: &mut T) -> String {
+        match given {
             [] => self.show(&**target, true),
             [text] => match self.kind.parse(text) {
-                Some(value) => {
-                    (self.set)(&mut **target, value);
+                Some(parsed) => {
+                    (self.set)(&mut **target, parsed);
                     self.show(&**target, false)
                 }
                 None => self.refusal(),
@@ -226,22 +227,22 @@ pub(crate) trait DvarSet: Resource<Mutability = Mutable> + Sized {
 }
 
 /// Adds the usage line of every variable of `R` that nothing else named.
-fn register_dvars<R: DvarSet>(registry: &mut ConsoleRegistry) {
+fn register_dvars<R: DvarSet>(book: &mut OrderCatalog) {
     for dvar in R::DVARS {
-        if registry.resolve(dvar.name).is_none() {
-            registry.register(CommandSpec::new(dvar.name).usage(dvar.usage()));
+        if book.look_up(dvar.dvar_name).is_none() {
+            book.enlist(OrderBlueprint::new(dvar.dvar_name).help_line(dvar.usage()));
         }
     }
 }
 
 pub(crate) fn route_dvars<R: DvarSet>(
-    mut commands: MessageReader<ConsoleCommand>,
-    mut echo: ConsoleEcho,
+    mut commands: MessageReader<TypedOrder>,
+    mut echo: PromptReplyWriter,
     mut target: ResMut<R>,
 ) {
-    for command in commands.read() {
-        if let Some(dvar) = R::DVARS.iter().find(|dvar| dvar.name == command.name) {
-            echo.write(dvar.answer(&command.args, &mut target));
+    for order in commands.read() {
+        if let Some(dvar) = R::DVARS.iter().find(|dvar| dvar.dvar_name == order.name) {
+            echo.write(dvar.answer(&order.words, &mut target));
         }
     }
 }
@@ -249,8 +250,8 @@ pub(crate) fn route_dvars<R: DvarSet>(
 macro_rules! every_set {
     ($($set:ty),+ $(,)?) => {
         /// Registers the variables of every set.
-        pub(crate) fn register_all(registry: &mut ConsoleRegistry) {
-            $(register_dvars::<$set>(registry);)+
+        pub(crate) fn register_all(book: &mut OrderCatalog) {
+            $(register_dvars::<$set>(book);)+
         }
 
         /// The routers of every set, run one after the other.
@@ -260,37 +261,41 @@ macro_rules! every_set {
 
         #[cfg(test)]
         fn every_name() -> Vec<&'static str> {
-            let mut names = Vec::new();
-            $(names.extend(<$set as DvarSet>::DVARS.iter().map(|dvar| dvar.name));)+
+            let mut names: Vec<&'static str> = vec![];
+            $(names.extend(<$set as DvarSet>::DVARS.iter().map(|dvar| dvar.dvar_name));)+
             names
         }
     };
 }
 
 every_set!(
-    render_frontend::assemble::drawsurf::dof::GlowDvars,
-    render_frontend::assemble::drawsurf::dof::DofDvars,
-    render_frontend::assemble::drawsurf::fog::FogDvars,
-    render_frontend::assemble::drawsurf::DistortionSettings,
-    render_frontend::assemble::drawsurf::ColourDrawMethod,
-    render_frontend::adapters::anim::view_kick::GunOffset,
-    render_frontend::prepare::scene::view_parms::SmEnableDvar,
-    render_frontend::prepare::scene::view_parms::SmSunEnableDvar,
-    render_frontend::prepare::scene::view_parms::RZnearDvar,
-    render_frontend::prepare::scene::view_parms::RZnearDepthhackDvar,
-    render_frontend::prepare::scene::smodel_geom_cache::SmcEnableDvar,
-    render_frontend::prepare::scene::smodel_geom_cache::LodRampDvar,
-    render_frontend::prepare::scene::smodel_geom_cache::LodRampSkinnedDvar,
-    render_fx::FxMarkDvars,
-    net::ClientActionInput,
+    render_frontend::assemble::draw_items::dof::BloomTunables,
+    render_frontend::assemble::draw_items::dof::BokehTunables,
+    render_frontend::assemble::draw_items::fog::HazeTunables,
+    render_frontend::assemble::draw_items::WarpSettings,
+    render_frontend::assemble::draw_items::ColourPaintMethod,
+    render_frontend::adapters::motion::eye_kick::GunOffset,
+    render_frontend::prepare::scene::eye_parms::SmEnableDvar,
+    render_frontend::prepare::scene::eye_parms::SmSunEnableDvar,
+    render_frontend::prepare::scene::eye_parms::NearClipSetting,
+    render_frontend::prepare::scene::eye_parms::GunNearClipSetting,
+    render_frontend::prepare::scene::prop_geom_memo::PropCacheEnableTunable,
+    render_frontend::prepare::scene::prop_geom_memo::DetailRampTunable,
+    render_frontend::prepare::scene::prop_geom_memo::DetailRampSkinnedTunable,
+    render_fx::EffectStainTunables,
+    net::PlayerControlSnapshot,
 );
 
 #[cfg(test)]
 mod tests {
+    use bevy::{app::App, ecs::change_detection::DetectChanges, ecs::system::Res};
     use std::collections::HashSet;
 
-    use super::*;
-    use crate::{ConsoleLine, ConsoleSettings, ConsoleState};
+    use crate::dvars::*;
+    use crate::PromptOutputRow;
+    use crate::PromptPanelOptions;
+    use crate::PromptPanelStatus;
+    use bevy::app::Update;
 
     #[derive(Resource, Default)]
     struct Fake {
@@ -341,7 +346,7 @@ mod tests {
         ];
     }
 
-    #[derive(Resource, Default)]
+    #[derive(Default, Resource)]
     struct Flags(Vec<bool>);
 
     fn note_change(fake: Res<Fake>, mut flags: ResMut<Flags>) {
@@ -349,11 +354,11 @@ mod tests {
     }
 
     fn app() -> App {
-        let mut app = App::new();
-        app.add_message::<ConsoleCommand>()
-            .init_resource::<ConsoleState>()
-            .init_resource::<ConsoleSettings>()
-            .init_resource::<ConsoleLine>()
+        let mut app = App::default();
+        app.add_message::<TypedOrder>()
+            .init_resource::<PromptPanelStatus>()
+            .init_resource::<PromptPanelOptions>()
+            .init_resource::<PromptOutputRow>()
             .init_resource::<Flags>()
             .insert_resource(Fake {
                 level: 2.0,
@@ -364,30 +369,28 @@ mod tests {
         app
     }
 
-    fn feed(app: &mut App, script: &str) {
-        for command in ConsoleCommand::parse_script(script) {
+    fn feed(app: &mut App, typed: &str) {
+        for command in TypedOrder::parse_script(typed) {
             app.world_mut().write_message(command);
         }
         app.update();
     }
 
     fn lines(app: &App) -> Vec<String> {
-        app.world().resource::<ConsoleState>().log.to_vec()
+        app.world().resource::<PromptPanelStatus>().lines.to_vec()
     }
 
     #[test]
     fn a_question_shows_the_value_and_what_it_may_be() {
         let mut app = app();
         feed(&mut app, "fk_level; fk_on; fk_later; fk_free");
-        assert_eq!(
-            lines(&app),
-            [
-                "fk_level = 2 (domain 1..5) (floor 1)",
-                "fk_on = 0",
-                "fk_later = unread",
-                "fk_free = 0",
-            ]
-        );
+        let expected = [
+            "fk_level = 2 (domain 1..5) (floor 1)",
+            "fk_on = 0",
+            "fk_later = unread",
+            "fk_free = 0",
+        ];
+        assert_eq!(lines(&app), expected);
     }
 
     #[test]
@@ -397,20 +400,16 @@ mod tests {
             &mut app,
             "fk_level 4.5; fk_free -12.25; fk_later 3; fk_floor 9",
         );
-        assert_eq!(
-            lines(&app),
-            [
-                "fk_level = 4.5 (floor 1)",
-                "fk_free = -12.25",
-                "fk_later = 3",
-                "fk_floor = 9",
-            ]
-        );
+        let expected = [
+            "fk_level = 4.5 (floor 1)",
+            "fk_free = -12.25",
+            "fk_later = 3",
+            "fk_floor = 9",
+        ];
+        assert_eq!(lines(&app), expected);
         let fake = app.world().resource::<Fake>();
-        assert_eq!(
-            (fake.level, fake.free, fake.later),
-            (4.5, -12.25, Some(3.0))
-        );
+        let expected = (4.5, -12.25, Some(3.0));
+        assert_eq!((fake.level, fake.free, fake.later), expected);
     }
 
     #[test]
@@ -420,19 +419,17 @@ mod tests {
             &mut app,
             "fk_level 0.5; fk_level 5.5; fk_level high; fk_level 1 2; fk_floor 0.25; fk_free nan; fk_free inf; fk_on 2",
         );
-        assert_eq!(
-            lines(&app),
-            [
-                "usage: fk_level [1..5]",
-                "usage: fk_level [1..5]",
-                "usage: fk_level [1..5]",
-                "usage: fk_level [1..5]",
-                "usage: fk_floor [>= 0.5]",
-                "usage: fk_free [units]",
-                "usage: fk_free [units]",
-                "usage: fk_on [0|1]",
-            ]
-        );
+        let expected = [
+            "usage: fk_level [1..5]",
+            "usage: fk_level [1..5]",
+            "usage: fk_level [1..5]",
+            "usage: fk_level [1..5]",
+            "usage: fk_floor [>= 0.5]",
+            "usage: fk_free [units]",
+            "usage: fk_free [units]",
+            "usage: fk_on [0|1]",
+        ];
+        assert_eq!(lines(&app), expected);
         let fake = app.world().resource::<Fake>();
         assert_eq!((fake.level, fake.floor, fake.free), (2.0, 1.0, 0.0));
         assert!(!fake.on);
@@ -453,16 +450,14 @@ mod tests {
             &mut app,
             "fk_on 1; fk_on off; fk_on true; fk_on 0; fk_on on",
         );
-        assert_eq!(
-            lines(&app),
-            [
-                "fk_on = 1",
-                "fk_on = 0",
-                "fk_on = 1",
-                "fk_on = 0",
-                "fk_on = 1"
-            ]
-        );
+        let expected = [
+            "fk_on = 1",
+            "fk_on = 0",
+            "fk_on = 1",
+            "fk_on = 0",
+            "fk_on = 1"
+        ];
+        assert_eq!(lines(&app), expected);
         assert!(app.world().resource::<Fake>().on);
     }
 
@@ -487,9 +482,9 @@ mod tests {
 
     #[test]
     fn usage_names_what_the_variable_takes() {
-        let mut registry = ConsoleRegistry::default();
-        register_dvars::<Fake>(&mut registry);
-        let help = registry.help_lines();
+        let mut book = OrderCatalog::default();
+        register_dvars::<Fake>(&mut book);
+        let help = book.usage_listing();
         for want in [
             "fk_on [0|1] — a switch",
             "fk_level [1..5] — a level",
@@ -505,11 +500,11 @@ mod tests {
 
     #[test]
     fn a_name_that_was_there_first_is_left_alone() {
-        let mut registry = ConsoleRegistry::default();
-        registry.register(CommandSpec::new("fk_on").usage("fk_on — mine"));
-        register_dvars::<Fake>(&mut registry);
-        assert!(registry.help_lines().contains(&"fk_on — mine".to_owned()));
-        assert_eq!(registry.names().iter().filter(|n| *n == "fk_on").count(), 1);
+        let mut book = OrderCatalog::default();
+        book.enlist(OrderBlueprint::new("fk_on").help_line("fk_on — mine"));
+        register_dvars::<Fake>(&mut book);
+        assert!(book.usage_listing().contains(&"fk_on — mine".to_owned()));
+        assert_eq!(book.all_names().iter().filter(|n| *n == "fk_on").count(), 1);
     }
 
     #[test]
@@ -522,9 +517,9 @@ mod tests {
 
     #[test]
     fn every_set_registers_a_usage_that_starts_with_its_name() {
-        let mut registry = ConsoleRegistry::default();
-        register_all(&mut registry);
-        let help = registry.help_lines();
+        let mut book = OrderCatalog::default();
+        register_all(&mut book);
+        let help = book.usage_listing();
         for name in every_name() {
             assert!(
                 help.iter()

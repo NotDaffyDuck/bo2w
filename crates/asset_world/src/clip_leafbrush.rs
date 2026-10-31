@@ -1,6 +1,6 @@
 //! Reading the leaf-brush tables of a clip map.
 
-use crate::clip_error::ClipCollisionError;
+use crate::clip_error::SolidsTraceFault;
 
 /// The deepest a leaf-brush node chain is followed.
 pub(crate) const LEAFBRUSH_NODE_MAX_DEPTH: usize = 64;
@@ -8,11 +8,11 @@ pub(crate) const LEAFBRUSH_NODE_MAX_DEPTH: usize = 64;
 /// The place and length of the brushes a leaf adds to the shared leaf-brush
 /// table, given the table's length before and after the leaf's brushes went
 /// in.
-pub(crate) fn leafbrush_range(len_before: usize, len_after: usize) -> Result<(u32, u16), ClipCollisionError> {
+pub(crate) fn leafbrush_range(len_before: usize, len_after: usize) -> Result<(u32, u16), SolidsTraceFault> {
     let count = len_after.checked_sub(len_before).map(u16::try_from);
     match (u32::try_from(len_before), count) {
         (Ok(first), Some(Ok(count))) => Ok((first, count)),
-        _ => Err(ClipCollisionError::LeafbrushIndexOverflow),
+        _ => Err(SolidsTraceFault::LeafSolidIndexExceeded),
     }
 }
 
@@ -37,7 +37,7 @@ mod tests {
 
     #[test]
     fn a_range_that_cannot_be_indexed_is_refused() {
-        let overflow = Err(ClipCollisionError::LeafbrushIndexOverflow);
+        let overflow = Err(SolidsTraceFault::LeafSolidIndexExceeded);
         assert_eq!(leafbrush_range(5, 4), overflow);
         assert_eq!(leafbrush_range(0, usize::from(u16::MAX) + 1), overflow);
         if usize::BITS > 32 {

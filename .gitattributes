@@ -1,0 +1,2 @@
+# git apply needs the patch with LF endings, the same as the crate it patches.
+*.diff eol=lf

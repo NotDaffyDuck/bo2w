@@ -4,7 +4,7 @@
 //! (multiplayer's `maps/mp/gametypes/_globallogic`); the engine provides
 //! them. [`compile`] turns GSC source text into a [`ScriptObject`] that links
 //! and runs beside BO2's own, with the same waits, threads, notifies and
-//! endons. The code follows BO2's own code generation, read off the zones'
+//! endons. The code follows BO2's own code stamp, read off the zones'
 //! compiled scripts: arguments pushed last first, a call's value always left
 //! on the stack (`DecTop` after a call statement), locals counted from the
 //! last, keys pushed before the reference they index, `foreach` over the
@@ -24,7 +24,7 @@ use crate::object::{Case, CaseValue, DecodedFunction, Import, Insn, ScriptObject
 /// Compile one script's source. `name` is its path (`maps/mp/gametypes/_globallogic`).
 pub fn compile(name: &str, source: &str) -> Result<ScriptObject, String> {
     let tokens = lex(source).map_err(|e| format!("{name}: {e}"))?;
-    let mut p = Parser { t: tokens, pos: 0 };
+    let mut p = Parser { t: tokens, cursor: 0 };
     let mut includes = Vec::new();
     let mut functions = Vec::new();
     let mut address = 0u32;
@@ -48,7 +48,7 @@ pub fn compile(name: &str, source: &str) -> Result<ScriptObject, String> {
         functions.push(DecodedFunction {
             name: f.name,
             params: f.params.len() as u8,
-            flags: 0,
+            flag_bits: 0,
             address,
             code,
         });
@@ -69,8 +69,8 @@ pub fn compile(name: &str, source: &str) -> Result<ScriptObject, String> {
 enum Tok {
     Ident(String),
     Int(i32),
-    Float(f32),
-    Str(String),
+    Real(f32),
+    Quoted(String),
     IStr(String),
     Hash(String),
     Punct(&'static str),
@@ -91,41 +91,41 @@ const PUNCTS: [&str; 46] = [
 
 fn lex(src: &str) -> Result<Vec<Token>, String> {
     let b = src.as_bytes();
-    let mut i = 0;
+    let mut at = 0;
     let mut line = 1u32;
     let mut out = Vec::new();
-    while i < b.len() {
-        let c = b[i];
+    while at < b.len() {
+        let c = b[at];
         if c == b'\n' {
             line += 1;
-            i += 1;
+            at += 1;
             continue;
         }
         if c.is_ascii_whitespace() {
-            i += 1;
+            at += 1;
             continue;
         }
-        if src[i..].starts_with("//") {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
+        if src[at..].starts_with("//") {
+            while at < b.len() && b[at] != b'\n' {
+                at += 1;
             }
             continue;
         }
-        if src[i..].starts_with("/*") {
-            let end = src[i + 2..].find("*/").ok_or("unterminated comment")?;
-            line += src[i..i + 2 + end].matches('\n').count() as u32;
-            i += end + 4;
+        if src[at..].starts_with("/*") {
+            let end = src[at + 2..].find("*/").ok_or("unterminated comment")?;
+            line += src[at..at + 2 + end].matches('\n').count() as u32;
+            at += end + 4;
             continue;
         }
         // Developer blocks: retail builds skip them.
-        if src[i..].starts_with("/#") {
-            let end = src[i + 2..].find("#/").ok_or("unterminated /# block")?;
-            line += src[i..i + 2 + end].matches('\n').count() as u32;
-            i += end + 4;
+        if src[at..].starts_with("/#") {
+            let end = src[at + 2..].find("#/").ok_or("unterminated /# block")?;
+            line += src[at..at + 2 + end].matches('\n').count() as u32;
+            at += end + 4;
             continue;
         }
-        if c == b'"' || ((c == b'&' || c == b'#') && b.get(i + 1) == Some(&b'"')) {
-            let start = if c == b'"' { i + 1 } else { i + 2 };
+        if c == b'"' || ((c == b'&' || c == b'#') && b.get(at + 1) == Some(&b'"')) {
+            let start = if c == b'"' { at + 1 } else { at + 2 };
             let mut j = start;
             let mut s = String::new();
             while j < b.len() && b[j] != b'"' {
@@ -147,22 +147,22 @@ fn lex(src: &str) -> Result<Vec<Token>, String> {
             let tok = match c {
                 b'&' => Tok::IStr(s),
                 b'#' => Tok::Hash(s),
-                _ => Tok::Str(s),
+                _ => Tok::Quoted(s),
             };
             out.push(Token { tok, line });
-            i = j + 1;
+            at = j + 1;
             continue;
         }
-        if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
-            let mut j = i;
+        if c.is_ascii_digit() || (c == b'.' && b.get(at + 1).is_some_and(u8::is_ascii_digit)) {
+            let mut j = at;
             let mut float = false;
             while j < b.len() && (b[j].is_ascii_digit() || b[j] == b'.') {
                 float |= b[j] == b'.';
                 j += 1;
             }
-            let text = &src[i..j];
+            let text = &src[at..j];
             let tok = if float {
-                Tok::Float(
+                Tok::Real(
                     text.parse()
                         .map_err(|_| format!("line {line}: bad number {text}"))?,
                 )
@@ -173,19 +173,19 @@ fn lex(src: &str) -> Result<Vec<Token>, String> {
                 )
             };
             out.push(Token { tok, line });
-            i = j;
+            at = j;
             continue;
         }
         if c.is_ascii_alphabetic() || c == b'_' {
-            let mut j = i;
+            let mut j = at;
             while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
                 j += 1;
             }
             out.push(Token {
-                tok: Tok::Ident(src[i..j].to_ascii_lowercase()),
+                tok: Tok::Ident(src[at..j].to_ascii_lowercase()),
                 line,
             });
-            i = j;
+            at = j;
             continue;
         }
         if c == b'#' {
@@ -193,7 +193,7 @@ fn lex(src: &str) -> Result<Vec<Token>, String> {
                 tok: Tok::Punct("#"),
                 line,
             });
-            i += 1;
+            at += 1;
             continue;
         }
         // Script paths as BO2's own sources and public mods write them
@@ -204,16 +204,16 @@ fn lex(src: &str) -> Result<Vec<Token>, String> {
                 tok: Tok::Punct("/"),
                 line,
             });
-            i += 1;
+            at += 1;
             continue;
         }
-        match PUNCTS.iter().find(|p| src[i..].starts_with(**p)) {
+        match PUNCTS.iter().find(|p| src[at..].starts_with(**p)) {
             Some(p) => {
                 out.push(Token {
                     tok: Tok::Punct(p),
                     line,
                 });
-                i += p.len();
+                at += p.len();
             }
             None => return Err(format!("line {line}: unexpected '{}'", c as char)),
         }
@@ -226,8 +226,8 @@ fn lex(src: &str) -> Result<Vec<Token>, String> {
 #[derive(Clone, Debug)]
 enum Expr {
     Int(i32),
-    Float(f32),
-    Str(String),
+    Real(f32),
+    Quoted(String),
     IStr(String),
     Hash(String),
     Undefined,
@@ -271,7 +271,8 @@ enum Stmt {
     Dec(Expr),
     Wait(Expr),
     FrameEnd,
-    Waittill(Expr, Expr, Vec<String>),
+    /// `target waittill(event, names...)`.
+    Waittill { target: Expr, event: Expr, names: Vec<String> },
     WaittillMatch(Expr, Expr, Expr),
     Notify(Expr, Expr, Vec<Expr>),
     Endon(Expr, Expr),
@@ -293,24 +294,29 @@ struct FunctionDef {
 
 struct Parser {
     t: Vec<Token>,
-    pos: usize,
+    cursor: usize,
 }
 
 impl Parser {
+    /// Moves past the current token.
+    fn step(&mut self) {
+        self.cursor += 1;
+    }
+
     fn at_end(&self) -> bool {
-        self.pos >= self.t.len()
+        self.cursor >= self.t.len()
     }
 
     fn peek(&self) -> Option<&Tok> {
-        self.t.get(self.pos).map(|t| &t.tok)
+        self.t.get(self.cursor).map(|t| &t.tok)
     }
 
     fn peek_at(&self, k: usize) -> Option<&Tok> {
-        self.t.get(self.pos + k).map(|t| &t.tok)
+        self.t.get(self.cursor + k).map(|t| &t.tok)
     }
 
     fn err(&self, msg: &str) -> String {
-        let line = self.t.get(self.pos).or(self.t.last()).map_or(0, |t| t.line);
+        let line = self.t.get(self.cursor).or(self.t.last()).map_or(0, |t| t.line);
         format!("line {line}: {msg} (at {:?})", self.peek())
     }
 
@@ -328,7 +334,7 @@ impl Parser {
 
     fn eat_punct(&mut self, p: &str) -> bool {
         if self.is_punct(p) {
-            self.pos += 1;
+            self.step();
             true
         } else {
             false
@@ -337,7 +343,7 @@ impl Parser {
 
     fn eat_word(&mut self, w: &str) -> bool {
         if self.is_word(w) {
-            self.pos += 1;
+            self.step();
             true
         } else {
             false
@@ -356,7 +362,7 @@ impl Parser {
         match self.peek() {
             Some(Tok::Ident(s)) => {
                 let s = s.clone();
-                self.pos += 1;
+                self.step();
                 Ok(s)
             }
             _ => Err(self.err("expected a name")),
@@ -415,7 +421,7 @@ impl Parser {
         if self.is_punct("{") {
             // A bare block: run as an always-true if.
             let b = self.block()?;
-            return Ok(Stmt::If(Expr::Int(1), b, Vec::new()));
+            return Ok(Stmt::If(Expr::Int(1), b, vec![]));
         }
         if self.eat_word("if") {
             self.expect("(")?;
@@ -493,10 +499,10 @@ impl Parser {
                         let neg = self.eat_punct("-");
                         let label = match self.peek().cloned() {
                             Some(Tok::Int(n)) => CaseValue::Int(if neg { -n } else { n }),
-                            Some(Tok::Str(s)) => CaseValue::Str(s),
+                            Some(Tok::Quoted(s)) => CaseValue::Quoted(s),
                             _ => return Err(self.err("expected a case value")),
                         };
-                        self.pos += 1;
+                        self.step();
                         self.expect(":")?;
                         labels.push(label);
                     } else if self.eat_word("default") {
@@ -566,7 +572,7 @@ impl Parser {
         };
         let lhs = self.postfix()?;
         if let Some(word) = keyword_at(self, 0) {
-            self.pos += 2;
+            self.cursor += 2;
             let name = self.expr()?;
             let mut rest = Vec::new();
             while self.eat_punct(",") {
@@ -582,7 +588,7 @@ impl Parser {
                             _ => Err(self.err("waittill takes variable names")),
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    Ok(Stmt::Waittill(lhs, name, vars))
+                    Ok(Stmt::Waittill { target: lhs, event: name, names: vars })
                 }
                 "waittillmatch" => {
                     let v = rest
@@ -657,7 +663,7 @@ impl Parser {
         'outer: loop {
             for (p, code) in LEVELS[level] {
                 if self.is_punct(p) {
-                    self.pos += 1;
+                    self.step();
                     let rhs = self.binary(level + 1)?;
                     lhs = match *p {
                         "||" => Expr::Or(Box::new(lhs), Box::new(rhs)),
@@ -683,7 +689,7 @@ impl Parser {
             } else {
                 return Ok(lhs);
             };
-            self.pos += 1;
+            self.step();
             let rhs = self.unary()?;
             lhs = Expr::Bin(code, Box::new(lhs), Box::new(rhs));
         }
@@ -699,7 +705,7 @@ impl Parser {
         if self.eat_punct("-") {
             return Ok(match self.unary()? {
                 Expr::Int(n) => Expr::Int(-n),
-                Expr::Float(f) => Expr::Float(-f),
+                Expr::Real(f) => Expr::Real(-f),
                 e => Expr::Neg(Box::new(e)),
             });
         }
@@ -725,7 +731,7 @@ impl Parser {
     /// `[[ e ]](`. `None` when the tokens are not a call.
     fn callee(&mut self) -> Result<Option<Callee>, String> {
         if self.is_punct("[[") {
-            self.pos += 1;
+            self.step();
             let e = self.expr()?;
             self.expect("]]")?;
             return Ok(Some(Callee::Pointer(Box::new(e))));
@@ -734,7 +740,7 @@ impl Parser {
             if let Some(Tok::Ident(n)) = self.peek_at(1).cloned()
                 && self.is_punct_at(2, "(")
             {
-                self.pos += 2;
+                self.cursor += 2;
                 return Ok(Some(Callee::Named(String::new(), n)));
             }
             return Ok(None);
@@ -756,11 +762,11 @@ impl Parser {
             && let Some(Tok::Ident(n)) = self.peek_at(k + 1).cloned()
             && self.is_punct_at(k + 2, "(")
         {
-            self.pos += k + 2;
+            self.cursor += k + 2;
             return Ok(Some(Callee::Named(path, n)));
         }
         if k == 1 && self.is_punct_at(1, "(") {
-            self.pos += 1;
+            self.step();
             return Ok(Some(Callee::Named(String::new(), first)));
         }
         Ok(None)
@@ -768,7 +774,7 @@ impl Parser {
 
     fn primary(&mut self) -> Result<Expr, String> {
         // A call with no object: `[thread] callee(args)`.
-        let save = self.pos;
+        let save = self.cursor;
         let thread = self.eat_word("thread");
         if let Some(callee) = self.callee()? {
             let args = self.args()?;
@@ -779,15 +785,15 @@ impl Parser {
                 thread,
             });
         }
-        self.pos = save;
+        self.cursor = save;
         let Some(tok) = self.peek().cloned() else {
             return Err(self.err("expected an expression"));
         };
-        self.pos += 1;
+        self.step();
         Ok(match tok {
             Tok::Int(n) => Expr::Int(n),
-            Tok::Float(f) => Expr::Float(f),
-            Tok::Str(s) => Expr::Str(s),
+            Tok::Real(f) => Expr::Real(f),
+            Tok::Quoted(s) => Expr::Quoted(s),
             Tok::IStr(s) => Expr::IStr(s),
             Tok::Hash(s) => Expr::Hash(s),
             Tok::Punct("(") => {
@@ -819,24 +825,24 @@ impl Parser {
                 _ => {
                     // path::name (a function reference)
                     let mut path = w.clone();
-                    let save = self.pos;
+                    let save = self.cursor;
                     while self.is_punct("/")
                         && let Some(Tok::Ident(seg)) = self.peek_at(1).cloned()
                     {
-                        self.pos += 2;
+                        self.cursor += 2;
                         path.push('/');
                         path.push_str(&seg);
                     }
                     if self.eat_punct("::") {
                         Expr::FuncRef(path, self.ident()?)
                     } else {
-                        self.pos = save;
+                        self.cursor = save;
                         Expr::Local(w)
                     }
                 }
             },
             _ => {
-                self.pos -= 1;
+                self.cursor -= 1;
                 return Err(self.err("expected an expression"));
             }
         })
@@ -855,11 +861,11 @@ impl Parser {
                 continue;
             }
             if self.is_punct("[") {
-                self.pos += 1;
+                self.step();
                 let k = self.expr()?;
                 // `a[b[c]]`: the lexer read the two closing brackets as one.
                 if self.is_punct("]]") {
-                    self.t[self.pos].tok = Tok::Punct("]");
+                    self.t[self.cursor].tok = Tok::Punct("]");
                 } else {
                     self.expect("]")?;
                 }
@@ -867,7 +873,7 @@ impl Parser {
                 continue;
             }
             // A method call: `obj [thread] callee(args)`.
-            let save = self.pos;
+            let save = self.cursor;
             let thread = self.eat_word("thread");
             let is_keyword = matches!(self.peek(), Some(Tok::Ident(w))
                 if matches!(w.as_str(), "waittill" | "waittillmatch" | "notify" | "endon"));
@@ -881,7 +887,7 @@ impl Parser {
                 };
                 continue;
             }
-            self.pos = save;
+            self.cursor = save;
             return Ok(e);
         }
     }
@@ -944,7 +950,7 @@ impl Gen {
         }
     }
 
-    fn label(&mut self) -> Label {
+    fn new_label(&mut self) -> Label {
         self.labels += 1;
         Label(self.labels)
     }
@@ -957,11 +963,11 @@ impl Gen {
         self.code.push(I::Op(Insn::Plain(code)));
     }
 
-    fn slot(&mut self, name: &str) -> usize {
-        match self.locals.iter().position(|l| l == name) {
-            Some(i) => i,
+    fn local_slot(&mut self, ident: &str) -> usize {
+        match self.locals.iter().position(|l| l == ident) {
+            Some(known) => known,
             None => {
-                self.locals.push(name.to_owned());
+                self.locals.push(ident.to_owned());
                 self.locals.len() - 1
             }
         }
@@ -970,7 +976,7 @@ impl Gen {
     fn hidden_local(&mut self, what: &str) -> usize {
         self.hidden += 1;
         let name = format!("__{what}{}", self.hidden);
-        self.slot(&name)
+        self.local_slot(&name)
     }
 
     fn import(&mut self, code: u8, ns: &str, name: &str, params: usize, flags: u8) {
@@ -980,7 +986,7 @@ impl Gen {
                 ns: ns.to_owned(),
                 name: name.to_owned(),
                 params: params as u8,
-                flags,
+                flag_bits: flags,
             },
         )));
     }
@@ -1082,12 +1088,12 @@ impl Gen {
                 self.plain(op::WAIT);
             }
             Stmt::FrameEnd => self.plain(op::WAIT_TILL_FRAME_END),
-            Stmt::Waittill(obj, name, vars) => {
-                self.expr(name)?;
-                self.expr(obj)?;
+            Stmt::Waittill { target, event, names } => {
+                self.expr(event)?;
+                self.expr(target)?;
                 self.plain(op::WAIT_TILL);
-                for v in vars {
-                    let slot = self.slot(v);
+                for v in names {
+                    let slot = self.local_slot(v);
                     self.code
                         .push(I::Local(op::SAFE_SET_WAITTILL_VARIABLE_FIELD_CACHED, slot));
                 }
@@ -1114,23 +1120,23 @@ impl Gen {
                 self.expr(obj)?;
                 self.plain(op::END_ON);
             }
-            Stmt::If(c, then, other) => {
-                let l_else = self.label();
+            Stmt::If(c, then, otherwise) => {
+                let l_else = self.new_label();
                 self.expr(c)?;
                 self.code.push(I::Jump(op::JUMP_ON_FALSE, l_else));
                 self.block(then)?;
-                if other.is_empty() {
+                if otherwise.is_empty() {
                     self.here(l_else);
                 } else {
-                    let l_end = self.label();
-                    self.code.push(I::Jump(op::JUMP, l_end));
+                    let l_end = self.new_label();
+                    self.code.push(I::Jump(op::LEAP, l_end));
                     self.here(l_else);
-                    self.block(other)?;
+                    self.block(otherwise)?;
                     self.here(l_end);
                 }
             }
             Stmt::While(c, body) => {
-                let (top, end) = (self.label(), self.label());
+                let (top, end) = (self.new_label(), self.new_label());
                 self.here(top);
                 if let Some(c) = c {
                     self.expr(c)?;
@@ -1144,7 +1150,7 @@ impl Gen {
             }
             Stmt::For(init, c, step, body) => {
                 self.block(init)?;
-                let (top, cont, end) = (self.label(), self.label(), self.label());
+                let (top, cont, end) = (self.new_label(), self.new_label(), self.new_label());
                 self.here(top);
                 if let Some(c) = c {
                     self.expr(c)?;
@@ -1161,8 +1167,8 @@ impl Gen {
             Stmt::Foreach(key, value, arr, body) => {
                 let a = self.hidden_local("array");
                 let k = self.hidden_local("key");
-                let v = self.slot(value);
-                let named_key = key.as_ref().map(|n| self.slot(n));
+                let v = self.local_slot(value);
+                let named_key = key.as_ref().map(|n| self.local_slot(n));
                 self.expr(arr)?;
                 self.code
                     .push(I::Local(op::EVAL_LOCAL_VARIABLE_REF_CACHED, a));
@@ -1172,7 +1178,7 @@ impl Gen {
                 self.code
                     .push(I::Local(op::EVAL_LOCAL_VARIABLE_REF_CACHED, k));
                 self.plain(op::SET_VARIABLE_FIELD);
-                let (top, cont, end) = (self.label(), self.label(), self.label());
+                let (top, cont, end) = (self.new_label(), self.new_label(), self.new_label());
                 self.here(top);
                 self.code.push(I::Local(op::EVAL_LOCAL_VARIABLE_CACHED, k));
                 self.plain(op::IS_DEFINED);
@@ -1203,11 +1209,11 @@ impl Gen {
                 self.here(end);
             }
             Stmt::Switch(v, arms) => {
-                let end = self.label();
-                let labels: Vec<Label> = arms.iter().map(|_| self.label()).collect();
+                let end = self.new_label();
+                let labels: Vec<Label> = arms.iter().map(|_| self.new_label()).collect();
                 let mut cases = Vec::new();
-                for ((values, _), l) in arms.iter().zip(&labels) {
-                    for value in values {
+                for ((matches, _), l) in arms.iter().zip(&labels) {
+                    for value in matches {
                         cases.push((value.clone(), *l));
                     }
                 }
@@ -1223,14 +1229,14 @@ impl Gen {
             }
             Stmt::Break => {
                 let (end, _) = *self.loops.last().ok_or("break outside a loop")?;
-                self.code.push(I::Jump(op::JUMP, end));
+                self.code.push(I::Jump(op::LEAP, end));
             }
             Stmt::Continue => {
                 let cont = self
                     .loops
                     .iter()
                     .rev()
-                    .find_map(|(_, c)| *c)
+                    .find_map(|pair| pair.1)
                     .ok_or("continue outside a loop")?;
                 self.code.push(I::Jump(op::JUMP_BACK, cont));
             }
@@ -1263,7 +1269,7 @@ impl Gen {
     fn reference(&mut self, e: &Expr) -> Result<(), String> {
         match e {
             Expr::Local(n) => {
-                let slot = self.slot(n);
+                let slot = self.local_slot(n);
                 self.code
                     .push(I::Local(op::EVAL_LOCAL_VARIABLE_REF_CACHED, slot));
             }
@@ -1277,7 +1283,7 @@ impl Gen {
                 match &**base {
                     Expr::Game => self.plain(op::GET_GAME_REF),
                     Expr::Local(n) => {
-                        let slot = self.slot(n);
+                        let slot = self.local_slot(n);
                         self.code
                             .push(I::Local(op::EVAL_LOCAL_ARRAY_REF_CACHED, slot));
                     }
@@ -1293,8 +1299,8 @@ impl Gen {
     fn expr(&mut self, e: &Expr) -> Result<(), String> {
         match e {
             Expr::Int(n) => self.code.push(I::Op(Insn::Int(op::GET_INTEGER, *n))),
-            Expr::Float(f) => self.code.push(I::Op(Insn::Float(*f))),
-            Expr::Str(s) => self.code.push(I::Op(Insn::Str(op::GET_STRING, s.clone()))),
+            Expr::Real(f) => self.code.push(I::Op(Insn::Real(*f))),
+            Expr::Quoted(s) => self.code.push(I::Op(Insn::Str(op::GET_STRING, s.clone()))),
             Expr::IStr(s) => self.code.push(I::Op(Insn::Str(op::GET_ISTRING, s.clone()))),
             Expr::Hash(s) => self.code.push(I::Op(Insn::Hash(crate::vm::hash_name(
                 &s.to_ascii_lowercase(),
@@ -1313,7 +1319,7 @@ impl Gen {
                 self.plain(op::VECTOR);
             }
             Expr::Local(n) => {
-                let slot = self.slot(n);
+                let slot = self.local_slot(n);
                 self.code
                     .push(I::Local(op::EVAL_LOCAL_VARIABLE_CACHED, slot));
             }
@@ -1357,7 +1363,7 @@ impl Gen {
                 self.plain(*code);
             }
             Expr::And(a, b) | Expr::Or(a, b) => {
-                let end = self.label();
+                let end = self.new_label();
                 self.expr(a)?;
                 let jump = if matches!(e, Expr::And(..)) {
                     op::JUMP_ON_FALSE_EXPR
@@ -1429,7 +1435,7 @@ impl Gen {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Program, Strings, Value, Vm, compile};
+    use crate::*;
 
     /// Compile `src` as one script, run `main` on the level, then `frames`
     /// server frames; returns the VM.
@@ -1439,7 +1445,7 @@ mod tests {
         let program = Program::link(vec![obj], &mut strings).expect("links");
         let mut vm = Vm::new(program, strings);
         crate::natives::bind_core(&mut vm);
-        let level = Value::Object(vm.level);
+        let level = ScriptValue::Object(vm.level);
         vm.spawn_named(&mut (), "test/t", "main", level, vec![])
             .expect("main exists");
         for _ in 0..frames {
@@ -1456,7 +1462,7 @@ mod tests {
     /// bo2mp: the engine's multiplayer `_globallogic` compiles.
     #[test]
     fn engine_globallogic_compiles() {
-        let src = include_str!("../../sim/src/t6/scripts/mp_globallogic.gsc");
+        let src = include_str!("../../sim/src/zombie_rt/scripts/mp_globallogic.gsc");
         let obj = compile("maps/mp/gametypes/_globallogic", src).expect("compiles");
         assert!(
             obj.functions.len() > 80,
@@ -1636,7 +1642,7 @@ mod tests {
             let program = Program::link_with(vec![obj], &mut strings, engine_first).expect("links");
             let mut vm = Vm::new(program, strings);
             crate::natives::bind_core(&mut vm);
-            let level = Value::Object(vm.level);
+            let level = ScriptValue::Object(vm.level);
             vm.spawn_named(&mut (), "test/t", "main", level, vec![])
                 .expect("main exists");
             assert_eq!(level_int(&mut vm, "z"), Some(want));
@@ -1730,12 +1736,12 @@ mod tests {
         let mut vm: Vm<()> = Vm::new(program, strings);
         crate::natives::bind_core(&mut vm);
         vm.bind("gone", false, |vm, host, _, a| {
-            if let Some(Value::Object(o)) = a.first() {
+            if let Some(ScriptValue::Object(o)) = a.first() {
                 vm.free_object(host, *o);
             }
-            Ok(Value::Undefined)
+            Ok(ScriptValue::Undefined)
         });
-        let level = Value::Object(vm.level);
+        let level = ScriptValue::Object(vm.level);
         vm.spawn_named(&mut (), "test/t", "main", level, vec![])
             .expect("main exists");
         // The rest of that frame's scripts.
@@ -1782,19 +1788,17 @@ mod tests {
         crate::natives::bind_core(&mut vm);
         // As the game's `delete`: `death` (its waiters run after), then the free.
         vm.bind("gone", false, |vm, host, _, a| {
-            if let Some(Value::Object(o)) = a.first() {
+            if let Some(ScriptValue::Object(o)) = a.first() {
                 vm.notify_queued(host, *o, "death", &[]);
                 vm.free_object(host, *o);
             }
-            Ok(Value::Undefined)
+            Ok(ScriptValue::Undefined)
         });
-        let level = Value::Object(vm.level);
+        let level = ScriptValue::Object(vm.level);
         vm.spawn_named(&mut (), "test/t", "main", level, vec![])
             .expect("main exists");
         vm.run_due(&mut ());
-        for _ in 0..4 {
-            vm.run_frame(&mut ());
-        }
+        (0..4).for_each(|_| vm.run_frame(&mut ()));
         assert_eq!(level_int(&mut vm, "left"), Some(1));
         assert_eq!(level_int(&mut vm, "count"), Some(1));
         assert_eq!(level_int(&mut vm, "other"), Some(2));

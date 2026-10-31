@@ -19,15 +19,15 @@
 
 extern crate alloc;
 
-mod iwi;
+mod texture;
 mod lzo;
 
-pub use iwi::{IWI_HEADER_LEN, IwiError, IwiFormat, IwiImage, parse_iwi};
-pub use lzo::{LzoError, decompress as lzo1x_decompress};
+pub use texture::{IWI_HEADER_LEN, IwiError, IwiFormat, IwiImage, parse_iwi};
+pub use lzo::LzoError;
 
 use alloc::vec::Vec;
 
-pub const MAGIC: &[u8; 4] = b"KAPI";
+pub const FORMAT_TAG: &[u8; 4] = b"KAPI";
 pub const VERSION: u32 = 0x50000;
 pub const HEADER_LEN: usize = 16;
 pub const SECTION_LEN: usize = 16;
@@ -41,32 +41,32 @@ pub const COMMAND_OUTPUT_MAX: usize = 0x8000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpakError {
-    TooShort { need: usize, have: usize },
-    BadMagic([u8; 4]),
-    BadVersion(u32),
+    TooShort { need: usize, got: usize },
+    WrongSignature([u8; 4]),
+    UnsupportedRevision(u32),
     NoSection(u32),
-    BadBlock { at: u64, count: u32 },
-    BlockOffset { at: u64, says: u32, have: usize },
+    CorruptSegment { at: u64, count: u32 },
+    BlockOffset { at: u64, says: u32, got: usize },
     Lzo { at: u64, error: LzoError },
     Truncated { at: u64 },
 }
 
 impl core::fmt::Display for IpakError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&self, w: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            IpakError::TooShort { need, have } => write!(f, "ipak needs {need} bytes, has {have}"),
-            IpakError::BadMagic(m) => write!(f, "not an ipak: magic {m:02x?}"),
-            IpakError::BadVersion(v) => write!(f, "ipak version {v:#x} (want {VERSION:#x})"),
-            IpakError::NoSection(t) => write!(f, "ipak has no section of type {t}"),
-            IpakError::BadBlock { at, count } => {
-                write!(f, "ipak block at {at:#x} claims {count} commands")
+            IpakError::TooShort { need, got } => write!(w, "ipak needs {need} bytes, has {got}"),
+            IpakError::WrongSignature(m) => write!(w, "not an ipak: magic {m:02x?}"),
+            IpakError::UnsupportedRevision(v) => write!(w, "ipak version {v:#x} (want {VERSION:#x})"),
+            IpakError::NoSection(t) => write!(w, "ipak has no section of type {t}"),
+            IpakError::CorruptSegment { at, count } => {
+                write!(w, "ipak block at {at:#x} claims {count} commands")
             }
-            IpakError::BlockOffset { at, says, have } => write!(
-                f,
-                "ipak block at {at:#x} continues output at {says:#x}, but {have:#x} bytes came before"
+            IpakError::BlockOffset { at, says, got } => write!(
+                w,
+                "ipak block at {at:#x} continues output at {says:#x}, but {got:#x} bytes came before"
             ),
-            IpakError::Lzo { at, error } => write!(f, "ipak command at {at:#x}: {error}"),
-            IpakError::Truncated { at } => write!(f, "ipak entry ends inside a block at {at:#x}"),
+            IpakError::Lzo { at, error } => write!(w, "ipak command at {at:#x}: {error}"),
+            IpakError::Truncated { at } => write!(w, "ipak entry ends inside a block at {at:#x}"),
         }
     }
 }
@@ -78,8 +78,8 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Section {
     pub kind: u32,
-    pub offset: u32,
-    pub size: u32,
+    pub starts_at: u32,
+    pub byte_len: u32,
     pub item_count: u32,
 }
 
@@ -97,17 +97,16 @@ pub fn parse_header(bytes: &[u8]) -> Result<IpakHeader, IpakError> {
     if bytes.len() < HEADER_LEN {
         return Err(IpakError::TooShort {
             need: HEADER_LEN,
-            have: bytes.len(),
+            got: bytes.len(),
         });
     }
-    let mut magic = [0u8; 4];
-    magic.copy_from_slice(&bytes[0..4]);
-    if &magic != MAGIC {
-        return Err(IpakError::BadMagic(magic));
+    let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    if &magic != FORMAT_TAG {
+        return Err(IpakError::WrongSignature(magic));
     }
     let version = u32_at(bytes, 4);
     if version != VERSION {
-        return Err(IpakError::BadVersion(version));
+        return Err(IpakError::UnsupportedRevision(version));
     }
     let file_size = u32_at(bytes, 8);
     let count = u32_at(bytes, 12) as usize;
@@ -115,7 +114,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<IpakHeader, IpakError> {
     if bytes.len() < need {
         return Err(IpakError::TooShort {
             need,
-            have: bytes.len(),
+            got: bytes.len(),
         });
     }
     let mut index = None;
@@ -124,8 +123,8 @@ pub fn parse_header(bytes: &[u8]) -> Result<IpakHeader, IpakError> {
         let at = HEADER_LEN + i * SECTION_LEN;
         let s = Section {
             kind: u32_at(bytes, at),
-            offset: u32_at(bytes, at + 4),
-            size: u32_at(bytes, at + 8),
+            starts_at: u32_at(bytes, at + 4),
+            byte_len: u32_at(bytes, at + 8),
             item_count: u32_at(bytes, at + 12),
         };
         match s.kind {
@@ -143,24 +142,24 @@ pub fn parse_header(bytes: &[u8]) -> Result<IpakHeader, IpakError> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IndexEntry {
-    pub key: u64,
+    pub lookup_key: u64,
     /// Offset into the data section.
-    pub offset: u32,
+    pub data_at: u32,
     /// Stored bytes, block headers included.
-    pub size: u32,
+    pub stored_len: u32,
 }
 
 impl IndexEntry {
-    pub const fn key_of(name_hash: u32, data_hash: u32) -> u64 {
-        (name_hash as u64) << 32 | data_hash as u64
+    pub const fn key_of(label_digest: u32, data_hash: u32) -> u64 {
+        (label_digest as u64) << 32 | data_hash as u64
     }
 
-    pub fn name_hash(&self) -> u32 {
-        (self.key >> 32) as u32
+    pub fn label_digest(&self) -> u32 {
+        (self.lookup_key >> 32) as u32
     }
 
     pub fn data_hash(&self) -> u32 {
-        self.key as u32
+        self.lookup_key as u32
     }
 }
 
@@ -170,23 +169,23 @@ pub fn parse_index(bytes: &[u8], count: usize) -> Result<Vec<IndexEntry>, IpakEr
     if bytes.len() < need {
         return Err(IpakError::TooShort {
             need,
-            have: bytes.len(),
+            got: bytes.len(),
         });
     }
-    let mut out: Vec<IndexEntry> = (0..count)
+    let mut listed: Vec<IndexEntry> = (0..count)
         .map(|i| {
             let at = i * INDEX_ENTRY_LEN;
             let data_hash = u32_at(bytes, at);
-            let name_hash = u32_at(bytes, at + 4);
+            let label_digest = u32_at(bytes, at + 4);
             IndexEntry {
-                key: IndexEntry::key_of(name_hash, data_hash),
-                offset: u32_at(bytes, at + 8),
-                size: u32_at(bytes, at + 12),
+                lookup_key: IndexEntry::key_of(label_digest, data_hash),
+                data_at: u32_at(bytes, at + 8),
+                stored_len: u32_at(bytes, at + 12),
             }
         })
         .collect();
-    out.sort();
-    Ok(out)
+    listed.sort_unstable();
+    Ok(listed)
 }
 
 /// Decode one stored entry. `stored` is the entry's bytes and `file_at` the
@@ -208,14 +207,14 @@ pub fn decode_entry(stored: &[u8], file_at: u64, out: &mut Vec<u8>) -> Result<()
         let offset = first & 0x00FF_FFFF;
         let count = first >> 24;
         if count as usize > BLOCK_COMMANDS {
-            return Err(IpakError::BadBlock { at, count });
+            return Err(IpakError::CorruptSegment { at, count });
         }
         let carries_data = (0..count as usize).any(|c| u32_at(header, 4 + c * 4) >> 24 <= 1);
         if carries_data && offset as usize != out.len() & 0x00FF_FFFF {
             return Err(IpakError::BlockOffset {
                 at,
                 says: offset,
-                have: out.len(),
+                got: out.len(),
             });
         }
         pos += BLOCK_HEADER_LEN;
@@ -256,14 +255,14 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    fn block(offset: u32, cmds: &[(u32, &[u8])]) -> Vec<u8> {
+    fn block(offset: u32, steps: &[(u32, &[u8])]) -> Vec<u8> {
         let mut b = vec![0u8; BLOCK_HEADER_LEN];
-        b[0..4].copy_from_slice(&(offset | (cmds.len() as u32) << 24).to_le_bytes());
-        for (i, (kind, data)) in cmds.iter().enumerate() {
+        b[0..4].copy_from_slice(&(offset | (steps.len() as u32) << 24).to_le_bytes());
+        for (i, (kind, data)) in steps.iter().enumerate() {
             let cmd = data.len() as u32 | kind << 24;
             b[4 + i * 4..8 + i * 4].copy_from_slice(&cmd.to_le_bytes());
         }
-        for (_, data) in cmds {
+        for (_, data) in steps {
             b.extend_from_slice(data);
         }
         b
@@ -306,9 +305,9 @@ mod tests {
             bytes.extend_from_slice(&0u32.to_le_bytes());
         }
         let idx = parse_index(&bytes, 3).unwrap();
-        assert_eq!(idx[0].name_hash(), 3);
-        assert_eq!((idx[1].name_hash(), idx[1].data_hash()), (9, 1));
-        assert_eq!((idx[2].name_hash(), idx[2].data_hash()), (9, 2));
+        assert_eq!(idx[0].label_digest(), 3);
+        assert_eq!((idx[1].label_digest(), idx[1].data_hash()), (9, 1));
+        assert_eq!((idx[2].label_digest(), idx[2].data_hash()), (9, 2));
     }
 
     #[test]

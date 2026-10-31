@@ -1,8 +1,8 @@
 [package]
-name = "asset_anim"
+name = "anim_bank"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
+publish.workspace = true
 description = "Animation clips and sets as the engine plays them."
 
 [dependencies]

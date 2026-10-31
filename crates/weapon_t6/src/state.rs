@@ -105,7 +105,7 @@ pub fn is_raising(state: i32) -> bool {
 }
 
 /// Offhand states 22..=29 (the offhand weapon is the one in hand).
-pub fn is_offhand(state: i32) -> bool {
+pub fn is_secondary_gear(state: i32) -> bool {
     (OFFHAND_INIT..=OFFHAND_END).contains(&state)
 }
 

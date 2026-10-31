@@ -27,8 +27,8 @@ fn untouched_table() -> [f32; HITLOC_COUNT] {
 /// game does not know keeps no scale of its own and is skipped; a missing
 /// header word, a dangling name, a scale that is not a number, or a finished
 /// table that is not usable all reject the whole file.
-fn parse_pairs(text: &str) -> Option<[f32; HITLOC_COUNT]> {
-    let body = text.trim().strip_prefix(HEADER_WORD)?;
+fn parse_pairs(words: &str) -> Option<[f32; HITLOC_COUNT]> {
+    let body = words.trim().strip_prefix(HEADER_WORD)?;
     let mut table = untouched_table();
     let mut tokens = body.split('\\').filter(|token| !token.is_empty());
     while let Some(part) = tokens.next() {

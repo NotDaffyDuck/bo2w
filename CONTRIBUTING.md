@@ -1,59 +1,55 @@
-# Contributing
+# Contributing to bo2mp
 
-IW4L is a personal, experimental project. It is open so that it can be read,
-built and fixed — not because it comes with an obligation to serve every
-request. Decisions are the maintainer's.
+bo2mp is a personal, experimental fan project. The code is open so people can read it, build it and
+fix it; that does not oblige anyone to take on every request, and the maintainer makes the
+decisions.
 
-## Bug reports
+## Reporting a bug
 
-Reports are welcome, with no promised fix date. A report is prioritised against
-what the project actually claims:
+You are welcome to report bugs, with no promise about when one is fixed. Reports are weighed
+against what the project says it does:
 
-> A failure in a scenario the project says works outweighs a missing feature it
-> never promised.
+> Something broken in a scenario the project says works matters more than a feature it never
+> promised.
 
-`README.md` says what is claimed. "Add everything the original had" is not a
-roadmap item.
+The claims are in `README.md`. "Do everything the original game did" is not a roadmap entry.
 
-What a useful report contains, and nothing more:
+A report needs these and nothing else:
 
-* the release tag or commit
-* OS and GPU
-* which game's data you pointed IW4L at, and which map
-* the steps, and what happened instead
+* the commit or release tag you ran
+* your operating system and GPU
+* the map you were on
+* the steps you took and what happened instead of what you expected
 
-That is the whole list. Do not attach your `.env`, a memory dump, or an archive
-of the game — none of those will be read, and the last one cannot be accepted.
+Do not attach your `.env`, a memory dump or any archive of the game. Those are not read, and the
+game archive cannot be accepted at all.
 
-## Changes
+## Code changes
 
-* **Small and self-contained** — a fix, a crash, a wrong constant, a doc
-  correction: open it directly.
-* **Architectural** — a new crate, a new subsystem, a change to how data flows
-  between `sim`, `render_frontend` and `net`: open an issue first. A large
-  branch that arrives unannounced is likely to be turned down for reasons that
-  have nothing to do with its quality.
+* **Small, standalone changes** (a fix, a crash, one wrong number, a docs typo): send them
+  directly.
+* **Design-level changes** (a new crate or subsystem, or a change in how data moves between `sim`,
+  `render_frontend` and `net`): open an issue first. A big branch that shows up unannounced may be
+  declined for reasons that have nothing to do with how good it is.
 
-Before opening anything:
+Before sending anything, run:
 
 ```bash
-make publish-check   # the tracked tree is the product and nothing else
 cargo fmt --all
 cargo clippy --workspace --all-targets
+cargo test --workspace
 ```
 
-`CONTEXT.md` documents how the maintainer works — artifacts, iterations, agent
-clones. It is a maintainer's workflow, not a requirement for contributing: you
-do not need `make mr`, the iteration naming, or anything under `context/` to
-change the runtime.
+`CONTEXT.md` describes how the maintainer works: artifacts, iterations and agent clones. That is a
+private workflow, not a requirement. Changing the runtime needs none of it, nor anything under
+`context/`.
 
-## Game data
+## Original game data
 
-Never attach, commit or link original game files — maps, weapons, sounds,
-executables. That holds for issues, pull requests and release assets alike.
-IW4L reads data from an installation each user already owns, and the project is
-not a distribution channel for it.
+Do not attach, commit or link any original game file (maps, weapons, sounds, executables). This
+covers issues, pull requests and release assets alike. bo2mp reads data from a Black Ops II
+installation that each user already owns, and the project is no place to distribute it.
 
-## Written by an LLM
+## Who writes the code
 
-This whole project is written by an LLM.
+An LLM writes all of this project.

@@ -1,6 +1,7 @@
 //! Putting a manifest's files into the install folder. A file is checked
 //! before it is written and written so that a failure leaves the old one.
 
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,138 +25,149 @@ pub fn bring_in(
     entry: &FileEntry,
     fetch: impl FnOnce(&str) -> Result<Vec<u8>, String>,
 ) -> Result<Outcome, String> {
-    let destination = dir.join(&entry.path);
-    if is_current(&destination, entry)? {
+    let target = dir.join(&entry.path);
+    if is_current(&target, entry)? {
         return Ok(Outcome::Current);
     }
     let shipped = fetch(entry.remote_name())?;
     let bytes = unpack(entry, shipped)?;
-    replace_file(&destination, &bytes)?;
+    replace_file(&target, &bytes)?;
     Ok(Outcome::Installed)
 }
 
 fn is_current(path: &Path, entry: &FileEntry) -> Result<bool, String> {
     let wanted = hash_digits(&entry.sha256)?;
-    let same_size = fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() == entry.size);
-    Ok(same_size && file_digest(path).is_ok_and(|found| found == wanted))
+    let right_size = match fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.len() == entry.size,
+        Err(_) => false,
+    };
+    // Only a file of the right size is worth hashing.
+    Ok(right_size && matches!(file_digest(path), Ok(found) if found == wanted))
+}
+
+/// `what size <got> != <want>` when a length is off.
+fn check_len(what: &str, got: usize, want: u64) -> Result<(), String> {
+    if got as u64 == want { Ok(()) } else { Err(format!("{what} size {got} != {want}")) }
 }
 
 /// The file's bytes, once the download has been checked and, if it came
 /// compressed, expanded. Every number the manifest gives is held to.
 fn unpack(entry: &FileEntry, shipped: Vec<u8>) -> Result<Vec<u8>, String> {
     let remote = entry.remote_name();
-    if let Some(size) = entry.download_size
-        && shipped.len() as u64 != size
-    {
-        return Err(format!("{remote} size {} != {size}", shipped.len()));
+    if let Some(want) = entry.download_size {
+        check_len(remote, shipped.len(), want)?;
     }
-    if let Some(hash) = &entry.download_sha256
-        && digest(&shipped) != hash_digits(hash)?
-    {
-        return Err(format!("{remote} download sha256 mismatch"));
+    if let Some(want_hash) = entry.download_sha256.as_deref() {
+        let want = hash_digits(want_hash)?;
+        if digest(&shipped) != want {
+            return Err(format!("{remote}: download sha256 mismatch"));
+        }
     }
-    let bytes = if remote.ends_with(".zst") {
-        expand(remote, &shipped, entry.size)?
-    } else {
-        shipped
+    let installed = entry.path.as_str();
+    let plain = match remote.strip_suffix(".zst") {
+        Some(_) => expand(remote, &shipped, entry.size)?,
+        None => shipped,
     };
-    if bytes.len() as u64 != entry.size {
-        return Err(format!(
-            "{} size {} != {}",
-            entry.path,
-            bytes.len(),
-            entry.size
-        ));
+    check_len(installed, plain.len(), entry.size)?;
+    let want = hash_digits(&entry.sha256)?;
+    match digest(&plain) == want {
+        true => Ok(plain),
+        false => Err(format!("{installed} sha256 mismatch")),
     }
-    if digest(&bytes) != hash_digits(&entry.sha256)? {
-        return Err(format!("{} sha256 mismatch", entry.path));
-    }
-    Ok(bytes)
 }
 
 /// Expands zstd data, reading no more than one byte past the size the
 /// manifest promises, so a small download cannot become an enormous file.
 fn expand(name: &str, shipped: &[u8], promised: u64) -> Result<Vec<u8>, String> {
-    let failed = |error: io::Error| format!("decode {name}: {error}");
-    let decoder = zstd::stream::read::Decoder::new(shipped).map_err(failed)?;
-    let mut bytes = Vec::new();
-    decoder
-        .take(promised.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(failed)?;
-    Ok(bytes)
+    let limit = promised.saturating_add(1);
+    let mut out = Vec::new();
+    zstd::stream::read::Decoder::new(shipped)
+        .and_then(|decoder| decoder.take(limit).read_to_end(&mut out))
+        .map_err(|why| format!("decode {name}: {why}"))?;
+    Ok(out)
 }
 
 /// Writes `bytes` to `destination` without ever leaving it half written: the
 /// bytes go to a `.part` file first, the old file steps aside as `.bak`
 /// (a running `.exe` can be renamed, not overwritten) and comes back if the
 /// new one cannot be moved in.
-pub fn replace_file(destination: &Path, bytes: &[u8]) -> Result<(), String> {
-    let staged = with_suffix(destination, ".part");
-    let backup = with_suffix(destination, ".bak");
-    stage(&staged, bytes)?;
-    let replacing = destination.exists();
-    if replacing && let Err(error) = fs::rename(destination, &backup) {
-        let _ = fs::remove_file(&staged);
-        return Err(format!(
-            "rename {} to backup: {error}",
-            destination.display()
-        ));
-    }
-    if let Err(error) = fs::rename(&staged, destination) {
-        if replacing {
-            let _ = fs::rename(&backup, destination);
+pub fn replace_file(target: &Path, contents: &[u8]) -> Result<(), String> {
+    let [staged, prior_copy] = [".part", ".bak"].map(|suffix| with_suffix(target, suffix));
+    stage(&staged, contents)?;
+    let had_old = target.exists();
+    let shown = target.display();
+    // Cleanup below is best effort: the error that matters is already known.
+    if had_old {
+        if let Err(why) = fs::rename(target, &prior_copy) {
+            fs::remove_file(&staged).ok();
+            return Err(format!("rename {shown} to backup: {why}"));
         }
-        let _ = fs::remove_file(&staged);
-        return Err(format!("install {}: {error}", destination.display()));
     }
-    if replacing {
-        let _ = fs::remove_file(&backup);
+    match fs::rename(&staged, target) {
+        Ok(()) => {
+            if had_old {
+                fs::remove_file(&prior_copy).ok();
+            }
+            Ok(())
+        }
+        Err(why) => {
+            if had_old {
+                fs::rename(&prior_copy, target).ok();
+            }
+            fs::remove_file(&staged).ok();
+            Err(format!("install {shown}: {why}"))
+        }
     }
-    Ok(())
 }
 
 /// Writes `bytes` to `path` and makes sure they reached the disk.
-fn stage(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let written = File::create(path)
-        .map_err(|error| format!("create {}: {error}", path.display()))
-        .and_then(|mut file| {
-            file.write_all(bytes)
-                .map_err(|error| format!("write {}: {error}", path.display()))?;
-            file.sync_all()
-                .map_err(|error| format!("sync {}: {error}", path.display()))
-        });
-    if written.is_err() {
-        let _ = fs::remove_file(path);
+fn stage(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let step = |verb: &str| {
+        let shown = path.display().to_string();
+        let verb = verb.to_owned();
+        move |why: io::Error| format!("{verb} {shown}: {why}")
+    };
+    let result = (|| {
+        let mut out = File::create(path).map_err(step("create"))?;
+        out.write_all(contents).map_err(step("write"))?;
+        out.sync_all().map_err(step("sync"))
+    })();
+    if result.is_err() {
+        fs::remove_file(path).ok();
     }
-    written
+    result
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
+    let mut full = OsString::from(path.as_os_str());
+    full.push(suffix);
+    full.into()
+}
+
+/// Lowercase hex of a finished hash.
+fn hex(state: Sha256) -> String {
+    state.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The SHA-256 of `bytes` as lowercase hex.
 pub fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    let mut state = Sha256::new();
+    state.update(bytes);
+    hex(state)
 }
 
 /// The SHA-256 of a file's contents as lowercase hex.
 pub fn file_digest(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut chunk = vec![0; 64 * 1024];
-    loop {
-        let read = file.read(&mut chunk)?;
-        if read == 0 {
-            return Ok(format!("{:x}", hasher.finalize()));
-        }
-        hasher.update(&chunk[..read]);
+    let mut source = File::open(path)?;
+    let mut state = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 16];
+    let mut filled = source.read(&mut buffer)?;
+    while filled > 0 {
+        state.update(&buffer[..filled]);
+        filled = source.read(&mut buffer)?;
     }
+    Ok(hex(state))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,7 +262,7 @@ mod tests {
         let outcome = bring_in(dir.path(), &entry, |_| Ok(b"newer".to_vec()));
         assert_eq!(outcome, Ok(Outcome::Installed));
         assert_eq!(fs::read(dir.join("bo2mp.exe")).unwrap(), b"newer");
-        assert_eq!(dir.names(), ["bo2mp.exe"]);
+        assert_eq!(dir.entry_names(), ["bo2mp.exe"]);
     }
 
     #[test]
@@ -285,7 +297,7 @@ mod tests {
         assert_eq!(failed, Err("GET: 404".to_owned()));
 
         assert_eq!(fs::read(dir.join("bo2mp.exe")).unwrap(), b"old");
-        assert_eq!(dir.names(), ["bo2mp.exe"]);
+        assert_eq!(dir.entry_names(), ["bo2mp.exe"]);
     }
 
     #[test]
@@ -296,7 +308,7 @@ mod tests {
         assert_eq!(wrong_hash, "f sha256 mismatch");
         let wrong_size = bring_in(dir.path(), &entry, |_| Ok(b"short".to_vec())).unwrap_err();
         assert_eq!(wrong_size, "f size 5 != 8");
-        assert!(dir.names().is_empty());
+        assert!(dir.entry_names().is_empty());
     }
 
     #[test]
@@ -315,7 +327,7 @@ mod tests {
             error,
             format!("f size {} != {}", promised.len() + 1, promised.len())
         );
-        assert!(dir.names().is_empty());
+        assert!(dir.entry_names().is_empty());
     }
 
     #[test]
@@ -340,7 +352,7 @@ mod tests {
     fn a_file_that_cannot_step_aside_keeps_its_place() {
         let dir = TestDir::new("stuck");
         fs::write(dir.join("bo2mp.exe"), b"old").unwrap();
-        // A folder already sits where the backup would go.
+        // A folder already sits where the prior_copy would go.
         fs::create_dir(dir.join("bo2mp.exe.bak")).unwrap();
         fs::write(dir.join("bo2mp.exe.bak/inner"), b"x").unwrap();
         let error = replace_file(&dir.join("bo2mp.exe"), b"new").unwrap_err();

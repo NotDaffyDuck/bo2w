@@ -1,9 +1,8 @@
 # bo2mp: Black Ops II Multiplayer
 
-bo2mp is a fan rebuild that plays Call of Duty: Black Ops II multiplayer against bots, from your own PC copy of the
-game, in its own Black Ops II engine written in Rust on [bevy](https://bevyengine.org/) and [wgpu](https://wgpu.rs/).
-It grew out of [IW4L](https://github.com/vladtrc/iw4L), an open-source Call of Duty runtime (Apache 2.0, credited in
-NOTICE); every piece of IW4L's MW2 engine has since been taken out (2026-10-21). The same code that runs Nuketown Zombies runs Black Ops II's own multiplayer scripts,
+bo2mp is a fan rebuild that plays Call of Duty: Black Ops II multiplayer against bots, and Black Ops II Zombies, from
+your own PC copy of the game, in its own Black Ops II engine written in Rust on [bevy](https://bevyengine.org/) and [wgpu](https://wgpu.rs/).
+The same code that runs Nuketown Zombies runs Black Ops II's own multiplayer scripts,
 menus and bots, so matches follow the game's real rules without touching the original executable.
 
 **Status:** matches against Black Ops II's own bots play on every multiplayer map, started from BO2's own menus;
@@ -40,8 +39,8 @@ three days of work (2026-10-13 to 2026-10-15).
 - **Hunter Killer** (passed a playtest 10-15): unfolds its wings as it leaves your hand, flies like a jet, locks onto an
   enemy only when it can see them, and an enemy can escape behind a wall.
 - **Care Package** (playtested 10-15, nearly there): the drone flies in with the crate on its hook, the crate lands on
-  the ground, teammates and enemies can take it (with the steal callout) and an icon points to it. Still open: the
-  drone's blades do not spin yet.
+  the ground, teammates and enemies can take it (with the steal callout) and an icon points to it. The drone's blades now spin
+  in a real match (fixed 10-29, waiting on a playtest).
 - **UAV** checked against BO2's code; **Counter-UAV** jams the enemy minimap with BO2's own static.
 - One key (3) brings out your cheapest earned streak.
 
@@ -62,10 +61,10 @@ Every item is listed with its date in [Recent changes](#recent-changes). What is
 - [Latest update (2026-10-15)](#latest-update-2026-10-15)
 - [Map completion](#map-completion)
 - [Features](#features)
+- [Zombies](#zombies)
 - [Screenshots](#screenshots)
 - [Requirements](#requirements)
-- [Install](#install)
-- [Run / Play](#run--play)
+- [Build and run](#build-and-run)
 - [Configuration](#configuration)
 - [Mods (GSC scripts)](#mods-gsc-scripts)
 - [How it works](#how-it-works)
@@ -87,20 +86,20 @@ Carrier         ██████████  98%   ████████�
 Drone           ██████████  96%   █████░░░░░  50%
 Express         ██████████  98%   ██████████ 100%
 Hijacked        ██████████  98%   ████████░░  75%
-Meltdown        ██████████  98%   not compared yet
+Meltdown        ██████████  98%   ████████░░  75%
 Overflow        ██████████  96%   ██████████ 100%
 Plaza           ██████████  98%   ██████████ 100%
-Raid            ██████████  98%   not compared yet
+Raid            ██████████  98%   ██████████ 100%
 Slums           ██████████  98%   █████░░░░░  50%
 Standoff        ██████████  98%   ██████████ 100%
 Turbine         ██████████  98%   ████████░░  75%
-Yemen           ██████████  98%   █████░░░░░  50%
+Yemen           ██████████  98%   ████████░░  75%
 Nuketown 2025   ██████████  98%   █████████░  88%
 Downhill        ██████████  98%   not compared yet
-Mirage          ██████████  98%   not compared yet
-Hydro           ██████████  96%   not compared yet
-Grind           ██████████  98%   not compared yet
-Encore          ██████████  98%   not compared yet
+Mirage          ██████████  98%   ██████████ 100%
+Hydro           ██████████  96%   █████████░  88%
+Grind           ██████████  98%   ██████████ 100%
+Encore          ██████████  98%   █████░░░░░  50%
 Magma           ██████████  98%   not compared yet
 Vertigo         ██████████  98%   not compared yet
 Studio          ██████████  98%   not compared yet
@@ -108,14 +107,14 @@ Uplink          ██████████  98%   not compared yet
 Detour          ██████████  98%   not compared yet
 Cove            ██████████  98%   not compared yet
 Rush            ██████████  98%   not compared yet
-Dig             █████████░  90%   not compared yet
-Frost           ████████░░  78%   not compared yet
-Pod             ████████░░  78%   not compared yet
-Takeoff         █████████░  86%   not compared yet
-All maps        ██████████  96%   ████░░░░░░  35%
+Dig             ██████████  98%   not compared yet
+Frost           ██████████  98%   not compared yet
+Pod             ██████████  98%   not compared yet
+Takeoff         ██████████  98%   not compared yet
+All maps        ██████████  98%   █████░░░░░  52%
 ```
 
-Mechanics: each map's systems and modes work by Black Ops II's rules. Visuals: set spots compared side by side with Black Ops II. Scored in [`docs/maps.json`](docs/maps.json) (pass or match 1, part or close half, not yet 0), last updated 2026-10-20; drawn by [`docs/make_bars.py`](docs/make_bars.py).
+Mechanics: each map's systems and modes work by Black Ops II's rules. Visuals: set spots compared side by side with Black Ops II. Scored in [`docs/maps.json`](docs/maps.json) (pass or match 1, part or close half, not yet 0), last updated 2026-10-30; drawn by [`docs/make_bars.py`](docs/make_bars.py).
 <!-- map-bars:end -->
 
 ## Features
@@ -141,6 +140,50 @@ Mechanics: each map's systems and modes work by Black Ops II's rules. Visuals: s
 - **Scorestreaks.** Score earns streaks through BO2's own momentum code; bots call in Orbital VSAT, Counter-UAV,
   EMP, Death Machine, War Machine, Swarm, Escort Drone and K9 Unit.
 
+## Zombies
+
+The same engine plays Black Ops II Zombies by the game's own scripts. Run it from the play folder:
+
+```powershell
+.\bo2mp.exe frontend t6:zm_nuked
+```
+
+This opens on BO2's own main menu: ONLINE > SOLO PLAY opens BO2's globe. Turn it with Left/Right and press Enter on a
+map, pick a start and a mode, then START MATCH (or CUSTOM GAMES for the starting round and difficulty). After a game it
+goes back to the lobby. `.\bo2mp.exe map t6:zm_nuked` skips the menu and goes straight into Nuketown.
+
+| Map on the globe | Starts and modes |
+|---|---|
+| TranZit | TranZit (story), Bus Depot (Survival), Town (Grief, Survival), Farm (Grief, Survival), Diner (Turned) |
+| Nuketown | Survival |
+| Die Rise | Die Rise (story) |
+| Mob of the Dead | Mob of the Dead (story), Cell Block (Grief) |
+| Buried | Buried (story), Borough (Grief, Turned) |
+| Origins | Origins (story) |
+
+The nine Black Ops maps from the map pack (Nacht der Untoten, Verrückt, Shi No Numa, Der Riese, Kino der Toten, Five,
+Ascension, Shangri-La and Moon) sit on the globe too. Nuketown is the most finished map; every map was played through
+on 2026-10-11.
+
+- **The game's own scripts.** BO2's compiled server scripts run in the engine's script VM: zombies rise from the
+  ground and climb fences, rounds speed up from walk to sprint, points, wall buys, a Mystery Box that moves, perks,
+  Pack-a-Punch, power-ups, going down and game over.
+- **Zombie AI.** Actors with BO2's animation states, A* over the map's path nodes with jump and climb links,
+  body-blocking crowds, doors and debris that cut paths.
+- **BO2's HUD and menus.** A HavokScript (BO2's UI Lua) reader and VM runs BO2's own HUD scripts and menus, including
+  the pause menu and Options.
+- **Specialty weapons.** The wonder weapons, staffs, craftables, shields and special grenades of every map, and a few
+  guest weapons from other games (read from your own copy of those games when you have them).
+- **A cheat menu for solo games.** Num 1 opens it and pauses the game: points, God Mode, No Clip, Zombies Ignore You,
+  Infinite Ammo, End Round, Drop Power-Up, Power On, Open All Doors, Pack-a-Punch Gun, All Perks, and a Special Weapons
+  tab that puts the weapon you pick into your hands. Never in Public Match or co-op.
+- **Co-op** (being finished last): Custom Games with a friend (host, join, kick) and Public Match, tested with two
+  copies on one PC.
+
+The first start after a reboot is slow: it reads the game's image packs from disk, which took about 3 minutes with
+Black Ops II on a hard drive. Later starts are much quicker. `BO2ZM_LUI=0` brings back the simple hand-made HUD instead
+of BO2's own.
+
 ## Screenshots
 
 There are none on this page on purpose: everything the engine draws is Black Ops II's own art, read from your own
@@ -155,45 +198,73 @@ install at run time, and that art is not ours to share. What the recent fixes ch
 
 ## Requirements
 
-- **Your own Call of Duty: Black Ops II for PC** (Steam) with Multiplayer installed (Steam app 202990).
+- **Your own Call of Duty: Black Ops II for PC** (Steam) with Multiplayer installed (Steam app 202990), and the
+  Zombies part installed to play Zombies.
 - **Windows x64** (built and played on Windows 11 only so far).
 - **Rust** (stable toolchain via [rustup](https://rustup.rs/); the code uses the 2024 edition) and
   **Visual Studio 2022 Build Tools** with the C++ workload (MSVC).
 - A DirectX 12 or Vulkan capable GPU. Development and testing used an RTX 4070 Ti at 1920x1080.
 - Tens of GB free for the Rust build output.
 
-## Install
+## Build and run
 
-There are no releases: you build it from this tree. These steps were done on the author's PC only, never on a fresh
-one by someone else.
+There are no releases: you build it from this tree.
 
-1. Install Rust and the Visual Studio 2022 Build Tools (C++ workload).
-2. Clone the repository and check out the branch: `git checkout main`.
-3. Build the game:
+**Build.** Clone the repository and build the launcher:
 
-   ```powershell
-   cargo build -p launcher --profile play
-   ```
+```powershell
+git clone <repository-url> bo2mp
+$env:CARGO_TARGET_DIR = "D:/bo2mp-target"   # any folder on a drive with tens of GB free
+cargo build --profile play -p launcher --manifest-path bo2mp/Cargo.toml
+```
 
-   The binary is `target\play\bo2mp.exe`.
-4. Make a play folder anywhere, copy `bo2mp.exe` into it, and create a `.env` file next to it that points at the
-   folder holding your Black Ops II install (quoted, with forward slashes), for example:
+The binary is `<target-dir>\play\bo2mp.exe`. The patched `wgpu-hal` the renderer needs is committed under
+`third_party/wgpu-hal` and wired in by `[patch.crates-io]` in `Cargo.toml`, so no extra step is needed.
 
-   ```text
-   BO2MP_GAMES="C:/Program Files (x86)/Steam/steamapps/common/Call of Duty Black Ops II"
-   ```
+**Point it at your game.** Make a play folder anywhere, copy `bo2mp.exe` into it, and put a `.env` file next to it
+whose `BO2MP_GAMES` names the folder holding your Black Ops II install (quoted, forward slashes):
 
-## Run / Play
+```text
+BO2MP_GAMES="C:/Program Files (x86)/Steam/steamapps/common/Call of Duty Black Ops II"
+```
 
-From the play folder:
+`BO2MP_GAMES` can also be set in the environment. With no `.env` beside the binary, the first `.env` found walking up
+from the working directory is used; with `BO2MP_GAMES` unset, the folder `bo2mp.exe` sits in is used.
+
+**Play.** From the play folder:
 
 ```powershell
 .\bo2mp.exe frontend t6mp
 ```
 
-Pick a mode, map and bots in the custom games lobby and press Start Match. A Windows shortcut with that target and
-"Start in" set to the play folder works the same way. Keys follow BO2's PC defaults; Esc opens BO2's pause menu.
-Settings, saved classes, caches and logs go to `bo2mp-artifacts\` next to `bo2mp.exe`.
+Pick a mode, map and bots in the custom games lobby and press Start Match. Keys follow BO2's PC defaults; Esc opens
+BO2's pause menu. Settings, saved classes, caches and logs go to `bo2mp-artifacts\` next to `bo2mp.exe`.
+
+**Dedicated server or bot match, no window.** `serve <zone>` starts a dedicated server with no window.
+`BO2MP_HEADLESS=1` runs any mode with no window, graphics card or sound device. A hidden Team Deathmatch on Nuketown
+with one enemy bot (`BO2MP_BOTS` is friends,enemies,difficulty):
+
+```powershell
+.\bo2mp.exe serve t6:mp_nuketown_2020
+
+$env:BO2MP_HEADLESS = "1"; $env:BO2MP_SOUND = "off"; $env:BO2MP_SCRIPTS = "1"
+$env:BO2MP_GAMETYPE = "tdm"; $env:BO2MP_BOTS = "0,1,1"
+.\bo2mp.exe map t6:mp_nuketown_2020
+```
+
+`.\bo2mp.exe --help` lists every launch mode (`map`, `serve`, `menu`, `frontend`, `play <demo>`).
+
+**What the crates do** (`crates/`):
+
+- `launcher`, `bootstrap`, `console`, `updater`: the `bo2mp.exe` entry point, start-up, command line, console, updates.
+- `assets`, `asset_*`, `fastfile_t5`, `fastfile_t6`, `ipak_t6`, `sab_t6`: reading BO2's own files (zones, images, sounds) from your install.
+- `render`, `render_*`, `d3d9_*`, `lighting_t6`, `dpvs_t6`, `marks_t6`, `fx`, `fx_t6`, `glass_t6`: drawing the world, models, effects and decals.
+- `sim`, `gsc_t6`, `hks_t6`, `gamemode_t6`, `entity_t6`, `weapon_t6`, `playerstate_t6`, `frame`: the game simulation, BO2's scripts and menus, modes, entities and guns.
+- `movement_t6`, `clipmap_t6`, `trace_t6`, `game_math`: player movement, collision and traces.
+- `anim_t6`, `xanim_t6`, `dobj_t6`, `xmodel_runtime`: animation and models at run time.
+- `net`, `session`, `bots`, `replay`, `killcam_t6`, `master_protocol`, `bo2mp-master`: networking, match set-up, bots, demos, killcam, the server list.
+- `ui`, `hud`, `hud_t6`, `input_t6`, `audio`, `bo2_profile`: menus, HUD, input, sound, saved classes and stats.
+- `diag`, `perf`, `bo2zm_tools`, `xtask` (top level): logging, profiling, developer tools, the task runner.
 
 ## Configuration
 
@@ -240,33 +311,36 @@ Multiplayer adds to bo2zm's crates (`fastfile_t6`, `asset_t6`, `gsc_t6`, `hks_t6
 
 - Build: `cargo build -p launcher --profile play`; tools: `cargo build -p bo2zm_tools --profile play`.
 - Tests: `cargo test -p gsc_t6` (and `cargo test -p <crate>` for the others).
-- Like upstream IW4L, this code is written by an LLM (Claude), directed and play-tested by the author.
+- An LLM (Claude) writes this code; the author directs it and play-tests it.
 
 ## Coming soon
 
+### Top priority: finish the fan remake
+
+This repository is the free 1:1 Black Ops II fan remake, never sold.
+(tag `split-2026-10-29`) into its own repository with its own roadmap; nothing here needs untangling from Black Ops II.
+
+1. [ ] A playtest of the standalone build on the test PC: maps load (fixed 2026-10-29, proven on a hidden test map), a match plays to the end (2026-10-29 playtest: models and windows wrong; checked 2026-10-30: the vanishing walls are fixed, the glass and the black frames match BO2, and a grenade blast fades cleanly with no glowing ball left on Nuketown and Frostbite; the vanishing models and the white glowing ball were not seen again and need a fresh report; the stuck menu music is fixed: it turns off as the match starts, checked in a hidden test match on 2026-10-30; the static needs a check by ear)
+2. [x] Hosting a match opens a real listening port, so a second PC can join (2026-10-29; a second PC joining not tried yet)
+3. [x] The tree and bush shader that declares one value twice, so 12 of its versions fail to build (2026-10-29; a test now builds all 880 world shader versions)
+4. [x] Clean-up: the old gate script, the old fork names in the changelog, machine paths in the docs (2026-10-29)
+5. [x] Zombies checked in play on this build (2026-10-29; two hidden Nuketown Zombies runs, round 3 reached and a real game over, 0 errors)
+6. [ ] The polish below, one item at a time: scorestreaks, bots, killcam, map details, side by side with Black Ops II
+7. [ ] Bring this build into other games again, as with the Minecraft and CoD MP versions
+
+### Black Ops II polish
+
 > Keep this list current: when an item ships, move it to Recent changes with the date, then add what is next.
 
-- [ ] Hellstorm's marks on the minimap as in BO2: one for the missile and one for each bomblet (sizes 50 and 32), coloured the way BO2 colours them
-- [ ] Every map's own map logic from Black Ops II's map data: its windows and breakable props are on every map, and its solid models on every map (10-17); every mode plays on every map (10-17); the moving parts, sounds and end-of-match nuke BO2's client scripts run are in (10-17); whole Demolition and Search and Destroy rounds pass on the maps that came with the game (10-19; Drone's Demolition waits on the mantle links below), Nuketown 2025's and Takeoff's pass too, and Pod's, Frost's, Dig's, Rush's, Cove's, Detour's, Uplink's, Studio's, Vertigo's, Magma's, Encore's, Grind's, Hydro's and Mirage's Search and Destroy and Demolition (10-19) and Downhill's (10-20), still to come on the other DLC maps; then the 7 modes bots cannot finish yet (below), then side-by-side pictures with BO2
-- [ ] Studio's brontosaurus: BO2's half-second blend between its chewing and its looking around (every map plays all of its own moving props, 10-16)
-- [ ] Takeoff's shuttle lit as in BO2: it draws black in the end-of-match launch (the launch itself plays as in BO2, 10-16)
-- [ ] Carrier's parked helicopter lit as in BO2: it draws solid black, though BO2's own colour map for it is light camo
-- [ ] Drone's centre area floor drawn as in BO2: it draws flat pale blue (its ground there is a blended grass and dirt surface)
-- [ ] Cargo's sky drawn from BO2's sunset sky cube (it draws grey and overcast), without the two small specks in its south view
-- [ ] Vertigo's doors: BO2's door box, so a moving door sets off explosives in its way and a closing one crushes a sentry or a tactical insertion
-- [ ] Express: BO2's camera shake and rumble when the train passes close (its dust and minimap icons are in, 10-16)
-- [ ] Drone's window pieces drawn as clearly as in BO2: its windows break into pieces on screen, but the pieces draw as faintly as the unbroken pane (every other map with windows is checked on screen, 10-19)
+- [ ] Every map's own map logic from Black Ops II's map data: its windows and breakable props are on every map, and its solid models on every map (10-17); every mode plays on every map (10-17); the moving parts, sounds and end-of-match nuke BO2's client scripts run are in (10-17); whole Demolition and Search and Destroy rounds pass on the maps that came with the game (10-19; Drone's too, 10-30), Nuketown 2025's and Takeoff's pass too, and Pod's, Frost's, Dig's, Rush's, Cove's, Detour's, Uplink's, Studio's, Vertigo's, Magma's, Encore's, Grind's, Hydro's and Mirage's Search and Destroy and Demolition (10-19) and Downhill's (10-20), still to come on the other DLC maps; Pod's, Takeoff's and Dig's party modes graded from their 10-20 matches (10-30; One Flag's capture still unconfirmed); then the 7 modes bots cannot finish yet (below), then side-by-side pictures with BO2
 - [ ] Bots that stop getting stuck on corners and props: BO2's own stuck rescue and its look-ahead check on the route
 - [ ] Bots that never stand facing a wall, and always shoot at an enemy walking in front of them
 - [ ] Bots that spawn pressed into an invisible wall walk off it, as BO2's movement lets them (on Pod a bot could stand at its spawn for a whole match)
 - [ ] Bots on Nuketown's upper floor: its ledge links carry no jump or drop mark, so bots walk them; match how BO2 moves its bots over them
-- [ ] Bots over BO2's ledge, mantle and window links on every map: bots face the link, press the climb, break a window in their way and, when a jump falls short, are sent on to the far side as in BO2 (10-19; Hydro: 35 of 45 climbs finish, 3 given up; Grind: 18 of 21, none given up); the other maps are still to be measured, and Dig's HQ, Drone's Kill Confirmed and Demolition, Pod's and Takeoff's CTF wait on it
-- [ ] A hit marker and BO2's hit sound every time you hit someone, BO2's own headshot marker and sound, and no marker when someone else hits you
-- [ ] Getting up from a dive at BO2's speed, and diving over low objects the BO2 way
-- [ ] Bodies that fall without spinning, the way BO2's ragdolls throw them
+- [ ] Bots over BO2's ledge, mantle and window links on every map: bots face the link, press the climb, break a window in their way and, when a jump falls short, are sent on to the far side as in BO2 (10-19; Hydro: 35 of 45 climbs finish, 3 given up; Grind: 18 of 21, none given up; Drone, 10-30: bots wait on a script's look point at a jump or ladder link as BO2 does, 183 of 186 climbs finish, 3 given up, was 193 of 221 with 28 given up); the other maps are still to be measured, and Dig's HQ, Drone's Kill Confirmed, Pod's and Takeoff's CTF wait on it
 - [ ] Every other scorestreak proven against BO2. Fixes from a check of every scorestreak against BO2's scripts are in the game since r130 but not yet checked side by side: Care Package capture bar and prompt, K9 Unit, Stealth Chopper, AGR, VTOL Warship, Dragonfire, Escort Drone, Sentry Gun, Guardian, Hellstorm, RC-XD, Counter-UAV, EMP, Orbital VSAT, the UAV in free-for-all, streaks taking damage, and the scorestreak icons on the HUD
 - [ ] Lightning Strike's tablet looking exactly like BO2's: a mark left on each picked spot, the "Press [key] to Target (N remaining)" line, the map inside the tablet's lit screen at BO2's size and position, the world blurred behind it, the tablet itself at BO2's size and place in view, Nuketown's map turned and fitted as BO2 does, and teammates' arrows at BO2's size (the target pick, the enemies it shows and where the strikes land already match BO2)
-- [ ] Scorestreaks one at a time, each checked against BO2 and passed in a playtest before the next: the UAV (r134), the RC-XD (r144) and the Hunter Killer (10-15) passed, the Counter-UAV (r135) and the Care Package (10-15) are in test (Care Package playtest 10-15: better, but the drone's blades still do not spin on the test PC; fixed next time); the Hunter Killer's last rough edges (now and then it flies past its target, or into an object on the way to one) get a second look after the last scorestreak
+- [ ] Scorestreaks one at a time, each checked against BO2 and passed in a playtest before the next: the UAV (r134), the RC-XD (r144) and the Hunter Killer (10-15) passed, the Counter-UAV (r135) and the Care Package (10-15) are in test (Care Package playtest 10-15: better, but the drone's blades did not spin on the test PC; fixed 10-29, waiting on a playtest); the Hunter Killer's last rough edges (now and then it flies past its target, or into an object on the way to one) get a second look after the last scorestreak
 - [ ] Killcam: show a true replay of how you were killed (it sometimes shows a near third-person view of the other player instead, and stutters): fixed and checked side by side with BO2, goes in with the next build
 - [ ] Two scorestreaks at once, and a key of your own for each scorestreak
 - [ ] Public Match map vote checked against real BO2 footage next: how long the first lobby's vote runs (10 seconds for now), whether some maps come up more often than others (all equal for now), and which tile grows when the vote closes
@@ -296,22 +370,85 @@ Multiplayer adds to bo2zm's crates (`fastfile_t6`, `asset_t6`, `gsc_t6`, `hks_t6
 - [ ] Every test match runs cheap by default, Multiplayer and Zombies: no graphics for checks that only read the log, the fast setting for checks that take screenshots
 - [ ] Zombies draws props that share a model together, as Multiplayer now does (Nuketown Zombies draws about 1,800 props a frame)
 - [ ] Playing together over LAN
-- [ ] Multiplayer and Zombies in one app, switched from BO2's main menu (for now they ship as two separate apps)
+- [ ] Multiplayer and Zombies switched from one BO2 main menu (both are in this app now: `frontend t6mp` and `frontend t6:zm_nuked`; the one shared menu is still to come)
+
+Zombies, each ships only once it matches Black Ops II side by side:
+
+- [ ] The Special Weapons tab on every map: the 31-79 JGb215 shrinking zombies away from Shangri-La (it fires and kills, but they stay full size); the Gersh Device, QED and Matryoshka Dolls checked away from their own maps; the G-Strike throwing the zombies it kills; the Galvaknuckles lighting up the zombie they hit; the shrink ray's blue puff; the Gersh Device portal's white-cyan core
+- [ ] Every map: zombies tearing boards off a window without glitching; zombie voices as loud as in Black Ops II; box guns with their magazines in the right place; standing up after a dive at Black Ops II's speed
+- [ ] Buried: the Ray Gun Mark II's damage and blast; the box less bright; patchy lighting; the Ballistic Knife (the stab, its place in the hand, the fired blade hurting zombies); zombies that find their way to you from every spot
+- [ ] TranZit: zombies climbing onto the bus; the bus's route, barricades, driving feel and turning wheels; parts in random spots each game; Maxis's side of the easter egg
+- [ ] Die Rise: sound cut-outs; riding the lift smoothly; a doorway after the lift drop that blocks only the player; the cloud floor under the rooftops; the red light on the Jugger-Nog lift's back wall
+- [ ] Mob of the Dead: knifing zombies through windows; zombie heads drawn white; the Afterlife time bar and its own meter in place of the gun's ammo count; colours
+- [ ] Origins, after a full side-by-side look: planes moving in the sky, colours, the invisible wall at Generator 2, the tank the player walks through, pipes and props out of place
+- [ ] Grief and Turned: the round scoreboard drawn on the sign in the world, like BO2
+- [ ] The loading movies of Die Rise, Mob of the Dead, Buried and Origins (the painted loading picture shows for now)
+- [ ] The nine Black Ops maps, one at a time: box, perks, power and Pack-a-Punch checked where the map has them
+- [ ] Zombies go limp and fall when they die (ragdolls); Die Rise's Trample Steam throws them
+- [ ] Zombies co-op for 2-4 players over the home network (Public Match, Custom Games with Friends, the party following its leader), last, after everything above; tested so far with two copies on one PC
 
 ## Recent changes
 
+- 2026-10-31 (shots, lag compensation): moving map pieces (doors, lifts and other movers) are now rewound to the exact moment the shooter saw, part way between the two stored moments, as Black Ops II's mover records do: they slide in a straight line and turn the short way round, with their walls and hit boxes going along. Unlike players they are not held to 400 ms; a shot older than every stored moment sees them in the oldest. Checked against BO2's own mover code and in tests
+- 2026-10-31 (shots, bullets through walls): a bullet that can go through walls now passes as many as in Black Ops II: it hits up to six surfaces and loses strength for five. Before, each wall used up two of its five passes, so it stopped after three. Each wall costs its own thickness against how much of that surface the gun can go through, as in BO2. Glass is unchanged.
+- 2026-10-31 (shots, lag compensation): a rewound shot now sees each player exactly where the shooter's screen showed him, part way between the two stored moments, as Black Ops II does: he slides in a straight line and turns the short way round, with his hit boxes and riot shield going along. Before, the shot used the earlier of the two moments. Moving map pieces still use the earlier moment.
+- 2026-10-31 (killcam and spectating): the end-of-round and final killcams now set the match flags Black Ops II uses for them, so the HUD can tell the round-end killcam apart from the final one. An unknown flag name now stops the script with BO2's own error. Script calls that allow or block spectating a team now work: a dead player or spectator follows only the teams they're allowed to see, the same way BO2 handles it. Checked in tests
+- 2026-10-31 (shots, lag compensation): shots are judged against where players stood as far back as Black Ops II allows, 400 ms (200 ms before). As in BO2, a shot fired 50 ms or less after what the shooter saw is judged against the players where they stand now. Knife lunges use the same 400 ms. Checked against BO2's own rewind code and in tests
+- 2026-10-31 (bots, Nuketown jump links): bots no longer give up on the low jump-up spots in Nuketown's yards. Black Ops II's bots keep their route at a jump spot and press jump once a second until the crouch its bot script sets has worn off; ours used to back away and drop the route after 2.4 s. In a hidden 12-bot Nuketown match, 98 of 99 jumps, climbs and ladders were finished (85 of 114 before)
+- 2026-10-31 (game type from the lobby): the game type picked in the lobby now sets the match rules too, not only the scripts. Before, a lobby match ran free-for-all rules unless a test setting named the game type.
+- 2026-10-30 (ragdolls): bodies now fall and settle the way Black Ops II's ragdolls do, using BO2's own slowing numbers and its rules for when a body is at rest (still for half a second while touching the ground, or one second regardless) and when a ragdoll is done (most of its parts at rest, falling very fast, or 9 seconds old). In a hidden Nuketown match, bodies turned a median 25 degrees as they fell (40 before) and every one came to rest, a median 1.3 s after death. With Oldschool's blast throwing every body, the farthest slide was 272 units and it stopped 4 seconds after touching down
+- 2026-10-30 (map table): the map completion table is redrawn from docs/maps.json for the multiplayer maps; Frost's mechanics and the newer side-by-side checks (Meltdown, Raid, Yemen, Mirage, Hydro, Grind, Encore) now show.
+- 2026-10-30 (bots, Nuketown upper floor): checked against Black Ops II's own bot route code: BO2's bots never plan a route over a ledge link with no jump, ladder or drop mark, and ours now do the same (since the climb fix). In a hidden 12-bot Nuketown match, none of the map's 8 unmarked links was used; bots took the stairs, and all 114 links they did take were jump or ladder links
+- 2026-10-30 (bots, spawns): checked that bots that spawn pressed into an invisible wall walk off it, as Black Ops II's bots do. Three of Pod's spawn points sit 8 units inside BO2's own player-clip walls; the bots' walk checks already shrink their box there the way BO2's do (since 10-20), so they do not judge the way ahead blocked. In a hidden Pod match bots spawned at two of them and walked off in half a second or less
+- 2026-10-30 (bots, Frostbite ledges): the two Frostbite ledges where bots seemed to walk into a wall checked against Black Ops II's own map data: both are jump links there, and our bots take them as jumps (9 of 9 and 2 of 2 finished in hidden matches); a test now holds this
+- 2026-10-30 (bots, climbing): bots now plan routes the way Black Ops II's do: they never take a climb that BO2's map data marks with no jump, mantle or drop hint. On Dig the bots that gave up on a climb went from 57 to 12 in a hidden Headquarters match, and from 26 to 0 at those links on Frostbite, where bots standing still fell from about 20 to 14 seconds per 100 bot-seconds
+- 2026-10-30 (map logic, party modes): Pod's Gun Game, One in the Chamber, Sharpshooter, Sticks and Stones and One Flag, Takeoff's Sharpshooter, Sticks and Stones and One Flag, and Dig's One in the Chamber are graded from the hidden test matches already run on 10-20: every one ends by itself, the end-of-match board opens, with no script error. One in the Chamber never reached its score limit of 50 with bots (11 and 7 kills): Pod's ended on the 3-minute limit, Dig's by itself at 138 s. One Flag's file shows the flag taken and the match won, but no capture is logged on its own, so the capture stays unconfirmed.
+- 2026-10-30 (bots, cars and vans): shots, grenades and the bots' route checks now meet the cars and vans that carry their own collision, as in Black Ops II (BO2 traces such a model through a stand-in brush model made from its collision). On Frostbite no bot stalls at the van by the west building any more (17 times before, 0 in two hidden matches)
+- 2026-10-30 (hit markers): checked against Black Ops II's own hit-marker script in a hidden 5-player Nuketown match: every hit that did damage showed the marker and played BO2's hit sound to the shooter, and only to the shooter; no one got a marker for being hit. BO2 multiplayer has no separate headshot marker, so a head hit shows the same marker and adds BO2's head-crack sound, which the test now records even with the sound off
+- 2026-10-30 (maps, Drone's windows): Drone's broken windows now show their pieces as clearly as in BO2: cracked, frosty pieces that catch the light as they fall, drawn with the glass pieces' own shine. Before, all 124 pieces of a shot-out window drew so faintly they could not be seen. Checked in hidden test shots of the same window on the build before the glass fix and on today's build.
+- 2026-10-30 (movement, dive): the dolphin dive checked against Black Ops II's own dive numbers in tests: it rises to a jump's height and hangs there until 400 ms after take-off, slides for 300 ms on touch-down, and getting up takes 400 ms to a crouch and 600 ms to stand; it carries you over a box 24 or 36 units tall and stops at a 48-unit one
+- 2026-10-30 (models and windows): a hidden grenade-blast check for the test runner; the blast fades cleanly on Nuketown and Frostbite, with no glowing ball left behind
+- 2026-10-30 (Hellstorm on the minimap): a Hellstorm now shows on the minimap as in BO2: one large mark for the missile and a smaller one for each bomblet, green to the player's own team and red to everyone else. Before, the marks were white. Checked in hidden Nuketown test shots: the marks draw in BO2's own-team green.
+- 2026-10-30 (maps, Studio): the brontosaurus now eases between chewing and looking around over half a second, as in Black Ops II, and looks around every 15 to 20 seconds; a hidden test game logged 8 switches, each one a smooth half-second blend
+- 2026-10-30 (maps, Express): the passing train now shakes the view and rumbles the controller for anyone within 512 units of a car, with Black Ops II's own numbers (a 0.2 earthquake for a quarter second, renewed every 0.05 s while the train moves); a hidden test game logged it on both of the train's runs and never between them
+- 2026-10-30 (bots, Drone): bots now climb Drone's crates and catwalk rails. Heading for a jump or ladder link, a bot puts off what a script told it to look at and faces the link, as BO2 does, so it finds the ledge; before, it stood at the crate facing ~30 degrees off until it gave up. In a hidden Demolition match with 12 bots, 3 climbs of 186 were given up, down from 28 of 221, and the match played through.
+- 2026-10-30 (bots, Frostbite): a bot that died while a script was steering it out of a tight spot no longer stands frozen for up to 15 seconds after it respawns. As in BO2, a bot's whole state is wiped when it dies. In a hidden Frostbite match the bot moved again 0.2 s after respawning.
+- 2026-10-30 (graphics, Cove's sea): the sea around Cove no longer shows a hard seam where bright, glaring water met a darker patch near the island. Each stretch of sea was reflecting a different nearby probe; it now reflects the map's own sea sky, as BO2's shoreline water does, so the whole sea reads as one surface. Checked in hidden test shots from Cove's south and west views.
+- 2026-10-30 (graphics, Plaza's starfield): the round starfield over Plaza's club now draws with BO2's own three-layer shader instead of one still picture: two star layers drift slowly in opposite directions and shift with your view (parallax) over a still blue nebula ring, using the map's own scales, drift speeds, depths and brightness. Checked against BO2's shader code and material data and in hidden test shots, not yet compared to real BO2 side by side (the stars look sparser than the old still picture)
+- 2026-10-30 (graphics, Cargo's skyline): the two small specks in the sky over Cargo's city were the lit tops of far skyscrapers whose see-through bodies the sky was painting over. The sky now goes down before see-through surfaces, as in BO2, so those towers stand hazy in the distance under their tops. Checked in hidden test shots from Cargo's south view.
+- 2026-10-30 (scripts, grenades): a grenade a map or mode script throws for itself (BO2's magicgrenadetype) is now one grenade, as in BO2, instead of that one plus a nameless copy beside it. Checked in a hidden Vertigo test match: the C4 goes off when a door closes on it and nothing is left behind.
+- 2026-10-30 (map logic, Vertigo's doors): checked in a hidden test match. Vertigo's sliding glass doors now sweep the space they move through, as BO2's map script measures it: a closing door crushes a sentry gun and destroys a tactical insertion left in the doorway, and a moving door sets off C4 in its way. Before, a door checked a thin box beside the doorway and only clipped a sentry by luck.
+- 2026-10-30 (Oldschool mode): in Oldschool mode every death throws the body away from the hit, as BO2's Oldschool explosion push does; before, those bodies just dropped. Checked in hidden Nuketown matches: before, 10 deaths with no push; after, every death pushed the body, with 0 errors.
+- 2026-10-30 (climbing): climbing onto a ledge follows its animation the whole way again; a fix-up for spots inside walls had been nudging the body mid-climb, so on Nuketown bots finished the climb onto the house steps a few units short and slid back off. Checked in hidden Nuketown matches: the climb now ends on the step and the bot walks on up the stairs.
+- 2026-10-30 (bots on Nuketown): bots jump through the upstairs window instead of stopping on the sill and turning back; they no longer swerve around a teammate on the way to a jump, and they walk at full speed until they are close to it, as in BO2. Checked in hidden Nuketown matches: before, 19 and 37 stuck reports with 8 window jumps given up; after, 9 and 20 with none given up, and 0 errors.
+- 2026-10-30 (bots on Raid): bots no longer loop at the planter by the stairs or at the two pillars near the back wall; a bot stuck twice short of the same route point now picks a new route. Checked in hidden Raid matches: 3 runs with the change had no bot stuck longer than 1 second, against stretches of up to 7 seconds before.
+- 2026-10-30 (Zombies, hit markers, model lighting): switching from the main menu to Zombies now loads in about 15 seconds without showing Nuketown's art first, and the Public Match globe on the Zombies map picker works; switching back to Multiplayer works too. The title music stops when a match starts. Hit markers show when a shot lands. Props and vehicles placed by map scripts are lit from their own position, not from the map's centre. Checked: every test passes, and a hidden 12-bot Frostbite match ran with 0 errors.
+- 2026-10-30 (map views): Takeoff's shuttle is lit and textured in the end-of-match launch, and Carrier's parked helicopter draws its light grey camo instead of solid black. Drone's floor draws right; the pale blue only showed from a camera inside the sealed hole under the floor, which players cannot reach. Cargo's sky matches BO2. Checked in hidden runs on Takeoff, Cargo, Carrier and Drone.
+- 2026-10-30 (ragdolls): bodies no longer shoot off or slide away when a limb lands bent into the floor; they settle and lie still. Checked: a new test drops 48 bodies on Nuketown in every pose and all come to rest, every test passes, and a hidden 12-bot Frostbite match ran with 0 errors.
+- 2026-10-30 (explosion deaths): a barrel, car or stuck Semtex now throws the body at BO2's speed; a plain gunshot death still drops the body without a push, as in BO2. Checked: every test passes, and a hidden 12-bot Frostbite match ran with 0 errors.
+- 2026-10-30 (Drone glass): broken glass on Drone leaves shards on the floor as in BO2, and the shards catch the light like BO2 glass. Checked: every test passes, and a hidden 12-bot Frostbite match ran with 0 errors.
+- 2026-10-30 (scorestreaks, bots): all 22 scorestreaks call in, and a streak given from the console counts as one earned in play. Bots that get stuck use BO2's own script rescue first, with a fallback step to the side. Checked: every test passes, hidden runs called in every streak, and a hidden 12-bot Frostbite match ran with 0 errors.
+- 2026-10-29 (sound, glass, walls): the sound thread now runs as a high-priority audio thread, so the mix stays on time while the PC is busy (a test with every CPU core loaded: 0 late, 0 overrun); the title music stops when a match starts; windows crack on the first hit, bleed while cracked and shatter from grenades, melee and jumping through; rooms behind a doorway right in front of the player no longer vanish to the sky; the Hijacked kitchen cabinets draw their texture instead of a checkerboard. Loading and frame rate were measured against the previous build: no slowdown (about 10 ms of work per frame in both).
+- 2026-10-29 (Care Package blades): the Care Package drone's blades now spin in a real match. The drone is drawn by a different part of the game than the map's own models, and that part only turned car wheels, so the blades stood still on the test PC (an older hidden test went through the other part, which is why it looked fixed). Checked: a hidden 3-minute bot match logged the drone's rotors turning in that part, 0 errors.
+- 2026-10-29 (Zombies menu, preset classes): the ZOMBIES button now opens the Zombies main menu (Online, Options, Multiplayer, Quit) and stays there instead of joining a Nuketown match (screenshots at 30 s and 60 s); it now shows BO2's real Black Ops II Zombies title art behind the menu. Preset classes (Sniper, SMG and the rest) now spawn with their guns instead of only a knife. Bots now get through Nuketown's upstairs window (12 of 13 window paths finish, before almost none did).
+- 2026-10-29 (sound + shaders): in big fights up to 181 sounds played at once, each with its own room echo, which overloaded the sound thread (static, the sound speeding up and slowing down; back to the menu cleared it). Now at most 24 sounds use the room echo at once (checked: a hidden 4-minute 12-bot match stayed at 24 or below, 226 audio tests). The tree and bush shader no longer declares a value twice; a new test builds all 880 world shader versions with 0 failures (it also caught 30 more broken versions, now fixed).
+- 2026-10-29 (hosting + clean-up): hosting a LAN match now runs the lobby service inside the game and opens a real UDP port (default 4433; checked: the host listens and a handshake succeeds, net tests 56 of 56, lobby service tests 23). The docs use placeholders instead of machine paths, and the changelog uses the current crate names.
+- 2026-10-29 (split): this repository stays the free 1:1 Black Ops II fan remake; the sellable engine and its roadmap (untangle Black Ops II, our own renderer, voxel models, a non-BO2 game, optimization, the browser) moved to a repository of their own. Shared history ends at tag `split-2026-10-29`.
+- 2026-10-29 (match end): a match now leaves the level after the end scoreboard, as in Black Ops II (the final killcam, the board, then the scripts' `exitLevel` five seconds later). A headless run (`BO2MP_HEADLESS=1`), or any run with `BO2MP_ONE_MATCH=1`, ends the process there with exit code 0; `BO2MP_ONE_MATCH=0` keeps a headless run going on to the next match
+- 2026-10-27 (own code): the code that still matched the old fork base line for line is rewritten in our own form, down to 7,756 lines of about 686,000 (under the 8,000 goal), Zombies included; NOTICE now lists only the third-party material we ship. Checked: build, 8,148 tests, four hidden mode games and a bots game.
+- 2026-10-24 (Zombies joins this engine): Black Ops II Zombies (all six Black Ops II maps, Town and the nine Black Ops maps, the cheat menu and the specialty weapons) is merged into this code, on top of the rewritten engine, started with `frontend t6:zm_nuked`; the Zombies README section is new. Not yet checked in play on this build.
 - 2026-10-24 (own code): the first-person viewmodel code (spawning the held weapon's arms and gun, the per-frame pose tick, placement, view kick, held-weapon sync and match reset) is rewritten from behaviour and split into small modules, each pinned by tests first. Checked: workspace build, 308 animation-crate tests and 240 simulation tests.
 - 2026-10-23 (own engine): render_frontend's scene preparation has about 200 unit tests, covering view and camera maths, culling, the model and lighting caches, worker command order and world placement. Checked: 212 tests in render_frontend, 219 in sim.
 - 2026-10-23 (own code): the animation crate's scene-occupancy code (other players' bodies, missiles, dropped items, dynamic entities and their physics, the killcam and the third-person and vehicle cameras) is rewritten from behaviour and split into small modules.
 - 2026-10-23 (engine clean-out): the render_frame crate (the per-frame render output: packed source lists, destination-ring records, product status, GPU layout contract) is rewritten from its behaviour, with 67 tests pinning it first; the old engine's lines in it went from 1,834 to 0.
 - 2026-10-21 (public-ready pass): the game screenshots are off this page (they are Black Ops II's own art); the effect random table, which was Modern Warfare 2's, is now our own generated table; code comments no longer point at reference files or personal folders; NOTICE names the patched wgpu-hal and the generated zone layouts; and `make publish-check` now also flags decompile paths and file:line pins. Checked: 900 tests in the touched crates.
-- 2026-10-21 (own engine): every last piece of IW4L's MW2 engine is out: all 20 MW2 crates deleted (about 82,000 lines), and no IW4/IW5 or IW4L name is left in the code, build files, scripts or file names. The settings folder is now `bo2mp-artifacts\` (the old `iw4l-artifacts\` was copied over and kept). Checked: build, 1,033 tests, four hidden mode games and a game with only bo2mp names.
-- 2026-10-21 (engine clean-out): entity_iw4 is gone: audio, bots, hud, net and sim run on the BO2 entity crate (entity_t6).
-- 2026-10-21 (engine clean-out): fastfile_iw5 (Modern Warfare 3's zone loader, unused) removed
-- 2026-10-21 (engine clean-out): render_anim and render_frontend no longer use the MW2 entity crate (entity_iw4); they read Black Ops II's entity states and events
+- 2026-10-21 (own engine): every last piece of the old MW2 engine is out: all 20 MW2 crates deleted (about 82,000 lines), and no old MW2/MW3 engine name is left in the code, build files, scripts or file names. The settings folder is now `bo2mp-artifacts\` (the old settings folder was copied over and kept). Checked: build, 1,033 tests, four hidden mode games and a game with only bo2mp names.
+- 2026-10-21 (engine clean-out): The old MW2 entity crate is gone: audio, bots, hud, net and sim run on the BO2 entity crate (entity_t6).
+- 2026-10-21 (engine clean-out): the old Modern Warfare 3 zone-loader crate (unused) removed
+- 2026-10-21 (engine clean-out): render_anim and render_frontend no longer use the old MW2 entity crate; they read Black Ops II's entity states and events
 - 2026-10-21 (engine clean-out): the HUD's 2D drawing (pictures and text, with the typing and fading text effect) now goes through Black Ops II's own draw commands, colours and text styles instead of MW2's; MW2's text outline, which Black Ops II does not have, is gone
-- 2026-10-21 (engine clean-out): 10-21: entity step A: console, render_anim and render_frontend read BO2's entity types and name helpers from entity_t6 (console no longer uses entity_iw4).
-- 2026-10-21 (engine clean-out): 10-21: anim_iw4 deleted; the sim reads anim_t6's packed legs/torso value (MW2's stance torso reset removed).
+- 2026-10-21 (engine clean-out): 10-21: entity step A: console, render_anim and render_frontend read BO2's entity types and name helpers from entity_t6 (console no longer uses the old MW2 entity crate).
+- 2026-10-21 (engine clean-out): 10-21: the old MW2 anim crate deleted; the sim reads anim_t6's packed legs/torso value (MW2's stance torso reset removed).
 - 2026-10-20 (engine clean-out): the render crates hold BO2's own vertex rows; one conversion to MW2 rows at the GPU upload, until T2 moves the shaders to BO2 rows
 - 2026-10-20 (engine clean-out): a window takes a mark only on surfaces whose material allows it, as BO2's; a shattered pane takes no more marks
 - 2026-10-20 (engine clean-out): marks: a bullet mark also lands on the BO2 windows its box touches (up to 8 unbroken panes), each its own mark that the pane's shatter frees
@@ -559,7 +696,7 @@ Multiplayer adds to bo2zm's crates (`fastfile_t6`, `asset_t6`, `gsc_t6`, `hks_t6
 - 2026-10-06 BO2's lobby countdown on one line, the loading screen's "Awaiting challenge", the mode name in the pause menu
 - 2026-10-06 BO2's HUD corners (score panel, streak bar, weapon strip, mirrored gun panels), the killcam, ACOG and Dual Band sights
 - 2026-10-06 Create-a-Class polish: locked camos stay locked in custom games (Gold and Diamond hidden as in BO2), mouse icons on the class tiles, the world behind in-match menus is blurred, grey and dim
-- 2026-10-06 Create-a-Class as in BO2: weapon, attachment, perk, equipment and wildcard pickers with their pictures, Personalize Weapon and Knife, rank-gated unlocks; Barracks opens; lobby footer and STORE; BO2's game-mode order and defaults (Aftermath, 10 minutes, 75 kills); two quick key presses no longer count as one
+- 2026-10-06 BO2's Create-a-Class: pickers with pictures for weapons and their attachments, perks, equipment and wildcards; Personalize for guns and the knife; unlocks gated by rank; the Barracks open; the lobby footer with STORE; modes listed in BO2's order with its defaults (Aftermath, 75 kills in 10 minutes); a fast double key press counts twice
 - 2026-10-06 BO2's sniper scope (overlay, hold breath on Shift) and sights on every gun; Create-a-Class class sets; BO2's lobby backdrop and loading screen; match rules and bots (Regular) start at BO2's defaults
 - 2026-10-05 The keyboard and mouse work BO2's main menu and lobbies (before, every key was ignored there); bots default to Regular
 - 2026-10-05 The knife kills in one hit, as in BO2; ranks, XP and rank-ups; Combat Training and the After Action Report; K9 Unit and AGR fixes; impact, jump, dive and body-fall sounds
@@ -570,13 +707,24 @@ Multiplayer adds to bo2zm's crates (`fastfile_t6`, `asset_t6`, `gsc_t6`, `hks_t6
 - 2026-10-04 Every mode BO2 lets bots into plays against bots; BO2's class menu, HUD and pause menu in the match
 - 2026-10-04 Team Deathmatch against BO2's own bots on Nuketown 2025
 - 2026-10-04 All 31 multiplayer maps load with their own factions; BO2's colour grading from each map's vision file
-- 2026-10-04 BO2's multiplayer front end: lobbies, Create-a-Class, Setup Bots, Start Match
+- 2026-10-04 The multiplayer menus from BO2: lobbies, Create-a-Class, Setup Bots and Start Match
 - 2026-10-04 A multiplayer map loads from BO2's multiplayer zones; a compiler for BO2 script source
+
+Zombies history (before it joined this engine):
+
+- 2026-10-15 Zombies public release v2026.10.15; Minecraft Zombies' guest weapons, BO2's gun rules for climbs, grenades and riot shields, and many more specialty weapons on any map from the Special Weapons tab
+- 2026-10-14 Specialty weapons: the Hell's Retriever and Redeemer charge like BO2; the cheat menu's Special Weapons tab; the Jet Gun, Head Chopper, Subwoofer, Gersh Device and others; maps load faster (each shader compiled once)
+- 2026-10-11 to 2026-10-12 The solo cheat menu on Num 1; feeding Cerberus and the Afterlife shock on Mob of the Dead; barricade prompts; a dead zombie's eyes go dark; every map played through in one sitting, the nine Black Ops maps included
+- 2026-10-10 BO2's movement rules line by line (dolphin dive, PC keys, falls, slides); perk machine lights; Die Rise, TranZit, Buried and Mob of the Dead mechanics (bus, easter eggs, Brutus, Time Bomb, Paralyzer); co-op through Custom Games, Friends and Public Match
+- 2026-10-09 Maps checked against BO2 one by one (Nuketown 100%, TranZit, Die Rise, Mob of the Dead, Buried, Origins); Turned on the Diner; the install steps checked from a fresh clone
+- 2026-10-08 Every Zombies map and the nine Black Ops maps on BO2's globe; Survival on Town; BO2's movement in Zombies
+- 2026-10-05 BO2's own front end (main menu, lobby, globe, loading screen, music); controller aim assist
+- 2026-10-03 to 2026-10-04 BO2's HUD, pause menu and Options from its UI scripts (HavokScript VM and LUI widgets)
+- 2026-10-02 Nuketown Zombies plays by the game's own scripts: zombies, rounds, buys, box, perks, Pack-a-Punch, game over
+- 2026-09-30 First commit; BO2 zones, image packs and a byte-exact zone walk; Nuketown loads, walkable and lit from BO2 files alone
 
 ## Credits and license
 
-- [IW4L](https://github.com/vladtrc/iw4L) by vladtrc and its contributors: the engine this fork is built on,
-  Apache License 2.0.
 - For Black Ops II, OpenAssetTools and [gsc-tool](https://github.com/xensik/gsc-tool) (both GPL-3.0) were read for
   format facts only; none of their code is copied.
 - The Portal Gun's blocky model and texture are copied from the Portal Gun mod by MeowMC
@@ -584,5 +732,5 @@ Multiplayer adds to bo2zm's crates (`fastfile_t6`, `asset_t6`, `gsc_t6`, `hks_t6
 - Call of Duty, Black Ops and their assets, trademarks and intellectual property belong to their owners
   (Activision). No game files are included.
 
-Licensed under the [Apache License 2.0](LICENSE), like upstream; [`NOTICE`](NOTICE) holds the copyright notices.
+Licensed under the [Apache License 2.0](LICENSE); [`NOTICE`](NOTICE) lists the third-party material.
 The license covers this source code only.

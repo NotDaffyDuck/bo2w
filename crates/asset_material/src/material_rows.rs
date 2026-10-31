@@ -6,15 +6,15 @@ use std::sync::Arc;
 use bevy::prelude::Image;
 
 use crate::{
-    AssetNamespace, AssetRef, MaterialDrawRoute, TECHNIQUE_SLOT_COUNT, TechniqueTable, ZoneOwner,
+    AssetCategoryScope, AssetPointer, SortRoute, RENDER_RECIPE_SLOT_TOTAL, TechniqueSlotTable, ZoneCustodian,
 };
 
-pub const TS_2D: u8 = 0;
-pub const TS_FUNCTION: u8 = 1;
-pub const TS_COLOR_MAP: u8 = 2;
-pub const TS_NORMAL_MAP: u8 = 5;
-pub const TS_SPECULAR_MAP: u8 = 8;
-pub const TS_WATER_MAP: u8 = 0x0B;
+pub const TS_2D: u8 = 0x00;
+pub const SEMANTIC_FUNCTION: u8 = 0x01;
+pub const SEMANTIC_COLOR: u8 = 0x02;
+pub const SEMANTIC_NORMAL: u8 = 0x05;
+pub const SEMANTIC_SPECULAR: u8 = 0x08;
+pub const SEMANTIC_LIQUID: u8 = 11;
 
 /// Which prepared variant of an image a decode produced.
 ///
@@ -34,17 +34,17 @@ pub struct ImageVariantId {
 }
 
 #[derive(Clone, Debug)]
-pub struct AuthoredImage {
-    pub namespace: AssetNamespace,
-    pub name: AssetRef,
-    pub map_type: u8,
+pub struct HandBuiltTexture {
+    pub namespace: AssetCategoryScope,
+    pub name: AssetPointer,
+    pub texture_kind: u8,
     pub semantic: u8,
     pub category: u8,
-    pub use_srgb_reads: bool,
+    pub srgb_sampled: bool,
     pub width: u16,
     pub height: u16,
     pub depth: u16,
-    pub level_count: u8,
+    pub tier_total: u8,
     pub format: u32,
     pub payload: Arc<Vec<u8>>,
     pub decoded: Option<Arc<Image>>,
@@ -56,43 +56,43 @@ pub struct AuthoredImage {
 
 /// One texture a material samples, by the name hash its shader asks for.
 #[derive(Clone, Debug)]
-pub struct MaterialTextureBinding {
-    pub name_hash: u32,
-    pub name_start: u8,
-    pub name_end: u8,
-    pub sampler_state: u8,
+pub struct SurfaceImageAttachment {
+    pub label_digest: u32,
+    pub label_head_offset: u8,
+    pub label_tail_offset: u8,
+    pub texture_sampling_mode: u8,
     pub semantic: u8,
     /// Row in the image list; `None` while the image is not in the population.
     pub image: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
-pub struct MaterialConstant {
-    pub name_hash: u32,
+pub struct ShaderParameterValue {
+    pub label_digest: u32,
     pub name: [u8; 12],
     pub literal: [f32; 4],
 }
 
 #[derive(Clone, Debug)]
-pub struct AuthoredMaterial {
-    pub name: AssetRef,
-    pub namespace: AssetNamespace,
+pub struct DesignerMaterial {
+    pub name: AssetPointer,
+    pub namespace: AssetCategoryScope,
     /// The technique set the material names; Black Ops II rows leave it empty.
-    pub technique_set: AssetRef,
-    pub sort_key: u8,
-    pub info_game_flags: u8,
-    pub state_flags: u8,
-    pub camera_region: u8,
-    pub surface_type_bits: Option<u32>,
+    pub method_set: AssetPointer,
+    pub draw_order: u8,
+    pub game_flag_info: u8,
+    pub condition_bits: u8,
+    pub camera_zone: u8,
+    pub facet_type_bits: Option<u32>,
     /// The state-bit pairs the passes index.
-    pub state_bits: Vec<[u32; 2]>,
+    pub raster_bits: Vec<[u32; 2]>,
     /// Which pair each technique slot uses.
-    pub state_bits_entry: Option<[u8; TECHNIQUE_SLOT_COUNT]>,
-    pub technique_table: Option<TechniqueTable>,
-    pub route: Option<MaterialDrawRoute>,
-    pub textures: Vec<MaterialTextureBinding>,
-    pub constants: Vec<MaterialConstant>,
-    pub zone: ZoneOwner,
+    pub raster_slot: Option<[u8; RENDER_RECIPE_SLOT_TOTAL]>,
+    pub method_table: Option<TechniqueSlotTable>,
+    pub route: Option<SortRoute>,
+    pub textures: Vec<SurfaceImageAttachment>,
+    pub constants: Vec<ShaderParameterValue>,
+    pub zone: ZoneCustodian,
     /// The draw the renderer follows; `None` on a placeholder row.
     pub t6_draw: Option<asset_core::T6Draw>,
 }

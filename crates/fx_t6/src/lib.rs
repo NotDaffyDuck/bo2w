@@ -7,14 +7,14 @@
 
 mod beam;
 mod bolt;
-mod collide;
+mod world_hits;
 mod def;
-mod draw;
-mod elem_type;
+mod draw_class;
+mod look_kind;
 mod flags;
 mod laser;
 mod pool;
-mod post_light;
+mod late_lighting;
 mod random;
 mod random_table;
 pub mod runtime;
@@ -23,14 +23,14 @@ mod update;
 
 pub use beam::*;
 pub use bolt::*;
-pub use collide::*;
+pub use world_hits::*;
 pub use def::*;
-pub use draw::*;
-pub use elem_type::*;
+pub use draw_class::*;
+pub use look_kind::*;
 pub use flags::*;
 pub use laser::*;
 pub use pool::*;
-pub use post_light::*;
+pub use late_lighting::*;
 pub use random::*;
 pub use sort::*;
 pub use update::*;

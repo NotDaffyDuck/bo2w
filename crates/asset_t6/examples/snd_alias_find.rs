@@ -2,13 +2,13 @@
 //! and the duck they start, for the zones given; then a count of ducks per alias prefix.
 //! cargo run -p asset_t6 --example snd_alias_find -- PATTERN ZONE...
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let pattern = args.next().expect("pattern").to_ascii_lowercase();
-    let mut groups: Vec<(String, u32)> = Vec::new();
+    let mut argv = std::env::args().skip(1);
+    let pattern = argv.next().expect("pattern").to_ascii_lowercase();
+    let mut alias_groups: Vec<(String, u32)> = Vec::new();
     let mut printed = 0usize;
     let mut matched = 0usize;
     let mut by_duck: std::collections::BTreeMap<String, usize> = Default::default();
-    let caps: Vec<_> = args
+    let caps: Vec<_> = argv
         .map(|zone| asset_t6::capture_zone(std::path::Path::new(&zone)).expect("zone"))
         .collect();
     // A bank's alias may name a duck another bank (another zone) defines.
@@ -25,8 +25,8 @@ fn main() {
     let mut used: std::collections::BTreeSet<u32> = Default::default();
     for cap in &caps {
         if let Some(g) = &cap.snd_globals {
-            if groups.is_empty() {
-                groups = g.duck_groups.clone();
+            if alias_groups.is_empty() {
+                alias_groups = g.duck_groups.clone();
             }
         }
         for bank in &cap.sound_banks {
@@ -61,7 +61,7 @@ fn main() {
     for (duck, n) in by_duck {
         println!("duck {duck}: {n}");
     }
-    let names: Vec<String> = groups.iter().map(|(n, _)| n.clone()).collect();
+    let names: Vec<String> = alias_groups.iter().map(|(n, _)| n.clone()).collect();
     println!("duck groups: {}", names.join(" "));
     for id in used {
         let Some(d) = duck_refs.get(&id) else { continue };
@@ -76,8 +76,8 @@ fn main() {
         println!(
             "duck {}: fade_in {} fade_out {} delay {} length {} distance {}; volume/filter: {}",
             d.name,
-            d.fade_in,
-            d.fade_out,
+            d.ease_on,
+            d.ease_off,
             d.start_delay,
             d.length,
             d.distance,

@@ -20,8 +20,9 @@ SINCE ?=
 
 # Words after the first goal are its arguments (`make map mp_raid`), so each
 # one becomes a goal that does nothing.
-VERB := $(firstword $(MAKECMDGOALS))
-REST := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+ASKED := $(MAKECMDGOALS)
+VERB := $(firstword $(ASKED))
+REST := $(wordlist 2,$(words $(ASKED)),$(ASKED))
 ifneq ($(REST),)
 .PHONY: $(REST)
 $(REST): ; @true

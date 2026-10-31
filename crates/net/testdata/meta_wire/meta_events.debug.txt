@@ -1,19 +1,27 @@
-SnapshotMetaSectionBytes {
-    match_header: 21,
-    events: 1455,
-    aliases: 41,
-    entity_dobjs: 2,
-    corpses: 9,
-    entities: 2,
-    script_movers: 2,
-    entity_kernel: 16,
-    item_tables: 4,
-    area_entities: 1,
-    objectives: 31,
-    world_objects: 11,
+MetaSectionSizes {
+    header_len: 21,
+    event_len: 1459,
+    alias_len: 41,
+    dobj_len: 2,
+    corpse_len: 9,
+    entity_len: 2,
+    mover_len: 2,
+    kernel_len: 16,
+    item_len: 4,
+    area_len: 1,
+    objective_len: 31,
+    world_len: 11,
 }
-SnapshotMeta {
-    objectives: ObjectiveMatch {
+TickLedgerNotes {
+    phase: Warmup,
+    kind: FreeForAll,
+    prematch: Waiting {
+        spent_ms: 0,
+    },
+    match_clock_ms: 0,
+    score_limit: 0,
+    time_limit_ms: 0,
+    objectives: MatchBoard {
         scores: [
             0,
             0,
@@ -33,85 +41,77 @@ SnapshotMeta {
         missile_vision: None,
         pain_vision: None,
     },
-    phase: Warmup,
-    match_elapsed_ms: 0,
-    prematch: Waiting {
-        elapsed_ms: 0,
-    },
-    score_limit: 0,
-    time_limit_ms: 0,
-    kind: FreeForAll,
     clients: [],
     journal: [
-        EventRecord {
-            sequence: EventSequence(
+        OccurrenceEntry {
+            sequence: EventStamp(
                 1,
             ),
-            tick: Tick(
+            tick: StepNo(
                 101,
             ),
             audience: All,
-            event: AttackReleased,
+            event: TriggerLet,
         },
-        EventRecord {
-            sequence: EventSequence(
+        OccurrenceEntry {
+            sequence: EventStamp(
                 2,
             ),
-            tick: Tick(
+            tick: StepNo(
                 102,
             ),
             audience: AllExcept(
-                ClientId(
+                SeatNo(
                     3,
                 ),
             ),
-            event: ScoreChanged {
-                client: ClientId(
+            event: TallyMoved {
+                client: SeatNo(
                     1,
                 ),
                 score: 100,
                 kills: 2,
-                deaths: 0,
+                times_died: 0,
             },
         },
-        EventRecord {
-            sequence: EventSequence(
+        OccurrenceEntry {
+            sequence: EventStamp(
                 3,
             ),
-            tick: Tick(
+            tick: StepNo(
                 103,
             ),
             audience: Client(
-                ClientId(
+                SeatNo(
                     2,
                 ),
             ),
             event: Spawned {
-                class_id: ClassId(
+                class_id: LoadoutClass(
                     1,
                 ),
-                spawn_index: 4,
-                life_sequence: LifeSequence(
+                spawn_slot: 4,
+                life_sequence: LifeCount(
                     2,
                 ),
             },
         },
-        EventRecord {
-            sequence: EventSequence(
+        OccurrenceEntry {
+            sequence: EventStamp(
                 4,
             ),
-            tick: Tick(
+            tick: StepNo(
                 104,
             ),
             audience: Clients(
                 [
-                    ClientId(
+                    SeatNo(
                         0,
                     ),
-                    ClientId(
+                    SeatNo(
                         5,
                     ),
-                    ClientId(
+                    SeatNo(
                         9,
                     ),
                 ],
@@ -122,18 +122,18 @@ SnapshotMeta {
         },
     ],
     entity_events: [
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 10,
             ),
-            tick: Tick(
+            tick: StepNo(
                 200,
             ),
             audience: All,
-            event: EntityEventKind(
+            event: EventCode(
                 222,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 40,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -159,25 +159,25 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 11,
             ),
-            tick: Tick(
+            tick: StepNo(
                 201,
             ),
             audience: Client(
-                ClientId(
+                SeatNo(
                     1,
                 ),
             ),
-            event: EntityEventKind(
+            event: EventCode(
                 111,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 41,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -203,21 +203,21 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 12,
             ),
-            tick: Tick(
+            tick: StepNo(
                 202,
             ),
             audience: All,
-            event: EntityEventKind(
+            event: EventCode(
                 105,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 42,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -243,25 +243,25 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 13,
             ),
-            tick: Tick(
+            tick: StepNo(
                 203,
             ),
             audience: Client(
-                ClientId(
+                SeatNo(
                     3,
                 ),
             ),
-            event: EntityEventKind(
+            event: EventCode(
                 113,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 43,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -287,21 +287,21 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 14,
             ),
-            tick: Tick(
+            tick: StepNo(
                 204,
             ),
             audience: All,
-            event: EntityEventKind(
+            event: EventCode(
                 117,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 44,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -327,25 +327,25 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 15,
             ),
-            tick: Tick(
+            tick: StepNo(
                 205,
             ),
             audience: Client(
-                ClientId(
+                SeatNo(
                     5,
                 ),
             ),
-            event: EntityEventKind(
+            event: EventCode(
                 256,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 45,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -371,21 +371,21 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 16,
             ),
-            tick: Tick(
+            tick: StepNo(
                 206,
             ),
             audience: All,
-            event: EntityEventKind(
+            event: EventCode(
                 131,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 46,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -411,25 +411,25 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 17,
             ),
-            tick: Tick(
+            tick: StepNo(
                 207,
             ),
             audience: Client(
-                ClientId(
+                SeatNo(
                     7,
                 ),
             ),
-            event: EntityEventKind(
+            event: EventCode(
                 217,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 47,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -455,21 +455,21 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 18,
             ),
-            tick: Tick(
+            tick: StepNo(
                 208,
             ),
             audience: All,
-            event: EntityEventKind(
+            event: EventCode(
                 218,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 48,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -495,25 +495,25 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 19,
             ),
-            tick: Tick(
+            tick: StepNo(
                 209,
             ),
             audience: Client(
-                ClientId(
+                SeatNo(
                     9,
                 ),
             ),
-            event: EntityEventKind(
+            event: EventCode(
                 4,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 49,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -539,21 +539,21 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 20,
             ),
-            tick: Tick(
+            tick: StepNo(
                 210,
             ),
             audience: All,
-            event: EntityEventKind(
+            event: EventCode(
                 11,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 50,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -579,25 +579,25 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
-        EntityEventRecord {
-            sequence: EventSequence(
+        ThingHappening {
+            sequence: EventStamp(
                 21,
             ),
-            tick: Tick(
+            tick: StepNo(
                 211,
             ),
             audience: Client(
-                ClientId(
+                SeatNo(
                     11,
                 ),
             ),
-            event: EntityEventKind(
+            event: EventCode(
                 18,
             ),
-            payload: EntityEventPayload {
+            payload: HappeningBody {
                 number: 51,
                 other_entity_num: 41,
                 attacker_entity_num: 3,
@@ -623,12 +623,12 @@ SnapshotMeta {
                 ],
                 surf_type: 7,
                 surface_flags: 32,
-                simulation_flags: 2,
+                wall_pass_bits: 2,
             },
         },
     ],
     pellet_fx: [
-        PelletFxRecord {
+        ScatterPuff {
             attacker: 3,
             weapon: 99,
             correlation: 7,
@@ -651,9 +651,9 @@ SnapshotMeta {
             ],
             surf_type: 5,
             surface_flags: 64,
-            flesh_flags: 1,
+            body_hit_bits: 1,
         },
-        PelletFxRecord {
+        ScatterPuff {
             attacker: 0,
             weapon: 0,
             correlation: 0,
@@ -676,12 +676,12 @@ SnapshotMeta {
             ],
             surf_type: 0,
             surface_flags: 0,
-            flesh_flags: 0,
+            body_hit_bits: 0,
         },
     ],
     debris: [
         DebrisRecord {
-            model: "xmodel_glass_shard",
+            mesh: "xmodel_glass_shard",
             origin: [
                 10.0,
                 20.0,
@@ -709,36 +709,36 @@ SnapshotMeta {
     effect_names: [],
     hud_materials: [],
     hud_strings: [],
-    rng: RngDebugMeta {
+    rng: DiceTrace {
         root_seed: 0,
         scheme: 0,
         spawn_draws: 0,
         combat_draws: 0,
         bot_draws: 0,
     },
-    world_objects: WorldObjectSnapshot {
+    world_objects: PropsSnapshot {
         as_of_ms: 0,
         map_round_epoch: 0,
         t6_glass: [],
         destructible_loop_sounds: [],
     },
     area_entities: None,
-    entity_dobjs: [],
-    entities: [],
-    script_movers: [],
-    entity_kernel: EntityKernelSnapshot {
+    entity_kernel: FrozenSlotTable {
         slots: [],
         high_water: 26,
         free_fifo: [],
         level_time_ms: 0,
         frame_serial: 0,
     },
-    corpses: PlayerCorpsePool {
+    entities: [],
+    entity_dobjs: [],
+    script_movers: [],
+    corpses: CorpseYard {
         slots: [
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -751,9 +751,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -774,10 +774,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -790,9 +790,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -813,10 +813,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -829,9 +829,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -852,10 +852,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -868,9 +868,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -891,10 +891,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -907,9 +907,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -930,10 +930,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -946,9 +946,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -969,10 +969,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -985,9 +985,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -1008,10 +1008,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -1024,9 +1024,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -1054,13 +1054,13 @@ SnapshotMeta {
     item_pickups: [],
     oriented_blockers: [
         OrientedBlocker {
-            entnum: 12,
+            ent_no: 12,
             origin: [
                 64.0,
                 -32.0,
                 8.0,
             ],
-            axis: [
+            frame: [
                 [
                     1.0,
                     0.0,
@@ -1077,18 +1077,20 @@ SnapshotMeta {
                     1.0,
                 ],
             ],
-            mins: [
+            lo: [
                 -8.0,
                 -16.0,
                 -4.0,
             ],
-            maxs: [
+            hi: [
                 8.0,
                 16.0,
                 4.0,
             ],
+            face_bits: 64,
         },
     ],
+    follows: [],
     feel: Some(
         Bo2Feel {
             sprint_strafe_speed_scale: 1.5,
@@ -1113,7 +1115,7 @@ SnapshotMeta {
             omni: false,
             mantle_weapon_height: 17.5,
             mantle_weapon_anim_height: 18.5,
-            jump_height: 19.5,
+            leap_height: 19.5,
         },
     ),
     enemy_models: [],

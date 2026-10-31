@@ -1,14 +1,17 @@
 use bevy::prelude::*;
+use bevy::render::RenderApp;
 
-pub struct RenderGpuPlugin;
+use crate::SubmitReadyGpu;
 
-impl Plugin for RenderGpuPlugin {
-    fn build(&self, app: &mut App) {
-        crate::drawsurf::register_drawsurf_render(app);
-        app.init_resource::<crate::GpuSubmitReady>();
-        let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) else {
-            return;
-        };
-        render_app.init_resource::<crate::GpuSubmitReady>();
+/// Installs the GPU side of the renderer into the app and its render sub-app.
+pub struct DrawGpuPlugin;
+
+impl Plugin for DrawGpuPlugin {
+    fn build(&self, host: &mut App) {
+        crate::surf_gpu::register_facet_draw_render(host);
+        host.init_resource::<SubmitReadyGpu>();
+        if let Some(render_sub) = host.get_sub_app_mut(RenderApp) {
+            render_sub.init_resource::<SubmitReadyGpu>();
+        }
     }
 }

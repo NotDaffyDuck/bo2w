@@ -11,7 +11,7 @@
 //!   falling ramp `vc_RS.x..vc_RE.x`, highlights a rising ramp `y`,
 //!   midtones a rising ramp `z` times a falling ramp `w`; each smoothstep,
 //!   the three normalised,
-//! - in linear (squared): the shadow, midtone and highlight matrices
+//! - in linear (squared): the shadow, midtone and highlight joint_transforms
 //!   (`vc_SM*`, `vc_MM*`, `vc_HM*`, rows with an offset) mixed by those
 //!   weights, clamped; then per channel the power `vc_FGM`, the saturation
 //!   `vc_FSM` (weights, amount), the blend back toward the input `vc_FBM`,
@@ -48,7 +48,7 @@ pub struct T6Vision {
 }
 
 impl Default for T6Vision {
-    /// What changes nothing: identity levels and matrices, full saturation.
+    /// What changes nothing: identity levels and joint_transforms, full saturation.
     fn default() -> Self {
         let row = |i: usize| {
             let mut r = [0.0; 4];
@@ -86,60 +86,60 @@ pub const T6_LUMA: [f32; 3] = [0.212585, 0.715195, 0.07222];
 /// name keep their identity value; `None` when it names no `vc_` row.
 pub fn parse_t6_vision(text: &str) -> Option<T6Vision> {
     let mut v = T6Vision::default();
-    let mut found = false;
-    for line in text.lines() {
-        let line = line.trim();
-        let Some((name, rest)) = line.split_once(char::is_whitespace) else {
-            continue;
-        };
-        let value = rest.trim().trim_matches('"');
-        let mut four = [0.0f32; 4];
-        let mut n = 0;
-        for (slot, part) in four.iter_mut().zip(value.split_whitespace()) {
-            let Ok(x) = part.parse::<f32>() else {
-                break;
-            };
-            *slot = x;
-            n += 1;
-        }
-        let name = name.to_ascii_lowercase();
+    let mut rows_set = 0usize;
+    for (name, value) in text.lines().filter_map(vision_row) {
         if name == "r_filmenable" {
             v.film_enable = value.trim() != "0";
             continue;
         }
-        if n != 4 {
-            continue;
+        if let (Some(four), Some(slot)) = (leading_four(value), vision_slot(&mut v, &name)) {
+            *slot = four;
+            rows_set += 1;
         }
-        let target = match name.as_str() {
-            "vc_lib" => &mut v.levels_in_black,
-            "vc_liw" => &mut v.levels_in_white,
-            "vc_lig" => &mut v.levels_in_gamma,
-            "vc_lob" => &mut v.levels_out_black,
-            "vc_low" => &mut v.levels_out_white,
-            "vc_rgbh" => &mut v.bloom_rgb_hi,
-            "vc_rgbl" => &mut v.bloom_rgb_lo,
-            "vc_yh" => &mut v.bloom_y_hi,
-            "vc_yl" => &mut v.bloom_y_lo,
-            "vc_rs" => &mut v.range_start,
-            "vc_re" => &mut v.range_end,
-            "vc_smr" => &mut v.shadow[0],
-            "vc_smg" => &mut v.shadow[1],
-            "vc_smb" => &mut v.shadow[2],
-            "vc_hmr" => &mut v.highlight[0],
-            "vc_hmg" => &mut v.highlight[1],
-            "vc_hmb" => &mut v.highlight[2],
-            "vc_mmr" => &mut v.midtone[0],
-            "vc_mmg" => &mut v.midtone[1],
-            "vc_mmb" => &mut v.midtone[2],
-            "vc_fgm" => &mut v.final_gamma,
-            "vc_fsm" => &mut v.final_saturation,
-            "vc_fbm" => &mut v.final_blend,
-            _ => continue,
-        };
-        *target = four;
-        found = true;
     }
-    found.then_some(v)
+    (rows_set > 0).then_some(v)
+}
+
+/// One `name "values"` line as (lowercased name, unquoted value text).
+fn vision_row(line: &str) -> Option<(String, &str)> {
+    let (name, rest) = line.trim().split_once(char::is_whitespace)?;
+    Some((name.to_ascii_lowercase(), rest.trim().trim_matches('"')))
+}
+
+/// The first four numbers of `value`; `None` unless all four parse.
+fn leading_four(value: &str) -> Option<[f32; 4]> {
+    let mut parts = value.split_whitespace().map(|p| p.parse::<f32>().ok());
+    Some([parts.next()??, parts.next()??, parts.next()??, parts.next()??])
+}
+
+/// The row of `v` a `vc_` name stands for.
+fn vision_slot<'a>(v: &'a mut T6Vision, name: &str) -> Option<&'a mut [f32; 4]> {
+    Some(match name {
+        "vc_lib" => &mut v.levels_in_black,
+        "vc_liw" => &mut v.levels_in_white,
+        "vc_lig" => &mut v.levels_in_gamma,
+        "vc_lob" => &mut v.levels_out_black,
+        "vc_low" => &mut v.levels_out_white,
+        "vc_rgbh" => &mut v.bloom_rgb_hi,
+        "vc_rgbl" => &mut v.bloom_rgb_lo,
+        "vc_yh" => &mut v.bloom_y_hi,
+        "vc_yl" => &mut v.bloom_y_lo,
+        "vc_rs" => &mut v.range_start,
+        "vc_re" => &mut v.range_end,
+        "vc_smr" => &mut v.shadow[0],
+        "vc_smg" => &mut v.shadow[1],
+        "vc_smb" => &mut v.shadow[2],
+        "vc_hmr" => &mut v.highlight[0],
+        "vc_hmg" => &mut v.highlight[1],
+        "vc_hmb" => &mut v.highlight[2],
+        "vc_mmr" => &mut v.midtone[0],
+        "vc_mmg" => &mut v.midtone[1],
+        "vc_mmb" => &mut v.midtone[2],
+        "vc_fgm" => &mut v.final_gamma,
+        "vc_fsm" => &mut v.final_saturation,
+        "vc_fbm" => &mut v.final_blend,
+        _ => return None,
+    })
 }
 
 /// Side of the colour table.
@@ -173,12 +173,11 @@ pub fn t6_grade_colour(v: &T6Vision, c: [f32; 3], alpha: f32) -> [f32; 3] {
     }
     let lin = c.map(|x| x * x);
     let row = |r: [f32; 4]| r[0] * lin[0] + r[1] * lin[1] + r[2] * lin[2] + r[3] * alpha;
-    let mut out = [0.0f32; 3];
-    for (ch, o) in out.iter_mut().enumerate() {
+    let mut out: [f32; 3] = core::array::from_fn(|ch| {
         let graded =
             w[0] * row(v.shadow[ch]) + w[1] * row(v.midtone[ch]) + w[2] * row(v.highlight[ch]);
-        *o = graded.clamp(0.0, 1.0).powf(v.final_gamma[ch]);
-    }
+        graded.clamp(0.0, 1.0).powf(v.final_gamma[ch])
+    });
     let fs = v.final_saturation;
     let lum = dot3(out, [fs[0], fs[1], fs[2]]);
     for (ch, o) in out.iter_mut().enumerate() {
@@ -253,9 +252,8 @@ fn put_grade(grade: Option<Arc<T6Grade>>) {
 /// bo2mp vehicle screens: the naked vision's grade (the map's own, or a
 /// script's `visionsetnaked`) and the server's vision for the local player
 /// over it (`setvisionsetforplayer` while `useservervisionset` is on).
-type NakedSlot = RwLock<(Option<Arc<T6Grade>>, Option<String>)>;
-fn naked_slot() -> &'static NakedSlot {
-    static SLOT: std::sync::OnceLock<NakedSlot> = std::sync::OnceLock::new();
+fn naked_slot() -> &'static RwLock<(Option<Arc<T6Grade>>, Option<String>)> {
+    static SLOT: std::sync::OnceLock<RwLock<(Option<Arc<T6Grade>>, Option<String>)>> = std::sync::OnceLock::new();
     SLOT.get_or_init(Default::default)
 }
 
@@ -419,6 +417,17 @@ vc_FSM \"0.212585 0.715195 0.072220 0.880859\"\n";
         assert_eq!(v.shadow[1], [0.0, 1.0, 0.0, 0.0]);
         assert_eq!(v.final_saturation[3], 0.880859);
         assert!(parse_t6_vision("r_filmEnable \"1\"\n").is_none());
+    }
+
+    #[test]
+    fn vision_edge_rows() {
+        let v = parse_t6_vision("r_filmenable 0\nvc_yh \"1 2 3\"\nvc_yl \"1 2 3 4 5\"\nvc_rs \"1 x 3 4\"\nbogus \"1 2 3 4\"\nvc_hmg 1 2 3 4\nlone\n").unwrap();
+        assert!(!v.film_enable);
+        assert_eq!(v.bloom_y_hi, T6Vision::default().bloom_y_hi);
+        assert_eq!(v.bloom_y_lo, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(v.range_start, T6Vision::default().range_start);
+        assert_eq!(v.highlight[1], [1.0, 2.0, 3.0, 4.0]);
+        assert!(parse_t6_vision("r_filmenable 0\nvc_yh \"1 2 3\"\n").is_none());
     }
 
     #[test]

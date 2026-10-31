@@ -1,53 +1,54 @@
-mod def;
-mod draw;
-mod elem;
-mod gaps;
-mod glass;
-mod lifetime;
-mod marks;
-mod motion;
-mod orient;
-mod play;
-mod sort;
-mod spawn;
-mod system;
-mod trail;
-mod update;
+mod recipe;
+mod paint;
+mod particle_bin;
+mod holes;
+mod pane;
+mod clock;
+mod decal;
+mod flight;
+mod facing;
+mod launch;
+mod depth_order;
+mod birth;
+mod host;
+mod ribbon;
+mod tick;
 
-pub use def::{FxEffectDefInfo, FxElemDefInfo};
-pub use draw::{
-    FxCloudInstance, FxDrawElemContext, FxDrawTrailContext, FxDrawTrailSampleContext,
-    FxElemLightInstance, FxGenerateVertsOut, FxModelInstance, FxSpriteInstance, FxTrailDrawDef,
-    FxTrailMeshInstance, FxTrailSampleVisual, generate_verts, generate_verts_with_trails,
+pub use recipe::{EmitterRecipeSummary, ParticleRecipeSummary};
+pub use paint::{
+    SwarmCopy, PartDrawInputs, RibbonDrawInputs, RibbonSampleInputs,
+    ParticleGlowCopy, CornerBuildOutput, MeshParticleCopy, EffectSpriteInstance, StreakPaintRecipe,
+    StreakMeshCopy, StreakSampleLook, build_corners, build_corners_and_streaks,
 };
-pub use elem::FxElemSlot;
-pub use gaps::{ChildSpawn, CodeMeshStep, FxGap, FxGapCause, FxGaps};
-pub use glass::{FxGlassSystemHost, GlassWorldContact, GlassWorldTrace};
+pub use particle_bin::ParticleBinSlot;
+pub use holes::{ChildKind, ProceduralMeshPhase, EffectHole, EffectHoleReason, GapBook};
+pub use pane::{PaneShardOwner, GlassWorldContact, GlassWorldTrace};
 pub use glass_t6::{
     T6_GLASS_LOW_LOD_DIST, T6Glass, T6PaneShape, T6Shard, T6ShardCounts, T6ShardMotion,
     T6ShardVertex,
 };
-pub use lifetime::{
-    FxMsec, LE_MOVING_TRACER, LE_TR_LINEAR, LOCAL_ENTITY_POOL_CAPACITY, LocalEntityPool,
-    LocalEntitySlot, local_entity_is_live, set_presentation_clock, tracer_travel_msec,
+pub use clock::{
+    EffectClockMs, THING_FLYING_STREAK, PATH_STRAIGHT_LINE, CLIENT_THING_LIMIT, ClientOnlyThingBank,
+    ClientOnlyThingSlot, client_thing_alive, set_show_clock, tracer_flight_ms,
 };
-pub use marks::{
-    FxMarksSystemHost, GfxMarkMeshCensus, GfxMarkMeshSurf, MarkImpactRequest, MarkImpactResult,
-    MarkReceiverEnable, MarkTraceRecord,
+pub use decal::{
+    DecalOwner, DecalMeshTally, DecalMeshPatch, DecalContactAsk, MarkOutcome,
+    DecalAcceptToggle, DecalRayLog,
 };
-pub use motion::{evaluate_elem_collide_motion, evaluate_elem_motion};
-pub use play::{
-    FxPlayPose, FxPlayRequest, PlayResult, axis_from_hit_normal, play_bolted, play_oriented,
-    spawn_impact_or_death_effect, spawn_oriented,
+pub use flight::{compute_bouncing_particle_path, compute_particle_path};
+pub use launch::{
+    EffectStartFrame, EffectStartAsk, PlaybackResult, basis_off_contact_facing, start_attached, start_aligned,
+    play_hit_or_death_effect, play_facing,
 };
-pub use spawn::{sort_effect_elems, spawn_looping_partial};
-pub use system::{
-    FX_CATALOG_INDEX_NONE, FxBoltOrientation, FxBoltTarget, FxEffectSlot, FxPackedLightingSrc,
-    FxResolvedBoltPose, FxSystemHost, PendingDecalSpawn, PendingRunnerSpawn, PendingSoundSpawn,
-    PendingTrailImpact, SpawnFail,
+pub use birth::{order_effect_parts, birth_repeat_fraction};
+pub use host::{
+    NO_RECIPE_LISTING, AttachPointFrame, EffectBoltTarget, LiveEffect, BakedShadeSource,
+    SettledAttachFrame, EffectSystemHost, QueuedDecalBirth, QueuedSpawnerBirth, QueuedSound,
+    QueuedTrailHit, SpawnRefusal,
 };
-pub use trail::FxTrailCollideHit;
-pub use update::{
-    FxChildKind, FxChildSpawnRequest, FxElemMotionQuery, FxElemMotionResult, FxElemTraceHit,
-    FxEmitQuery, FxImpactSpawn, PendingCollide, update,
+pub use host::UNTURNED_BASIS;
+pub use ribbon::StreakBounceContact;
+pub use tick::{
+    OffspringSort, OffspringBirthAsk, ParticleMoveAsk, ParticleMoveOutcome, ParticleRayContact,
+    EmissionAsk, ContactBirth, QueuedBounceCheck, advance_effects,
 };

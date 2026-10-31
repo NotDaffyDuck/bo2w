@@ -2,7 +2,7 @@
 name = "bootstrap"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
+publish.workspace = true
 description = "Composition root: reads the command line and builds the bevy App for a menu, map, serve or play run."
 
 [features]
@@ -40,7 +40,7 @@ ui.workspace = true
 weapon_t6.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+libc = "0.2.189"
 
 [lints]
 workspace = true

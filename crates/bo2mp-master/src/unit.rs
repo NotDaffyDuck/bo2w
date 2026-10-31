@@ -6,6 +6,7 @@ use crate::args::UnitSettings;
 
 /// The unit file text, ending in a newline.
 pub fn render(settings: &UnitSettings) -> String {
+    let port = settings.channel.port();
     let UnitSettings {
         channel,
         exec,
@@ -15,9 +16,8 @@ pub fn render(settings: &UnitSettings) -> String {
         group,
     } = settings;
     let start = format!(
-        "{} serve --bind 0.0.0.0:{} --cert {} --key {}",
+        "{} serve --bind 0.0.0.0:{port} --cert {} --key {}",
         exec.display(),
-        channel.port(),
         cert.display(),
         key.display(),
     );

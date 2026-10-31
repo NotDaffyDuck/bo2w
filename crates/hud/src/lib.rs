@@ -4,35 +4,44 @@
 mod clock;
 mod draw2d;
 mod flash;
-mod font_overlay;
+mod glyph_layer;
 mod gaps;
-mod gpu_list;
+mod draw_batch;
 mod hud_elems;
 mod images;
 mod iris;
 mod menus;
-mod overhead_names;
+mod name_tags;
 mod plugin;
-mod presentation_scale;
+mod screen_fit;
 mod rangefinder;
-mod reticle;
+mod aim_mark;
 mod sight;
 mod surface;
-mod ui_write;
+mod ui_emit;
 
-pub use draw2d::{
-    Draw2dCmd, Draw2dCmdCensus, Draw2dList, Draw2dOp, Draw2dProvenance, Draw2dQuad, tessellate,
-};
-pub use gaps::{GapCause, HudGap, HudPresentationGaps};
-pub use gpu_list::{HudTessBatch, HudTessGpuFrame, HudTessTechnique, HudTessVertex};
+pub use draw2d::FlatPaintEntry;
+pub use draw2d::FlatPaintTally;
+pub use draw2d::FlatPaintQueue;
+pub use draw2d::FlatPaintAction;
+pub use draw2d::FlatPaintOrigin;
+pub use draw2d::FlatPaintRect;
+pub use draw2d::expand_paint_list;
+pub use gaps::GapReason;
+pub use gaps::HudShortage;
+pub use gaps::HudGapBook;
+pub use draw_batch::HudStitchBatch;
+pub use draw_batch::OverlayMeshBatch;
+pub use draw_batch::HudStitchMethod;
+pub use draw_batch::HudGpuVertex;
 pub use menus::ScriptMenus;
-pub use overhead_names::{
-    OverheadPosedHead, OverheadPosedPlayerFrame, OverheadPosedPlayerFramePublished,
+pub use name_tags::{
+    NameplateSkullPose, NameplateBodyPose, NameplateBodyPoseShared,
 };
-pub use plugin::HudPlugin;
-pub use presentation_scale::{
-    HorizontalAlign, PlacedRect, PresentationScale, ScaleClass, VIRTUAL_HEIGHT, VIRTUAL_WIDTH,
-    VerticalAlign,
+pub use plugin::OverlayModule;
+pub use screen_fit::{
+    AnchorX, PxRect, WindowScale, UnitClass, CANVAS_HEIGHT, CANVAS_WIDTH,
+    AnchorY,
 };
 pub use rangefinder::RangefinderSpots;
-pub use surface::Hud2dSurface;
+pub use surface::FlatOverlayCanvas;

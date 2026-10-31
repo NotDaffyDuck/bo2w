@@ -5,22 +5,20 @@
 //! disk.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const EXTENSION: &str = ".bo2mpdemo";
+const DEMO_FOLDER: &str = "demos";
 const MAX_NAME_LEN: usize = 64;
 const AUTO_NAMES: u32 = 10_000;
 
-/// The file a demo called `name` is stored in.
-pub fn demo_path(artifacts_root: &Path, name: &str) -> PathBuf {
-    artifacts_root
-        .join("demos")
-        .join(format!("{name}{EXTENSION}"))
+/// The file a demo called `stem` is stored in.
+pub fn recording_file(artifacts: &Path, stem: &str) -> PathBuf {
+    artifacts.join(DEMO_FOLDER).join(format!("{stem}{EXTENSION}"))
 }
 
 /// `name` with everything but letters, digits, `_` and `-` removed and at most
 /// 64 characters kept; `None` when nothing is left.
-pub fn sanitize_demo_name(name: &str) -> Option<String> {
+pub fn tidy_clip_name(name: &str) -> Option<String> {
     let kept: String = name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
@@ -31,29 +29,29 @@ pub fn sanitize_demo_name(name: &str) -> Option<String> {
 
 /// What a player typed for a demo, reduced to the name itself: no folders, no
 /// `.bo2mpdemo`.
-pub fn demo_stem(requested: &str) -> &str {
+pub fn recording_stem(requested: &str) -> &str {
     let file = requested.rsplit(['/', '\\']).next().unwrap_or(requested);
     file.strip_suffix(EXTENSION).unwrap_or(file)
 }
 
-/// The name the `index`th unnamed recording gets.
-pub fn auto_demo_name(index: u32) -> String {
-    format!("demo{index:04}")
+/// Older spelling bootstrap still calls; the rename sweep moves it over.
+
+/// The name the `slot`th unnamed recording gets.
+pub fn generated_recording_name(slot: u32) -> String {
+    format!("demo{slot:04}")
 }
 
 /// The first unnamed-recording name with no demo behind it yet.
-pub fn next_free_demo_name(artifacts_root: &Path) -> String {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
-    first_free_name(|name| demo_path(artifacts_root, name).exists(), stamp)
+pub fn first_unused_demo_name(artifacts: &Path) -> String {
+    let stamp = std::time::UNIX_EPOCH.elapsed().map_or(0, |since| since.as_secs());
+    first_free_name(|name| recording_file(artifacts, name).exists(), stamp)
 }
 
 /// The first `demoNNNN` that `taken` does not claim; when all 10,000 are
 /// taken, `demo` and `stamp` instead.
 fn first_free_name(taken: impl Fn(&str) -> bool, stamp: u64) -> String {
     (0..AUTO_NAMES)
-        .map(auto_demo_name)
+        .map(generated_recording_name)
         .find(|name| !taken(name))
         .unwrap_or_else(|| format!("demo{stamp}"))
 }
@@ -65,7 +63,7 @@ mod tests {
 
     #[test]
     fn a_demo_lives_under_demos_with_the_extension() {
-        let path = demo_path(Path::new("art"), "round1");
+        let path = recording_file(Path::new("art"), "round1");
         assert_eq!(
             path,
             Path::new("art").join("demos").join("round1.bo2mpdemo")
@@ -75,7 +73,7 @@ mod tests {
     #[test]
     fn sanitizing_keeps_letters_digits_underscore_and_dash() {
         assert_eq!(
-            sanitize_demo_name("Nuke_Town-2"),
+            tidy_clip_name("Nuke_Town-2"),
             Some("Nuke_Town-2".to_owned())
         );
     }
@@ -83,52 +81,52 @@ mod tests {
     #[test]
     fn sanitizing_drops_everything_else() {
         assert_eq!(
-            sanitize_demo_name("my demo!.. /x"),
+            tidy_clip_name("my demo!.. /x"),
             Some("mydemox".to_owned())
         );
-        assert_eq!(sanitize_demo_name("../../etc"), Some("etc".to_owned()));
-        assert_eq!(sanitize_demo_name("naïve"), Some("nave".to_owned()));
+        assert_eq!(tidy_clip_name("../../etc"), Some("etc".to_owned()));
+        assert_eq!(tidy_clip_name("naïve"), Some("nave".to_owned()));
     }
 
     #[test]
     fn sanitizing_cuts_at_64_characters() {
         let long = "a".repeat(100);
-        assert_eq!(sanitize_demo_name(&long), Some("a".repeat(64)));
+        assert_eq!(tidy_clip_name(&long), Some("a".repeat(64)));
     }
 
     #[test]
     fn sanitizing_nothing_gives_none() {
         for empty in ["", "..", "!!! ", "/\\"] {
-            assert_eq!(sanitize_demo_name(empty), None, "{empty:?}");
+            assert_eq!(tidy_clip_name(empty), None, "{empty:?}");
         }
     }
 
     #[test]
     fn the_stem_drops_folders_and_the_extension() {
-        assert_eq!(demo_stem("round1"), "round1");
-        assert_eq!(demo_stem("round1.bo2mpdemo"), "round1");
-        assert_eq!(demo_stem("demos/round1.bo2mpdemo"), "round1");
-        assert_eq!(demo_stem("C:\\games\\demos\\round1"), "round1");
-        assert_eq!(demo_stem("a/b\\c.bo2mpdemo"), "c");
+        assert_eq!(recording_stem("round1"), "round1");
+        assert_eq!(recording_stem("round1.bo2mpdemo"), "round1");
+        assert_eq!(recording_stem("demos/round1.bo2mpdemo"), "round1");
+        assert_eq!(recording_stem("C:\\games\\demos\\round1"), "round1");
+        assert_eq!(recording_stem("a/b\\c.bo2mpdemo"), "c");
     }
 
     #[test]
     fn the_stem_of_a_folder_is_empty() {
-        assert_eq!(demo_stem("demos/"), "");
-        assert_eq!(demo_stem(""), "");
+        assert_eq!(recording_stem("demos/"), "");
+        assert_eq!(recording_stem(""), "");
     }
 
     #[test]
     fn the_stem_removes_only_one_trailing_extension() {
-        assert_eq!(demo_stem("x.bo2mpdemo.bo2mpdemo"), "x.bo2mpdemo");
-        assert_eq!(demo_stem("x.bo2mpdemo.bak"), "x.bo2mpdemo.bak");
+        assert_eq!(recording_stem("x.bo2mpdemo.bo2mpdemo"), "x.bo2mpdemo");
+        assert_eq!(recording_stem("x.bo2mpdemo.bak"), "x.bo2mpdemo.bak");
     }
 
     #[test]
     fn automatic_names_are_four_digits_wide() {
-        assert_eq!(auto_demo_name(0), "demo0000");
-        assert_eq!(auto_demo_name(42), "demo0042");
-        assert_eq!(auto_demo_name(12345), "demo12345");
+        assert_eq!(generated_recording_name(0), "demo0000");
+        assert_eq!(generated_recording_name(42), "demo0042");
+        assert_eq!(generated_recording_name(12345), "demo12345");
     }
 
     #[test]
@@ -151,11 +149,11 @@ mod tests {
     #[test]
     fn the_next_free_name_follows_the_demos_on_disk() {
         let dir = TestDir::new("names");
-        assert_eq!(next_free_demo_name(dir.path()), "demo0000");
+        assert_eq!(first_unused_demo_name(dir.path()), "demo0000");
         let demos = dir.path().join("demos");
         std::fs::create_dir_all(&demos).unwrap();
         std::fs::write(demos.join("demo0000.bo2mpdemo"), b"").unwrap();
         std::fs::write(demos.join("demo0001.bo2mpdemo"), b"").unwrap();
-        assert_eq!(next_free_demo_name(dir.path()), "demo0002");
+        assert_eq!(first_unused_demo_name(dir.path()), "demo0002");
     }
 }

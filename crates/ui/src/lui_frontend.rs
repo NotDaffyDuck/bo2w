@@ -58,23 +58,23 @@ pub struct Bo2mpFrontendAssets {
 /// end again, at its main menu.
 pub(crate) fn restore_after_match(
     mut commands: Commands,
-    screen: Res<frame::AppScreen>,
+    on_screen: Res<frame::ShellScreen>,
     saved: Option<Res<Bo2mpFrontendAssets>>,
     front: Option<Res<Bo2mpFrontend>>,
     mut played: Local<bool>,
 ) {
     let Some(saved) = saved else { return };
-    match *screen {
-        frame::AppScreen::MainMenu if *played && front.is_none() => {
+    match *on_screen {
+        frame::ShellScreen::MainMenu if *played && front.is_none() => {
             *played = false;
-            diag::info!(Ui, "bo2mp front end: back from the match");
+            diag::info!(Ui, "front end: the match is over, menus back");
             commands.insert_resource(saved.ui.clone());
             commands.insert_resource(saved.icons.clone());
             commands.insert_resource(saved.fonts.clone());
             commands.insert_resource(saved.front.clone());
             commands.remove_resource::<session::Bo2mpMatchSetup>();
         }
-        frame::AppScreen::MainMenu => {}
+        frame::ShellScreen::MainMenu => {}
         _ => *played = true,
     }
 }
@@ -85,9 +85,9 @@ pub(crate) fn install(host: &mut Host, front: &Bo2mpFrontend) -> Mp {
     match bo2_profile::read_stats_text(&front.stats_path) {
         Ok(text) => {
             mp.borrow_mut().load_text(&text);
-            diag::info!(Ui, "bo2mp front end: stats from {}", front.stats_path.display());
+            diag::info!(Ui, "front end: stats read from {}", front.stats_path.display());
         }
-        Err(_) => diag::info!(Ui, "bo2mp front end: no stats file yet ({})", front.stats_path.display()),
+        Err(_) => diag::info!(Ui, "front end: stats file {} not there yet", front.stats_path.display()),
     }
     mp
 }
@@ -152,16 +152,16 @@ pub(crate) fn open(host: &mut Host, mp: Option<&Mp>, back: Option<&LobbyReturn>)
             // The lobby's script loads when its menu first opens; it has not yet.
             host.require("T6.Menus.PublicGameLobby");
             let shutdown = host.field("CoD", "PublicGameLobby");
-            let f = host.vm.index(&shutdown, &Value::str("ShutdownLobby")).unwrap_or(Value::Nil);
+            let f = host.vm.lookup_index(&shutdown, &Value::str("ShutdownLobby")).unwrap_or(Value::Nil);
             let found = matches!(f, Value::Func(_));
-            let event = hks_t6::value::Table::new_ref();
-            event.borrow_mut().set(Value::str("controller"), Value::Num(0.0));
+            let event = hks_t6::value::LuaTable::new_ref();
+            event.borrow_mut().store(Value::str("controller"), Value::Num(0.0));
             let ran = found && host.call(f, vec![Value::Nil, Value::Table(event)]).is_some();
-            diag::info!(Ui, "bo2mp front end: the public lobby disbanded (End Game; ShutdownLobby found {found}, ran {ran}); back to `PlayerMatchPartyLobby`");
+            diag::info!(Ui, "front end: public lobby broke up (End Game; ShutdownLobby found {found}, ran {ran}), going to `PlayerMatchPartyLobby`");
             host.root_event("open_menu", &[("menuName", Value::str("PlayerMatchPartyLobby"))]);
             return;
         }
-        diag::info!(Ui, "bo2mp front end: back to `{}`", back.menu);
+        diag::info!(Ui, "front end: going to menu `{}`", back.menu);
         host.root_event("open_menu", &[("menuName", Value::str(&back.menu))]);
         return;
     }
@@ -199,13 +199,13 @@ pub(crate) fn open_loading(host: &mut Host, setup: &session::Bo2mpMatchSetup) {
             .find(|t| !t.is_empty())
             .unwrap_or_default();
         let gametype = text(&type_key);
-        diag::info!(Ui, "bo2mp loading: `{}` {name:?} at {place:?}, {gametype:?} (keys {map_key} {type_key})", setup.map);
+        diag::info!(Ui, "loading screen: `{}` {name:?} at {place:?}, {gametype:?} (keys {map_key} {type_key})", setup.map);
         if let Ok(probe) = std::env::var("BO2MP_LOC_GREP") {
             let probe = probe.to_ascii_uppercase();
             let mut hits: Vec<_> = v.localize.iter().filter(|(k, _)| k.contains(&probe)).collect();
             hits.sort();
             for (k, t) in hits.into_iter().take(60) {
-                diag::info!(Ui, "bo2mp localize {k} = {t:?}");
+                diag::info!(Ui, "loading screen: text {k} is {t:?}");
             }
         }
         for (k, x) in [
@@ -224,10 +224,10 @@ pub(crate) fn open_loading(host: &mut Host, setup: &session::Bo2mpMatchSetup) {
     let t = std::time::Instant::now();
     host.require("T6.HUD.Loading");
     let made = host.field("LUI", "createMenu");
-    let has = matches!(host.vm.index(&made, &Value::str("Loading")), Ok(Value::Nil)).then_some("no").unwrap_or("yes");
-    diag::info!(Ui, "bo2mp loading: T6.HUD.Loading required in {:.0} ms (LUI.createMenu.Loading: {has})", t.elapsed().as_secs_f64() * 1000.0);
+    let has = matches!(host.vm.lookup_index(&made, &Value::str("Loading")), Ok(Value::Nil)).then_some("no").unwrap_or("yes");
+    diag::info!(Ui, "loading screen: T6.HUD.Loading took {:.0} ms (LUI.createMenu.Loading: {has})", t.elapsed().as_secs_f64() * 1000.0);
     host.open_menu("Loading");
-    diag::info!(Ui, "bo2mp loading: Loading opened ({:.0} ms)", t.elapsed().as_secs_f64() * 1000.0);
+    diag::info!(Ui, "loading screen: Loading menu up after {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
     // (The spinner is not started here: the script's own timer raises
     // `start_spinner` after `SpinnerDelayTime`, as in BO2 - a loading screen
     // under 19 s shows no spinner.)
@@ -238,21 +238,22 @@ pub(crate) fn open_loading(host: &mut Host, setup: &session::Bo2mpMatchSetup) {
     if !status.is_empty() {
         host.set_menu_label_text("Menu.Loading", "statusLabel", &status);
     }
-    diag::info!(Ui, "bo2mp loading: started ({:.0} ms)", t.elapsed().as_secs_f64() * 1000.0);
+    diag::info!(Ui, "loading screen: spinner going after {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
 }
 
 /// Whether an element is a 3D widget the 2D layer cannot draw (the globe,
 /// the holotable grids turned into the screen).
-pub(crate) fn is_3d(d: &hks_t6::host::Drawn) -> bool {
-    d.kind == "globe" || d.x_rot.abs() > 0.01 || d.y_rot.abs() > 0.01
+pub(crate) fn has_depth_axis(d: &hks_t6::host::Drawn) -> bool {
+    d.element_kind == "globe" || d.x_rot.abs() > 0.01 || d.y_rot.abs() > 0.01
 }
 
 /// Combat Training's rotation: Custom Games' Change Map list (BO2's
 /// mp/mapsTable.csv, `Engine.GetMaps`) less the maps whose zone is not in
 /// his install, the clock rolling its draws.
-fn new_rotation(host: &Host, identity: Option<&frame::LaunchIdentity>) -> hks_t6::mapvote::Rotation {
+fn new_rotation(host: &Host, identity: Option<&frame::StartupPersona>) -> hks_t6::mapvote::Rotation {
     let installed: std::collections::HashSet<String> = identity
-        .map_or_else(Vec::new, |id| asset_transport::list_mp_maps(&asset_transport::GamesRoot(id.games_root.clone())))
+        .map(|id| asset_transport::multiplayer_map_names(&asset_transport::GameInstallDir(id.titles_install_dir.clone())))
+        .unwrap_or_default()
         .into_iter()
         .collect();
     let maps = {
@@ -271,7 +272,7 @@ const VOTE_CLOSES_BEFORE_START_MS: f64 = hks_t6::playlists::START_TIMER_MS;
 /// The public lobby's countdown started: the next match's map, from the
 /// rotation, and the playlist's game type go to `ui_mapname` /
 /// `ui_gametype`, and BO2's map vote opens on it.
-fn public_lobby_opened(host: &mut Host, mp: &Mp, identity: Option<&frame::LaunchIdentity>) {
+fn public_lobby_opened(host: &mut Host, mp: &Mp, identity: Option<&frame::StartupPersona>) {
     let Some(p) = mp.borrow().playlist.and_then(hks_t6::playlists::by_index) else { return };
     if mp.borrow().rotation.is_none() {
         let r = new_rotation(host, identity);
@@ -288,7 +289,7 @@ fn public_lobby_opened(host: &mut Host, mp: &Mp, identity: Option<&frame::Launch
         // The lobby's limit: the match's player slots (BO2 sets
         // party_maxplayers to the session's slots once a public lobby is
         // joined).
-        v.dvars.insert("party_maxplayers".to_owned(), p.max_players().to_string());
+        v.dvars.insert("party_maxplayers".to_owned(), p.seat_capacity().to_string());
     }
     {
         let mut m = mp.borrow_mut();
@@ -329,14 +330,14 @@ fn send_map_vote(host: &mut Host, mp: &Mp) {
     host.root_event("map_vote_set_votes_and_maps", &fields);
 }
 
-/// His vote (`xpartyveto n`: 1 NEXT, 2 PREVIOUS, 3 RANDOM).
+/// His vote (`xpartyveto n`: 1 MINT_COUNTER, 2 PREVIOUS, 3 RANDOM).
 pub(crate) fn map_vote(host: &mut Host, mp: &Mp, n: i32) {
     let cast = {
         let mut m = mp.borrow_mut();
         let c = hks_t6::mapvote::Choice::from_number(n);
         c.zip(m.vote.as_mut()).is_some_and(|(c, v)| v.cast(c))
     };
-    diag::info!(Ui, "bo2mp front end: map vote {n} ({})", if cast { "counted" } else { "not open" });
+    diag::info!(Ui, "front end: vote for map {n} ({})", if cast { "counted" } else { "not open" });
     if cast {
         send_map_vote(host, mp);
     }
@@ -354,7 +355,7 @@ fn close_map_vote(host: &mut Host, mp: &Mp) {
         }
     };
     let Some((choice, map)) = closed else { return };
-    diag::info!(Ui, "bo2mp front end: map vote closed, {choice:?} `{map}`");
+    diag::info!(Ui, "front end: voting over, {choice:?} `{map}`");
     {
         let mut v = host.values.borrow_mut();
         v.dvars.insert("ui_mapname".to_owned(), map);
@@ -366,66 +367,71 @@ fn close_map_vote(host: &mut Host, mp: &Mp) {
 
 /// Each frame: save his stats when they changed; START MATCH starts the
 /// match the lobby set up.
+/// True when it handed him to a match this frame (the caller stops the menu
+/// music then: BO2's front-end song ends as the map loads, and the match's
+/// own `PlayMusic("")` comes late or, in a public lobby, not at all).
 pub(crate) fn tick(
     host: &mut Host,
     mp: &Mp,
     front: &Bo2mpFrontend,
-    identity: Option<&frame::LaunchIdentity>,
+    identity: Option<&frame::StartupPersona>,
     commands: &mut Commands,
-    swap: Option<&mut session::SessionSwapRequest>,
-) {
+    swap: Option<&mut session::SessionHandoverOrder>,
+) -> bool {
     for line in std::mem::take(&mut mp.borrow_mut().stat_log) {
-        diag::info!(Ui, "bo2mp stats command: {line}");
+        diag::info!(Ui, "front end: stats line {line}");
     }
     if mp.borrow_mut().take_dirty() {
         let done: bo2_profile::SaveDone = Box::new(|file, result| match result {
-            Ok(()) => diag::info!(Ui, "bo2mp front end: stats saved to {}", file.display()),
-            Err(e) => diag::warn!(Ui, "bo2mp front end: stats not saved ({}): {e}", file.display()),
+            Ok(()) => diag::info!(Ui, "front end: stats written to {}", file.display()),
+            Err(e) => diag::warn!(Ui, "front end: stats could not be written to {}: {e}", file.display()),
         });
         let all = bo2_profile::SaveJob::Whole(mp.borrow().profile.stats.clone());
         bo2_profile::save_in_background(&front.stats_path, all, Some(done));
     }
-    // ZOMBIES: our Nuketown Zombies, swapped in as START MATCH swaps a map.
+    // ZOMBIES when the Zombies menus could not start: our Nuketown Zombies,
+    // swapped in as START MATCH swaps a map.
     if mp.borrow().zombies_requested {
         mp.borrow_mut().zombies_requested = false;
         let zone = "t6:zm_nuked".to_owned();
-        diag::info!(Ui, "bo2mp front end: ZOMBIES");
+        diag::info!(Ui, "front end: zombies picked");
         commands.remove_resource::<Bo2mpFrontend>();
-        match swap {
-            Some(swap) => match swap.request_zone(zone.clone()) {
-                Ok(id) => diag::info!(Ui, "bo2mp front end: starting `{zone}` (swap #{id})"),
-                Err(e) => diag::warn!(Ui, "bo2mp front end: `{zone}` not started: {e}"),
-            },
-            None => diag::warn!(Ui, "bo2mp front end: no session to start `{zone}`"),
+        if let Some(swap) = swap {
+            match swap.ask_for_region(zone.clone()) {
+                Ok(id) => diag::info!(Ui, "front end: zombies map `{zone}` asked for (swap #{id})"),
+                Err(e) => diag::warn!(Ui, "front end: zombies map `{zone}` refused: {e}"),
+            }
+        } else {
+            diag::warn!(Ui, "front end: zombies map `{zone}` has no session to load in");
         }
-        return;
+        return true;
     }
     // Combat Training: the public lobby's countdown (from the front end's
     // first frame back from a match), run out.
     // (LUI's clock reads 0 until the new front end's first frame.)
-    let wait = if host.now_ms() > 0.0 { mp.borrow_mut().public_start_in.take() } else { None };
+    let wait = if host.clock_millis() > 0.0 { mp.borrow_mut().public_start_in.take() } else { None };
     if let Some(wait) = wait {
-        mp.borrow_mut().public_start_ms = Some(host.now_ms() + wait);
+        mp.borrow_mut().public_start_ms = Some(host.clock_millis() + wait);
         public_lobby_opened(host, mp, identity);
     }
-    let closing = mp.borrow().public_start_ms.is_some_and(|at| host.now_ms() >= at - VOTE_CLOSES_BEFORE_START_MS);
+    let closing = mp.borrow().public_start_ms.is_some_and(|at| host.clock_millis() >= at - VOTE_CLOSES_BEFORE_START_MS);
     if closing {
         close_map_vote(host, mp);
     }
     let training = {
         let m = mp.borrow();
-        m.public_start_ms.filter(|at| host.now_ms() >= *at).and(m.playlist).and_then(hks_t6::playlists::by_index)
+        m.public_start_ms.filter(|at| host.clock_millis() >= *at).and(m.playlist).and_then(hks_t6::playlists::by_index)
     };
     if training.is_none() && !mp.borrow().start_requested {
         mp.borrow_mut().private_start_ms = None;
-        return;
+        return false;
     }
     // A Custom Game counts down "Game starting in N" before it starts.
     if training.is_none() {
-        let now = host.now_ms();
+        let now = host.clock_millis();
         let at = *mp.borrow_mut().private_start_ms.get_or_insert(now + PRIVATE_COUNTDOWN_MS);
         if now < at {
-            return;
+            return false;
         }
         mp.borrow_mut().private_start_ms = None;
     }
@@ -466,7 +472,7 @@ pub(crate) fn tick(
         setup.bot_difficulty = p.difficulty;
     }
     let zone = setup.zone();
-    diag::info!(Ui, "bo2mp front end: START MATCH {setup:?} ranked {}", training.is_some());
+    diag::info!(Ui, "front end: match starting {setup:?} ranked {}", training.is_some());
     // The match's server reads and writes his stats file (his classes, XP);
     // XP counts in Combat Training, not in Custom Games.
     sim::set_local_stats_path(front.stats_path.clone());
@@ -490,13 +496,15 @@ pub(crate) fn tick(
     commands.insert_resource(setup);
     // The match's HUD is the game's own, not the front end.
     commands.remove_resource::<Bo2mpFrontend>();
-    match swap {
-        Some(swap) => match swap.request_zone(zone.clone()) {
-            Ok(id) => diag::info!(Ui, "bo2mp front end: starting `{zone}` (swap #{id})"),
-            Err(e) => diag::warn!(Ui, "bo2mp front end: `{zone}` not started: {e}"),
-        },
-        None => diag::warn!(Ui, "bo2mp front end: no session to start `{zone}`"),
+    if let Some(swap) = swap {
+        match swap.ask_for_region(zone.clone()) {
+            Ok(id) => diag::info!(Ui, "front end: map `{zone}` asked for (swap #{id})"),
+            Err(e) => diag::warn!(Ui, "front end: map `{zone}` refused: {e}"),
+        }
+    } else {
+        diag::warn!(Ui, "front end: map `{zone}` has no session to load in");
     }
+    true
 }
 
 /// bo2mp lane C: a multiplayer match's screen values from his client dvars
@@ -532,8 +540,8 @@ pub(crate) struct MatchValues {
     /// "<selector material> <radius>", "" when not).
     pub locsel: String,
     /// bo2mp scope lane: his killcam ("<kind>|<killer>": kind 1 killcam,
-    /// 2 final killcam; "" none): BIT_IN_KILLCAM, BIT_FINAL_KILLCAM and the
-    /// killer's name card.
+    /// 2 final killcam, 4 the round's end killcam; "" none): BIT_IN_KILLCAM,
+    /// BIT_FINAL_KILLCAM / BIT_ROUND_END_KILLCAM and the killer's name card.
     pub killcam: String,
     /// bo2mp scope lane: his script took the HUD away (`setclientuivisibilityflag
     /// hud_visible 0`, as at the match's end) while a killcam still plays:
@@ -571,10 +579,10 @@ pub(crate) struct MatchValues {
 /// covers (BO2's `setminimap`), north, him and his team (position, yaw).
 #[derive(Clone, Debug)]
 pub(crate) struct MinimapView {
-    pub material: String,
+    pub pic: String,
     pub ul: [f32; 2],
     pub lr: [f32; 2],
-    pub north_yaw: f32,
+    pub compass_heading: f32,
     /// The world distance across the minimap, edge to edge (the map's
     /// `compassmaxrange`; measured against real BO2 on Aftermath: the HUD
     /// box spans 2048 units, 512 map pixels = 7840 units, 1.1 box px per
@@ -597,17 +605,17 @@ pub(crate) struct MinimapView {
 impl MinimapView {
     pub(crate) fn of(m: &MatchValues, me: ([f32; 2], f32), friends: Vec<([f32; 2], f32)>, enemies: Vec<([f32; 2], f32, bool, f32)>) -> Option<MinimapView> {
         let f: Vec<&str> = m.minimap.split(',').collect();
-        let (material, a, b, c, d, n, r) = match f[..] {
-            [material, a, b, c, d, n, r] => (material, a, b, c, d, n, r),
-            [material, a, b, c, d, n] => (material, a, b, c, d, n, "2048"),
+        let (pic, a, b, c, d, n, r) = match f[..] {
+            [pic, a, b, c, d, n, r] => (pic, a, b, c, d, n, r),
+            [pic, a, b, c, d, n] => (pic, a, b, c, d, n, "2048"),
             _ => return None,
         };
         let num = |x: &str| x.trim().parse::<f32>().unwrap_or(0.0);
         Some(MinimapView {
-            material: material.to_owned(),
+            pic: pic.to_owned(),
             ul: [num(a), num(b)],
             lr: [num(c), num(d)],
-            north_yaw: num(n),
+            compass_heading: num(n),
             range: num(r).max(100.0),
             me,
             friends,
@@ -747,7 +755,7 @@ impl MinimapView {
 
     /// The map's north and east in the world.
     fn axes(&self) -> ([f32; 2], [f32; 2]) {
-        let r = self.north_yaw.to_radians();
+        let r = self.compass_heading.to_radians();
         ([r.cos(), r.sin()], [r.sin(), -r.cos()])
     }
 
@@ -866,11 +874,11 @@ impl Scramble<'_> {
         fits(self.noise) && fits(self.tv)
     }
 
-    /// The scrambled map's colour (0..255) at map point (`u`, `v`).
-    pub(crate) fn colour(&self, f: &ScrambleFrame, map: (&[u8], usize, usize), u: f32, v: f32) -> [f32; 4] {
+    /// The scrambled map's colour (0..255) at map point (`pu`, `pv`).
+    pub(crate) fn colour(&self, f: &ScrambleFrame, map: (&[u8], usize, usize), pu: f32, pv: f32) -> [f32; 4] {
         let sv = SCRAMBLE_SV0;
         let (nd, nw, nh) = self.noise;
-        let n = (sample_bilinear(nd, nw, nh, (u + f.off[0]) * 0.07, (v + f.off[1]) * 0.07, true, 0) / 255.0).clamp(0.0, 1.0);
+        let n = (sample_bilinear(nd, nw, nh, (pu + f.off[0]) * 0.07, (pv + f.off[1]) * 0.07, true, 0) / 255.0).clamp(0.0, 1.0);
         let a = (sv[1] * 2.0).clamp(0.0, 1.0);
         let m = n * 344.0 - 704.0;
         let res = (a * m + 722.0).floor() * 2.0;
@@ -891,11 +899,11 @@ impl Scramble<'_> {
                 / 3.0;
             [r, g, b, alpha]
         };
-        let blocky = chroma((res * u).floor() / res + 0.5 / res, (res * v).floor() / res + 0.5 / res);
+        let blocky = chroma((res * pu).floor() / res + 0.5 / res, (res * pv).floor() / res + 0.5 / res);
         if wgt <= 0.0 {
             return blocky;
         }
-        let smooth = chroma(u, v);
+        let smooth = chroma(pu, pv);
         std::array::from_fn(|i| blocky[i] + wgt * (smooth[i] - blocky[i]))
     }
 }
@@ -961,7 +969,7 @@ impl MatchValues {
 /// What a match's HUD has already been sent (each numbered item once).
 #[derive(Default)]
 pub(crate) struct MatchSeen {
-    menu: String,
+    shown_menu: String,
     lui: u32,
     feed: u32,
     /// The kill feed's lines (newest last) and when each came (LUI time);
@@ -975,9 +983,9 @@ pub(crate) struct MatchSeen {
 /// one killed.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FeedLine {
-    attacker: String,
+    killer: String,
     icon: Option<(String, f32)>,
-    victim: String,
+    fallen: String,
     /// Whether the killer and the one killed are on his team (`None`: no
     /// team known, the name keeps the font's white).
     attacker_mine: Option<bool>,
@@ -996,7 +1004,7 @@ const FEED_FADE_OUT_MS: f64 = 500.0;
 
 /// `obj:name(args...)`.
 fn call_method(host: &mut Host, obj: &Value, name: &str, args: Vec<Value>) -> Option<Vec<Value>> {
-    let f = host.vm.index(obj, &Value::str(name)).ok()?;
+    let f = host.vm.lookup_index(obj, &Value::str(name)).ok()?;
     let mut all = vec![obj.clone()];
     all.extend(args);
     host.call(f, all)
@@ -1006,7 +1014,7 @@ fn call_method(host: &mut Host, obj: &Value, name: &str, args: Vec<Value>) -> Op
 /// kill icon, the one killed (a suicide or a fall: the icon and him).
 fn feed_line(_host: &Host, mp: &Mp, item: &str, my_team: &str) -> Option<FeedLine> {
     let mut f = item.split('|').skip(1);
-    let (attacker, victim, weapon) = (f.next()?, f.next()?, f.next().unwrap_or(""));
+    let (killer, fallen, weapon) = (f.next()?, f.next()?, f.next().unwrap_or(""));
     let mod_ = f.next().unwrap_or("");
     let own = f.next() == Some("self");
     // (The sides the sim saw: the killer's, the one killed's.) The engine's
@@ -1039,9 +1047,9 @@ fn feed_line(_host: &Host, mp: &Mp, item: &str, my_team: &str) -> Option<FeedLin
         named(base).or_else(|| named("hud_obit_death_suicide"))
     };
     Some(FeedLine {
-        attacker: if own { String::new() } else { attacker.to_owned() },
+        killer: if own { String::new() } else { killer.to_owned() },
         icon,
-        victim: victim.to_owned(),
+        fallen: fallen.to_owned(),
         attacker_mine,
         victim_mine,
     })
@@ -1051,19 +1059,19 @@ fn feed_line(_host: &Host, mp: &Mp, item: &str, my_team: &str) -> Option<FeedLin
 /// bottom, each line fading out after a few seconds: the killer's name, the
 /// weapon's kill icon, the name of the one killed, left to right.
 fn draw_feed(host: &mut Host, mp: &Mp, seen: &mut MatchSeen) {
-    let now = host.now_ms();
+    let now = host.clock_millis();
     seen.feed_lines.retain(|(_, at)| now - at < FEED_MS);
     let Some(window) = mp.borrow().windows.iter().find(|(_, i)| *i == 0).map(|(w, _)| w.clone()) else {
         return;
     };
     let fonts = host.field("CoD", "fonts");
-    let font = host.vm.index(&fonts, &Value::str("ExtraSmall")).unwrap_or(Value::Nil);
+    let font = host.vm.lookup_index(&fonts, &Value::str("ExtraSmall")).unwrap_or(Value::Nil);
     let sizes = host.field("CoD", "textSize");
-    let h = host.vm.index(&sizes, &Value::str("ExtraSmall")).ok().and_then(|v| v.as_num()).unwrap_or(16.0);
+    let h = host.vm.lookup_index(&sizes, &Value::str("ExtraSmall")).ok().and_then(|v| v.as_num()).unwrap_or(16.0);
     if seen.feed_rows.is_empty() {
         let ui_text = host.field("LUI", "UIText");
         let ui_image = host.field("LUI", "UIImage");
-        let (Ok(new_text), Ok(new_image)) = (host.vm.index(&ui_text, &Value::str("new")), host.vm.index(&ui_image, &Value::str("new"))) else {
+        let (Ok(new_text), Ok(new_image)) = (host.vm.lookup_index(&ui_text, &Value::str("new")), host.vm.lookup_index(&ui_image, &Value::str("new"))) else {
             return;
         };
         for _ in 0..FEED_LINES {
@@ -1081,20 +1089,20 @@ fn draw_feed(host: &mut Host, mp: &Mp, seen: &mut MatchSeen) {
         }
     }
     let measure = host.vm.global("GetTextDimensions");
-    let width = |host: &mut Host, text: &str| -> f32 {
-        if text.is_empty() {
+    let width = |host: &mut Host, words: &str| -> f32 {
+        if words.is_empty() {
             return 0.0;
         }
-        host.call(measure.clone(), vec![Value::str(text), font.clone(), Value::Num(h)])
+        host.call(measure.clone(), vec![Value::str(words), font.clone(), Value::Num(h)])
             .and_then(|r| r.get(2).and_then(Value::as_num))
-            .unwrap_or(h * 0.5 * text.len() as f32)
+            .unwrap_or(h * 0.5 * words.len() as f32)
     };
     // BO2's name colours: the scripts' `CoD.teamColorFriendly` / `teamColorEnemy` (the g_TeamColor_MyTeam / EnemyTeam dvars).
     let team_rgb = |host: &mut Host, mine: bool| -> Option<[f32; 3]> {
         let t = host.field("CoD", if mine { "teamColorFriendly" } else { "teamColorEnemy" });
         let mut c = [0.0; 3];
         for (i, k) in ["r", "g", "b"].iter().enumerate() {
-            c[i] = host.vm.index(&t, &Value::str(k)).ok().and_then(|v| v.as_num())?;
+            c[i] = host.vm.lookup_index(&t, &Value::str(k)).ok().and_then(|v| v.as_num())?;
         }
         Some(c)
     };
@@ -1109,8 +1117,8 @@ fn draw_feed(host: &mut Host, mp: &Mp, seen: &mut MatchSeen) {
     for (i, [a, icon, v]) in seen.feed_rows.clone().iter().enumerate() {
         let bottom = -(((FEED_LINES - 1 - i) as f32) * h);
         let place = |host: &mut Host, e: &Value, x0: f32, x1: f32, top: f32| {
-            call_method(host, e, "setLeftRight", vec![Value::Bool(true), Value::Bool(false), Value::Num(x0), Value::Num(x1)]);
-            call_method(host, e, "setTopBottom", vec![Value::Bool(false), Value::Bool(true), Value::Num(top), Value::Num(bottom)]);
+            call_method(host, e, "setLeftRight", vec![Value::Boolean(true), Value::Boolean(false), Value::Num(x0), Value::Num(x1)]);
+            call_method(host, e, "setTopBottom", vec![Value::Boolean(false), Value::Boolean(true), Value::Num(top), Value::Num(bottom)]);
         };
         let Some((line, at)) = i.checked_sub(pad).and_then(|k| shown.get(k)) else {
             for e in [a, icon, v] {
@@ -1122,8 +1130,8 @@ fn draw_feed(host: &mut Host, mp: &Mp, seen: &mut MatchSeen) {
         let alpha = (age / FEED_FADE_IN_MS).min((FEED_MS - age) / FEED_FADE_OUT_MS).clamp(0.0, 1.0) as f32;
         let mut x = 0.0;
         // The killer.
-        let w = width(host, &line.attacker);
-        call_method(host, a, "setText", vec![Value::str(&line.attacker)]);
+        let w = width(host, &line.killer);
+        call_method(host, a, "setText", vec![Value::str(&line.killer)]);
         let c = line.attacker_mine.and_then(|m| team_rgb(host, m)).unwrap_or([1.0; 3]);
         call_method(host, a, "setRGB", vec![Value::Num(c[0]), Value::Num(c[1]), Value::Num(c[2])]);
         place(host, a, x, x + w, bottom - h);
@@ -1141,8 +1149,8 @@ fn draw_feed(host: &mut Host, mp: &Mp, seen: &mut MatchSeen) {
                     call_method(host, icon, "setImage", vec![mat]);
                 }
                 let low = bottom - (h - ih) * 0.5;
-                call_method(host, icon, "setLeftRight", vec![Value::Bool(true), Value::Bool(false), Value::Num(x), Value::Num(x + iw)]);
-                call_method(host, icon, "setTopBottom", vec![Value::Bool(false), Value::Bool(true), Value::Num(low - ih), Value::Num(low)]);
+                call_method(host, icon, "setLeftRight", vec![Value::Boolean(true), Value::Boolean(false), Value::Num(x), Value::Num(x + iw)]);
+                call_method(host, icon, "setTopBottom", vec![Value::Boolean(false), Value::Boolean(true), Value::Num(low - ih), Value::Num(low)]);
                 call_method(host, icon, "setAlpha", vec![Value::Num(alpha)]);
                 x += iw + gap;
             }
@@ -1150,10 +1158,10 @@ fn draw_feed(host: &mut Host, mp: &Mp, seen: &mut MatchSeen) {
                 call_method(host, icon, "setAlpha", vec![Value::Num(0.0)]);
             }
         }
-        let victim = line.victim.clone();
+        let fallen = line.fallen.clone();
         // The one killed.
-        let w = width(host, &victim);
-        call_method(host, v, "setText", vec![Value::str(&victim)]);
+        let w = width(host, &fallen);
+        call_method(host, v, "setText", vec![Value::str(&fallen)]);
         let c = line.victim_mine.and_then(|m| team_rgb(host, m)).unwrap_or([1.0; 3]);
         call_method(host, v, "setRGB", vec![Value::Num(c[0]), Value::Num(c[1]), Value::Num(c[2])]);
         place(host, v, x, x + w, bottom - h);
@@ -1162,7 +1170,7 @@ fn draw_feed(host: &mut Host, mp: &Mp, seen: &mut MatchSeen) {
 }
 
 /// His stats file for a match's class menu (beside settings.cfg).
-pub(crate) fn stats_path(identity: Option<&frame::LaunchIdentity>) -> std::path::PathBuf {
+pub(crate) fn stats_path(identity: Option<&frame::StartupPersona>) -> std::path::PathBuf {
     identity.map_or_else(|| std::path::PathBuf::from(diag::ARTIFACTS_DIR), |i| i.artifacts.clone()).join("bo2mp_stats.txt")
 }
 
@@ -1203,7 +1211,7 @@ pub(crate) fn match_load(host: &mut Host, mp: &Mp, gametype: &str, map: &str) {
     // The class set the menus read is the server's: a ranked match (Combat
     // Training) gives the public set, any other the custom match set.
     let private = host.field("CoD", "GAMEMODE_PRIVATE_MATCH").as_num().map_or(1, |n| n as i32);
-    if sim::local_match_ranked() {
+    if sim::ranked() {
         mp.borrow_mut().game_modes.remove(&private);
     } else {
         mp.borrow_mut().game_modes.insert(private);
@@ -1264,10 +1272,10 @@ fn killstreak_hud(host: &mut Host, new: &MatchValues) {
         "hud_update_killstreak_hud",
         &[
             ("controller", Value::Num(0.0)),
-            ("chopperGunner", Value::Bool(kind == Some("heli_player_gunner_mp"))),
-            ("reaper", Value::Bool(kind == Some("remote_mortar_mp"))),
-            ("predator", Value::Bool(kind == Some("remote_missile_mp"))),
-            ("infrared", Value::Bool(new.infrared == "1")),
+            ("chopperGunner", Value::Boolean(kind == Some("heli_player_gunner_mp"))),
+            ("reaper", Value::Boolean(kind == Some("remote_mortar_mp"))),
+            ("predator", Value::Boolean(kind == Some("remote_missile_mp"))),
+            ("infrared", Value::Boolean(new.infrared == "1")),
         ],
     );
 }
@@ -1316,7 +1324,7 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
         _ => host.field("CoD", "TEAM_FREE").as_num().unwrap_or(0.0),
     };
     if changed(|v| &v.team) || changed(|v| &v.scores) || changed(|v| &v.gametype) {
-        diag::info!(Ui, "bo2mp hud: team {:?} scores {:?} gametype {:?}", new.team, new.scores, new.gametype);
+        diag::info!(Ui, "match hud: side {:?} scores {:?} mode {:?}", new.team, new.scores, new.gametype);
     }
     if changed(|v| &v.team) {
         let t = team_num(host, &new.team);
@@ -1324,9 +1332,9 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
         host.root_event("hud_update_team_change", &[("team", Value::Num(t))]);
     }
     if changed(|v| &v.scores) || changed(|v| &v.team) {
-        let (allies, axis) = new.scores.split_once(',').unwrap_or(("0", "0"));
-        let (allies, axis) = (allies.trim().parse::<f32>().unwrap_or(0.0), axis.trim().parse::<f32>().unwrap_or(0.0));
-        let (yours, enemy) = if new.team == "axis" { (axis, allies) } else { (allies, axis) };
+        let (side_a, side_b) = new.scores.split_once(',').unwrap_or(("0", "0"));
+        let (side_a, side_b) = (side_a.trim().parse::<f32>().unwrap_or(0.0), side_b.trim().parse::<f32>().unwrap_or(0.0));
+        let (yours, enemy) = if new.team == "axis" { (side_b, side_a) } else { (side_a, side_b) };
         let t = team_num(host, &new.team);
         host.root_event(
             "hud_update_scores",
@@ -1346,7 +1354,7 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
         let mut board = Vec::new();
         for row in new.rows.split(';') {
             let f: Vec<&str> = row.split('|').collect();
-            let [c, name, score, kills, deaths] = f[..] else { continue };
+            let [c, who, score, kills, deaths] = f[..] else { continue };
             let Some(team) = team_of(c) else { continue };
             let num = |x: &str| x.trim().parse::<f32>().unwrap_or(0.0);
             let values: Vec<f32> = cols
@@ -1360,7 +1368,7 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
                 })
                 .collect();
             let team = team_num(host, &team) as i32;
-            board.push(hks_t6::mp::BoardRow { client: c.parse().unwrap_or(0), team, name: name.to_owned(), cols: values });
+            board.push(hks_t6::mp::BoardRow { client: c.parse().unwrap_or(0), team, name: who.to_owned(), cols: values });
         }
         board.sort_by(|a, b| b.cols.first().unwrap_or(&0.0).total_cmp(a.cols.first().unwrap_or(&0.0)));
         // The board's sides (GetTeamPositions): BO2's scoreboard script asks
@@ -1371,10 +1379,10 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
         let scores = if !board.is_empty() && board.iter().all(|r| r.team == free) {
             vec![(free, 0.0)]
         } else {
-            let (allies, axis) = new.scores.split_once(',').unwrap_or(("0", "0"));
+            let (side_a, side_b) = new.scores.split_once(',').unwrap_or(("0", "0"));
             vec![
-                (team_num(host, "allies") as i32, allies.trim().parse::<f32>().unwrap_or(0.0)),
-                (team_num(host, "axis") as i32, axis.trim().parse::<f32>().unwrap_or(0.0)),
+                (team_num(host, "allies") as i32, side_a.trim().parse::<f32>().unwrap_or(0.0)),
+                (team_num(host, "axis") as i32, side_b.trim().parse::<f32>().unwrap_or(0.0)),
             ]
         };
         // (The After Action Report's scoreboard is the match's last.)
@@ -1432,7 +1440,7 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
             .split_once('|')
             .map_or((0, None), |(k, c)| (k.parse::<u8>().unwrap_or(0), c.parse::<i32>().ok().filter(|c| *c >= 0)));
         mp.borrow_mut().callout = killer;
-        diag::info!(Ui, "bo2mp lui: killcam state {:?}", new.killcam);
+        diag::info!(Ui, "match hud: killcam now {:?}", new.killcam);
         // Kind 3 is the card at his death, before the killcam: BO2's engine
         // sends `player_obituary_callout` with the killer's name card and
         // "Killed By" (notificationpopups.lua PlayerObituaryCallout); the
@@ -1446,9 +1454,9 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
                 let killed_by = host.values.borrow().localize.get("CGAME_KILLEDBY").cloned().unwrap_or_else(|| "Killed By".to_owned());
                 card.borrow_mut().set_str("killString", Value::str(&killed_by));
                 host.root_event_table("player_obituary_callout", card);
-                diag::info!(Ui, "bo2mp lui: killed-by card sent (killer {killer})");
+                diag::info!(Ui, "match hud: killed-by card up for {killer}");
             } else {
-                diag::warn!(Ui, "bo2mp lui: no killed-by card: no callout data for {killer}");
+                diag::warn!(Ui, "match hud: {killer} has no callout data, so no killed-by card");
             }
         }
         // The final one's bit first: the widget reads it as it opens.
@@ -1458,9 +1466,10 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
         // BIT_IN_KILLCAM.
         let want = [
             ("BIT_FINAL_KILLCAM", kind == 2),
-            ("BIT_IN_KILLCAM", (1..=2).contains(&kind)),
-            ("BIT_SPECTATING_CLIENT", (1..=2).contains(&kind)),
-            ("BIT_PLAYER_DEAD", (1..=2).contains(&kind)),
+            ("BIT_ROUND_END_KILLCAM", kind == 4),
+            ("BIT_IN_KILLCAM", matches!(kind, 1 | 2 | 4)),
+            ("BIT_SPECTATING_CLIENT", matches!(kind, 1 | 2 | 4)),
+            ("BIT_PLAYER_DEAD", matches!(kind, 1 | 2 | 4)),
         ];
         for (name, on) in want {
             let Some(bit) = host.field("CoD", name).as_num().map(|n| n as i32) else { continue };
@@ -1509,8 +1518,8 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
         let reaper = new.vehicle.split_whitespace().next() == Some("remote_mortar_mp");
         diag::info!(
             Ui,
-            "bo2mp hud: vehicle {:?} (chopper gunner screen {gunner}, hellstorm screen {missile}, \
-             lodestar screen {reaper})",
+            "match hud: riding {:?} (chopper gunner view {gunner}, hellstorm view {missile}, \
+             lodestar view {reaper})",
             new.vehicle
         );
         // His keys for the vehicle's own commands: BO2 binds each (up, down,
@@ -1563,7 +1572,7 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
     }
     if changed(|v| &v.vision) {
         let found = asset_world::set_t6_player_vision(&new.vision);
-        diag::info!(Ui, "bo2mp hud: server vision {:?} (vision found: {found})", new.vision);
+        diag::info!(Ui, "match hud: host vision {:?} (found: {found})", new.vision);
     }
     if changed(|v| &v.settings) {
         apply_settings(host, mp, &new.settings);
@@ -1571,11 +1580,11 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
     }
     if changed(|v| &v.timeleft) {
         let ms = new.timeleft.trim().parse::<f32>().map_or(0.0, |s| s * 1000.0);
-        mp.borrow_mut().game_end_ms = (!new.timeleft.trim().is_empty()).then(|| host.now_ms() + f64::from(ms));
+        mp.borrow_mut().game_end_ms = (!new.timeleft.trim().is_empty()).then(|| host.clock_millis() + f64::from(ms));
         host.root_event("hud_update_game_timer", &[("timeLeft", Value::Num(ms))]);
     }
-    if new.menu != seen.menu {
-        seen.menu = new.menu.clone();
+    if new.menu != seen.shown_menu {
+        seen.shown_menu = new.menu.clone();
         match new.menu.split_once(':') {
             Some((_, "")) => host.root_event("close_all_ingame_menus", &[]),
             Some((_, menu)) => host.root_event("open_ingame_menu", &[("menuName", Value::str(menu))]),
@@ -1591,15 +1600,15 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
         }
         seen.lui = n;
         let Some(name) = parts.next() else { continue };
-        let data = hks_t6::value::Table::new_ref();
+        let data = hks_t6::value::LuaTable::new_ref();
         for (i, a) in parts.enumerate() {
             let v = a.trim().parse::<f32>().map_or_else(|_| Value::str(a), Value::Num);
-            data.borrow_mut().set(Value::Num((i + 1) as f32), v);
+            data.borrow_mut().store(Value::Num((i + 1) as f32), v);
         }
-        diag::info!(Ui, "bo2mp lui notify: {item}");
+        diag::info!(Ui, "match hud: notify {item}");
         // (A medal shown is one the After Action Report lists.)
         if name == "medal_received" {
-            if let Some(row) = data.borrow().get(&Value::Num(1.0)).as_num() {
+            if let Some(row) = data.borrow().read_key(&Value::Num(1.0)).as_num() {
                 hks_t6::aar::record_medal(row as i32);
             }
         }
@@ -1612,9 +1621,35 @@ pub(crate) fn match_events(host: &mut Host, seen: &mut MatchSeen, old: Option<&M
         }
         seen.feed = n;
         if let Some(line) = feed_line(host, mp, item, &new.team) {
-            let now = host.now_ms();
+            let now = host.clock_millis();
             seen.feed_lines.push_back((line, now));
         }
     }
     draw_feed(host, mp, seen);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::world::CommandQueue;
+
+    fn ticked(mp: &Mp) -> bool {
+        let mut host = Host::new(Vec::new(), Box::new(|_, _, _| 0.0));
+        let front = Bo2mpFrontend { stats_path: std::env::temp_dir().join("bo2mp_tick_test_stats") };
+        let world = World::new();
+        let mut queue = CommandQueue::default();
+        let mut commands = Commands::new(&mut queue, &world);
+        tick(&mut host, mp, &front, None, &mut commands, None)
+    }
+
+    #[test]
+    fn the_menu_music_stops_only_when_a_match_is_handed_over() {
+        let mp: Mp = Default::default();
+        assert!(!ticked(&mp), "nothing asked: the menus keep their song");
+        mp.borrow_mut().start_requested = true;
+        assert!(!ticked(&mp), "a Custom Game still counting down");
+        let mp: Mp = Default::default();
+        mp.borrow_mut().zombies_requested = true;
+        assert!(ticked(&mp), "ZOMBIES swaps the map in");
+    }
 }

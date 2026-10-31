@@ -28,9 +28,9 @@ pub const HITLOC_NAMES: [&str; HITLOC_COUNT] = [
     "riotshield",
 ];
 
-pub const HITLOC_NONE: u8 = 0;
-pub const HITLOC_HELMET: u8 = 1;
-pub const HITLOC_HEAD: u8 = 2;
+pub const BODY_ZONE_UNSET: u8 = 0;
+pub const STRUCK_HELM: u8 = 1;
+pub const STRUCK_SKULL: u8 = 2;
 pub const HITLOC_GUN: u8 = 19;
 pub const HITLOC_RIOTSHIELD: u8 = 20;
 
@@ -41,20 +41,25 @@ pub const GLOBAL_START: [f32; HITLOC_COUNT] = {
     t
 };
 
-/// Weapon types whose own table is used (bullet, grenade, projectile).
-const OWN_TABLE_TYPES: [i32; 3] = [0, 1, 2];
+/// BO2 `weapType_t` values whose own table is used (bullet, grenade, projectile).
+const OWN_TABLE_TYPES: [i32; 3] = [
+    crate::facts::gun_family_code::BULLET as i32,
+    crate::facts::gun_family_code::GRENADE as i32,
+    crate::facts::gun_family_code::PROJECTILE as i32,
+];
 
 /// G_GetWeaponHitLocationMultiplier's choice, per slot: a bullet, grenade or projectile weapon
 /// uses its own table (BO2 replaces, where MW2 multiplied it with the global one); anything
-/// else uses the global table. A weapon with no table of its own keeps the global one.
+/// else uses the global table. `gun_family_code` is BO2's raw `weapType_t`, not a remapped number.
+/// A weapon with no table of its own keeps the global one.
 #[must_use]
 pub fn location_table(
-    weap_type: i32,
+    gun_family_code: i32,
     global: [f32; HITLOC_COUNT],
     weapon: Option<[f32; HITLOC_COUNT]>,
 ) -> [f32; HITLOC_COUNT] {
     match weapon {
-        Some(own) if OWN_TABLE_TYPES.contains(&weap_type) => own,
+        Some(own) if OWN_TABLE_TYPES.contains(&gun_family_code) => own,
         _ => global,
     }
 }
@@ -68,7 +73,7 @@ pub fn location_scale(table: &[f32; HITLOC_COUNT], hitloc: u8) -> f32 {
 /// BO2's headshot: the helmet or the head.
 #[must_use]
 pub const fn is_headshot(hitloc: u8) -> bool {
-    hitloc == HITLOC_HELMET || hitloc == HITLOC_HEAD
+    hitloc == STRUCK_HELM || hitloc == STRUCK_SKULL
 }
 
 /// The name of a hit location ("none" past the end).
@@ -79,8 +84,8 @@ pub fn hitloc_name(hitloc: u8) -> &'static str {
 
 /// Damage times the multiplier, cut to a whole number, at least 1 (melee skips this).
 #[must_use]
-pub fn scaled_damage(damage: i32, scale: f32) -> i32 {
-    ((damage as f32 * scale) as i32).max(1)
+pub fn scaled_damage(damage: i32, factor: f32) -> i32 {
+    ((damage as f32 * factor) as i32).max(1)
 }
 
 #[cfg(test)]
@@ -110,9 +115,12 @@ mod tests {
         let mut own = [1.0f32; HITLOC_COUNT];
         own[2] = 1.5;
         assert_eq!(location_table(0, global, Some(own))[2], 1.5);
+        assert_eq!(location_table(1, global, Some(own))[2], 1.5);
         assert_eq!(location_table(2, global, Some(own))[2], 1.5);
-        // melee (and every other type) and a weapon with no table: the global one
-        assert_eq!(location_table(3, global, Some(own))[2], 2.0);
+        // binoculars, gas, bomb, mine, melee, riot shield and a weapon with no table: global
+        for raw in [3, 4, 5, 6, 7, 8] {
+            assert_eq!(location_table(raw, global, Some(own))[2], 2.0, "raw type {raw}");
+        }
         assert_eq!(location_table(0, global, None)[2], 2.0);
     }
 

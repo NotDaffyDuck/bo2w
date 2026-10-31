@@ -3,27 +3,30 @@
 //! the sound it makes when the motor lights.
 //!
 //! Each row of the missile occupancy is looked at once per frame. What has
-//! already played is remembered per entity in [`MissileBoltState`], so a
+//! already played is remembered per entity in [`RocketAttachState`], so a
 //! looping trail starts once and a missile that is replaced by another
 //! (same entity number, new projectile) starts over.
 
-use asset_game::{FxName, WeaponSoundSlot};
-use assets::{PreparedProjectileMeshes, PreparedWeapons};
+use asset_game::{FxName, WeaponAudioRole};
+use assets::{ReadiedProjectileMeshes, StagedWeapons};
 use bevy::prelude::*;
-use render_fx::combat::missile_bolt_target;
+use render_fx::battle_fx::rocket_arrow_victim;
 
-use super::stage::FxStage;
+use super::stage::{FxStage, Playback};
 use super::weapon_audio::WeaponVoices;
-use crate::adapters::anim::dobj_pose::HostDObjPoseFrame;
-use crate::adapters::anim::missile::{MissileBoltRow, MissileBoltState, MissileOccupancy};
+use crate::adapters::motion::puppet_pose::HostSkeletonFrame;
+use crate::adapters::motion::missile::{
+    RocketAttachRow, RocketAttachState, RocketSceneSlot, LiveRocketEntry,
+};
 
-fn fresh_row(projectile: Option<u32>, weapon: u32) -> MissileBoltRow {
-    MissileBoltRow {
-        projectile,
+fn fresh_row(proj_ent: Option<u32>, weapon: u32) -> RocketAttachRow {
+    let trail_played = false;
+    RocketAttachRow {
+        projectile: proj_ent,
         weapon,
-        trail_played: false,
-        beacon_played: false,
-        ignition_played: false,
+        trail_done: trail_played,
+        marker_effect_done: false,
+        ignition_effect_done: false,
         ignition_fx_played: false,
     }
 }
@@ -42,28 +45,28 @@ impl Look {
     /// The effect the weapon authored for this look.
     fn authored<'a>(
         self,
-        weapons: &'a asset_game::WeaponRegistry,
-        weapon: u32,
+        weapons: &'a asset_game::WeaponLedger,
+        gun_no: u32,
     ) -> Option<FxName<'a>> {
         match self {
-            Look::Trail => weapons.proj_trail_of(weapon),
-            Look::Beacon => weapons.proj_beacon_of(weapon),
-            Look::Ignition => weapons.proj_ignition_of(weapon),
+            Look::Trail => weapons.shot_wake_for(gun_no),
+            Look::Beacon => weapons.shot_light_for(gun_no),
+            Look::Ignition => weapons.shot_ignite_for(gun_no),
         }
     }
 
-    fn already_played(self, row: &MissileBoltRow) -> bool {
+    fn already_played(self, row: &RocketAttachRow) -> bool {
         match self {
-            Look::Trail => row.trail_played,
-            Look::Beacon => row.beacon_played,
+            Look::Trail => row.trail_done,
+            Look::Beacon => row.marker_effect_done,
             Look::Ignition => row.ignition_fx_played,
         }
     }
 
-    fn mark_played(self, row: &mut MissileBoltRow) {
+    fn mark_played(self, row: &mut RocketAttachRow) {
         match self {
-            Look::Trail => row.trail_played = true,
-            Look::Beacon => row.beacon_played = true,
+            Look::Trail => row.trail_done = true,
+            Look::Beacon => row.marker_effect_done = true,
             Look::Ignition => row.ignition_fx_played = true,
         }
     }
@@ -71,123 +74,148 @@ impl Look {
     /// The beacon shows from the start; the trail and the ignition flash
     /// wait for the motor.
     fn needs_ignition(self) -> bool {
-        !matches!(self, Look::Beacon)
+        self != Look::Beacon
     }
 
     /// A trail or beacon with no pose to ride is a gap worth counting; the
     /// one-shot ignition flash simply waits for the next frame.
     fn counts_pose_gap(self) -> bool {
-        !matches!(self, Look::Ignition)
+        self != Look::Ignition
     }
 
-    fn due(self, ignited: bool, row: &MissileBoltRow) -> bool {
+    fn due(self, ignited: bool, row: &RocketAttachRow) -> bool {
         (ignited || !self.needs_ignition()) && !self.already_played(row)
     }
 }
 
+/// Counts one more of something that went missing.
+fn tally(counter: &mut u64) {
+    *counter = counter.saturating_add(1);
+}
+
+/// What a frame of missiles is looked at against.
+struct Flight<'a> {
+    registry: &'a asset_game::WeaponLedger,
+    meshes: &'a asset_model::MissileMeshRoster,
+    poses: Option<&'a HostSkeletonFrame>,
+}
+
+/// Starts each look of one missile that is due and has a pose to ride.
+fn start_looks(
+    missile: &LiveRocketEntry,
+    ent_no: u32,
+    flight: &Flight<'_>,
+    bolts: &mut RocketAttachState,
+    play: &mut Playback<'_>,
+) {
+    for look in Look::ALL {
+        let due = bolts
+            .rows
+            .get(&ent_no)
+            .is_some_and(|row| look.due(missile.ignited, row));
+        let name = due.then(|| look.authored(flight.registry, missile.weapon)).flatten();
+        let Some(name) = name else {
+            continue;
+        };
+        let target = rocket_arrow_victim(
+            flight.poses,
+            flight.meshes,
+            missile.namespace,
+            &missile.name,
+            ent_no,
+        );
+        let Some(goal) = target else {
+            if look.counts_pose_gap() {
+                tally(&mut bolts.posing_shortfalls);
+            }
+            continue;
+        };
+        let mut began = 0;
+        if !play.bolted(Some(name), Some(goal), &mut began) {
+            tally(&mut bolts.playback_shortfalls);
+        } else if let Some(row) = bolts.rows.get_mut(&ent_no) {
+            look.mark_played(row);
+        }
+    }
+}
+
+/// Says the motor's ignition sound once; without a queued sound the next frame tries again.
+fn ignition_sound(
+    missile: &LiveRocketEntry,
+    ent_no: u32,
+    bolts: &mut RocketAttachState,
+    voices: &mut WeaponVoices,
+) {
+    let slot = WeaponAudioRole::ProjIgnition;
+    if !voices.authors(missile.weapon, slot) {
+        return;
+    }
+    let Some(alias) = voices.alias(missile.weapon, slot) else {
+        return tally(&mut bolts.ignition_shortfalls);
+    };
+    let said = voices.say(missile.weapon, alias, Some(missile.origin), Some(ent_no));
+    if let (true, Some(row)) = (said, bolts.rows.get_mut(&ent_no)) {
+        row.ignition_effect_done = true;
+    }
+}
+
 pub(super) fn tick_missile_present_state(
-    occupancy: Option<Res<MissileOccupancy>>,
-    weapons: Option<Res<PreparedWeapons>>,
-    projectile_meshes: Option<Res<PreparedProjectileMeshes>>,
-    mut bolts: ResMut<MissileBoltState>,
-    poses: Option<Res<HostDObjPoseFrame>>,
+    occupancy: Option<Res<RocketSceneSlot>>,
+    weapons: Option<Res<StagedWeapons>>,
+    shell_visual_models: Option<Res<ReadiedProjectileMeshes>>,
+    mut bolt_list: ResMut<RocketAttachState>,
+    poses: Option<Res<HostSkeletonFrame>>,
     mut stage: FxStage,
     mut voices: WeaponVoices,
 ) {
-    let Some(occupancy) = occupancy.as_deref() else {
-        return;
-    };
-    let Some(registry) = weapons
-        .as_deref()
-        .map(|prepared| &*prepared.0)
-        .filter(|registry| !registry.is_empty())
-    else {
-        return;
-    };
-    let Some(meshes) = projectile_meshes
-        .as_deref()
-        .map(|prepared| &prepared.0)
-        .filter(|meshes| !meshes.is_empty())
-    else {
+    let registry = weapons.as_deref().map(|prepared| &*prepared.0);
+    let meshes = shell_visual_models.as_deref().map(|prepared| &prepared.0);
+    let (Some(occupancy), Some(registry), Some(meshes)) = (
+        occupancy.as_deref(),
+        registry.filter(|registry| !registry.is_empty()),
+        meshes.filter(|meshes| !meshes.is_empty()),
+    ) else {
         return;
     };
     let Some(mut play) = stage.playback() else {
         return;
     };
+    let flight = Flight {
+        registry,
+        meshes,
+        poses: poses.as_deref(),
+    };
 
-    let mut live = Vec::with_capacity(occupancy.rows.len());
+    let mut alive = Vec::with_capacity(occupancy.rows.len());
     for missile in &occupancy.rows {
         let Some(entnum) = missile.entnum else {
-            bolts.predicted_rows_skipped = bolts.predicted_rows_skipped.saturating_add(1);
+            tally(&mut bolt_list.guessed_rows_dropped);
             continue;
         };
-        live.push(entnum);
+        alive.push(entnum);
 
-        let remembered = bolts
+        let remembered = bolt_list
             .rows
             .entry(entnum)
-            .or_insert_with(|| fresh_row(missile.id, missile.weapon));
-        if remembered.weapon != missile.weapon || remembered.projectile != missile.id {
-            *remembered = fresh_row(missile.id, missile.weapon);
+            .or_insert_with(|| fresh_row(missile.entry_id, missile.weapon));
+        if (remembered.weapon, remembered.projectile) != (missile.weapon, missile.entry_id) {
+            *remembered = fresh_row(missile.entry_id, missile.weapon);
         }
-        let sound_due = missile.ignited && !remembered.ignition_played;
+        let sound_due = missile.ignited && !remembered.ignition_effect_done;
 
-        for look in Look::ALL {
-            let due = bolts
-                .rows
-                .get(&entnum)
-                .is_some_and(|row| look.due(missile.ignited, row));
-            if !due {
-                continue;
-            }
-            let Some(name) = look.authored(registry, missile.weapon) else {
-                continue;
-            };
-            let Some(target) = missile_bolt_target(
-                poses.as_deref(),
-                meshes,
-                missile.namespace,
-                &missile.name,
-                entnum,
-            ) else {
-                if look.counts_pose_gap() {
-                    bolts.pose_gaps = bolts.pose_gaps.saturating_add(1);
-                }
-                continue;
-            };
-            let mut started = 0;
-            if play.bolted(Some(name), Some(target), &mut started) {
-                if let Some(row) = bolts.rows.get_mut(&entnum) {
-                    look.mark_played(row);
-                }
-            } else {
-                bolts.play_gaps = bolts.play_gaps.saturating_add(1);
-            }
-        }
-
-        if sound_due && voices.authors(missile.weapon, WeaponSoundSlot::ProjIgnition) {
-            match voices.alias(missile.weapon, WeaponSoundSlot::ProjIgnition) {
-                Some(alias) => {
-                    // Only a sound that reached the queue counts as played;
-                    // without one the next frame tries again.
-                    if voices.say(missile.weapon, alias, Some(missile.origin), Some(entnum))
-                        && let Some(row) = bolts.rows.get_mut(&entnum)
-                    {
-                        row.ignition_played = true;
-                    }
-                }
-                None => bolts.ignition_gaps = bolts.ignition_gaps.saturating_add(1),
-            }
+        start_looks(missile, entnum, &flight, &mut bolt_list, &mut play);
+        if sound_due {
+            ignition_sound(missile, entnum, &mut bolt_list, &mut voices);
         }
     }
-    bolts.rows.retain(|entnum, _| live.contains(entnum));
+    bolt_list.rows.retain(|entnum, _| alive.contains(entnum));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn row() -> MissileBoltRow {
+    fn row() -> RocketAttachRow {
         fresh_row(Some(7), 3)
     }
 
@@ -197,7 +225,7 @@ mod tests {
         for look in Look::ALL {
             assert!(!look.already_played(&row), "{look:?}");
         }
-        assert!(!row.ignition_played);
+        assert!(!row.ignition_effect_done);
         assert_eq!((row.projectile, row.weapon), (Some(7), 3));
     }
 
@@ -236,7 +264,7 @@ mod tests {
         let mut row = row();
         Look::Ignition.mark_played(&mut row);
         assert!(row.ignition_fx_played);
-        assert!(!row.ignition_played);
+        assert!(!row.ignition_effect_done);
     }
 
     #[test]

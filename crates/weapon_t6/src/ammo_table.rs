@@ -11,12 +11,12 @@ const CLIP_ROW_BYTES: usize = 12;
 const SLOT_BYTES: usize = 5;
 /// The slot byte that is set while the gun is dual wielded.
 const DUAL_WIELD_BYTE: usize = 1;
-const WEAPON_DATA_BYTES: usize = ROWS * SLOT_BYTES;
+const GUN_SLOT_BLOCK_LEN: usize = ROWS * SLOT_BYTES;
 
 /// The stock table's size.
-pub const AMMO_TABLE_BYTES: usize = ROWS * AMMO_ROW_BYTES;
+pub const MAGAZINE_CHART_SIZE: usize = ROWS * AMMO_ROW_BYTES;
 /// The clip table's size.
-pub const AMMOCLIP_TABLE_BYTES: usize = ROWS * CLIP_ROW_BYTES;
+pub const CLIP_LEDGER_LEN: usize = ROWS * CLIP_ROW_BYTES;
 
 fn read_i32(table: &[u8], at: usize) -> i32 {
     let mut word = [0; 4];
@@ -24,20 +24,20 @@ fn read_i32(table: &[u8], at: usize) -> i32 {
     i32::from_le_bytes(word)
 }
 
-fn write_i32(table: &mut [u8], at: usize, value: i32) {
-    table[at..at + 4].copy_from_slice(&value.to_le_bytes());
+fn write_i32(table: &mut [u8], at: usize, word: i32) {
+    table[at..at + 4].copy_from_slice(&word.to_le_bytes());
 }
 
 /// Where the row keyed `key` starts.
-fn find_row(table: &[u8], row_bytes: usize, key: i32) -> Option<usize> {
+fn find_row(table: &[u8], row_len: usize, key: i32) -> Option<usize> {
     (0..ROWS)
-        .map(|row| row * row_bytes)
+        .map(|row| row * row_len)
         .find(|&at| read_i32(table, at) == key)
 }
 
 /// The row keyed `key`, else the first free row, given the key. None when full.
-fn claim_row(table: &mut [u8], row_bytes: usize, key: i32) -> Option<usize> {
-    let at = find_row(table, row_bytes, key).or_else(|| find_row(table, row_bytes, 0))?;
+fn claim_row(table: &mut [u8], row_len: usize, key: i32) -> Option<usize> {
+    let at = find_row(table, row_len, key).or_else(|| find_row(table, row_len, 0))?;
     write_i32(table, at, key);
     Some(at)
 }
@@ -47,132 +47,132 @@ fn hand_field(hand: u8) -> usize {
     4 + usize::from(hand.min(1)) * 4
 }
 
-/// Rounds of `ammo_index` not in a clip; 0 with no row.
-pub fn get_ammo_not_in_clip(ammo: &[u8; AMMO_TABLE_BYTES], ammo_index: i32) -> i32 {
-    find_row(ammo, AMMO_ROW_BYTES, ammo_index).map_or(0, |at| read_i32(ammo, at + 4))
+/// Rounds of `ammo_type_slot` not in a clip; 0 with no row.
+pub fn get_ammo_not_in_clip(ammo: &[u8; MAGAZINE_CHART_SIZE], ammo_type_slot: i32) -> i32 {
+    find_row(ammo, AMMO_ROW_BYTES, ammo_type_slot).map_or(0, |at| read_i32(ammo, at + 4))
 }
 
-/// Sets the rounds of `ammo_index` not in a clip, taking a free row if it has none.
+/// Sets the rounds of `ammo_type_slot` not in a clip, taking a free row if it has none.
 /// False when the table is full.
 pub fn set_ammo_not_in_clip(
-    ammo: &mut [u8; AMMO_TABLE_BYTES],
-    ammo_index: i32,
+    clip_rows: &mut [u8; MAGAZINE_CHART_SIZE],
+    ammo_type_slot: i32,
     count: i32,
 ) -> bool {
-    let Some(at) = claim_row(ammo, AMMO_ROW_BYTES, ammo_index) else {
+    let Some(at) = claim_row(clip_rows, AMMO_ROW_BYTES, ammo_type_slot) else {
         return false;
     };
-    write_i32(ammo, at + 4, count);
+    write_i32(clip_rows, at + 4, count);
     true
 }
 
-/// The clip table has a row for `clip_index` (0 never counts).
-pub fn clip_row_present(ammoclip: &[u8; AMMOCLIP_TABLE_BYTES], clip_index: i32) -> bool {
-    clip_index != 0 && find_row(ammoclip, CLIP_ROW_BYTES, clip_index).is_some()
+/// The clip table has a row for `motion_clip_slot` (0 never counts).
+pub fn clip_row_present(magazine_rows: &[u8; CLIP_LEDGER_LEN], motion_clip_slot: i32) -> bool {
+    motion_clip_slot != 0 && find_row(magazine_rows, CLIP_ROW_BYTES, motion_clip_slot).is_some()
 }
 
-/// The stock table has a row for `ammo_index` (0 never counts).
-pub fn ammo_row_present(ammo: &[u8; AMMO_TABLE_BYTES], ammo_index: i32) -> bool {
-    ammo_index != 0 && find_row(ammo, AMMO_ROW_BYTES, ammo_index).is_some()
+/// The stock table has a row for `ammo_type_slot` (0 never counts).
+pub fn ammo_row_present(ammo: &[u8; MAGAZINE_CHART_SIZE], ammo_type_slot: i32) -> bool {
+    ammo_type_slot != 0 && find_row(ammo, AMMO_ROW_BYTES, ammo_type_slot).is_some()
 }
 
-/// Rounds in `hand`'s clip of `clip_index`; 0 with no row.
-pub fn get_clip_for_hand(ammoclip: &[u8; AMMOCLIP_TABLE_BYTES], clip_index: i32, hand: u8) -> i32 {
-    find_row(ammoclip, CLIP_ROW_BYTES, clip_index)
-        .map_or(0, |at| read_i32(ammoclip, at + hand_field(hand)))
+/// Rounds in `hand`'s clip of `motion_clip_slot`; 0 with no row.
+pub fn get_clip_for_hand(magazine_rows: &[u8; CLIP_LEDGER_LEN], motion_clip_slot: i32, hand: u8) -> i32 {
+    find_row(magazine_rows, CLIP_ROW_BYTES, motion_clip_slot)
+        .map_or(0, |at| read_i32(magazine_rows, at + hand_field(hand)))
 }
 
-/// Sets the rounds in `hand`'s clip of `clip_index`, taking a free row if it has none.
+/// Sets the rounds in `hand`'s clip of `motion_clip_slot`, taking a free row if it has none.
 /// False when the table is full.
 pub fn set_clip_for_hand(
-    ammoclip: &mut [u8; AMMOCLIP_TABLE_BYTES],
-    clip_index: i32,
+    magazine_rows: &mut [u8; CLIP_LEDGER_LEN],
+    motion_clip_slot: i32,
     hand: u8,
     count: i32,
 ) -> bool {
-    let Some(at) = claim_row(ammoclip, CLIP_ROW_BYTES, clip_index) else {
+    let Some(at) = claim_row(magazine_rows, CLIP_ROW_BYTES, motion_clip_slot) else {
         return false;
     };
-    write_i32(ammoclip, at + hand_field(hand), count);
+    write_i32(magazine_rows, at + hand_field(hand), count);
     true
 }
 
 /// The clip table key for a weapon: its clip index, or the weapon itself when that is 0.
 #[must_use]
-pub fn clip_table_key(clip_index: i32, weapon: u32) -> i32 {
-    if clip_index == 0 {
-        weapon as i32
+pub fn clip_table_key(motion_clip_slot: i32, gun: u32) -> i32 {
+    if motion_clip_slot == 0 {
+        gun as i32
     } else {
-        clip_index
+        motion_clip_slot
     }
 }
 
 /// The stock table key for a weapon: its ammo index, or the weapon itself when that is 0.
 #[must_use]
-pub fn ammo_table_key(ammo_index: i32, weapon: u32) -> i32 {
-    if ammo_index == 0 {
-        weapon as i32
+pub fn ammo_table_key(ammo_type_slot: i32, gun: u32) -> i32 {
+    if ammo_type_slot == 0 {
+        gun as i32
     } else {
-        ammo_index
+        ammo_type_slot
     }
 }
 
 /// The slot holding `weapon`; -1 for none or no weapon.
-pub fn player_weapons_find_slot(weapons: &[i32; 15], weapon: i32) -> i32 {
-    if weapon == 0 {
+pub fn player_weapons_find_slot(weapons: &[i32; 15], gun: i32) -> i32 {
+    if gun == 0 {
         return -1;
     }
     weapons
         .iter()
-        .position(|&held| held == weapon)
+        .position(|&held| held == gun)
         .map_or(-1, |slot| slot as i32)
 }
 
 /// The dual wield byte of `weapon`'s slot, if it has one and the data covers it.
 fn dual_wield_byte(weapons: &[i32; 15], weapon_data_len: usize, weapon: u32) -> Option<usize> {
     let slot = usize::try_from(player_weapons_find_slot(weapons, weapon as i32)).ok()?;
-    (weapon_data_len >= WEAPON_DATA_BYTES).then_some(slot * SLOT_BYTES + DUAL_WIELD_BYTE)
+    (weapon_data_len >= GUN_SLOT_BLOCK_LEN).then_some(slot * SLOT_BYTES + DUAL_WIELD_BYTE)
 }
 
 /// Marks whether the slot holding `weapon` is dual wielded.
 pub fn latch_weapon_dual_wield(
-    weapons: &[i32; 15],
-    weapon_data: &mut [u8],
-    weapon: u32,
+    slots: &[i32; 15],
+    gun_rows: &mut [u8],
+    gun: u32,
     dual: bool,
 ) {
-    if let Some(at) = dual_wield_byte(weapons, weapon_data.len(), weapon) {
-        weapon_data[at] = u8::from(dual);
+    if let Some(at) = dual_wield_byte(slots, gun_rows.len(), gun) {
+        gun_rows[at] = u8::from(dual);
     }
 }
 
 /// 1 when the held weapon is dual wielded, else 0.
-pub fn num_hands_for_held(weapons: &[i32; 15], weapon_data: &[u8], held_weapon: u32) -> i32 {
-    if held_weapon == 0 {
+pub fn num_hands_for_held(weapons: &[i32; 15], table_bytes: &[u8], gun_in_hand: u32) -> i32 {
+    if gun_in_hand == 0 {
         return 0;
     }
-    dual_wield_byte(weapons, weapon_data.len(), held_weapon)
-        .map_or(0, |at| i32::from(weapon_data[at] != 0))
+    dual_wield_byte(weapons, table_bytes.len(), gun_in_hand)
+        .map_or(0, |at| i32::from(table_bytes[at] != 0))
 }
 
 /// Every round a weapon has: its stock, its right clip, and its left clip when dual wielded.
 pub fn get_ammo_player_both_clips(
-    weapons: &[i32; 15],
-    weapon_data: &[u8],
-    ammo: &[u8; AMMO_TABLE_BYTES],
-    ammoclip: &[u8; AMMOCLIP_TABLE_BYTES],
-    weapon: u32,
-    ammo_index: i32,
-    clip_index: i32,
+    slots: &[i32; 15],
+    gun_rows: &[u8],
+    ammo: &[u8; MAGAZINE_CHART_SIZE],
+    magazine_rows: &[u8; CLIP_LEDGER_LEN],
+    gun: u32,
+    ammo_type_slot: i32,
+    motion_clip_slot: i32,
 ) -> i32 {
-    let stock = get_ammo_not_in_clip(ammo, ammo_index);
-    let right = get_clip_for_hand(ammoclip, clip_index, 0);
-    let left = if num_hands_for_held(weapons, weapon_data, weapon) == 1 {
-        get_clip_for_hand(ammoclip, clip_index, 1)
+    let stock = get_ammo_not_in_clip(ammo, ammo_type_slot);
+    let right = get_clip_for_hand(magazine_rows, motion_clip_slot, 0);
+    let left = if num_hands_for_held(slots, gun_rows, gun) == 1 {
+        get_clip_for_hand(magazine_rows, motion_clip_slot, 1)
     } else {
         0
     };
-    stock.wrapping_add(right).wrapping_add(left)
+    left.wrapping_add(right).wrapping_add(stock)
 }
 
 #[cfg(test)]
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn stock_rows_are_found_or_take_a_free_row() {
-        let mut ammo = [0; AMMO_TABLE_BYTES];
+        let mut ammo = [0; MAGAZINE_CHART_SIZE];
         assert_eq!(get_ammo_not_in_clip(&ammo, 7), 0);
         assert!(!ammo_row_present(&ammo, 7));
         assert!(set_ammo_not_in_clip(&mut ammo, 7, 90));
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn a_full_table_takes_no_new_key() {
-        let mut ammo = [0; AMMO_TABLE_BYTES];
+        let mut ammo = [0; MAGAZINE_CHART_SIZE];
         for key in 1..=15 {
             assert!(set_ammo_not_in_clip(&mut ammo, key, key));
         }
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn each_hand_has_its_own_clip() {
-        let mut clips = [0; AMMOCLIP_TABLE_BYTES];
+        let mut clips = [0; CLIP_LEDGER_LEN];
         assert!(set_clip_for_hand(&mut clips, 4, 0, 30));
         assert!(set_clip_for_hand(&mut clips, 4, 1, 25));
         assert!(set_clip_for_hand(&mut clips, 4, 9, 20));
@@ -228,9 +228,9 @@ mod tests {
     fn the_left_clip_counts_only_when_dual_wielded() {
         let mut weapons = [0; 15];
         weapons[2] = 40;
-        let mut data = [0u8; WEAPON_DATA_BYTES];
-        let mut ammo = [0; AMMO_TABLE_BYTES];
-        let mut clips = [0; AMMOCLIP_TABLE_BYTES];
+        let mut data = [0u8; GUN_SLOT_BLOCK_LEN];
+        let mut ammo = [0; MAGAZINE_CHART_SIZE];
+        let mut clips = [0; CLIP_LEDGER_LEN];
         set_ammo_not_in_clip(&mut ammo, 40, 100);
         set_clip_for_hand(&mut clips, 40, 0, 10);
         set_clip_for_hand(&mut clips, 40, 1, 7);

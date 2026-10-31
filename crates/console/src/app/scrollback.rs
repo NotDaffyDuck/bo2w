@@ -1,350 +1,389 @@
-//! Picking text out of the scrollback with the mouse.
+//! Mouse selection inside the console log.
 //!
-//! The scrollback is one text node. A press or drag lands on a glyph, the
-//! glyph stands for a character of the joined log, and the selection is the
-//! stretch of characters between where the drag began and where it is now.
+//! The log is drawn as a single text node. Pressing or dragging over it hits a
+//! letter_shape, each letter_shape maps to a character of the newline-joined log, and the
+//! selection covers the characters between the drag's start and its current
+//! end.
 
-use bevy::{
-    picking::{
-        events::{Drag, Pointer, Press, Release},
-        pointer::PointerButton,
-    },
-    prelude::*,
-    text::{EditableText, TextLayoutInfo},
-    ui::{ComputedUiRenderTargetInfo, UiGlobalTransform},
+use bevy::{picking::events::Drag, picking::events::Pointer, picking::events::Press};
+use bevy::picking::events::Release;
+use bevy::picking::pointer::PointerButton;
+use bevy::prelude::*;
+use bevy::text::EditableText;
+use bevy::text::TextLayoutInfo;
+use bevy::ui::ComputedUiRenderTargetInfo;
+use bevy::ui::UiGlobalTransform;
+
+use super::panel::PromptEntity;
+use super::panel::PromptText;
+use super::panel::ScrollbackEntity;
+use super::panel::ScrollbackText;
+use super::state::PromptPanelOptions;
+use super::state::PromptPanelStatus;
+use crate::key_input::{
+    GlyphSpot, LogGrid, RowBounds, copy_prompt_echo, clip_prompt_highlight, map_glyphs_to_chars,
+    sorted_glyph_span, cut_glyph_span, word_bounds,
 };
 
-use super::{
-    panel::{PromptEntity, PromptText, ScrollbackEntity, ScrollbackText},
-    state::{ConsoleSettings, ConsoleState},
-};
-use crate::input::{
-    RunBounds, ScrollCell, cell_char_index, cell_rects_for_char_range, copy_prompt_echo,
-    copy_prompt_selection, hit_scroll_cell, line_char_range, map_glyphs_to_chars,
-    ordered_char_range, slice_char_range, word_bounds,
-};
+/// A laid-out text reduced to what hit testing needs: which row and character
+/// each letter_shape belongs to, and the rectangle of every row.
+struct Glyphs(LogGrid);
 
-/// Where each glyph of a laid-out text stands in the text, and the box each
-/// row of it occupies.
-struct Glyphs {
-    /// For each glyph: its row, and the character of the text it draws.
-    cells: Vec<ScrollCell>,
-    runs: Vec<RunBounds>,
+/// The whole log as the text node shows it: one line per entry.
+fn log_text(state: &PromptPanelStatus) -> String {
+    state.lines.join("\n")
 }
 
 impl Glyphs {
     fn of(text: &str, layout: &TextLayoutInfo) -> Self {
-        let chars = map_glyphs_to_chars(text, layout.glyphs.len());
-        Self {
-            cells: layout
-                .glyphs
-                .iter()
-                .zip(chars)
-                .map(|(glyph, ch)| (glyph.line_index, ch))
-                .collect(),
-            runs: layout
-                .run_geometry
-                .iter()
-                .map(|run| {
-                    let bounds = run.bounds;
-                    (bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y)
-                })
-                .collect(),
+        let count = layout.glyphs.len();
+        let chars = map_glyphs_to_chars(text, count);
+        let mut cells = Vec::with_capacity(count);
+        for (letter_shape, ch) in layout.glyphs.iter().zip(chars) {
+            cells.push(GlyphSpot { row_id: letter_shape.line_index, ch });
         }
+        let mut runs = Vec::with_capacity(layout.run_geometry.len());
+        for geometry in &layout.run_geometry {
+            let Rect { min, max } = geometry.bounds;
+            runs.push(RowBounds { x_min: min.x, y_min: min.y, x_max: max.x, y_max: max.y });
+        }
+        Self(LogGrid::new(&cells, runs))
     }
 
-    /// The row, and the character, under a point of the text node.
+    /// Row and character at a point in the text node's own space.
     fn hit(&self, local: Vec2) -> Option<(usize, usize)> {
-        let (row, col) = hit_scroll_cell(&self.cells, &self.runs, (local.x, local.y))?;
-        let ch = cell_char_index(&self.cells, &self.runs, row, col)?;
+        let Vec2 { x, y } = local;
+        let (row, col) = self.0.hit((x, y))?;
+        let ch = self.0.char_at(row, col)?;
         Some((row, ch))
     }
 
-    /// The right edge of the widest row.
+    /// Where the widest row ends.
     fn text_right(&self) -> f32 {
-        self.runs.iter().map(|run| run.2).fold(0.0, f32::max)
+        self.0.widest()
     }
 }
 
-/// What a press selects: nothing yet for one click (the caret goes there), the
-/// word for two, the whole row for three or more.
-fn pressed_range(text: &str, glyphs: &Glyphs, local: Vec2, count: u8) -> Option<(usize, usize)> {
-    let (row, ch) = glyphs.hit(local)?;
+/// Selection made by a press: a single click only places the insert_column, a double
+/// click takes the word, and any further click takes the whole row.
+fn pressed_range(text: &str, glyphs: &Glyphs, at: Vec2, count: u8) -> Option<(usize, usize)> {
+    let (row, ch) = glyphs.hit(at)?;
     match count {
         0 | 1 => Some((ch, ch)),
         2 => Some(word_bounds(text, ch)),
-        _ => line_char_range(&glyphs.cells, &glyphs.runs, row),
+        _ => glyphs.0.row_span(row),
     }
 }
 
-/// The text the scrollback selection covers.
-fn selected_scrollback(state: &ConsoleState) -> Option<String> {
+/// The log text between the selection ends, if any is selected.
+fn selected_scrollback(state: &PromptPanelStatus) -> Option<String> {
     let anchor = state.scroll_anchor?;
-    let text = state.log.join("\n");
-    let slice = slice_char_range(&text, anchor, state.scroll_focus);
-    (!slice.is_empty()).then(|| slice.to_owned())
+    let text = log_text(state);
+    let picked = cut_glyph_span(&text, anchor, state.backlog_anchor);
+    (!picked.is_empty()).then(|| picked.to_owned())
 }
 
-fn selection_rects(glyphs: &Glyphs, lo: usize, hi: usize, block_right: f32) -> Vec<Rect> {
-    cell_rects_for_char_range(lo, hi, &glyphs.cells, &glyphs.runs, block_right)
-        .into_iter()
-        .map(|(x0, y0, x1, y1)| Rect::new(x0, y0, x1, y1))
-        .collect()
+fn selection_rects(glyphs: &Glyphs, lo: usize, hi: usize, text_box_right: f32) -> Vec<Rect> {
+    let mut rects: Vec<Rect> = Vec::new();
+    for RowBounds { x_min: left, y_min: top, x_max: right, y_max: bottom } in glyphs.0.paint(lo, hi, text_box_right) {
+        rects.push(Rect::new(left, top, right, bottom));
+    }
+    rects
 }
 
-/// A screen point as a place inside the text node, in layout units.
-fn to_local(
-    transform: &UiGlobalTransform,
-    node: &ComputedNode,
-    target: &ComputedUiRenderTargetInfo,
-    ui_scale: f32,
-    pointer: Vec2,
-) -> Option<Vec2> {
-    let inverse = transform.try_inverse()?;
-    Some(
-        inverse.transform_point2(pointer * target.scale_factor() / ui_scale)
-            - node.content_box().min,
-    )
+/// How far, in layout units, the text node's content reaches across, given
+/// the node's computed size and the window's scale.
+fn layout_width(node: &ComputedNode, render: &ComputedUiRenderTargetInfo, ui_scale: f32) -> f32 {
+    node.content_box().width() * render.scale_factor() / ui_scale
 }
 
-/// Starts a selection on a press in the scrollback and stretches it as the
-/// pointer drags. A press in the prompt drops the selection.
-#[allow(clippy::type_complexity)]
+/// Where the text node sits on screen, enough to turn a window position into a
+/// position inside it (in layout units).
+struct NodeFrame<'a> {
+    transform: &'a UiGlobalTransform,
+    node: &'a ComputedNode,
+    /// The window's scale factor, then the user's UI zoom it is divided by.
+    window_scale: f32,
+    user_scale: f32,
+}
+
+impl<'a> NodeFrame<'a> {
+    fn new(
+        transform: &'a UiGlobalTransform,
+        node: &'a ComputedNode,
+        render_target: &ComputedUiRenderTargetInfo,
+        user_scale: f32,
+    ) -> Self {
+        Self { transform, node, window_scale: render_target.scale_factor(), user_scale }
+    }
+
+    fn local(&self, window_at: Vec2) -> Option<Vec2> {
+        let to_node = self.transform.try_inverse()?;
+        let at = to_node.transform_point2(window_at * self.window_scale / self.user_scale);
+        Some(at - self.node.content_box().min)
+    }
+}
+
+/// What one primary press does to the log's selection.
+enum PressEffect {
+    /// Not about the log at all.
+    Ignore,
+    /// Drops whatever was selected.
+    Clear,
+    /// Starts a selection from `anchor` to `focus`.
+    Select(usize, usize),
+}
+
+impl PressEffect {
+    fn apply(self, state: &mut PromptPanelStatus) {
+        if let PressEffect::Select(anchor, focus) = self {
+            state.scroll_anchor = Some(anchor);
+            state.backlog_anchor = focus;
+            state.wheel_dragging = true;
+        } else if let PressEffect::Clear = self {
+            state.clear_scroll_selection();
+        }
+    }
+}
+
+/// The log's text node, as hit testing reads it.
+type LogNodeView<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static ComputedNode,
+        &'static ComputedUiRenderTargetInfo,
+        &'static UiGlobalTransform,
+        &'static TextLayoutInfo,
+        &'static ChildOf,
+    ),
+    With<ScrollbackText>,
+>;
+
+/// The log's text node, as selection painting writes it.
+type LogNodePaint<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut TextLayoutInfo, &'static ComputedNode, &'static ComputedUiRenderTargetInfo),
+    With<ScrollbackText>,
+>;
+
+/// Pressing in the log starts a selection there and dragging moves its far
+/// end; pressing in the prompt drops the log's selection.
 pub(super) fn handle_scrollback_pointer(
-    mut presses: MessageReader<Pointer<Press>>,
-    mut drags: MessageReader<Pointer<Drag>>,
+    mut press_events: MessageReader<Pointer<Press>>,
+    mut drag_events: MessageReader<Pointer<Drag>>,
     prompt: Option<Res<PromptEntity>>,
     scrollback: Option<Res<ScrollbackEntity>>,
-    mut state: ResMut<ConsoleState>,
-    ui_scale: Res<UiScale>,
-    texts: Query<
-        (
-            &ComputedNode,
-            &ComputedUiRenderTargetInfo,
-            &UiGlobalTransform,
-            &TextLayoutInfo,
-            &ChildOf,
-        ),
-        With<ScrollbackText>,
-    >,
+    mut state: ResMut<PromptPanelStatus>,
+    zoom: Res<UiScale>,
+    log_nodes: LogNodeView,
 ) {
-    if !state.open || (presses.is_empty() && drags.is_empty()) {
+    if !state.shown || (press_events.is_empty() && drag_events.is_empty()) {
         return;
     }
-    let Some(scrollback) = scrollback.map(|entity| entity.0) else {
+    let Some(log_entity) = scrollback.as_deref().map(|holder| holder.0) else {
         return;
     };
-    let prompt = prompt.map(|entity| entity.0);
-    let Ok((node, target, transform, layout, parent)) = texts.get(scrollback) else {
+    let Ok(found) = log_nodes.get(log_entity) else {
         return;
     };
-    let on_text = |entity: Entity| entity == scrollback || entity == parent.0;
-    let local_of = |pointer: Vec2| to_local(transform, node, target, ui_scale.0, pointer);
-    let text = state.log.join("\n");
-    let glyphs = Glyphs::of(&text, layout);
+    let (node, target, transform, layout, holder) = found;
+    let prompt_entity = prompt.as_deref().map(|holder| holder.0);
+    let frame = NodeFrame::new(transform, node, target, zoom.0);
+    let in_log = |entity: Entity| entity == log_entity || entity == holder.0;
+    let joined = log_text(&state);
+    let glyphs = Glyphs::of(&joined, layout);
 
-    for press in presses.read() {
-        if press.button != PointerButton::Primary {
-            continue;
-        }
-        if Some(press.entity) == prompt {
-            state.clear_scroll_selection();
-            continue;
-        }
-        if !on_text(press.entity) {
-            continue;
-        }
-        let range = local_of(press.pointer_location.position)
-            .and_then(|local| pressed_range(&text, &glyphs, local, press.count));
-        match range {
-            Some((anchor, focus)) => {
-                state.scroll_anchor = Some(anchor);
-                state.scroll_focus = focus;
-                state.scroll_gesture = true;
+    let effects: Vec<PressEffect> = press_events
+        .read()
+        .filter(|press| press.button == PointerButton::Primary)
+        .map(|press| {
+            if prompt_entity == Some(press.entity) {
+                PressEffect::Clear
+            } else if in_log(press.entity) {
+                frame
+                    .local(press.pointer_location.position)
+                    .and_then(|local| pressed_range(&joined, &glyphs, local, press.count))
+                    .map_or(PressEffect::Clear, |(anchor, focus)| PressEffect::Select(anchor, focus))
+            } else {
+                PressEffect::Ignore
             }
-            None => state.clear_scroll_selection(),
-        }
-    }
-    if !state.scroll_gesture {
+        })
+        .collect::<Vec<PressEffect>>();
+    effects.into_iter().for_each(|effect| effect.apply(&mut state));
+
+    // A drag counts only while a gesture that started in the log is held.
+    if !state.wheel_dragging {
         return;
     }
-    for drag in drags.read() {
-        if drag.button != PointerButton::Primary || !on_text(drag.entity) {
-            continue;
-        }
-        let hit = local_of(drag.pointer_location.position).and_then(|local| glyphs.hit(local));
-        if let Some((_, ch)) = hit {
-            state.scroll_focus = ch;
-        }
+    let last_char = drag_events
+        .read()
+        .filter(|drag| drag.button == PointerButton::Primary && in_log(drag.entity))
+        .filter_map(|drag| frame.local(drag.pointer_location.position))
+        .filter_map(|local| glyphs.hit(local))
+        .map(|(_, ch)| ch)
+        .last();
+    if let Some(ch) = last_char {
+        state.backlog_anchor = ch;
     }
 }
 
-/// Copies the selection to the clipboard when the mouse button comes up: the
-/// scrollback's when the press began there, the prompt's otherwise.
+/// When the primary button comes up, copies what is selected: the log's
+/// selection if the gesture started in the log, else the prompt's.
 pub(super) fn copy_selection_on_release(
-    mut releases: MessageReader<Pointer<Release>>,
+    mut release_events: MessageReader<Pointer<Release>>,
     prompts: Query<&EditableText, With<PromptText>>,
-    mut state: ResMut<ConsoleState>,
-    settings: Res<ConsoleSettings>,
-    mut clipboard: ResMut<Clipboard>,
+    mut state: ResMut<PromptPanelStatus>,
+    settings: Res<PromptPanelOptions>,
+    mut system_clipboard: ResMut<Clipboard>,
 ) {
-    if !state.open {
+    let open = state.shown;
+    if !open {
         state.clear_scroll_selection();
         return;
     }
-    if !releases
+    let primary_released = release_events
         .read()
-        .any(|release| release.button == PointerButton::Primary)
-    {
+        .any(|released| matches!(released.button, PointerButton::Primary));
+    if !primary_released {
         return;
     }
-    let from_scrollback = std::mem::take(&mut state.scroll_gesture);
-    let selected = if from_scrollback {
+    let started_in_log = std::mem::take(&mut state.wheel_dragging);
+    let picked = if started_in_log {
         selected_scrollback(&state)
     } else {
         prompts
             .single()
             .ok()
-            .and_then(|prompt| prompt.editor().selected_text().map(str::to_owned))
+            .and_then(|prompt| prompt.editor().selected_text().map(String::from))
     };
-    let result = copy_prompt_selection(selected.as_deref(), |text| {
-        clipboard.set_text(text).map_err(|error| error.to_string())
+    let outcome = clip_prompt_highlight(picked.as_deref(), |chosen| {
+        system_clipboard.set_text(chosen).map_err(|why| why.to_string())
     });
-    if let Some(line) = copy_prompt_echo(&result) {
-        state.echo(line, settings.log_capacity);
+    if let Some(note) = copy_prompt_echo(&outcome) {
+        state.post_line(note, settings.backlog_limit);
     }
 }
 
-/// Lays the selection's rectangles over the scrollback text.
+/// Keeps the selection rectangles in the log's text layout in step with the
+/// selection, writing them only when they change.
 pub(super) fn paint_scrollback_selection(
-    state: Res<ConsoleState>,
-    ui_scale: Res<UiScale>,
-    mut texts: Query<
-        (
-            &mut TextLayoutInfo,
-            &ComputedNode,
-            &ComputedUiRenderTargetInfo,
-        ),
-        With<ScrollbackText>,
-    >,
+    state: Res<PromptPanelStatus>,
+    zoom: Res<UiScale>,
+    mut log_nodes: LogNodePaint,
 ) {
-    let Ok((mut layout, node, target)) = texts.single_mut() else {
+    let Ok(found) = log_nodes.single_mut() else {
         return;
     };
-    let range = state
-        .scroll_anchor
-        .map(|anchor| ordered_char_range(anchor, state.scroll_focus))
-        .filter(|(lo, hi)| lo != hi);
-    let rects = match range {
-        None => Vec::new(),
-        Some((lo, hi)) => {
-            let text = state.log.join("\n");
-            let glyphs = Glyphs::of(&text, &layout);
-            let panel_right = node.content_box().width() * target.scale_factor() / ui_scale.0;
-            selection_rects(&glyphs, lo, hi, glyphs.text_right().max(panel_right))
-        }
+    let (mut layout, node, target) = found;
+    let range = if let Some(anchor) = state.scroll_anchor {
+        Some(sorted_glyph_span(anchor, state.backlog_anchor))
+    } else {
+        None
     };
-    if layout.selection_rects != rects {
-        layout.selection_rects = rects;
+    let wanted = match range {
+        Some((lo, hi)) if lo != hi => {
+            let joined = log_text(&state);
+            let glyphs = Glyphs::of(&joined, &layout);
+            let right_edge = layout_width(node, target, zoom.0).max(glyphs.text_right());
+            selection_rects(&glyphs, lo, hi, right_edge)
+        }
+        _ => vec![],
+    };
+    if layout.selection_rects != wanted {
+        layout.selection_rects = wanted;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::app::scrollback::*;
 
     /// "ab cd" over "ef", ten units to a character.
     fn two_rows() -> (&'static str, Glyphs) {
-        let cells = vec![(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (1, 6), (1, 7)];
-        let runs = vec![(0.0, 0.0, 50.0, 10.0), (0.0, 10.0, 20.0, 20.0)];
-        ("ab cd\nef", Glyphs { cells, runs })
+        let spots = [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (1, 6), (1, 7)];
+        let cells = spots.map(|(row_id, ch)| GlyphSpot { row_id, ch });
+        let runs = vec![
+            RowBounds { x_min: 0.0, y_min: 0.0, x_max: 50.0, y_max: 10.0 },
+            RowBounds { x_min: 0.0, y_min: 10.0, x_max: 20.0, y_max: 20.0 },
+        ];
+        ("ab cd\nef", Glyphs(LogGrid::new(&cells, runs)))
     }
 
-    fn state_with_log(anchor: Option<usize>, focus: usize) -> ConsoleState {
-        ConsoleState {
-            log: vec!["ab cd".to_owned(), "ef".to_owned()],
-            scroll_anchor: anchor,
-            scroll_focus: focus,
-            ..Default::default()
-        }
+    fn state_with_log(anchor: Option<usize>, focus: usize) -> PromptPanelStatus {
+        let mut state = PromptPanelStatus::default();
+        state.lines = ["ab cd", "ef"].map(String::from).to_vec();
+        state.scroll_anchor = anchor;
+        state.backlog_anchor = focus;
+        state
+    }
+
+    fn press_two_rows(x: f32, y: f32, count: u8) -> Option<(usize, usize)> {
+        let (text, glyphs) = two_rows();
+        pressed_range(text, &glyphs, Vec2::new(x, y), count)
     }
 
     #[test]
     fn one_click_puts_the_caret_at_the_character() {
-        let (text, glyphs) = two_rows();
-        let at = pressed_range(text, &glyphs, Vec2::new(12.0, 5.0), 1);
-        assert_eq!(at, Some((1, 1)));
+        assert_eq!(press_two_rows(12.0, 5.0, 1), Some((1, 1)));
     }
 
     #[test]
     fn two_clicks_take_the_word() {
-        let (text, glyphs) = two_rows();
-        let at = pressed_range(text, &glyphs, Vec2::new(32.0, 5.0), 2);
-        assert_eq!(at, Some((3, 5)));
+        assert_eq!(press_two_rows(32.0, 5.0, 2), Some((3, 5)));
     }
 
     #[test]
     fn three_clicks_take_the_row() {
-        let (text, glyphs) = two_rows();
-        let first = pressed_range(text, &glyphs, Vec2::new(5.0, 5.0), 3);
-        let second = pressed_range(text, &glyphs, Vec2::new(5.0, 15.0), 4);
-        assert_eq!((first, second), (Some((0, 5)), Some((6, 8))));
+        assert_eq!(press_two_rows(5.0, 5.0, 3), Some((0, 5)));
+        assert_eq!(press_two_rows(5.0, 15.0, 4), Some((6, 8)));
     }
 
     #[test]
     fn a_press_past_the_end_of_a_row_lands_after_its_last_character() {
-        let (text, glyphs) = two_rows();
-        let at = pressed_range(text, &glyphs, Vec2::new(500.0, 5.0), 1);
-        assert_eq!(at, Some((5, 5)));
+        assert_eq!(press_two_rows(500.0, 5.0, 1), Some((5, 5)));
     }
 
     #[test]
     fn a_press_with_no_text_laid_out_selects_nothing() {
-        let empty = Glyphs {
-            cells: Vec::new(),
-            runs: Vec::new(),
-        };
-        assert_eq!(pressed_range("", &empty, Vec2::ZERO, 1), None);
+        let bare = Glyphs(LogGrid::new(&[], vec![]));
+        assert!(pressed_range("", &bare, Vec2::ZERO, 1).is_none());
     }
 
     #[test]
     fn a_selection_inside_a_row_paints_that_stretch() {
         let (_, glyphs) = two_rows();
-        assert_eq!(
-            selection_rects(&glyphs, 1, 3, 80.0),
-            [Rect::new(10.0, 0.0, 30.0, 10.0)]
-        );
+        let painted = selection_rects(&glyphs, 1, 3, 80.0);
+        assert_eq!(painted, vec![Rect::new(10.0, 0.0, 30.0, 10.0)]);
     }
 
     #[test]
     fn a_selection_over_a_line_break_runs_to_the_block_edge() {
         let (_, glyphs) = two_rows();
-        assert_eq!(
-            selection_rects(&glyphs, 3, 7, 80.0),
-            [
-                Rect::new(30.0, 0.0, 80.0, 10.0),
-                Rect::new(0.0, 10.0, 10.0, 20.0)
-            ]
-        );
+        let painted = selection_rects(&glyphs, 3, 7, 80.0);
+        let first_row = Rect::new(30.0, 0.0, 80.0, 10.0);
+        let second_row = Rect::new(0.0, 10.0, 10.0, 20.0);
+        assert_eq!(painted, vec![first_row, second_row]);
     }
 
     #[test]
     fn the_widest_row_sets_the_text_edge() {
-        let (_, glyphs) = two_rows();
-        assert_eq!(glyphs.text_right(), 50.0);
+        assert_eq!(two_rows().1.text_right(), 50.0);
     }
 
     #[test]
     fn the_selection_copies_the_joined_log_whichever_way_it_was_dragged() {
-        for (anchor, focus) in [(3, 7), (7, 3)] {
-            let state = state_with_log(Some(anchor), focus);
+        let forward = state_with_log(Some(3), 7);
+        let backward = state_with_log(Some(7), 3);
+        for state in [forward, backward] {
             assert_eq!(selected_scrollback(&state).as_deref(), Some("cd\ne"));
         }
     }
 
     #[test]
     fn nothing_is_copied_without_a_selection() {
-        assert_eq!(selected_scrollback(&state_with_log(None, 0)), None);
-        assert_eq!(selected_scrollback(&state_with_log(Some(2), 2)), None);
+        assert!(selected_scrollback(&state_with_log(None, 0)).is_none());
+        assert!(selected_scrollback(&state_with_log(Some(2), 2)).is_none());
     }
 }

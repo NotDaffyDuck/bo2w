@@ -20,12 +20,13 @@ pub mod hull;
 mod slide;
 mod solver;
 pub(crate) mod step;
+
 #[cfg(test)]
 mod testkit;
 pub(crate) mod trace;
 
 use alloc::vec::Vec;
-use crate::bridge::{CollisionBackend, GroundTraceInput};
+use crate::bridge::{SolidProbe, SweepAsk};
 use trace_t6::Trace;
 
 pub use hull::{Hull, MAX_MOVER_VERTS, Mover, MoverBrush, player_hull};
@@ -42,15 +43,15 @@ pub struct Geom<'a> {
     /// Where the shape's local origin is in the world.
     pub origin: [f32; 3],
     /// The world box around the shape (the broad phase).
-    pub mins: [f32; 3],
-    pub maxs: [f32; 3],
+    pub lo_corner: [f32; 3],
+    pub hi_corner: [f32; 3],
     /// The contents a trace's mask must share to hit it.
     pub contents: u32,
     /// The surface flags a hit reports (brushes: [`brush_surface_flags`];
     /// terrain: its material's; players: 0).
-    pub surface_flags: u32,
+    pub surf_bits: u32,
     /// The entity number a hit reports (the world: `ENTITYNUM_WORLD`).
-    pub hit_id: u16,
+    pub struck_entity_num: u16,
     /// Another player (or anything alive): the ground trace can be told to
     /// skip these.
     pub sentient: bool,
@@ -65,13 +66,13 @@ pub struct Geom<'a> {
 pub enum Shape<'a> {
     /// A brush: its corner points, its box (the six axial faces) and the
     /// planes of its other sides (normal, distance).
-    Brush { verts: &'a [[f32; 3]], mins: [f32; 3], maxs: [f32; 3], sides: &'a [[f32; 4]] },
+    Brush { vertex_points: &'a [[f32; 3]], lo_corner: [f32; 3], hi_corner: [f32; 3], sides: &'a [[f32; 4]] },
     /// A box: centre and half size. `brush` is set when the box is a brush
     /// with only its six axial sides (BO2 builds those as boxes).
     Box { center: [f32; 3], half: [f32; 3], brush: bool },
     /// A terrain patch: a run of triangles (three indices each) into a
     /// vertex table.
-    Partition { verts: &'a [[f32; 3]], indices: &'a [u16] },
+    Partition { vertex_points: &'a [[f32; 3]], indices: &'a [u16] },
     /// Another player's body.
     Player { hull: Hull },
 }
@@ -80,16 +81,16 @@ impl Shape<'_> {
     /// The shape's farthest point toward `d` (local frame, before any skin).
     fn support(&self, d: [f32; 3]) -> [f32; 3] {
         match *self {
-            Shape::Brush { verts, .. } => farthest(verts.iter().copied(), d),
+            Shape::Brush { vertex_points, .. } => farthest(vertex_points.iter().copied(), d),
             Shape::Box { center, half, .. } => {
                 let sign = |a: usize| if d[a] >= 0.0 { half[a] } else { -half[a] };
                 [center[0] + sign(0), center[1] + sign(1), center[2] + sign(2)]
             }
-            Shape::Partition { verts, indices } => {
+            Shape::Partition { vertex_points, indices } => {
                 // BO2 walks the patch's unique vertices; the triangles' own
                 // indices reach the same points (one past the table is
                 // dropped, never a crash).
-                farthest(indices.iter().filter_map(|&i| verts.get(usize::from(i)).copied()), d)
+                farthest(indices.iter().filter_map(|&i| vertex_points.get(usize::from(i)).copied()), d)
             }
             Shape::Player { hull } => hull.support(d),
         }
@@ -100,7 +101,7 @@ impl Shape<'_> {
     fn center(&self) -> [f32; 3] {
         match *self {
             Shape::Box { center, .. } => center,
-            Shape::Player { hull } => hull.center,
+            Shape::Player { hull } => hull.core_pt,
             Shape::Brush { .. } | Shape::Partition { .. } => [0.0; 3],
         }
     }
@@ -116,7 +117,7 @@ impl Shape<'_> {
     /// A brush, or a box that is one: the player meets these as its 12-sided
     /// body; everything else meets the capsule.
     fn is_brush(&self) -> bool {
-        matches!(self, Shape::Brush { .. } | Shape::Box { brush: true, .. })
+        matches!(*self, Shape::Brush { .. } | Shape::Box { brush: true, .. })
     }
 }
 
@@ -135,9 +136,9 @@ fn farthest(points: impl Iterator<Item = [f32; 3]>, d: [f32; 3]) -> [f32; 3] {
 }
 
 /// A world that can run Black Ops II's collision.
-pub trait Bo2Collision: CollisionBackend {
+pub trait Bo2Collision: SolidProbe {
     /// true: the player moves with BO2's collision (physics mode 1). false:
-    /// the box traces of [`CollisionBackend`].
+    /// the box traces of [`SolidQuerySource`].
     fn gjk_on(&self) -> bool {
         false
     }
@@ -165,23 +166,24 @@ pub trait Bo2Collision: CollisionBackend {
 /// BO2's is_not_penetrating (PM_CheckDuck, PM_CanStand, PM_CanCrouch):
 /// with its collision on, the body placed at a point, and "stuck" is a trace
 /// that starts inside something (BO2 reads startsolid there where the box
-/// trace reads allsolid; the body's trace never sets allsolid). Off, the
+/// trace reads fully_embedded; the body's trace never sets fully_embedded). Off, the
 /// world's box trace. The shared stance checks get this in place of the
 /// world.
 pub(crate) struct PenetrationChecks<'a, C>(pub &'a C);
 
-impl<C: Bo2Collision> CollisionBackend for PenetrationChecks<'_, C> {
-    fn trace(&self, input: GroundTraceInput) -> Trace {
+impl<C: Bo2Collision> SolidProbe for PenetrationChecks<'_, C> {
+    fn trace(&self, input: SweepAsk) -> Trace {
         if !self.0.gjk_on() {
             return self.0.trace(input);
         }
-        let mut t = trace::player_trace(self.0, input.start, input.end, input.mins, input.maxs, input.tracemask);
-        t.allsolid = t.startsolid;
+        let SweepAsk { start, end, lo_corner: mins, hi_corner: maxs, collide_filter } = input;
+        let mut t = trace::player_trace(self.0, start, end, mins, maxs, collide_filter);
+        t.fully_embedded = t.starts_inside;
         t
     }
 
-    fn touch_entity(&self, trace: &Trace, end_pos: [f32; 3]) {
-        self.0.touch_entity(trace, end_pos);
+    fn brush_against(&self, hit: &Trace, finish_location: [f32; 3]) {
+        self.0.brush_against(hit, finish_location);
     }
 }
 
@@ -197,15 +199,15 @@ pub(crate) fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-pub(crate) fn scale(a: [f32; 3], s: f32) -> [f32; 3] {
-    [a[0] * s, a[1] * s, a[2] * s]
+pub(crate) fn scale(a: [f32; 3], factor: f32) -> [f32; 3] {
+    [a[0] * factor, a[1] * factor, a[2] * factor]
 }
 
 pub(crate) fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
-pub(crate) fn len_sq(a: [f32; 3]) -> f32 {
+pub(crate) fn magnitude_squared(a: [f32; 3]) -> f32 {
     dot(a, a)
 }
 

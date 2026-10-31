@@ -1,10 +1,12 @@
 //! The bank file: header, entry table, entry bytes.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read as _;
+use std::io::Seek as _;
 use std::path::{Path, PathBuf};
 
 use crate::Pcm16;
+use std::io::SeekFrom;
 
 pub const BANK_MAGIC: &[u8; 4] = b"2UX#";
 pub const BANK_VERSION: u32 = 14;
@@ -30,12 +32,12 @@ pub enum SoundFormat {
     Flac,
     WiiUAdpcm,
     Mpc,
-    Unknown(u8),
+    Unlisted(u8),
 }
 
 impl SoundFormat {
-    pub fn from_u8(v: u8) -> Self {
-        match v {
+    pub fn from_u8(code: u8) -> Self {
+        match code {
             0 => Self::Pcm16,
             1 => Self::Pcm24,
             2 => Self::Pcm32,
@@ -47,7 +49,7 @@ impl SoundFormat {
             8 => Self::Flac,
             9 => Self::WiiUAdpcm,
             10 => Self::Mpc,
-            other => Self::Unknown(other),
+            unlisted => Self::Unlisted(unlisted),
         }
     }
 }
@@ -70,7 +72,7 @@ pub fn sound_hash(name: &str) -> u32 {
 pub struct BankHeader {
     pub version: u32,
     pub entry_size: u32,
-    pub entry_count: u32,
+    pub entry_tally: u32,
     pub dependency_count: u32,
     pub file_size: u64,
     pub entry_offset: u64,
@@ -87,7 +89,7 @@ pub struct BankEntry {
     pub frame_count: u32,
     pub frame_rate_index: u8,
     pub channel_count: u8,
-    pub looping: bool,
+    pub loops: bool,
     pub format: SoundFormat,
 }
 
@@ -119,20 +121,21 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 
 impl BankFile {
     pub fn open(path: &Path) -> Result<Self, String> {
-        let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let shown = path.display();
+        let mut file = File::open(path).map_err(|e| format!("{shown}: {e}"))?;
         let mut head = vec![0u8; HEADER_SIZE];
         file.read_exact(&mut head)
-            .map_err(|e| format!("{}: header: {e}", path.display()))?;
-        let header = parse_header(&head).map_err(|e| format!("{}: {e}", path.display()))?;
-        let table_len = header.entry_count as usize * header.entry_size as usize;
+            .map_err(|e| format!("{shown}: header: {e}"))?;
+        let header = parse_header(&head).map_err(|e| format!("{shown}: {e}"))?;
+        let table_len = header.entry_tally as usize * header.entry_size as usize;
         file.seek(SeekFrom::Start(header.entry_offset))
-            .map_err(|e| format!("{}: entry table: {e}", path.display()))?;
+            .map_err(|e| format!("{shown}: entry table: {e}"))?;
         let mut table = vec![0u8; table_len];
         file.read_exact(&mut table)
-            .map_err(|e| format!("{}: entry table: {e}", path.display()))?;
+            .map_err(|e| format!("{shown}: entry table: {e}"))?;
         let entries = parse_entries(&table, header.entry_size as usize);
         Ok(Self {
-            path: path.to_path_buf(),
+            path: PathBuf::from(path),
             header,
             entries,
         })
@@ -151,9 +154,8 @@ impl BankFile {
     }
 
     /// One entry decoded to 16-bit PCM.
-    pub fn decode(&self, entry: &BankEntry) -> Result<Pcm16, String> {
-        let data = self.read(entry)?;
-        decode_entry(entry, &data)
+    pub fn decode(&self, item: &BankEntry) -> Result<Pcm16, String> {
+        self.read(item).and_then(|bytes| decode_entry(item, &bytes))
     }
 }
 
@@ -162,7 +164,7 @@ pub fn decode_entry(entry: &BankEntry, data: &[u8]) -> Result<Pcm16, String> {
     match entry.format {
         SoundFormat::Pcm16 => {
             let samples: Vec<i16> = data
-                .chunks_exact(2)
+                .chunks_exact(std::mem::size_of::<i16>())
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             Ok(Pcm16 {
@@ -209,7 +211,7 @@ pub fn parse_header(head: &[u8]) -> Result<BankHeader, String> {
     Ok(BankHeader {
         version,
         entry_size,
-        entry_count: u32_at(head, 20),
+        entry_tally: u32_at(head, 20),
         dependency_count,
         file_size: u64_at(head, 32),
         entry_offset: u64_at(head, 40),
@@ -227,7 +229,7 @@ pub fn parse_entries(table: &[u8], entry_size: usize) -> Vec<BankEntry> {
             frame_count: u32_at(e, 12),
             frame_rate_index: e[16],
             channel_count: e[17],
-            looping: e[18] != 0,
+            loops: e[18] != 0,
             format: SoundFormat::from_u8(e[19]),
         })
         .collect()

@@ -10,7 +10,7 @@
 //! (DynEntCl_MeleeEvent); ours have no physics, so they do not.
 
 use bevy::prelude::*;
-use render_fx::{HostFxSystem, PreparedImpactFx};
+use render_fx::{EffectsSystemHandle, ReadyHitFx};
 
 /// BO2's player_meleeRange default.
 const MELEE_RANGE: f32 = 55.0;
@@ -25,11 +25,11 @@ const MELEE_GLASS_OFFSETS: [[f32; 2]; 5] = [[0.0, 0.0], [1.0, 1.0], [-1.0, 1.0],
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn play(
     swing: On<net::EntityFireMelee>,
-    impact_fx: Option<Res<PreparedImpactFx>>,
-    mut host: ResMut<HostFxSystem>,
+    impact_effect: Option<Res<ReadyHitFx>>,
+    mut host: ResMut<EffectsSystemHandle>,
 ) {
     // Black Ops II only.
-    if !impact_fx
+    if !impact_effect
         .as_ref()
         .and_then(|fx| fx.0.as_ref())
         .is_some_and(|t| t.t6)
@@ -51,16 +51,16 @@ pub(crate) fn play(
 
 /// One of the swing's lines: from the eye, the reach along the view, nudged
 /// across and up by the offset (in melee widths and heights).
-fn melee_line(eye: [f32; 3], angles: [f32; 3], offset: [f32; 2]) -> ([f32; 3], [f32; 3]) {
-    let (forward, right, up) = game_math::angle_vectors(angles);
-    let across = MELEE_WIDTH * offset[0];
-    let lift = MELEE_HEIGHT * offset[1];
+fn melee_line(eye: [f32; 3], rot: [f32; 3], spread: [f32; 2]) -> ([f32; 3], [f32; 3]) {
+    let (fwd, right, up) = game_math::euler_basis(rot);
+    let across = MELEE_WIDTH * spread[0];
+    let lift = MELEE_HEIGHT * spread[1];
     (
         eye,
         [
-            eye[0] + forward[0] * MELEE_RANGE + right[0] * across + up[0] * lift,
-            eye[1] + forward[1] * MELEE_RANGE + right[1] * across + up[1] * lift,
-            eye[2] + forward[2] * MELEE_RANGE + right[2] * across + up[2] * lift,
+            eye[0] + fwd[0] * MELEE_RANGE + right[0] * across + up[0] * lift,
+            eye[1] + fwd[1] * MELEE_RANGE + right[1] * across + up[1] * lift,
+            eye[2] + fwd[2] * MELEE_RANGE + right[2] * across + up[2] * lift,
         ],
     )
 }

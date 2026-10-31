@@ -1,309 +1,310 @@
-use std::collections::HashMap;
+//! Bullet tracers: spawning them as moving local entities, ticking them along their
+//! straight paths and turning the live ones into beams for the beam tessellator.
 
-use asset_game::{OwnedTracerDef, TracerDefinitions};
-use assets::{AssetEdge, TracerSpace};
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+
+use asset_game::{SelfContainedTracerDef, TracerDefinitions};
+use assets::{AssetDependencyLink, TracerRange};
 use bevy::prelude::*;
-use entity_t6::trajectory::tr_type;
+use entity_t6::flight::path_kind;
 use entity_t6::{Trajectory, evaluate_trajectory};
 use fx::{
-    FxMsec, LE_MOVING_TRACER, LE_TR_LINEAR, LocalEntityPool, LocalEntitySlot, tracer_travel_msec,
+    EffectClockMs, THING_FLYING_STREAK, PATH_STRAIGHT_LINE, ClientOnlyThingBank, ClientOnlyThingSlot, tracer_flight_ms,
 };
 use fx_t6::runtime::vec3_normalize;
 use fx_t6::{
-    FX_BEAM_ADD_CAP, FX_TRACER_FIRST_PERSON_MAX_WIDTH, FX_TRACER_MIN_DIST, FxBeamKind, FxBeamTess,
-    FxBeamVert, FxTracerBeam, beam_color_key, beam_sample_color, tracer_segment_count,
+    RAY_QUEUE_LIMIT, OWN_BULLET_STREAK_WIDEST, BULLET_STREAK_SHORTEST, FxBeamKind, EffectBeamStitch,
+    RayCorner, FxTracerBeam, beam_color_key, beam_sample_color, tracer_segment_count,
 };
 
-use crate::host::CombatFxDump;
+use crate::host::{BattleEffectsSnapshot, TracerSample};
 
-// The tracer's local entity flies on BO2's linear trajectory.
-const _: () = assert!(LE_TR_LINEAR == tr_type::LINEAR);
+// Tracers fly on the engine's linear trajectory type.
+const _: () = assert!(PATH_STRAIGHT_LINE == path_kind::STRAIGHT);
+
+/// A tracer fired from the player's own weapon leaves the barrel this many milliseconds
+/// after the shot. Black Ops II's first-person muzzle flash lasts 15-20 ms and covers the
+/// barrel, and its pistol tracer (30 units long at 4,000 units/s) is only a streak over
+/// its first ~100 units, so it used to be spent under the flash and show as a three-pixel
+/// dash at the crosshair. This delay is our own choice, not the game's: the tracer starts
+/// on the first frame after it, whole from the barrel, and lands that much late.
+const OWN_TRACER_DELAY_MSEC: i32 = 25;
 
 #[derive(Resource, Default)]
-pub struct PreparedTracers(pub TracerDefinitions);
+pub struct StagedStreaks(pub TracerDefinitions);
 
+/// Decides which shots get a tracer: one every `render_spacing` shots per source, and one
+/// per pellet of a shotgun blast (its first segment only).
 #[derive(Resource, Default)]
-pub struct TracerDrawGate {
-    counts: HashMap<u32, u8>,
-
-    shots: HashMap<(u32, u32, u16), ()>,
+pub struct TracerRenderGuard {
+    shots_until_draw: HashMap<u32, u8>,
+    seen_pellets: HashSet<(u32, u32, u16)>,
 }
 
-impl TracerDrawGate {
-    pub fn first_segment_of_pellet(
+impl TracerRenderGuard {
+    /// True the first time this (source, shot, pellet) is asked about.
+    pub fn opening_leg_of_pellet(
         &mut self,
-        source_id: u32,
-        correlation: u32,
-        pellet: u16,
+        emitter_key: u32,
+        shot_key: u32,
+        pellet_ix: u16,
     ) -> bool {
-        self.shots
-            .insert((source_id, correlation, pellet), ())
-            .is_none()
+        self.seen_pellets.insert((emitter_key, shot_key, pellet_ix))
     }
 
-    pub fn should_spawn(&mut self, source_id: u32, draw_interval: u32) -> bool {
-        if draw_interval == 0 {
+    /// Counts a shot for `emitter_key`; true when it is the one that draws.
+    pub fn wants_spawn(&mut self, emitter_key: u32, render_spacing: u32) -> bool {
+        if render_spacing == 0 {
             return false;
         }
-        let period = draw_interval.min(255) as u8;
-        let entry = self.counts.entry(source_id).or_insert(0);
-        if *entry == 0 || period < *entry {
-            *entry = period;
+        let period = render_spacing.min(255) as u8;
+        let counter = self.shots_until_draw.entry(emitter_key).or_insert(0);
+        // A fresh source, or one whose interval got shorter, restarts its countdown.
+        if *counter == 0 || period < *counter {
+            *counter = period;
         }
-        *entry = entry.saturating_sub(1);
-        if *entry != 0 {
+        *counter -= 1;
+        if *counter > 0 {
             return false;
         }
-        *entry = period;
+        *counter = period;
         true
     }
 }
 
-pub struct QueuedBeam {
-    pub tess: FxBeamTess,
-    pub material: Option<usize>,
-}
-
-#[derive(Resource, Default)]
-pub struct TracerWorld {
-    pub pool: LocalEntityPool,
-    pub queued: Vec<QueuedBeam>,
-}
-
-impl TracerWorld {
-    pub fn live_count(&self) -> usize {
-        self.pool.live_count()
-    }
-
-    pub fn tr_time_min(&self) -> Option<i32> {
-        self.pool.tr_time_min()
-    }
-
-    pub fn end_time_min(&self) -> Option<i32> {
-        self.pool.end_time_min()
-    }
-}
-
+/// Why a shot got no tracer.
 #[derive(Debug)]
-pub enum TracerSpawnSkip {
+pub enum TracerSpawnRefusal {
     NoDef,
     Interval,
     Short,
 }
 
-pub fn try_spawn_tracer(
-    gate: &mut TracerDrawGate,
-    world: &mut TracerWorld,
-    catalog: &TracerDefinitions,
-    tracer: AssetEdge<TracerSpace>,
-    source_id: u32,
-    start: [f32; 3],
-    end: [f32; 3],
-    own_shot: bool,
-    clock: FxMsec,
-    combat: &mut CombatFxDump,
-) -> Result<(), TracerSpawnSkip> {
-    let Some(def) = tracer.bound_index().and_then(|index| catalog.def_at(index)) else {
-        return Err(TracerSpawnSkip::NoDef);
-    };
-    combat.last_tracer_name = Some(def.name.clone());
-    combat.last_tracer_mat_edge = Some(def.material.edge_kind().to_owned());
-    combat.last_tracer_mat_index = def.material.bound_index().map(|i| i as i64);
-    combat.last_tracer_material = def.present_name().map(str::to_owned);
-    combat.last_tracer_bind = def
-        .present_name()
-        .map(|name| asset_game::material_bind_name(name).to_owned());
-    combat.last_tracer_speed = Some(def.speed);
-    combat.last_tracer_beam_length = Some(def.beam_length);
-    combat.last_tracer_draw_interval = Some(i64::from(def.draw_interval));
-    if !gate.should_spawn(source_id, def.draw_interval) {
-        return Err(TracerSpawnSkip::Interval);
-    }
-    spawn_moving_tracer(world, def, start, end, own_shot, clock).map_err(|_| TracerSpawnSkip::Short)
+/// One beam waiting for the tessellator, with the material it draws with.
+pub struct PendingTracerBeam {
+    pub tess: EffectBeamStitch,
+    pub mat_ref: Option<usize>,
 }
 
-fn spawn_moving_tracer(
-    world: &mut TracerWorld,
-    def: &OwnedTracerDef,
-    start: [f32; 3],
-    end: [f32; 3],
-    own_shot: bool,
-    clock: FxMsec,
-) -> Result<(), ()> {
-    let delta = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
-    let dist = game_math::vec3_length(delta);
-    // TODO(fact): BO2's tracer near cut is not in the facts; fx_t6 keeps MW2's.
-    if dist <= FX_TRACER_MIN_DIST {
-        return Err(());
-    }
-    // bo2zm: a Black Ops II smoke tracer lies along the whole path (its
-    // speed is a token 1) until it has faded.
-    let travel = if def.fade_msec > 0 {
-        def.fade_msec as i32
-    } else {
-        tracer_travel_msec(dist, def.speed).ok_or(())?
+/// The tracers in flight, and the beams they were turned into at the last tick.
+#[derive(Resource, Default)]
+pub struct StreakLevel {
+    pub pool: ClientOnlyThingBank,
+    pub pending_list: Vec<PendingTracerBeam>,
+}
+
+/// Notes the tracer a shot looked up, for the `fx_dump` report.
+fn record_tracer_sample(sample: &mut TracerSample, def: &SelfContainedTracerDef) {
+    let present = def.existing_label();
+    *sample = TracerSample {
+        name: Some(def.name.clone()),
+        shader: present.map(str::to_owned),
+        bind: present.map(|name| asset_game::material_bind_name(name).to_owned()),
+        has_color: sample.has_color,
+        speed: Some(def.speed),
+        ray_extent: Some(def.ray_extent),
     };
-    let dir = vec3_normalize(delta);
-    let mut width = def.beam_width;
-    if own_shot {
-        // TODO(fact): BO2's first-person width cap is not in the facts; fx_t6 keeps MW2's.
-        width = width.min(FX_TRACER_FIRST_PERSON_MAX_WIDTH);
+}
+
+/// Looks the tracer up and notes it in the combat dump, applies the draw interval and
+/// spawns the moving tracer.
+pub fn attempt_bullet_streak(
+    gate: &mut TracerRenderGuard,
+    world: &mut StreakLevel,
+    catalog: &TracerDefinitions,
+    tracer: AssetDependencyLink<TracerRange>,
+    emitter_key: u32,
+    from_pt: [f32; 3],
+    end: [f32; 3],
+    fired_by_me: bool,
+    clock: EffectClockMs,
+    dump: &mut BattleEffectsSnapshot,
+) -> Result<(), TracerSpawnRefusal> {
+    let def = tracer
+        .extent_position()
+        .and_then(|index| catalog.recipe_at(index))
+        .ok_or(TracerSpawnRefusal::NoDef)?;
+    record_tracer_sample(&mut dump.sample, def);
+    if !gate.wants_spawn(emitter_key, def.render_spacing) {
+        return Err(TracerSpawnRefusal::Interval);
     }
-    // bo2zm: BO2MP_TRACER_DEBUG=w,s (test aid): tracers w times wider and s
-    // times slower, to see one drawn.
-    static DEBUG: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
-    let (wide, slow) = *DEBUG.get_or_init(|| {
+    launch_travelling_tracer(world, def, from_pt, end, fired_by_me, clock).ok_or(TracerSpawnRefusal::Short)
+}
+
+/// Test aid: `BO2MP_TRACER_DEBUG=w,s` makes tracers `w` times wider and `s` times slower
+/// so one can be seen at all. Unset or malformed means (1, 1).
+fn debug_scale() -> (f32, f32) {
+    static SCALE: OnceLock<(f32, f32)> = OnceLock::new();
+    *SCALE.get_or_init(|| {
         std::env::var("BO2MP_TRACER_DEBUG")
             .ok()
-            .and_then(|v| {
-                let (w, s) = v.split_once(',')?;
-                Some((w.parse().ok()?, s.parse().ok()?))
+            .and_then(|raw_text| {
+                let (wide, slow) = raw_text.split_once(',')?;
+                Some((wide.parse().ok()?, slow.parse().ok()?))
             })
             .unwrap_or((1.0, 1.0))
-    });
-    let (width, speed) = (width * wide, def.speed / slow);
-    let travel = if slow != 1.0 && def.fade_msec == 0 {
-        tracer_travel_msec(dist, speed).ok_or(())?
+    })
+}
+
+/// Allocates the flying tracer, or `None` when the shot is too short or too slow to draw.
+fn launch_travelling_tracer(
+    world: &mut StreakLevel,
+    def: &SelfContainedTracerDef,
+    from_pt: [f32; 3],
+    end: [f32; 3],
+    fired_by_me: bool,
+    clock: EffectClockMs,
+) -> Option<()> {
+    let offset = [end[0] - from_pt[0], end[1] - from_pt[1], end[2] - from_pt[2]];
+    let distance = game_math::vec3_norm(offset);
+    // TODO(fact): BO2's near cut for tracers is not in the facts; fx_t6 keeps the old value.
+    if distance <= BULLET_STREAK_SHORTEST {
+        return None;
+    }
+    let (wide, slow) = debug_scale();
+    let speed = def.speed / slow;
+    // A Black Ops II smoke tracer (speed is a token 1) lies along the whole path until it
+    // has faded; every other tracer lives as long as its flight takes.
+    let smoke = def.fade_msec > 0;
+    let lifetime = if smoke {
+        def.fade_msec as i32
     } else {
-        travel
+        tracer_flight_ms(distance, speed)?
     };
-    let delay = if own_shot && def.fade_msec == 0 {
+    let mut width = def.ray_thickness;
+    if fired_by_me {
+        // TODO(fact): BO2's first-person width cap is not in the facts either.
+        width = width.min(OWN_BULLET_STREAK_WIDEST);
+    }
+    let width = width * wide;
+    let delay = if fired_by_me && !smoke {
         OWN_TRACER_DELAY_MSEC
     } else {
         0
     };
-    world.pool.alloc(LocalEntitySlot {
-        le_type: LE_MOVING_TRACER,
-        pos_tr_time: clock.0.wrapping_add(delay),
-        pos_tr_type: LE_TR_LINEAR,
-        pos_tr_duration: 0,
-        pos_tr_delta: [dir[0] * speed, dir[1] * speed, dir[2] * speed],
-        pos_tr_base: start,
-        end_time: clock.0.wrapping_add(delay + travel),
-        material: def.material.bound_index(),
-        tracer_clip_dist: dist,
-        beam_length: def.beam_length.max(0.0),
-        beam_width: width.max(0.0),
-        screw_dist: def.screw_dist,
-        screw_radius: def.screw_radius.max(0.0),
+    let heading = vec3_normalize(offset);
+    world.pool.claim_slot(ClientOnlyThingSlot {
+        thing_category: THING_FLYING_STREAK,
+        path_start_ms: clock.0.wrapping_add(delay),
+        pos_tr_type: PATH_STRAIGHT_LINE,
+        path_length_ms: 0,
+        path_drift: heading.map(|axis| axis * speed),
+        path_start_point: from_pt,
+        finish_stamp: clock.0.wrapping_add(delay + lifetime),
+        shader_ix: def.material.extent_position(),
+        tracer_cut: distance,
+        ray_extent: def.ray_extent.max(0.0),
+        ray_thickness: width.max(0.0),
+        spiral_pitch_distance: def.spiral_pitch_distance,
+        spiral_radius: def.spiral_radius.max(0.0),
         colors: def.colors,
-        own_shot,
+        fired_by_me,
         fade_msec: def.fade_msec as i32,
         starts_when_drawn: delay > 0,
     });
-    Ok(())
+    Some(())
 }
 
-/// bo2zm M3 fix list 3: a tracer from his own gun leaves the barrel this
-/// long after the shot. Black Ops II's first-person muzzle flashes last 15-20
-/// ms and cover the barrel; its pistol tracer (30 long at 4,000 units/s) is
-/// only a streak in its first ~100 units, so it was spent under the flash and
-/// what was left was a 3-pixel dash at the crosshair: his "I don't have a
-/// tracer out of my pistol". Our choice, not the game's: it leaves on the
-/// first frame after this, whole from the barrel, and lands that much late.
-const OWN_TRACER_DELAY_MSEC: i32 = 25;
-
-pub fn tick_tracer_beams(world: &mut TracerWorld, clock: FxMsec) {
-    for tr in world.pool.live_mut() {
-        let late = clock.0.wrapping_sub(tr.pos_tr_time);
-        if tr.starts_when_drawn && late >= 0 {
-            tr.pos_tr_time = clock.0;
-            tr.end_time = tr.end_time.wrapping_add(late);
-            tr.starts_when_drawn = false;
+/// Advances every live tracer to `clock` and rebuilds the queue of beams to draw.
+pub fn step_tracer_beams(world: &mut StreakLevel, clock: EffectClockMs) {
+    // A delayed tracer starts its clock on the first tick at or after its start time, and
+    // its end time slides by however late that tick was.
+    for tracer in world.pool.live_mut() {
+        let late = clock.0.wrapping_sub(tracer.path_start_ms);
+        if tracer.starts_when_drawn && late >= 0 {
+            tracer.path_start_ms = clock.0;
+            tracer.finish_stamp = tracer.finish_stamp.wrapping_add(late);
+            tracer.starts_when_drawn = false;
         }
     }
-    world.pool.free_expired(clock);
-    world.queued.clear();
-    for tr in world.pool.live() {
-        // Not out of the barrel yet (his own tracers wait for the flash).
-        if clock.0.wrapping_sub(tr.pos_tr_time) < 0 {
+    world.pool.reclaim_finished(clock);
+    world.pending_list.clear();
+
+    for tracer in world.pool.live() {
+        // Still waiting for the muzzle flash to clear the barrel.
+        if clock.0.wrapping_sub(tracer.path_start_ms) < 0 {
             continue;
         }
-        let begin = evaluate_trajectory(
+        let head = evaluate_trajectory(
             &Trajectory {
-                tr_time: tr.pos_tr_time,
-                tr_type: tr.pos_tr_type,
-                tr_duration: tr.pos_tr_duration,
-                tr_delta: tr.pos_tr_delta,
-                tr_base: tr.pos_tr_base,
+                began_at: tracer.path_start_ms,
+                tr_type: tracer.pos_tr_type,
+                span_ms: tracer.path_length_ms,
+                rate: tracer.path_drift,
+                base_point: tracer.path_start_point,
             },
             clock.0,
         );
-        let dir = vec3_normalize(tr.pos_tr_delta);
-        let start_from_base = [
-            begin[0] - tr.pos_tr_base[0],
-            begin[1] - tr.pos_tr_base[1],
-            begin[2] - tr.pos_tr_base[2],
-        ];
-        let length_from_base =
-            start_from_base[0] * dir[0] + start_from_base[1] * dir[1] + start_from_base[2] * dir[2];
-        let remaining = (tr.tracer_clip_dist - length_from_base).max(0.0);
-        let beam_len = tr.beam_length.min(remaining).max(0.0);
-        if beam_len <= 0.0 {
+        let heading = vec3_normalize(tracer.path_drift);
+        let travelled: f32 = (0..3)
+            .map(|axis| (head[axis] - tracer.path_start_point[axis]) * heading[axis])
+            .sum();
+        // The beam never reaches past the point the shot ended.
+        let visible = tracer
+            .ray_extent
+            .min((tracer.tracer_cut - travelled).max(0.0))
+            .max(0.0);
+        if visible <= 0.0 {
             continue;
         }
-        let end = [
-            begin[0] + dir[0] * beam_len,
-            begin[1] + dir[1] * beam_len,
-            begin[2] + dir[2] * beam_len,
-        ];
-        if world.queued.len() >= FX_BEAM_ADD_CAP {
+        if world.pending_list.len() >= RAY_QUEUE_LIMIT {
             break;
         }
-        // bo2zm: a smoke tracer fades out over its life.
-        let mut colors = tr.colors;
-        if tr.fade_msec > 0 {
-            let left = (tr.end_time.wrapping_sub(clock.0)) as f32 / tr.fade_msec as f32;
-            for c in &mut colors {
-                c[3] *= left.clamp(0.0, 1.0);
+        let tail = [0, 1, 2].map(|axis| head[axis] + heading[axis] * visible);
+
+        // A smoke tracer fades out over its life; it is also the only kind with its own beam kind.
+        let smoke = tracer.fade_msec > 0;
+        let mut colors = tracer.colors;
+        if smoke {
+            let remaining = tracer.finish_stamp.wrapping_sub(clock.0) as f32 / tracer.fade_msec as f32;
+            for color in &mut colors {
+                color[3] *= remaining.clamp(0.0, 1.0);
             }
         }
-        // A smoke tracer (BO2's type 1) is the one that fades.
-        let smoke = tr.fade_msec > 0;
-        let tracer = FxTracerBeam {
-            wiggle_dist: tr.screw_radius,
-            // TODO(fact): asset_game does not load BO2's tracer texture-repeat
-            // field yet; 1 runs the texture once along the beam, as before.
+        let beam = FxTracerBeam {
+            sway_reach: tracer.spiral_radius,
+            // TODO(fact): asset_game does not load BO2's tracer texture-repeat field yet; 1
+            // runs the texture once along the beam, as it always has.
             tex_repeats: 1.0,
             segment_len: 0.0,
         };
-        world.queued.push(QueuedBeam {
-            tess: FxBeamTess {
+        world.pending_list.push(PendingTracerBeam {
+            tess: EffectBeamStitch {
                 kind: if smoke {
-                    FxBeamKind::SmokeTracer(tracer)
+                    FxBeamKind::SmokeTracer(beam)
                 } else {
-                    FxBeamKind::Tracer(tracer)
+                    FxBeamKind::Tracer(beam)
                 },
-                depth_hack: false,
+                near_layer_draw: false,
                 draw_surf_override: 0,
-                begin,
-                end,
+                begin: head,
+                end: tail,
                 colors: colors.map(beam_color_key),
-                radius: tr.beam_width,
-                segment_count: tracer_segment_count(smoke, beam_len, tr.screw_dist),
+                radius: tracer.ray_thickness,
+                piece_tally: tracer_segment_count(smoke, visible, tracer.spiral_pitch_distance),
             },
-            material: tr.material,
+            mat_ref: tracer.shader_ix,
         });
     }
 }
 
 /// Puts back the colour keys `fx_t6::beam_generate_verts` divides by 4.
 ///
-/// TODO(fact): BO2 stores beam RGB divided by 4 on every type but the smoke
-/// tracer (fx-beam-laser-t6 section 2, item 11); whether its tracer shader
-/// scales that back by 4 is unknown, so the undivided keys keep today's
-/// brightness until it is.
-pub fn beam_undivided_colors(tess: &FxBeamTess, verts: &mut [FxBeamVert]) {
-    let last = verts.len().saturating_sub(1);
-    let seg = f32::from(tess.segment_count.max(1));
-    for (i, v) in verts.iter_mut().enumerate() {
-        // The begin cap, a pair per segment step, the end cap.
-        let t = match i {
+/// TODO(fact): BO2 stores beam RGB divided by 4 on every type but the smoke tracer
+/// (fx-beam-laser-t6 section 2, item 11); whether its tracer shader scales that back by 4 is
+/// unknown, so the undivided keys keep today's brightness until it is.
+pub fn beam_undivided_colors(tess: &EffectBeamStitch, vertex_points: &mut [RayCorner]) {
+    let last = vertex_points.len().saturating_sub(1);
+    let steps = f32::from(tess.piece_tally.max(1));
+    for (n, vert) in vertex_points.iter_mut().enumerate() {
+        // Layout: begin cap, one pair of vertices per segment step, end cap.
+        let along = match n {
             0 => 0.0,
-            i if i == last => 1.0,
-            i => ((i - 1) / 2) as f32 / seg,
+            n if n == last => 1.0,
+            n => ((n - 1) / 2) as f32 / steps,
         };
-        let key = beam_sample_color(tess.kind, &tess.colors, t);
-        v.color = [key[0], key[1], key[2], v.color[3]];
+        let [r, g, b, _] = beam_sample_color(tess.kind, &tess.colors, along);
+        vert.color = [r, g, b, vert.color[3]];
     }
 }

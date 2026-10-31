@@ -1,38 +1,46 @@
-//! The prompt line: the keys that edit it, the history and completions behind
-//! the arrows and Tab, and what happens when a line is submitted.
+//! Input line handling: key editing, history and completion navigation, and
+//! what a submitted line does.
 
-use bevy::{
-    ecs::system::SystemParam,
-    input::{
-        ButtonState,
-        keyboard::{Key, KeyCode, KeyboardInput, NativeKeyCode},
-    },
-    input_focus::{FocusCause, InputFocus},
-    prelude::*,
-    text::{EditableText, FontCx, LayoutCx, TextEdit},
-    window::PrimaryWindow,
-};
+use bevy::ecs::system::SystemParam;
+use bevy::input::ButtonState;
+use bevy::input::keyboard::Key;
+use bevy::input::keyboard::KeyboardInput;
+use bevy::input::keyboard::NativeKeyCode;
+use bevy::input_focus::FocusCause;
+use bevy::input_focus::InputFocus;
+use bevy::prelude::*;
+use bevy::text::EditableText;
+use bevy::text::FontCx;
+use bevy::text::LayoutCx;
+use bevy::text::TextEdit;
 
-use super::{
-    panel::{PROMPT, PromptEntity, PromptText},
-    queue::ConsoleCommandQueue,
-    state::{ConsoleSettings, ConsoleState, set_line},
-};
-use crate::{ConsoleCommand, ConsoleEditor, ConsoleRegistry};
+use super::panel::INPUT_LEAD_GLYPH;
+use super::panel::PromptEntity;
+use super::panel::PromptText;
+use super::queue::TypedOrderBacklog;
+use super::state::PromptPanelOptions;
+use super::state::PromptPanelStatus;
+use super::state::set_line;
+use crate::TypedOrder;
+use crate::PromptLineEditor;
+use crate::OrderCatalog;
+use bevy::input::keyboard::KeyCode;
+use bevy::window::PrimaryWindow;
 
-/// The completions on offer for the line as it stands.
-pub(super) fn offered(state: &ConsoleState, registry: &ConsoleRegistry) -> Vec<String> {
-    registry.suggestions(&state.editor.line, state.editor.caret)
+/// Completion candidates for the current line and insert_column.
+pub(super) fn offered(state: &PromptPanelStatus, book: &OrderCatalog) -> Vec<String> {
+    let PromptLineEditor { line, insert_column, .. } = &state.editor;
+    book.hint_list(line, *insert_column)
 }
 
-/// What the keys pressed this frame ask the prompt to do.
+/// Prompt actions requested by this frame's key presses.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Wants {
     close: bool,
     clear: bool,
     home: bool,
     end: bool,
-    kill_word: bool,
+    erase_previous_word: bool,
     tab: bool,
     submit: bool,
     up: bool,
@@ -40,121 +48,124 @@ struct Wants {
 }
 
 impl Wants {
-    /// Reads the pressed keys. With Control held, W, U, A and E are line
-    /// editing and stop there; every other key is read by what it types.
+    /// Interprets pressed keys. Under Control, W/U/A/E are line-edit key_combos
+    /// and consume the key; everything else goes by its logical meaning.
     fn from_keys<'a>(control: bool, pressed: impl IntoIterator<Item = (KeyCode, &'a Key)>) -> Self {
-        let mut wants = Self::default();
+        let mut out = Self::default();
         for (code, logical) in pressed {
-            if control {
+            let key_combo = if control {
                 match code {
-                    KeyCode::KeyW => {
-                        wants.kill_word = true;
-                        continue;
-                    }
-                    KeyCode::KeyU => {
-                        wants.clear = true;
-                        continue;
-                    }
-                    KeyCode::KeyA => {
-                        wants.home = true;
-                        continue;
-                    }
-                    KeyCode::KeyE => {
-                        wants.end = true;
-                        continue;
-                    }
-                    _ => {}
+                    KeyCode::KeyW => Some(&mut out.erase_previous_word),
+                    KeyCode::KeyU => Some(&mut out.clear),
+                    KeyCode::KeyA => Some(&mut out.home),
+                    KeyCode::KeyE => Some(&mut out.end),
+                    _ => None,
                 }
+            } else {
+                None
+            };
+            if let Some(flag) = key_combo {
+                *flag = true;
+                continue;
             }
-            match logical {
-                Key::Escape => wants.close = true,
-                Key::ArrowUp => wants.up = true,
-                Key::ArrowDown => wants.down = true,
-                Key::Tab => wants.tab = true,
-                Key::Enter => wants.submit = true,
-                _ => {}
-            }
+            let flag = match logical {
+                Key::Escape => &mut out.close,
+                Key::ArrowUp => &mut out.up,
+                Key::ArrowDown => &mut out.down,
+                Key::Tab => &mut out.tab,
+                Key::Enter => &mut out.submit,
+                _ignored => continue,
+            };
+            *flag = true;
         }
-        wants
+        out
     }
 }
 
-/// The text box's own handling of these keys is replaced by the console's.
+/// Edits the console handles itself instead of letting the text box act.
 fn reserved_for_console(edit: &TextEdit) -> bool {
-    matches!(
-        edit,
-        TextEdit::Up(_) | TextEdit::Down(_) | TextEdit::SelectAll | TextEdit::CollapseSelection
-    )
+    match edit {
+        // Up and down walk the history and the completions.
+        TextEdit::Up(_) | TextEdit::Down(_) => true,
+        // Ctrl+A clears the line here; selections live in the log.
+        TextEdit::SelectAll | TextEdit::CollapseSelection => true,
+        _ => false,
+    }
 }
 
-/// Moves the highlighted completion on by one, wrapping round. `forward`
-/// goes to the next entry.
-fn cycle(selected: usize, len: usize, forward: bool) -> usize {
-    match (len, forward) {
+/// Steps the completion highlight, wrapping at both ends.
+fn cycle(selected: usize, ring: usize, forward: bool) -> usize {
+    match (ring, forward) {
         (0, _) => selected,
-        (_, true) => (selected + 1) % len,
-        (_, false) => (selected + len - 1) % len,
+        (_, true) => (selected + 1) % ring,
+        (_, false) => (selected + ring - 1) % ring,
     }
 }
 
-/// An arrow key: browses the history when that applies, otherwise moves
-/// through the completions. True when the history replaced the line.
-fn step_arrow(state: &mut ConsoleState, registry: &ConsoleRegistry, up: bool) -> bool {
-    let browsing = state.history_cursor.is_some();
-    if up {
-        if (browsing || state.editor.line.is_empty()) && state.history_recall(true) {
-            return true;
+/// Handles an arrow key: walks the history if that applies, else moves
+/// through the completions. Returns true when the history changed the line.
+fn step_arrow(state: &mut PromptPanelStatus, book: &OrderCatalog, up: bool) -> bool {
+    let in_history = state.recall_position.is_some();
+    let recalled = match (up, in_history) {
+        (true, _) => {
+            let may_recall = in_history || state.editor.line.is_empty();
+            may_recall && state.recall_earlier_entry(true)
         }
-    } else if browsing {
-        state.history_recall(false);
-        return true;
+        (false, true) => {
+            state.recall_earlier_entry(false);
+            true
+        }
+        (false, false) => false,
+    };
+    if !recalled {
+        let count = offered(state, book).len();
+        state.editor.highlight = cycle(state.editor.highlight, count, up);
     }
-    let len = offered(state, registry).len();
-    state.editor.selected = cycle(state.editor.selected, len, up);
-    false
+    recalled
 }
 
-/// Takes the typed line, prints it, and acts on it: `help` and `clear` are
-/// the console's own, an unknown command is reported, the rest are queued.
+/// Consumes the typed line and echoes it. `help` and `clear` are built in,
+/// unknown names are reported, everything else is queued.
 fn submit(
-    state: &mut ConsoleState,
-    registry: &ConsoleRegistry,
-    settings: &ConsoleSettings,
-    queue: &mut ConsoleCommandQueue,
+    state: &mut PromptPanelStatus,
+    book: &OrderCatalog,
+    settings: &PromptPanelOptions,
+    queue: &mut TypedOrderBacklog,
 ) {
-    if state.history_cursor.is_none() {
-        let completions = offered(state, registry);
-        state.editor.accept(&completions);
+    if state.recall_position.is_none() {
+        let candidates = offered(state, book);
+        state.editor.take_hint(&candidates);
     }
-    let line = state.editor.take();
-    state.leave_history_browse();
-    if line.trim().is_empty() {
+    let typed = state.editor.take_line();
+    state.quit_recall_mode();
+    if typed.trim().is_empty() {
         return;
     }
-    let capacity = settings.log_capacity;
-    state.echo(format!("{PROMPT}{line}"), capacity);
-    state.remember(&line);
-    for mut command in ConsoleCommand::parse_script(&line) {
-        let known = registry.resolve(&command.name).is_some();
-        match command.name.as_str() {
+    let cap = settings.backlog_limit;
+    state.post_line(format!("{INPUT_LEAD_GLYPH}{typed}"), cap);
+    state.remember(&typed);
+    for mut cmd in TypedOrder::parse_script(&typed) {
+        let verb = cmd.name.as_str();
+        match verb {
             "help" => {
-                for text in registry.help_lines() {
-                    state.echo(text, capacity);
+                for row in book.usage_listing() {
+                    state.post_line(row, cap);
                 }
             }
-            "clear" => state.log.clear(),
-            _ if !known => {
-                state.echo(format!("unknown command `{}`", command.name), capacity);
+            "clear" => state.lines.clear(),
+            name if book.look_up(name).is_none() => {
+                let msg = format!("unknown command `{name}`");
+                state.post_line(msg, cap);
             }
             _ => {
-                command.interactive = true;
-                queue.0.push_back(command);
+                cmd.typed_by_hand = true;
+                queue.0.push_back(cmd);
             }
         }
     }
 }
 
-/// The prompt's text box and everything needed to run edits on it.
+/// The prompt's text widget plus the contexts needed to run edits on it.
 #[derive(SystemParam)]
 pub(super) struct Prompt<'w, 's> {
     entity: Option<Res<'w, PromptEntity>>,
@@ -167,12 +178,12 @@ pub(super) struct Prompt<'w, 's> {
 
 impl<'w> Prompt<'w, '_> {
     fn entity(&self) -> Option<Entity> {
-        self.entity.as_deref().map(|prompt| prompt.0)
+        self.entity.as_deref().map(|found| found.0)
     }
 
     fn widget(&mut self) -> Option<Widget<'_, 'w>> {
-        let entity = self.entity.as_deref()?.0;
-        let text = self.texts.get_mut(entity).ok()?.into_inner();
+        let id = self.entity()?;
+        let text = self.texts.get_mut(id).ok()?.into_inner();
         Some(Widget {
             text,
             font_cx: &mut self.font_cx,
@@ -182,29 +193,31 @@ impl<'w> Prompt<'w, '_> {
     }
 
     fn drop_pending_edits(&mut self) {
-        if let Some(widget) = self.widget() {
-            widget.text.pending_edits.clear();
-        }
-    }
-
-    /// Gives the box the keyboard while the console is open and takes it
-    /// back when it closes, carrying the line across either way.
-    fn set_focus(&mut self, open: bool, editor: &mut ConsoleEditor) {
-        let Some(entity) = self.entity() else {
+        let Some(widget) = self.widget() else {
             return;
         };
-        if open {
-            self.focus.set(entity, FocusCause::Navigated);
-            if let Some(mut widget) = self.widget() {
-                widget.write(editor);
-            }
-        } else {
-            if self.focus.get() == Some(entity) {
+        widget.text.pending_edits.clear();
+    }
+
+    /// Hands keyboard focus to the widget when the console opens and releases
+    /// it on close, copying the line in the matching direction.
+    fn toggle_focus(&mut self, open: bool, editor: &mut PromptLineEditor) {
+        let Some(id) = self.entity() else {
+            return;
+        };
+        if !open {
+            if self.focus.get() == Some(id) {
                 self.focus.clear();
             }
             if let Some(widget) = self.widget() {
                 widget.read(editor);
             }
+            return;
+        }
+        let why = FocusCause::Navigated;
+        self.focus.set(id, why);
+        if let Some(mut widget) = self.widget() {
+            widget.paint_line(editor);
         }
     }
 }
@@ -217,61 +230,58 @@ struct Widget<'a, 'w> {
 }
 
 impl Widget<'_, '_> {
-    /// Runs the edits the box has queued.
+    /// Executes any edits waiting in the widget.
     fn apply(&mut self) {
-        if self.text.pending_edits.is_empty() && self.text.pending_paste.is_none() {
+        let idle = self.text.pending_edits.is_empty() && self.text.pending_paste.is_none();
+        if idle {
             return;
         }
+        let layout = &mut self.layout_cx.0;
         self.text
-            .apply_pending_edits(self.font_cx, &mut self.layout_cx.0, self.clipboard, |_| {
-                true
-            });
+            .apply_pending_edits(self.font_cx, layout, self.clipboard, |_| true);
     }
 
-    /// A line is one line: pasted line breaks become spaces.
+    /// Keeps the content on one line by turning line breaks into spaces.
     fn strip_newlines(&mut self) {
-        let value = self.text.value().to_string();
-        if !value.bytes().any(|byte| byte == b'\n' || byte == b'\r') {
+        let current = self.text.value().to_string();
+        if !current.contains(['\n', '\r']) {
             return;
         }
-        let cleaned = crate::input::normalize_command_paste(&value);
+        let flat = crate::key_input::tidy_pasted_orders(&current);
         self.text.clear();
-        self.text.editor.set_text(&cleaned);
+        self.text.editor.set_text(&flat);
         self.text.queue_edit(TextEdit::TextEnd(false));
     }
 
-    /// Copies the box's line and caret into the editor.
-    fn read(&self, editor: &mut ConsoleEditor) {
-        let line = self.text.value().to_string();
-        let byte = self.text.editor().raw_selection().focus().index();
-        editor.caret = line
-            .char_indices()
-            .take_while(|(index, _)| *index < byte)
-            .count();
-        editor.line = line;
+    /// Copies the widget's content and insert_column position into the editor.
+    fn read(&self, editor: &mut PromptLineEditor) {
+        let content = self.text.value().to_string();
+        let caret_byte = self.text.editor().raw_selection().focus().index();
+        // The column is the number of chars that start before the caret.
+        let starts = content.char_indices().map(|(start, _)| start);
+        editor.insert_column = starts.filter(|&start| start < caret_byte).count();
+        editor.line = content;
     }
 
-    /// Queues the editor's line and caret into the box.
-    fn write(&mut self, editor: &ConsoleEditor) {
+    /// Loads the editor's line and insert_column into the widget as queued edits.
+    fn paint_line(&mut self, editor: &PromptLineEditor) {
         self.text.clear();
         self.text.editor.set_text(&editor.line);
         self.text.queue_edit(TextEdit::TextStart(false));
-        for _ in 0..editor.caret {
-            self.text.queue_edit(TextEdit::Right(false));
-        }
+        (0..editor.insert_column).for_each(|_| self.text.queue_edit(TextEdit::Right(false)));
     }
 
-    /// Runs what was typed or pasted and reads the result back.
-    fn settle(&mut self, editor: &mut ConsoleEditor) {
+    /// Applies typed or pasted input, normalises it, and syncs the editor.
+    fn settle(&mut self, editor: &mut PromptLineEditor) {
         self.apply();
         self.strip_newlines();
         self.apply();
         self.read(editor);
     }
 
-    /// Puts the editor's line in the box and reads the caret back.
-    fn replace(&mut self, editor: &mut ConsoleEditor) {
-        self.write(editor);
+    /// Pushes the editor's line into the widget, then reads the insert_column back.
+    fn replace(&mut self, editor: &mut PromptLineEditor) {
+        self.paint_line(editor);
         self.apply();
         self.read(editor);
     }
@@ -279,64 +289,59 @@ impl Widget<'_, '_> {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_console_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    logical_keys: Res<ButtonInput<Key>>,
-    mut events: MessageReader<KeyboardInput>,
-    mut state: ResMut<ConsoleState>,
-    registry: Res<ConsoleRegistry>,
-    settings: Res<ConsoleSettings>,
-    mut queue: ResMut<ConsoleCommandQueue>,
+    key_state: Res<ButtonInput<KeyCode>>,
+    layout_keys: Res<ButtonInput<Key>>,
+    mut key_events: MessageReader<KeyboardInput>,
+    mut state: ResMut<PromptPanelStatus>,
+    book: Res<OrderCatalog>,
+    settings: Res<PromptPanelOptions>,
+    mut queue: ResMut<TypedOrderBacklog>,
     mut prompt: Prompt<'_, '_>,
 ) {
-    if keys.just_pressed(KeyCode::Backquote) {
-        state.open = !state.open;
+    let toggled = key_state.just_pressed(KeyCode::Backquote);
+    if toggled {
+        state.shown = !state.shown;
         prompt.drop_pending_edits();
-        prompt.set_focus(state.open, &mut state.editor);
-        if !state.open {
-            state.clear_scroll_selection();
-        }
-        return;
+        prompt.toggle_focus(state.shown, &mut state.editor);
     }
-    if !state.open {
+    if !state.shown {
         state.clear_scroll_selection();
+    }
+    if toggled || !state.shown {
         return;
     }
-    let Some(entity) = prompt.entity() else {
+    let Some(prompt_id) = prompt.entity() else {
         return;
     };
-    if prompt.focus.get() != Some(entity) {
-        prompt.focus.set(entity, FocusCause::Navigated);
+    if prompt.focus.get() != Some(prompt_id) {
+        let why = FocusCause::Navigated;
+        prompt.focus.set(prompt_id, why);
     }
 
-    let control = keys.pressed(KeyCode::ControlLeft)
-        || keys.pressed(KeyCode::ControlRight)
-        || logical_keys.pressed(Key::Control);
-    let wants = Wants::from_keys(
-        control,
-        events
-            .read()
-            .filter(|event| event.state.is_pressed())
-            .map(|event| (event.key_code, &event.logical_key)),
-    );
+    let ctrl_down = key_state.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight])
+        || layout_keys.pressed(Key::Control);
+    let pressed_now = key_events
+        .read()
+        .filter(|ev| ev.state.is_pressed())
+        .map(|ev| (ev.key_code, &ev.logical_key));
+    let wants = Wants::from_keys(ctrl_down, pressed_now);
     if wants.close {
-        state.open = false;
         prompt.drop_pending_edits();
         prompt.focus.clear();
+        state.shown = false;
         return;
     }
 
     let Some(mut widget) = prompt.widget() else {
         return;
     };
-    widget
-        .text
-        .pending_edits
-        .retain(|edit| !reserved_for_console(edit));
+    let queued = &mut widget.text.pending_edits;
+    queued.retain(|edit| !reserved_for_console(edit));
 
     if wants.clear {
         widget.text.clear();
         set_line(&mut state.editor, "");
-        state.leave_history_browse();
+        state.quit_recall_mode();
         return;
     }
     if wants.home {
@@ -347,123 +352,122 @@ pub(super) fn handle_console_input(
     }
     widget.settle(&mut state.editor);
 
-    if wants.kill_word {
-        state.editor.kill_word();
-        state.leave_history_browse();
+    if wants.erase_previous_word {
+        state.editor.erase_previous_word();
+        state.quit_recall_mode();
         widget.replace(&mut state.editor);
     }
-    if (wants.up || wants.down) && step_arrow(&mut state, &registry, wants.up) {
+    if (wants.up || wants.down) && step_arrow(&mut state, &book, wants.up) {
         widget.replace(&mut state.editor);
     }
     if wants.tab {
-        let completions = offered(&state, &registry);
-        if state.editor.accept(&completions) {
-            state.leave_history_browse();
+        let candidates = offered(&state, &book);
+        if state.editor.take_hint(&candidates) {
+            state.quit_recall_mode();
             widget.replace(&mut state.editor);
         }
     }
     if wants.submit {
-        submit(&mut state, &registry, &settings, &mut queue);
+        submit(&mut state, &book, &settings, &mut queue);
         widget.text.clear();
     }
 }
 
-/// One typed character as the pair of key events a keyboard would send.
+/// The press/release pair of key events a keyboard would send for `ch`.
 fn typed_character(ch: char, window: Entity) -> [KeyboardInput; 2] {
-    let text = ch.to_string();
-    let key = |state, text| KeyboardInput {
-        key_code: KeyCode::Unidentified(NativeKeyCode::Unidentified),
+    let as_text = ch.to_string();
+    let unknown = KeyCode::Unidentified(NativeKeyCode::Unidentified);
+    let repeat = false;
+    let event = |state, text| KeyboardInput {
+        key_code: unknown,
         logical_key: Key::Character(ch.to_string().into()),
         state,
         text,
-        repeat: false,
+        repeat,
         window,
     };
     [
-        key(ButtonState::Pressed, Some(text.into())),
-        key(ButtonState::Released, None),
+        event(ButtonState::Pressed, Some(as_text.into())),
+        event(ButtonState::Released, None),
     ]
 }
 
-/// `con_feed`: types the text the command left, as keyboard input, so it
-/// goes through the same path as real typing.
+/// `con_feed`: replays the stored text as keyboard events so it takes the
+/// same route as real typing.
 pub(super) fn feed_console_keyboard(
-    mut state: ResMut<ConsoleState>,
-    mut writer: MessageWriter<KeyboardInput>,
-    window: Query<Entity, With<PrimaryWindow>>,
+    mut state: ResMut<PromptPanelStatus>,
+    mut keyboard_out: MessageWriter<KeyboardInput>,
+    primary: Query<Entity, With<PrimaryWindow>>,
 ) {
-    let Some(text) = state.pending_feed.take() else {
+    // The text is used up even when the console is closed.
+    let Some(queued) = state.pending_feed.take() else {
         return;
     };
-    if !state.open {
-        return;
-    }
-    let Ok(window) = window.single() else {
+    let Ok(window) = primary.single() else {
         return;
     };
-    for ch in text.chars() {
-        for event in typed_character(ch, window) {
-            writer.write(event);
-        }
+    if state.shown {
+        keyboard_out.write_batch(queued.chars().flat_map(|ch| typed_character(ch, window)));
     }
 }
 
-/// `con_paste`: inserts the OS clipboard into the prompt.
+/// `con_paste`: drops the system clipboard into the prompt.
 pub(super) fn apply_console_os_paste(
-    mut state: ResMut<ConsoleState>,
-    settings: Res<ConsoleSettings>,
+    mut state: ResMut<PromptPanelStatus>,
+    settings: Res<PromptPanelOptions>,
     mut prompt: Prompt<'_, '_>,
 ) {
     if !std::mem::take(&mut state.pending_os_paste) {
         return;
     }
-    let capacity = settings.log_capacity;
-    if !state.open {
-        state.echo("con_paste: console closed", capacity);
+    let cap = settings.backlog_limit;
+    if !state.shown {
+        let closed = "con_paste: console closed";
+        state.post_line(closed, cap);
         return;
     }
     let Some(mut widget) = prompt.widget() else {
         return;
     };
-    let mut read = widget.clipboard.fetch_text();
-    match read.poll_result() {
-        Some(Ok(text)) if text.is_empty() => state.echo("clipboard empty", capacity),
-        Some(Ok(text)) => {
-            let count = text.chars().count();
-            widget.text.queue_edit(TextEdit::Insert(text.into()));
+    let mut fetch = widget.clipboard.fetch_text();
+    match fetch.poll_result() {
+        None => state.post_line("clipboard read pending", cap),
+        Some(Err(err)) => state.post_line(format!("clipboard read failed: {err}"), cap),
+        Some(Ok(text)) if text.is_empty() => state.post_line("clipboard empty", cap),
+        Some(Ok(pasted)) => {
+            let char_count = pasted.chars().count();
+            widget.text.queue_edit(TextEdit::Insert(pasted.into()));
             widget.settle(&mut state.editor);
-            state.echo(format!("pasted {count} chars"), capacity);
+            state.post_line(format!("pasted {char_count} chars"), cap);
         }
-        Some(Err(error)) => state.echo(format!("clipboard read failed: {error}"), capacity),
-        None => state.echo("clipboard read pending", capacity),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::CommandSpec;
+    use crate::app::prompt::*;
+    use crate::OrderBlueprint;
 
     fn pressed(control: bool, keys: &[(KeyCode, Key)]) -> Wants {
         Wants::from_keys(control, keys.iter().map(|(code, key)| (*code, key)))
     }
 
-    fn registry() -> ConsoleRegistry {
-        let mut registry = ConsoleRegistry::default();
-        registry.register(CommandSpec::new("map").usage("map <name>"));
-        registry.register(CommandSpec::new("quit").usage("quit"));
-        registry
+    fn book() -> OrderCatalog {
+        let mut book = OrderCatalog::default();
+        book.enlist(OrderBlueprint::new("map").help_line("map <name>"));
+        book.enlist(OrderBlueprint::new("quit").help_line("quit"));
+        book
     }
 
-    fn typed(line: &str) -> ConsoleState {
-        let mut state = ConsoleState::default();
+    fn typed(line: &str) -> PromptPanelStatus {
+        let mut state = PromptPanelStatus::default();
         set_line(&mut state.editor, line);
         state
     }
 
-    fn run(state: &mut ConsoleState) -> Vec<ConsoleCommand> {
-        let mut queue = ConsoleCommandQueue::default();
-        submit(state, &registry(), &ConsoleSettings::default(), &mut queue);
+    fn run(state: &mut PromptPanelStatus) -> Vec<TypedOrder> {
+        let mut queue = TypedOrderBacklog::default();
+        submit(state, &book(), &PromptPanelOptions::default(), &mut queue);
         queue.0.into_iter().collect()
     }
 
@@ -478,16 +482,14 @@ mod tests {
                 (KeyCode::Enter, Key::Enter),
             ],
         );
-        assert_eq!(
-            wants,
-            Wants {
-                close: true,
-                up: true,
-                tab: true,
-                submit: true,
-                ..Wants::default()
-            }
-        );
+        let expected = Wants {
+            close: true,
+            up: true,
+            tab: true,
+            submit: true,
+            ..Wants::default()
+        };
+        assert_eq!(wants, expected);
         assert!(pressed(false, &[(KeyCode::ArrowDown, Key::ArrowDown)]).down);
     }
 
@@ -503,21 +505,16 @@ mod tests {
                 letter(KeyCode::KeyE, "e"),
             ],
         );
-        assert_eq!(
-            wants,
-            Wants {
-                kill_word: true,
-                clear: true,
-                home: true,
-                end: true,
-                ..Wants::default()
-            }
-        );
-        assert_eq!(
-            pressed(false, &[letter(KeyCode::KeyW, "w")]),
-            Wants::default(),
-            "without Control a w is just a w"
-        );
+        let expected = Wants {
+            erase_previous_word: true,
+            clear: true,
+            home: true,
+            end: true,
+            ..Wants::default()
+        };
+        assert_eq!(wants, expected);
+        let expected = Wants::default();
+        assert_eq!(pressed(false, &[letter(KeyCode::KeyW, "w")]), expected, "without Control a w is just a w");
     }
 
     #[test]
@@ -545,14 +542,14 @@ mod tests {
 
     #[test]
     fn arrows_walk_the_history_from_an_empty_prompt() {
-        let mut state = ConsoleState::default();
+        let mut state = PromptPanelStatus::default();
         state.remember("map a");
         state.remember("quit");
-        assert!(step_arrow(&mut state, &registry(), true));
+        assert!(step_arrow(&mut state, &book(), true));
         assert_eq!(state.editor.line, "quit");
-        assert!(step_arrow(&mut state, &registry(), true));
+        assert!(step_arrow(&mut state, &book(), true));
         assert_eq!(state.editor.line, "map a");
-        assert!(step_arrow(&mut state, &registry(), false));
+        assert!(step_arrow(&mut state, &book(), false));
         assert_eq!(state.editor.line, "quit");
     }
 
@@ -560,10 +557,10 @@ mod tests {
     fn arrows_move_through_completions_once_something_is_typed() {
         let mut state = typed("m");
         state.remember("quit");
-        let before = offered(&state, &registry()).len();
+        let before = offered(&state, &book()).len();
         assert!(before > 0);
-        assert!(!step_arrow(&mut state, &registry(), true));
-        assert_eq!(state.editor.selected, cycle(0, before, true));
+        assert!(!step_arrow(&mut state, &book(), true));
+        assert_eq!(state.editor.highlight, cycle(0, before, true));
         assert_eq!(state.editor.line, "m", "the typed line is left alone");
     }
 
@@ -571,13 +568,13 @@ mod tests {
     fn a_submitted_command_is_echoed_remembered_and_queued_for_the_user() {
         let mut state = typed("map mp_nuked");
         let queued = run(&mut state);
-        assert_eq!(state.log, ["> map mp_nuked"]);
-        assert_eq!(state.history, ["map mp_nuked"]);
+        assert_eq!(state.lines, ["> map mp_nuked"]);
+        assert_eq!(state.recalled, ["map mp_nuked"]);
         assert_eq!(state.editor.line, "");
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].name, "map");
-        assert_eq!(queued[0].args, ["mp_nuked"]);
-        assert!(queued[0].interactive);
+        assert_eq!(queued[0].words, ["mp_nuked"]);
+        assert!(queued[0].typed_by_hand);
     }
 
     #[test]
@@ -592,27 +589,25 @@ mod tests {
         let mut state = typed("frobnicate now");
         let queued = run(&mut state);
         assert!(queued.is_empty());
-        assert_eq!(
-            state.log.last().map(String::as_str),
-            Some("unknown command `frobnicate`")
-        );
+        let expected = Some("unknown command `frobnicate`");
+        assert_eq!(state.lines.last().map(String::as_str), expected);
     }
 
     #[test]
     fn help_lists_every_command_and_clear_empties_the_scrollback() {
         let mut state = typed("help");
         assert!(run(&mut state).is_empty());
-        assert!(state.log.len() > 1);
+        assert!(state.lines.len() > 1);
         set_line(&mut state.editor, "clear");
         assert!(run(&mut state).is_empty());
-        assert!(state.log.is_empty());
+        assert!(state.lines.is_empty());
     }
 
     #[test]
     fn a_blank_line_does_nothing() {
         let mut state = typed("   ");
         assert!(run(&mut state).is_empty());
-        assert!(state.log.is_empty() && state.history.is_empty());
+        assert!(state.lines.is_empty() && state.recalled.is_empty());
     }
 
     #[test]
@@ -624,15 +619,15 @@ mod tests {
 
     #[test]
     fn enter_on_a_recalled_line_runs_it_as_it_is() {
-        let mut state = ConsoleState::default();
+        let mut state = PromptPanelStatus::default();
         state.remember("ma");
-        assert!(state.history_recall(true));
+        assert!(state.recall_earlier_entry(true));
         let queued = run(&mut state);
         assert!(
             queued.is_empty(),
             "`ma` is not a command, so it is reported"
         );
-        assert_eq!(state.log, ["> ma", "unknown command `ma`"]);
+        assert_eq!(state.lines, ["> ma", "unknown command `ma`"]);
     }
 
     #[test]

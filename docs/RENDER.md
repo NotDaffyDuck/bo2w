@@ -1,56 +1,67 @@
-# Render: what lives where
+# Rendering: crate map and frame path
 
-Nine crates. `render_frontend` reads the presented snapshot, `render_gpu` writes
-the pixels and solely owns `wgpu`. The island decides no game logic, never
-writes `AuthorityWorld`, decodes no assets.
+The render side is a set of crates around one rule: `render_frontend` reads the
+presented snapshot and plans the frame, and `render_gpu` writes the pixels and
+is the only crate that depends on `wgpu`. The render side makes no gameplay
+decisions, never writes `AuthorityWorld`, and decodes no assets. (Older copies
+of this page said nine crates; `render_backend` no longer exists.)
 
-| crate | owns |
+| crate | what it owns |
 |---|---|
-| `render_frontend` | `prepare/` scene, view, cull (`scene/{world,spawn,cull,camera}.rs`, `scene/gfx_scene.rs` anim-submission bridge, `worker_cmds.rs`); `adapters/` occupancy out of anim and FX; `assemble/` frame products (`drawsurf/{retained_list,frame_products,material_runtime}.rs`, `drawsurf/tess/`) |
-| `render_scene` | occupancy storage: lighting request/result, frustum planes, camera pose. Static light lookup and BSP cells publish on `MatchInstalled` and clear on teardown; frame culling does not republish them. `render_anim` / `render_fx` produce the poses and FX |
-| `render_frame` | the immutable frame-product snapshot at the frontend ↔ GPU border (`SourceRevisions`, `PackedSegments`, pure packing) |
-| `render_material`, `render_backend` | the material tables; the list views |
-| `render` | composition, `extract.rs`, `diag/` |
+| `render_frontend` | `prepare/`: world spawn, camera, visibility culling, model lighting, gfx scene (`scene/{world,spawn,cull,camera,frustum}.rs`, `prepare/gfx_scene.rs`, `worker_cmds.rs`). `adapters/`: occupancy produced from anim and FX. `assemble/`: the frame's products (`drawsurf/{list,setup,state}.rs`, `drawsurf/frame_products/`, `drawsurf/material_runtime/`, `drawsurf/tess/`) |
+| `render_scene` | occupancy storage: lighting requests and results, the planes of the frustum, camera pose, `dpvs_cells`. Static light lookup and BSP cells publish on `MatchInstalled` and clear on teardown, and frame culling does not republish them. `render_anim` and `render_fx` supply the poses and the effects |
+| `render_frame` | the immutable frame-product snapshot at the frontend/GPU border: `SourceRevisions`, the packed segment list, pure packing, and the `wgpu_layout` contract |
+| `render_material` | pure material rules: pass setup, vertex routing, the runtime catalog, tables built ahead of time, code-constant banks |
+| `render` | composition (`plugin/`), `extract.rs` plus `extract/`, and `diag/` |
+| `render_gpu` | the GPU pass code under `drawsurf/` |
 
-## The frame path
+## Path of one frame
 
 ```text
-zone → asset_iw4 IR → prepare/scene/world.rs (our own types) → spawn.rs (GPU)
-     camera.rs (look/WASD), frustum.rs + cull.rs + dpvs_t6
-     → assemble/drawsurf/list.rs   ONE sorted GfxDrawSurf[]
-       → setup.rs  techType → technique      → state.rs  GfxPassState / blend
-       → tess/{world,smodel,xmodel,fx,mark,glass,particle_cloud}.rs
-       → material_runtime.rs   N-pass execution or a typed refusal
-       → sm3*.rs   SM3 tokens (`d3d9_sm3`) → WGSL → gpu_contract.rs → wgpu
+zone -> prepare/scene/world (our own types) -> spawn (GPU)
+     camera + frustum + cull, dpvs_t6 visibility
+     -> assemble/drawsurf/list.rs     ONE sorted draw-surface list
+       -> setup.rs   technique selection (from render_material)
+       -> state.rs   pass state / blend decoded from the two state words
+       -> tess/{world,smodel,xmodel,glass,sky}.rs   per-surface-type emitters
+       -> material_runtime/   the sorted-material table and catalog
+       -> d3d9_sm3 (shader tokens -> WGSL) -> render_frame layout -> wgpu
 ```
 
-**One** drawsurf machine; only the tess emitters fork per surface type. World,
-static models and the viewmodel are three emitters into one list, not three
-renderers. Lighting is `lighting_iw4` (light grid) with
-`prepare/scene/smodel_lighting.rs` and `model_lighting_atlas.rs`, shadows
-`assemble/drawsurf/sun_shadow.rs`. A local `StaticSunAndFx` schedule overlaps
-static sun partition preparation on workers with FX on the main thread. It joins
-before frame products consume either result; dynamic casters merge afterward.
-Sun model draws reuse the colour geometry’s index buffers.
+Frame products are built in `frame_products/`: open the frame's inputs, plan
+the sun and spot shadow casters, build the camera, sun and spot lists (reusing
+last frame's work whenever its stamp still matches), then publish them into a
+ring bank that the renderer reads.
 
-## GPU-side ownership: `render_gpu/src/drawsurf/colour_submit/`, three owners
+There is **one** draw-surface machine. Only the tess emitters differ per
+surface type, so the world, the static models and the viewmodel are separate
+emitters feeding a single list, not separate renderers.
 
-* `geometry.rs` + `residency.rs` — residency. Capacity, live length, allocation
-  generation and uploaded revision are four quantities: a shrunk frame keeps its
-  buffer and a changed `PackedSegments` segment uploads alone;
-* `prepare_camera.rs` — shared installation resets generations and publishes
-  shadow views; sun, spot and camera then prepare in order, on pass-local
-  executors. A second `Camera3d` is the typed refusal `MultipleCameraViews`;
-* `record.rs` + `indirect.rs` — recording. Direct path `draw_indexed`; with
-  `BO2MP_MULTI_DRAW` and the indirect downlevel flags, adjacent compatible runs
-  merge into one `multi_draw_indexed_indirect`, order preserved.
+Lighting comes from `lighting_t6` (the light grid), with
+`prepare/scene/smodel_lighting.rs` and `model_lighting_atlas.rs`. Shadows are
+under `assemble/drawsurf/sun_shadow/`.
 
-`extract.rs` publishes `InstalledRenderWorld` when static geometry, ports or SMC
-maps change, and `PublishedRenderFrame` every frame. `d3d9_decl` / `d3d9_sm3` /
-`d3d9_state` carry D3D9 semantics with no word about IW4; the only D3D9 → `wgpu`
-crossing is the adapter inside `render`, while `session` stands the match up and
-`assets` owns the bytes. No live `r_*` dvars: env vars (`BO2MP_SINGLE_CELL`,
-`BO2MP_SUN_SHADOW_*`, …) and Perfetto (`BO2MP_PERF=1`, [`PERF.md`](PERF.md)).
+A local `StaticSunAndFx` schedule overlaps the static sun partition work on
+workers with FX work on the main thread. It joins before the frame products
+read either result, and dynamic casters merge afterward. Sun model draws reuse
+the colour geometry's index buffers.
 
-Film vision presets come out of the map and common fastfiles; `visionSetNaked` and
-`visionReset` on the console drive `FilmVisionView` between them over a transition.
+## Handoff to the GPU
+
+* `extract.rs` and `extract/seal.rs` seal each frame behind the frontend's
+  assembly. `InstalledRenderWorld` is published when static geometry, ports or
+  SMC maps change; `PublishedRenderFrame` is published every frame, and only
+  when the frontend says the plans belong to one coherent frame.
+* GPU-side publication lives in
+  `render_gpu/src/drawsurf/frame_publish.rs`, with drawing in `draw.rs`,
+  products in `products.rs` and resources in `gpu_resources.rs`.
+* `d3d9_decl`, `d3d9_sm3` and `d3d9_state` carry Direct3D 9 semantics with no
+  knowledge of any particular game. `session` stands the match up, and
+  `assets` holds the loaded bytes.
+* There are no live `r_*` dvars. Tuning goes through environment variables
+  (for example `BO2MP_SINGLE_CELL=1`, which shows only the eye's own cell as a
+  debugging aid) and Perfetto (`BO2MP_PERF=1`, see [`PERF.md`](PERF.md)).
+
+Film vision presets come from the map and common fastfiles. The console
+commands `visionSetNaked` and `visionReset` drive `FilmVisionView` between
+them over a timed transition.

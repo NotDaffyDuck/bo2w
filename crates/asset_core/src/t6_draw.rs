@@ -25,16 +25,31 @@ pub fn t6_fast() -> bool {
     T6_FAST.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// bo2zm: Black Ops II's texture filtering row (`tex_filter` in
+/// settings.cfg): the samplers' anisotropy, 1 (low), 4 or 16 (high).
+static T6_ANISO: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(16);
+
+pub fn t6_set_aniso(aniso: u16) {
+    T6_ANISO.store(aniso.clamp(1, 16), core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn t6_aniso() -> u16 {
+    T6_ANISO.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum T6Blend {
     Opaque,
     Blend,
     Add,
     Multiply,
-    /// Never drawn in colour: casts shadow only, or a screen distortion
+    /// Never drawn in colour: casts shadow only, a screen distortion
     /// (`distortion_*`, an effect's heat haze), which refracts the frame in
-    /// a pass this renderer does not have.
-    ShadowOnly,
+    /// a pass this renderer does not have, or a light sphere
+    /// (`*_sw4_3d_light_sphere_*`, a glow the shader works out from the
+    /// sphere's depth; as a plain model it drew a pale hard-edged disc, Mob
+    /// of the Dead's fires).
+    CasterOnly,
     /// The sky (`*_skycubemaphdr_*`): drawn behind everything from its cube
     /// colour map, never as a surface.
     Sky,
@@ -49,9 +64,9 @@ pub enum T6Cull {
 }
 
 /// The extra layers of a layered material (`*_b1c1n1_m2c2..`), read from
-/// its technique set's name, and where each layer's texcoord sits in the
+/// its technique set's name, and where each layer's uv_semantic sits in the
 /// world's second vertex stream. Per layer, that stream holds a half2
-/// texcoord, then 4 more bytes (the layer's tangent frame) when the layer
+/// uv_semantic, then 4 more bytes (the layer's tangent frame) when the layer
 /// has a normal map and so does the base layer (measured on every layered
 /// Nuketown material: `t6mat` `T6MAT_VD1`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -64,7 +79,7 @@ pub struct T6Layers {
     /// the layer replaces the colour where layer alpha * weight >= 0.5;
     /// `lit_sm_*_t1c1n1`).
     pub kinds: [u8; 3],
-    /// Per extra layer, its texcoord's byte offset in a vertex record.
+    /// Per extra layer, its uv_semantic's byte offset in a vertex record.
     pub uv_offsets: [u8; 3],
     /// Bytes per vertex in the second stream.
     pub stride: u8,
@@ -125,7 +140,7 @@ pub struct T6Draw {
     /// camera (the shadow-map level 3 counts as none).
     pub polygon_offset: u8,
     /// The material's sort key: blended surfaces draw in this order.
-    pub sort_key: u8,
+    pub draw_order: u8,
     /// Unlit materials: log2 of the colour scale (`scaleRGB`), 0..7.
     pub unlit_scale_exp: u8,
     /// Extra layers 1 and 2: 0 none, 1 blend, 2 multiply (`T6Layers`).
@@ -182,11 +197,34 @@ pub struct T6Draw {
     /// material's FPS (fxc disassembly, technique 4). Bit 15 of an unlit
     /// code that is no effect (a cloud's bit, which only effects use).
     pub anim: bool,
+    /// bo2zm M4 retest 5: an `mc_projecteddecal_*` technique (the blood a
+    /// hit paints on a zombie): its model is a box; the pixel shader (fxc
+    /// disassembly) reads the scene depth and paints the texture on what lies
+    /// inside the box, projected along its x axis.
+    pub projected_decal: bool,
+    /// bo2zm: a ghost technique (`sw4_3d_char_ghost*`, Mob's Afterlife
+    /// ghost hands): a bright cyan glow, its alpha from how the surface
+    /// faces the eye times two drifting edge noises.
+    pub ghost: bool,
+    /// bo2zm 27c: a scrolling cloud sheet (`mc_*_scrolling_zfeather`, Die
+    /// Rise's cloud floor), drawn unlit: its texture drifts with the game
+    /// time and it fades where the scene behind it is near.
+    pub sheet: bool,
+    /// bo2zm round 1: a zombie's eyes (`unlit_cheap_zombie_eyes`): the
+    /// texture is scaled by the eye brightness its client script set.
+    pub eyes: bool,
+    /// bo2mp: a lens flare (`sw4_3d_superflare_*`, Nuketown's sun): its
+    /// vertex shader lays 25 ghosts out on screen from the flare's point,
+    /// each a cell of the sprite atlas, times the grime map.
+    pub flare: bool,
 }
 
-/// A view-model glass technique set (`*_sw4_3d_viewmodel_transparent_*`).
+/// A view-model glass technique set (`*_sw4_3d_viewmodel_transparent_*`),
+/// or the broken-window shards' (`mc_sw4_3d_glass_scaled_*`): the same pixel
+/// shader but for UVs scaled about 0.5 and the highlight and reflection
+/// times Specular_Amount and Reflection_Amount (fxc disassembly, technique 4).
 fn glass_technique(name: &str) -> bool {
-    name.contains("viewmodel_transparent")
+    name.contains("viewmodel_transparent") || name.contains("sw4_3d_glass_scaled")
 }
 
 /// A tile blend technique set (`*_cod7_tile_blend*`).
@@ -236,14 +274,22 @@ fn sway_technique(name: &str) -> bool {
     false
 }
 
+/// A projected decal technique set (`mc_projecteddecal_*`).
+fn projected_decal_technique(name: &str) -> bool {
+    name.trim_start_matches(',')
+        .split('_')
+        .any(|t| t == "projecteddecal")
+}
+
 /// A water technique set this engine draws as water (`*_cod7water_*`,
-/// `*_cod7watershore_*`).
+/// `*_cod7watershore_*`, `*_cod7waterflowreflect_*`: Concert's pond).
 pub fn t6_water_kind(name: &str) -> Option<u8> {
     name.trim_start_matches(',')
         .split('_')
         .find_map(|t| match t {
             "cod7water" => Some(0),
             "cod7watershore" => Some(1),
+            "cod7waterflowreflect" => Some(2),
             _ => None,
         })
 }
@@ -255,6 +301,18 @@ fn objective_technique(name: &str) -> bool {
         .any(|t| t == "objective")
 }
 
+/// A ghost technique set (`mc_sw4_3d_char_ghost2_*`).
+fn ghost_technique(name: &str) -> bool {
+    name.contains("_char_ghost")
+}
+
+/// A lens flare technique set whose vertex shader is ported: Nuketown's sun
+/// (`sw4_3d_superflare_mp_nuketown_sun1`). Each superflare technique bakes
+/// its own ghost table, so the others stay hidden until theirs is ported.
+fn flare_technique(name: &str) -> bool {
+    name.contains("superflare_mp_nuketown_sun1")
+}
+
 /// A technique set that draws an effect: `effect_*`, or `particlecloud_*`
 /// (an effect's particle cloud).
 fn effect_technique(name: &str) -> bool {
@@ -262,11 +320,19 @@ fn effect_technique(name: &str) -> bool {
     name.starts_with("effect") || name.starts_with("particlecloud")
 }
 
+/// A technique set never drawn in colour (`T6Blend::ShadowOnly`): a shadow
+/// caster, a distortion or a light sphere.
+fn never_coloured(name: &str) -> bool {
+    name.split('_').any(|t| t == "shadowcaster")
+        || name.trim_start_matches(',').starts_with("distortion")
+        || name.contains("sw4_3d_light_sphere")
+}
+
 /// Decoded fields of a T6 `GfxStateBits::loadBits` pair (bit positions per
 /// the T6 `GfxStateBitsLoadBits` layout).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct T6StateBits {
-    /// GFXS_BLEND_*: 1 zero, 2 one, 3 src colour, 5 src alpha, 6 inv src
+    /// GFXS_BLEND_*: 1 zero, 2 one, 3 src colour, 5 src alpha, 6 stow_kind src
     /// alpha, 9 dst colour.
     pub src_blend: u8,
     pub dst_blend: u8,
@@ -275,7 +341,7 @@ pub struct T6StateBits {
     /// `Some(1)` = alpha test at 128/255, `Some(0)` = above 0.
     pub alpha_test: Option<u8>,
     /// GFXS_CULL_*: 1 none, 2 back, 3 front.
-    pub cull: u8,
+    pub cull_mode: u8,
     pub color_write_rgb: bool,
     pub polygon_offset: u8,
 }
@@ -289,7 +355,7 @@ impl T6StateBits {
             dst_blend: f(a, 4, 4),
             blend_op: f(a, 8, 3),
             alpha_test: (f(a, 11, 1) == 0).then(|| f(a, 12, 1)),
-            cull: f(a, 14, 2),
+            cull_mode: f(a, 14, 2),
             color_write_rgb: f(a, 27, 1) != 0,
             polygon_offset: f(b, 4, 2),
         }
@@ -304,32 +370,30 @@ const GFXS_BLEND_DESTCOLOR: u8 = 9;
 impl T6Draw {
     /// From the technique set's name, the material's sort key and, when the
     /// material has one, its main technique's `loadBits`.
-    pub fn from_technique_set(name: &str, sort_key: u8, state: Option<[u32; 2]>) -> Self {
-        let has = |word: &str| name.split('_').any(|t| t == word);
+    pub fn from_technique_set(set_name: &str, order: u8, packed: Option<[u32; 2]>) -> Self {
         // `effect_*` techniques (sprites, flashes, smoke) sample no lightmap
         // or grid: the effect system bakes their lighting into the vertex
         // colour (`lightingFrac`), so they draw unlit.
-        let effect = effect_technique(name);
-        let cloud = name.trim_start_matches(',').starts_with("particlecloud");
-        let objective = objective_technique(name);
-        let unlit = name.split('_').any(|t| t.starts_with("unlit")) || effect || objective;
+        let effect = effect_technique(set_name);
+        let cloud = set_name.trim_start_matches(',').starts_with("particlecloud");
+        let objective = objective_technique(set_name);
+        let unlit = set_name.split('_').any(|t| t.starts_with("unlit")) || effect || objective;
         // bo2zm M3 fix list 2: a multiply layer (`m1c1`) is a layer too: its
         // vertex colour is the layer weights, not a tint (the garage door's
         // blast-crater layer drew the whole door purple, 255/63/255).
-        let layered = name.split('_').any(|t| t.starts_with("b1"))
-            || T6Layers::from_technique_set(name).any();
-        let sky = name.split('_').any(|t| t.starts_with("sky"));
-        let shadow_only =
-            has("shadowcaster") || name.trim_start_matches(',').starts_with("distortion");
-        let Some(bits) = state else {
-            return Self::from_name(name, sort_key);
+        let layered = set_name.split('_').any(|t| t.starts_with("b1"))
+            || T6Layers::from_technique_set(set_name).any();
+        let sky = set_name.split('_').any(|t| t.starts_with("sky"));
+        let occluder_exclusive = never_coloured(set_name);
+        let Some(bits) = packed else {
+            return Self::from_name(set_name, order);
         };
         let st = T6StateBits::decode(bits);
-        let water = t6_water_kind(name).is_some();
+        let water = t6_water_kind(set_name).is_some();
         let blend = if sky {
             T6Blend::Sky
-        } else if shadow_only || !st.color_write_rgb {
-            T6Blend::ShadowOnly
+        } else if occluder_exclusive || !st.color_write_rgb {
+            T6Blend::CasterOnly
         } else if water {
             T6Blend::Blend
         } else if st.blend_op == 0 {
@@ -349,7 +413,7 @@ impl T6Draw {
             layered,
             alpha_test: st.alpha_test == Some(1),
             // A cloud's quads always face the camera.
-            cull: match st.cull {
+            cull: match st.cull_mode {
                 _ if cloud => T6Cull::None,
                 2 => T6Cull::Back,
                 3 => T6Cull::Front,
@@ -360,54 +424,59 @@ impl T6Draw {
             } else {
                 st.polygon_offset
             },
-            sort_key,
+            draw_order: order,
             unlit_scale_exp: 0,
             layers: {
-                let l = T6Layers::from_technique_set(name);
+                let l = T6Layers::from_technique_set(set_name);
                 [l.kinds[0], l.kinds[1]]
             },
             effect,
             cloud,
             objective,
-            foliage: foliage_technique(name),
-            sway: sway_technique(name),
+            foliage: foliage_technique(set_name),
+            sway: sway_technique(set_name),
             water,
-            flow: flow_technique(name),
-            tile: tile_technique(name),
-            flag: flag_technique(name),
-            tile_blend: tile_blend_technique(name),
-            glass: glass_technique(name),
-            anim: anim_technique(name),
+            flow: flow_technique(set_name),
+            tile: tile_technique(set_name),
+            flag: flag_technique(set_name),
+            tile_blend: tile_blend_technique(set_name),
+            glass: glass_technique(set_name),
+            anim: anim_technique(set_name),
+            projected_decal: projected_decal_technique(set_name),
+            ghost: ghost_technique(set_name),
+            sheet: false,
+            eyes: false,
+            flare: flare_technique(set_name),
         }
     }
 
     /// The name-only reading, for a material without a draw state.
-    fn from_name(name: &str, sort_key: u8) -> Self {
-        let has = |word: &str| name.split('_').any(|t| t == word);
-        let unlit = name.split('_').any(|t| t.starts_with("unlit"));
+    fn from_name(set_name: &str, order: u8) -> Self {
+        let has = |word: &str| set_name.split('_').any(|t| t == word);
+        let unlit = set_name.split('_').any(|t| t.starts_with("unlit"));
         // bo2zm M3 fix list 2: a multiply layer (`m1c1`) is a layer too: its
         // vertex colour is the layer weights, not a tint (the garage door's
         // blast-crater layer drew the whole door purple, 255/63/255).
-        let layered = name.split('_').any(|t| t.starts_with("b1"))
-            || T6Layers::from_technique_set(name).any();
-        let base = name.split('_').find(|t| {
+        let layered = set_name.split('_').any(|t| t.starts_with("b1"))
+            || T6Layers::from_technique_set(set_name).any();
+        let base = set_name.split('_').find(|t| {
             let b = t.as_bytes();
             b.len() >= 4 && matches!(b[0], b'r' | b'b' | b't') && b[1] == b'0' && b[2] == b'c'
         });
         let base_kind = base.map(|t| t.as_bytes()[0]);
-        let alpha_test =
-            base_kind == Some(b't') || name.split('_').any(|t| t.starts_with("treecanopy"));
-        let blend = if name.split('_').any(|t| t.starts_with("sky")) {
+        let tested =
+            base_kind == Some(b't') || set_name.split('_').any(|t| t.starts_with("treecanopy"));
+        let blend = if set_name.split('_').any(|t| t.starts_with("sky")) {
             T6Blend::Sky
-        } else if has("shadowcaster") || name.trim_start_matches(',').starts_with("distortion") {
-            T6Blend::ShadowOnly
+        } else if never_coloured(set_name) {
+            T6Blend::CasterOnly
         } else if has("multiply") {
             T6Blend::Multiply
         } else if has("add") {
             T6Blend::Add
         } else if has("blend") || base_kind == Some(b'b') {
             T6Blend::Blend
-        } else if has("replace") || sort_key <= 4 {
+        } else if has("replace") || order <= 4 {
             T6Blend::Opaque
         } else {
             T6Blend::Blend
@@ -416,27 +485,32 @@ impl T6Draw {
             blend,
             unlit,
             layered,
-            alpha_test,
+            alpha_test: tested,
             cull: T6Cull::None,
             polygon_offset: 0,
-            sort_key,
+            draw_order: order,
             unlit_scale_exp: 0,
             layers: {
-                let l = T6Layers::from_technique_set(name);
+                let l = T6Layers::from_technique_set(set_name);
                 [l.kinds[0], l.kinds[1]]
             },
-            effect: effect_technique(name),
-            cloud: name.trim_start_matches(',').starts_with("particlecloud"),
-            objective: objective_technique(name),
-            foliage: foliage_technique(name),
-            sway: sway_technique(name),
-            water: t6_water_kind(name).is_some(),
-            flow: flow_technique(name),
-            tile: tile_technique(name),
-            flag: flag_technique(name),
-            tile_blend: tile_blend_technique(name),
-            glass: glass_technique(name),
-            anim: anim_technique(name),
+            effect: effect_technique(set_name),
+            cloud: set_name.trim_start_matches(',').starts_with("particlecloud"),
+            objective: objective_technique(set_name),
+            foliage: foliage_technique(set_name),
+            sway: sway_technique(set_name),
+            water: t6_water_kind(set_name).is_some(),
+            flow: flow_technique(set_name),
+            tile: tile_technique(set_name),
+            flag: flag_technique(set_name),
+            tile_blend: tile_blend_technique(set_name),
+            glass: glass_technique(set_name),
+            anim: anim_technique(set_name),
+            projected_decal: projected_decal_technique(set_name),
+            ghost: ghost_technique(set_name),
+            sheet: false,
+            eyes: false,
+            flare: flare_technique(set_name),
         }
     }
 
@@ -446,16 +520,18 @@ impl T6Draw {
     /// scale's log2 in bits 12..14, a particle cloud in bit 15, the sort
     /// key in bits 16..23, extra layers 1 and 2 in bits 24..25 and 26..27, an
     /// objective in bit 28, foliage in bit 29, water in bit 30, emissive flow in bit 31;
-    /// a lit emissive tile in bit 12, a lit view-model glass in bit 15, an unlit animated screen in bit 15, a lit layer 1 test layer in bit 13 (its kind
-    /// bits say blend; a layer 2 test layer is drawn as blend). `NONE_CODE` marks a surface with no BO2 draw (no real code
-    /// has a low nibble of 0xf).
+    /// a lit emissive tile in bit 12, a lit view-model glass in bit 15, an unlit animated screen in bit 15, a lit layer 1 test layer in bit 13
+    /// (a layer 2 test layer is drawn as blend), a lit projected decal as bits
+    /// 12..14 together, a ghost as objective and foliage together, a scrolling
+    /// cloud sheet as cloud, water and flow together. `NONE_CODE` marks a
+    /// surface with no BO2 draw (no real code has a low nibble of 0xf).
     pub fn code(self) -> u32 {
         let blend: u32 = match self.blend {
             T6Blend::Opaque => 0,
             T6Blend::Blend => 1,
             T6Blend::Add => 2,
             T6Blend::Multiply => 3,
-            T6Blend::ShadowOnly => 4,
+            T6Blend::CasterOnly => 4,
             T6Blend::Sky => 5,
         };
         let cull: u32 = match self.cull {
@@ -470,11 +546,12 @@ impl T6Draw {
             | cull << 8
             | u32::from(self.polygon_offset & 3) << 10
             | u32::from(self.unlit_scale_exp & 7) << 12
-            | u32::from(self.sort_key) << 16
+            | u32::from(self.draw_order) << 16
             | layer_code(self.layers[0]) << 24
             | layer_code(self.layers[1]) << 26
             | if self.effect { 0x20 } else { 0 }
             | if self.cloud { 0x8000 } else { 0 }
+            | if self.sheet { Self::SHEET_MARK } else { 0 }
             | if self.objective { 0x1000_0000 } else { 0 }
             | if self.foliage { 0x2000_0000 } else { 0 }
             | if self.water { 0x4000_0000 } else { 0 }
@@ -493,7 +570,19 @@ impl T6Draw {
             }
             | if self.glass && !self.unlit { 0x8000 } else { 0 }
             | if self.anim && self.unlit && !self.effect { 0x8000 } else { 0 }
+            | if self.projected_decal && !self.unlit && !self.effect { 0x7000 } else { 0 }
+            | if self.ghost { Self::GHOST_MARK } else { 0 }
+            | if self.flare { Self::FLARE_MARK } else { 0 }
     }
+
+    /// A scrolling cloud sheet: an unlit code with the cloud bit (15) and
+    /// water and flow (30, 31) together, which no water or flow surface sets.
+    pub const SHEET_MARK: u32 = 0xc000_8000;
+    /// A ghost: objective and foliage (28, 29) together.
+    pub const GHOST_MARK: u32 = 0x3000_0000;
+    /// bo2mp: a lens flare: an effect with the cloud bit (15) and water (30)
+    /// but not flow (31), which no cloud, sheet or water surface sets.
+    pub const FLARE_MARK: u32 = 0x4000_8020;
 
     pub const NONE_CODE: u32 = 0xffff_ffff;
 }
@@ -529,6 +618,11 @@ mod tests {
         let other = T6Draw::from_technique_set("mc_lit_sm_b0c0n0_x", 56, Some(st));
         assert!(!other.glass);
         assert_eq!(other.code() & 0x8000, 0);
+        // mc/glass_clear_shatter_mp_model, a broken window's shards: the
+        // same glass.
+        let shard = T6Draw::from_technique_set("mc_sw4_3d_glass_scaled_z6e86f4e", 56, Some(st));
+        assert!(shard.glass && !shard.unlit);
+        assert_eq!(shard.code() & 0x8000, 0x8000);
     }
 
     #[test]
@@ -547,8 +641,12 @@ mod tests {
         assert_eq!(decal.blend, T6Blend::Multiply);
         assert!(decal.unlit);
         assert_eq!(d("wpc_unlit_blend_2840z6q0", 40).blend, T6Blend::Blend);
-        assert_eq!(d("wpc_shadowcaster_wj6w5j60", 4).blend, T6Blend::ShadowOnly);
-        assert_eq!(d(",distortion_81587199", 48).blend, T6Blend::ShadowOnly);
+        assert_eq!(d("wpc_shadowcaster_wj6w5j60", 4).blend, T6Blend::CasterOnly);
+        assert_eq!(d(",distortion_81587199", 48).blend, T6Blend::CasterOnly);
+        assert_eq!(
+            d("mc_sw4_3d_light_sphere_46j58w7u", 48).blend,
+            T6Blend::CasterOnly
+        );
         assert_eq!(d("mc_skycubemaphdr_1f117w7u", 4).blend, T6Blend::Sky);
     }
 
@@ -607,6 +705,14 @@ mod tests {
         assert_eq!(l("lit_sm_r0c0n0s0_b1c1n1x1_m2c2_m3c3").stride, 16);
         assert_eq!(l("lit_sm_r0c0n0x0_b1c1n1_b2c2n2").stride, 16);
         assert_eq!(l("lit_sm_r0c0n0x0_b1c1v1").stride, 4);
+        // Die Rise's paper decals: a tested layer, then a blend layer.
+        let t = l("lit_sm_r0c0n0x0_t1c1n1_b2c2n2s2v2");
+        assert_eq!(t.kinds, [4, 1, 0]);
+        assert_eq!(t.stride, 16);
+        // Origins: an add layer, then a multiply layer.
+        let a = l("lit_sm_r0c0n0x0_a1c1_m2c2");
+        assert_eq!(a.kinds, [3, 2, 0]);
+        assert_eq!(a.uv_offsets[1], 4);
         assert!(!l("wpc_lit_sm_r0c0n0x0_f488034e").any());
         assert!(!l("wpc_lit_sm_b0c0n0_19f3588f").any());
     }

@@ -170,10 +170,10 @@ build_menus()
     self.mm.menus["mt_guns"].parent = "maptest";
 }
 
-add_menu( name, title, parent )
+add_menu( name, heading, parent )
 {
     m = spawnstruct();
-    m.title = title;
+    m.title = heading;
     m.parent = parent;
     m.labels = [];
     m.funcs = [];

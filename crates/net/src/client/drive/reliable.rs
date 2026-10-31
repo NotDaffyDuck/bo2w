@@ -5,178 +5,172 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 use super::gun_pick::WeaponSelect;
-use super::stores::{ClientReliableAck, ReliableControlEvent};
-use crate::authority::inbox::ClientActionInbox;
+use super::stores::{PlayerGuaranteedReceipt, GuaranteedSimEvent};
+use crate::host_tick::peer_mail::PlayerActionIntake;
 use crate::client::frame_clock::FrameClock;
-use crate::transport::frame::Frame;
+use crate::net_links::tick_frames::Frame;
 use crate::{
-    ActionVerdict, FailStage, MasterBridge, ReliablePayload, ReliableRow, Scoreboard, SignonFailReason,
-    SignonPhase, SignonState, SvcCardSlot, SvcCardSlotCmd, SvcGameNotify, SvcHudSplash,
-    SvcLocalSound, SvcOpenMenu, SvcOpenMenuCmd, SvcSound,
+    ActionRulingNotice, AbortStep, DirectoryLink, GuaranteedEnvelope, GuaranteedEntry, Scoreboard, JoinFailureCause,
+    JoinSequenceStep, JoinProgressRecord, HostCardSlotMsg, CardSlotCommand, HostGameAnnouncement, HostScreenFlash,
+    HostLocalSoundMsg, HostMenuOpenMsg, MenuOpenCommand, HostSoundCue,
 };
 
 /// The five message streams the host's small commands turn into on this side.
 #[derive(SystemParam)]
-pub struct SvcFrameWriters<'w> {
-    sounds: MessageWriter<'w, SvcLocalSound>,
-    cards: MessageWriter<'w, SvcCardSlotCmd>,
-    menus: MessageWriter<'w, SvcOpenMenuCmd>,
-    splashes: MessageWriter<'w, SvcHudSplash>,
-    notices: MessageWriter<'w, SvcGameNotify>,
+pub struct HostFrameMessageSinks<'w> {
+    sounds: MessageWriter<'w, HostLocalSoundMsg>,
+    cards: MessageWriter<'w, CardSlotCommand>,
+    menus: MessageWriter<'w, MenuOpenCommand>,
+    splashes: MessageWriter<'w, HostScreenFlash>,
+    notices: MessageWriter<'w, HostGameAnnouncement>,
 }
 
-impl SvcFrameWriters<'_> {
-    pub(super) fn sound(&mut self, cmd: &SvcSound) {
-        self.sounds.write(SvcLocalSound {
-            stop: cmd.stop,
-            index: cmd.index,
+impl HostFrameMessageSinks<'_> {
+    pub(super) fn sound(&mut self, cmd: &HostSoundCue) {
+        self.sounds.write(HostLocalSoundMsg { stop: cmd.halt, index: cmd.slot });
+    }
+
+    pub(super) fn card(&mut self, cmd: &HostCardSlotMsg) {
+        self.cards.write(CardSlotCommand { client: cmd.client, card_slot: cmd.card_slot });
+    }
+
+    pub(super) fn menu(&mut self, cmd: &HostMenuOpenMsg) {
+        self.menus.write(MenuOpenCommand {
+            config_slot_number: cmd.config_slot_number,
         });
     }
 
-    pub(super) fn card(&mut self, cmd: &SvcCardSlot) {
-        self.cards.write(SvcCardSlotCmd {
-            client: cmd.client,
-            slot: cmd.slot,
-        });
-    }
-
-    pub(super) fn menu(&mut self, cmd: &SvcOpenMenu) {
-        self.menus.write(SvcOpenMenuCmd {
-            cs_index: cmd.cs_index,
-        });
-    }
-
-    pub(super) fn splash(&mut self, cmd: SvcHudSplash) {
+    pub(super) fn splash(&mut self, cmd: HostScreenFlash) {
         self.splashes.write(cmd);
     }
 
-    pub(super) fn notice(&mut self, cmd: SvcGameNotify) {
+    pub(super) fn notice(&mut self, cmd: HostGameAnnouncement) {
         self.notices.write(cmd);
     }
 }
 
 /// Everything a received reliable payload can touch.
 #[derive(SystemParam)]
-pub struct ReliableInbound<'w> {
-    actions: ResMut<'w, ClientActionInbox>,
-    ack: ResMut<'w, ClientReliableAck>,
-    events: MessageWriter<'w, ReliableControlEvent>,
-    svc: SvcFrameWriters<'w>,
-    scores: ResMut<'w, Scoreboard>,
-    signon: ResMut<'w, SignonState>,
-    bridge: Option<Res<'w, MasterBridge>>,
+pub struct GuaranteedIntakeParams<'w> {
+    intake_q: ResMut<'w, PlayerActionIntake>,
+    confirm_receipt: ResMut<'w, PlayerGuaranteedReceipt>,
+    notes: MessageWriter<'w, GuaranteedSimEvent>,
+    svc: HostFrameMessageSinks<'w>,
+    board: ResMut<'w, Scoreboard>,
+    join_rec: ResMut<'w, JoinProgressRecord>,
+    dir_link: Option<Res<'w, DirectoryLink>>,
 }
 
 /// Whether sequence number `a` comes after `b` when the 16-bit counter may have wrapped.
-fn is_newer_seq(a: u16, b: u16) -> bool {
-    a != b && a.wrapping_sub(b) < 0x8000
+fn is_newer_seq(x: u16, y: u16) -> bool {
+    // Ahead by 1..=0x7fff steps, read as a signed 16-bit gap.
+    (x.wrapping_sub(y) as i16) > 0
 }
 
-fn first_failure(payload: &ReliablePayload) -> Option<&str> {
-    payload.rows.iter().find_map(|(_, row)| match row {
-        ReliableRow::Failure(reason) => Some(reason.as_str()),
+fn first_failure(payload: &GuaranteedEnvelope) -> Option<&str> {
+    payload.entries.iter().find_map(|(_, row)| match row {
+        GuaranteedEntry::RefusalText(why) => Some(why.as_str()),
         _ => None,
     })
 }
 
-impl ReliableInbound<'_> {
+impl GuaranteedIntakeParams<'_> {
     /// Replaces the scoreboard with the text the host sent.
     pub(super) fn store_scores(&mut self, text: String) {
-        self.scores.parsed = crate::parse_scoreboard_cmd(&text);
-        self.scores.cmd = Some(text);
+        self.board.parsed = crate::read_board_command(&text);
+        self.board.command_text = Some(text);
     }
 
     /// Passes on the small commands that rode along with one tick: sounds, card slots,
     /// splashes, notices and menus become messages, the scoreboard text is stored.
     pub(super) fn take_frame_commands(&mut self, frame: Frame) {
-        for cmd in &frame.svc_sounds {
+        for cmd in &frame.host_sound_triggers {
             self.svc.sound(cmd);
         }
-        for cmd in &frame.svc_card_slots {
+        for cmd in &frame.host_nameplate_entries {
             self.svc.card(cmd);
         }
-        for cmd in frame.svc_hud_splashes {
+        for cmd in frame.flash_rows {
             self.svc.splash(cmd);
         }
-        for cmd in frame.svc_game_notifies {
+        for cmd in frame.alert_rows {
             self.svc.notice(cmd);
         }
-        for cmd in &frame.svc_open_menus {
+        for cmd in &frame.host_menu_openings {
             self.svc.menu(cmd);
         }
-        if let Some(text) = frame.svc_scores {
+        if let Some(text) = frame.board_text {
             self.store_scores(text);
         }
     }
 
     /// Ends the connection: drops what was still waiting on an answer, tells the master link and
     /// puts the sign-on into its failed phase.
-    fn abort(&mut self, reason: &str) {
-        self.actions.clear();
-        let match_key = crate::signon::live_match_key(self.bridge.as_deref());
-        if let Some(bridge) = &self.bridge {
-            bridge.fail(reason);
-        }
-        self.signon.set_phase(SignonPhase::Failed(SignonFailReason::Transport {
-            source: reason.to_owned(),
-            stage: FailStage::Transport,
-            match_key,
-        }));
+    fn abort(&mut self, why: &str) {
+        self.intake_q.clear();
+        let link = self.dir_link.as_deref();
+        let cause = JoinFailureCause::Transport {
+            source: String::from(why),
+            stage: AbortStep::Transport,
+            game_session_key: crate::join_walk::current_round_key(link),
+        };
+        link.inspect(|dir_link| dir_link.mark_failed(why));
+        self.join_rec.enter_phase(JoinSequenceStep::Failed(cause));
     }
 
     /// Takes in a payload: a host that lost rows or reported a failure ends the connection,
     /// otherwise each row not seen before is acted on in sequence order and acknowledged.
-    pub(super) fn apply(&mut self, local: sim::ClientId, payload: &ReliablePayload) {
-        if payload.dropped_oldest != 0 {
+    pub(super) fn apply(&mut self, own_id: sim::ClientId, payload: &GuaranteedEnvelope) {
+        if payload.evicted_stale_count != 0 {
             self.abort("ReliableControlOverflow: outcome unknown");
             return;
         }
-        if let Some(reason) = first_failure(payload) {
-            self.abort(reason);
+        if let Some(why) = first_failure(payload) {
+            self.abort(why);
             return;
         }
 
-        let acked_at_start = self.ack.0;
-        let mut rows: Vec<&(u16, ReliableRow)> = payload.rows.iter().collect();
-        rows.sort_by_key(|(seq, _)| seq.wrapping_sub(acked_at_start));
-        for (seq, row) in rows {
-            if !is_newer_seq(*seq, self.ack.0) {
-                continue;
-            }
-            if !self.take_row(local, row) {
+        let acked_at_start = self.confirm_receipt.0;
+        let mut entries: Vec<&(u16, GuaranteedEntry)> = payload.entries.iter().collect();
+        entries.sort_by_key(|(seq, _)| seq.wrapping_sub(acked_at_start));
+        for &(seq, ref row) in entries {
+            let fresh = is_newer_seq(seq, self.confirm_receipt.0);
+            if fresh && !self.take_row(own_id, row) {
                 return;
             }
-            self.ack.0 = *seq;
+            if fresh {
+                self.confirm_receipt.0 = seq;
+            }
         }
     }
 
     /// Acts on one row; `false` means the row ended the connection.
-    fn take_row(&mut self, local: sim::ClientId, row: &ReliableRow) -> bool {
+    fn take_row(&mut self, own_id: sim::ClientId, row: &GuaranteedEntry) -> bool {
         match row {
-            ReliableRow::Failure(reason) => {
-                self.abort(reason);
+            GuaranteedEntry::RefusalText(why) => {
+                self.abort(why);
                 return false;
             }
-            ReliableRow::Sound(cmd) => self.svc.sound(cmd),
-            ReliableRow::Card(cmd) => self.svc.card(cmd),
-            ReliableRow::Menu(cmd) => self.svc.menu(cmd),
-            ReliableRow::Splash(cmd) => self.svc.splash(cmd.clone()),
-            ReliableRow::Notify(cmd) => self.svc.notice(cmd.clone()),
-            ReliableRow::Scores(text) => self.store_scores(text.clone()),
-            ReliableRow::Event(event) => {
-                self.events.write(ReliableControlEvent(*event));
+            GuaranteedEntry::Sound(cmd) => self.svc.sound(cmd),
+            GuaranteedEntry::Card(cmd) => self.svc.card(cmd),
+            GuaranteedEntry::Menu(cmd) => self.svc.menu(cmd),
+            GuaranteedEntry::Splash(cmd) => self.svc.splash(cmd.clone()),
+            GuaranteedEntry::Notify(cmd) => self.svc.notice(cmd.clone()),
+            GuaranteedEntry::Standings(text) => self.store_scores(text.clone()),
+            GuaranteedEntry::Event(event) => {
+                self.notes.write(GuaranteedSimEvent(*event));
             }
-            ReliableRow::ActionOutcome { request_id, verdict } => match verdict {
-                ActionVerdict::PayloadMismatch => {
+            GuaranteedEntry::CommandResolution { request_id, verdict } => match verdict {
+                ActionRulingNotice::DuplicateIdDifferentBody => {
                     self.abort("ActionPayloadMismatch: connection retired");
                     return false;
                 }
-                ActionVerdict::Expired => {
+                ActionRulingNotice::TimedOut => {
                     self.abort("ActionOutcomeUnknown: request expired");
                     return false;
                 }
-                ActionVerdict::Applied | ActionVerdict::Refused => {
-                    self.actions.retire(local, *request_id);
+                ActionRulingNotice::TakenIntoEffect | ActionRulingNotice::Declined => {
+                    self.intake_q.resolve(own_id, *request_id);
                 }
             },
         }
@@ -187,12 +181,12 @@ impl ReliableInbound<'_> {
 /// A switch the host forced (a streak weapon taken away, a respawn loadout) becomes the
 /// request, so the next command asks for the gun that is about to be in hand.
 pub fn apply_weapon_switch_requests(
-    mut events: MessageReader<ReliableControlEvent>,
+    mut notes: MessageReader<GuaranteedSimEvent>,
     mut select: ResMut<WeaponSelect>,
     clock: Res<FrameClock>,
 ) {
-    for event in events.read() {
-        if let sim::SimEvent::WeaponSwitchRequested { weapon } = event.0 {
+    for event in notes.read() {
+        if let sim::MatchOccurrence::WeaponSwitchRequested { weapon } = event.0 {
             select.index = weapon;
             select.mapped_index = weapon;
             select.time = clock.time();
@@ -207,66 +201,66 @@ mod tests {
     const ME: sim::ClientId = sim::ClientId(3);
 
     #[derive(Resource)]
-    struct Delivery(ReliablePayload);
+    struct Delivery(GuaranteedEnvelope);
 
-    fn deliver_it(mut inbound: ReliableInbound, delivery: Res<Delivery>) {
+    fn deliver_it(mut inbound: GuaranteedIntakeParams, delivery: Res<Delivery>) {
         inbound.apply(ME, &delivery.0);
     }
 
     fn app_with_inbound() -> App {
         let mut app = App::new();
-        app.init_resource::<ClientActionInbox>()
-            .init_resource::<ClientReliableAck>()
+        app.init_resource::<PlayerActionIntake>()
+            .init_resource::<PlayerGuaranteedReceipt>()
             .init_resource::<Scoreboard>()
-            .init_resource::<SignonState>()
-            .add_message::<ReliableControlEvent>()
-            .add_message::<SvcLocalSound>()
-            .add_message::<SvcCardSlotCmd>()
-            .add_message::<SvcOpenMenuCmd>()
-            .add_message::<SvcHudSplash>()
-            .add_message::<SvcGameNotify>()
+            .init_resource::<JoinProgressRecord>()
+            .add_message::<GuaranteedSimEvent>()
+            .add_message::<HostLocalSoundMsg>()
+            .add_message::<CardSlotCommand>()
+            .add_message::<MenuOpenCommand>()
+            .add_message::<HostScreenFlash>()
+            .add_message::<HostGameAnnouncement>()
             .add_systems(Update, deliver_it);
         app
     }
 
-    fn payload(rows: Vec<(u16, ReliableRow)>) -> ReliablePayload {
-        ReliablePayload {
-            ack_through: 0,
-            rows,
-            dropped_oldest: 0,
+    fn payload(rows: Vec<(u16, GuaranteedEntry)>) -> GuaranteedEnvelope {
+        GuaranteedEnvelope {
+            confirmed_up_to: 0,
+            entries: rows,
+            evicted_stale_count: 0,
         }
     }
 
-    fn deliver(app: &mut App, payload: ReliablePayload) {
+    fn deliver(app: &mut App, payload: GuaranteedEnvelope) {
         app.insert_resource(Delivery(payload));
         app.update();
     }
 
     fn ack_of(app: &App) -> u16 {
-        app.world().resource::<ClientReliableAck>().0
+        app.world().resource::<PlayerGuaranteedReceipt>().0
     }
 
     fn sounds_heard(app: &mut App) -> Vec<(bool, u8)> {
         app.world_mut()
-            .resource_mut::<Messages<SvcLocalSound>>()
+            .resource_mut::<Messages<HostLocalSoundMsg>>()
             .drain()
             .map(|sound| (sound.stop, sound.index))
             .collect()
     }
 
     fn failure_text(app: &App) -> Option<String> {
-        match &app.world().resource::<SignonState>().phase {
-            SignonPhase::Failed(SignonFailReason::Transport {
+        match &app.world().resource::<JoinProgressRecord>().phase {
+            JoinSequenceStep::Failed(JoinFailureCause::Transport {
                 source,
-                stage: FailStage::Transport,
+                stage: AbortStep::Transport,
                 ..
             }) => Some(source.clone()),
             _ => None,
         }
     }
 
-    fn sound_row(seq: u16, index: u8) -> (u16, ReliableRow) {
-        (seq, ReliableRow::Sound(SvcSound { stop: false, index }))
+    fn sound_row(seq: u16, index: u8) -> (u16, GuaranteedEntry) {
+        (seq, GuaranteedEntry::Sound(HostSoundCue { halt: false, slot: index }))
     }
 
     #[test]
@@ -292,7 +286,7 @@ mod tests {
     #[test]
     fn the_sequence_counter_may_wrap_around() {
         let mut app = app_with_inbound();
-        app.insert_resource(ClientReliableAck(u16::MAX - 1));
+        app.insert_resource(PlayerGuaranteedReceipt(u16::MAX - 1));
         deliver(&mut app, payload(vec![sound_row(1, 3), sound_row(u16::MAX, 1), sound_row(0, 2)]));
         assert_eq!(sounds_heard(&mut app), [(false, 1), (false, 2), (false, 3)]);
         assert_eq!(ack_of(&app), 1);
@@ -314,24 +308,24 @@ mod tests {
         deliver(
             &mut app,
             payload(vec![
-                (1, ReliableRow::Card(SvcCardSlot { client: 7, slot: -2 })),
-                (2, ReliableRow::Menu(SvcOpenMenu { cs_index: 41 })),
+                (1, GuaranteedEntry::Card(HostCardSlotMsg { client: 7, card_slot: -2 })),
+                (2, GuaranteedEntry::Menu(HostMenuOpenMsg { config_slot_number: 41 })),
                 (
                     3,
-                    ReliableRow::Splash(SvcHudSplash {
+                    GuaranteedEntry::Splash(HostScreenFlash {
                         key: "kills".into(),
-                        slot: 1,
+                        card_slot: 1,
                         optional: 0,
                     }),
                 ),
             ]),
         );
         let world = app.world_mut();
-        let cards: Vec<_> = world.resource_mut::<Messages<SvcCardSlotCmd>>().drain().collect();
-        assert_eq!(cards, [SvcCardSlotCmd { client: 7, slot: -2 }]);
-        let menus: Vec<_> = world.resource_mut::<Messages<SvcOpenMenuCmd>>().drain().collect();
-        assert_eq!(menus, [SvcOpenMenuCmd { cs_index: 41 }]);
-        let splashes: Vec<_> = world.resource_mut::<Messages<SvcHudSplash>>().drain().collect();
+        let cards: Vec<_> = world.resource_mut::<Messages<CardSlotCommand>>().drain().collect();
+        assert_eq!(cards, [CardSlotCommand { client: 7, card_slot: -2 }]);
+        let menus: Vec<_> = world.resource_mut::<Messages<MenuOpenCommand>>().drain().collect();
+        assert_eq!(menus, [MenuOpenCommand { config_slot_number: 41 }]);
+        let splashes: Vec<_> = world.resource_mut::<Messages<HostScreenFlash>>().drain().collect();
         assert_eq!(splashes.len(), 1);
         assert_eq!(splashes[0].key, "kills");
     }
@@ -339,9 +333,9 @@ mod tests {
     #[test]
     fn scoreboard_text_replaces_the_stored_scoreboard() {
         let mut app = app_with_inbound();
-        deliver(&mut app, payload(vec![(1, ReliableRow::Scores("first".into()))]));
-        deliver(&mut app, payload(vec![(2, ReliableRow::Scores("second".into()))]));
-        assert_eq!(app.world().resource::<Scoreboard>().cmd.as_deref(), Some("second"));
+        deliver(&mut app, payload(vec![(1, GuaranteedEntry::Standings("first".into()))]));
+        deliver(&mut app, payload(vec![(2, GuaranteedEntry::Standings("second".into()))]));
+        assert_eq!(app.world().resource::<Scoreboard>().command_text.as_deref(), Some("second"));
     }
 
     #[test]
@@ -349,22 +343,22 @@ mod tests {
         let mut app = app_with_inbound();
         deliver(
             &mut app,
-            payload(vec![(1, ReliableRow::Event(sim::SimEvent::WeaponSwitchRequested { weapon: 9 }))]),
+            payload(vec![(1, GuaranteedEntry::Event(sim::MatchOccurrence::WeaponSwitchRequested { weapon: 9 }))]),
         );
-        let events: Vec<_> = app
+        let notes: Vec<_> = app
             .world_mut()
-            .resource_mut::<Messages<ReliableControlEvent>>()
+            .resource_mut::<Messages<GuaranteedSimEvent>>()
             .drain()
             .collect();
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].0, sim::SimEvent::WeaponSwitchRequested { weapon: 9 }));
+        assert_eq!(notes.len(), 1);
+        assert!(matches!(notes[0].0, sim::MatchOccurrence::WeaponSwitchRequested { weapon: 9 }));
     }
 
     #[test]
     fn a_host_that_dropped_rows_ends_the_connection_without_acting_on_the_payload() {
         let mut app = app_with_inbound();
         let mut lost = payload(vec![sound_row(1, 10)]);
-        lost.dropped_oldest = 2;
+        lost.evicted_stale_count = 2;
         deliver(&mut app, lost);
         assert_eq!(failure_text(&app).as_deref(), Some("ReliableControlOverflow: outcome unknown"));
         assert!(sounds_heard(&mut app).is_empty());
@@ -376,7 +370,7 @@ mod tests {
         let mut app = app_with_inbound();
         deliver(
             &mut app,
-            payload(vec![sound_row(1, 10), (2, ReliableRow::Failure("server said no".into()))]),
+            payload(vec![sound_row(1, 10), (2, GuaranteedEntry::RefusalText("server said no".into()))]),
         );
         assert_eq!(failure_text(&app).as_deref(), Some("server said no"));
         assert!(sounds_heard(&mut app).is_empty());
@@ -387,27 +381,27 @@ mod tests {
     fn a_failure_also_forgets_the_requests_still_waiting_for_an_answer() {
         let mut app = app_with_inbound();
         app.world_mut()
-            .resource_mut::<ClientActionInbox>()
-            .push(ME, sim::ClientAction::JoinMatch { request_id: 5 })
+            .resource_mut::<PlayerActionIntake>()
+            .push(ME, sim::PlayerIntent::JoinMatch { request_id: 5 })
             .unwrap();
-        deliver(&mut app, payload(vec![(1, ReliableRow::Failure("gone".into()))]));
-        assert_eq!(app.world().resource::<ClientActionInbox>().pending_len(), 0);
+        deliver(&mut app, payload(vec![(1, GuaranteedEntry::RefusalText("gone".into()))]));
+        assert_eq!(app.world().resource::<PlayerActionIntake>().waiting_count(), 0);
     }
 
     #[test]
     fn an_applied_or_refused_outcome_retires_the_request_and_is_acknowledged() {
-        for verdict in [ActionVerdict::Applied, ActionVerdict::Refused] {
+        for verdict in [ActionRulingNotice::TakenIntoEffect, ActionRulingNotice::Declined] {
             let mut app = app_with_inbound();
-            let mut inbox = ClientActionInbox::default();
-            inbox.push(ME, sim::ClientAction::JoinMatch { request_id: 5 }).unwrap();
-            inbox.push(ME, sim::ClientAction::SpawnClient { request_id: 6 }).unwrap();
+            let mut inbox = PlayerActionIntake::default();
+            inbox.push(ME, sim::PlayerIntent::JoinMatch { request_id: 5 }).unwrap();
+            inbox.push(ME, sim::PlayerIntent::SpawnClient { request_id: 6 }).unwrap();
             app.insert_resource(inbox);
             deliver(
                 &mut app,
-                payload(vec![(1, ReliableRow::ActionOutcome { request_id: 5, verdict })]),
+                payload(vec![(1, GuaranteedEntry::CommandResolution { request_id: 5, verdict })]),
             );
-            let inbox = app.world().resource::<ClientActionInbox>();
-            assert_eq!(inbox.pending_len(), 1, "{verdict:?}");
+            let inbox = app.world().resource::<PlayerActionIntake>();
+            assert_eq!(inbox.waiting_count(), 1, "{verdict:?}");
             assert_eq!(ack_of(&app), 1);
             assert!(failure_text(&app).is_none());
         }
@@ -416,8 +410,8 @@ mod tests {
     #[test]
     fn an_expired_or_mismatched_outcome_ends_the_connection_and_is_not_acknowledged() {
         let cases = [
-            (ActionVerdict::Expired, "ActionOutcomeUnknown: request expired"),
-            (ActionVerdict::PayloadMismatch, "ActionPayloadMismatch: connection retired"),
+            (ActionRulingNotice::TimedOut, "ActionOutcomeUnknown: request expired"),
+            (ActionRulingNotice::DuplicateIdDifferentBody, "ActionPayloadMismatch: connection retired"),
         ];
         for (verdict, text) in cases {
             let mut app = app_with_inbound();
@@ -425,7 +419,7 @@ mod tests {
                 &mut app,
                 payload(vec![
                     sound_row(1, 10),
-                    (2, ReliableRow::ActionOutcome { request_id: 5, verdict }),
+                    (2, GuaranteedEntry::CommandResolution { request_id: 5, verdict }),
                     sound_row(3, 12),
                 ]),
             );
@@ -438,7 +432,7 @@ mod tests {
     #[derive(Resource)]
     struct Carried(Option<Frame>);
 
-    fn pass_on(mut inbound: ReliableInbound, mut carried: ResMut<Carried>) {
+    fn pass_on(mut inbound: GuaranteedIntakeParams, mut carried: ResMut<Carried>) {
         if let Some(frame) = carried.0.take() {
             inbound.take_frame_commands(frame);
         }
@@ -446,15 +440,15 @@ mod tests {
 
     #[test]
     fn the_commands_riding_on_a_tick_all_arrive() {
-        let mut frame = crate::transport::frame::frame_from_tick(
-            &mut crate::SnapshotEncoder::new(),
-            &sim::TickInput::default(),
+        let mut frame = crate::net_links::tick_frames::frame_for_tick(
+            &mut crate::FrameDiffWriter::new(),
+            &sim::StepInputs::default(),
             &sim::Snapshot::unpublished(sim::Tick(0)),
         );
-        frame.svc_sounds = vec![SvcSound { stop: true, index: 4 }];
-        frame.svc_card_slots = vec![SvcCardSlot { client: 2, slot: 5 }];
-        frame.svc_open_menus = vec![SvcOpenMenu { cs_index: 8 }];
-        frame.svc_scores = Some("scores here".to_owned());
+        frame.host_sound_triggers = vec![HostSoundCue { halt: true, slot: 4 }];
+        frame.host_nameplate_entries = vec![HostCardSlotMsg { client: 2, card_slot: 5 }];
+        frame.host_menu_openings = vec![HostMenuOpenMsg { config_slot_number: 8 }];
+        frame.board_text = Some("scores here".to_owned());
 
         let mut app = app_with_inbound();
         app.insert_resource(Delivery(payload(Vec::new())));
@@ -464,20 +458,20 @@ mod tests {
 
         assert_eq!(sounds_heard(&mut app), [(true, 4)]);
         let world = app.world_mut();
-        assert_eq!(world.resource_mut::<Messages<SvcCardSlotCmd>>().drain().count(), 1);
-        assert_eq!(world.resource_mut::<Messages<SvcOpenMenuCmd>>().drain().count(), 1);
-        assert_eq!(world.resource::<Scoreboard>().cmd.as_deref(), Some("scores here"));
+        assert_eq!(world.resource_mut::<Messages<CardSlotCommand>>().drain().count(), 1);
+        assert_eq!(world.resource_mut::<Messages<MenuOpenCommand>>().drain().count(), 1);
+        assert_eq!(world.resource::<Scoreboard>().command_text.as_deref(), Some("scores here"));
     }
 
     #[test]
     fn a_forced_weapon_switch_becomes_the_request() {
         let mut app = App::new();
-        app.add_message::<ReliableControlEvent>()
+        app.add_message::<GuaranteedSimEvent>()
             .init_resource::<WeaponSelect>()
             .init_resource::<FrameClock>()
             .add_systems(Update, apply_weapon_switch_requests);
         app.world_mut()
-            .write_message(ReliableControlEvent(sim::SimEvent::WeaponSwitchRequested { weapon: 12 }));
+            .write_message(GuaranteedSimEvent(sim::MatchOccurrence::WeaponSwitchRequested { weapon: 12 }));
         app.update();
         let select = *app.world().resource::<WeaponSelect>();
         assert_eq!((select.index, select.mapped_index), (12, 12));

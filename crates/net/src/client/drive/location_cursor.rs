@@ -2,7 +2,7 @@
 //! The mouse moves it, and with the aim key held it turns instead into a direction arrow.
 
 use bevy::prelude::*;
-use playerstate_t6::game::{UserCmd, buttons};
+use playerstate_t6::game::{InputCommand, buttons};
 
 /// How far a mouse count moves the cursor, before the player's own sensitivity is applied.
 const MOUSE_REACH: f32 = 0.6;
@@ -14,7 +14,7 @@ const COUNTS_TO_MAP: f32 = 0.002;
 pub struct LocationCursor {
     pub at: [f32; 2],
     pub aim: [f32; 2],
-    pub yaw: f32,
+    pub heading_deg: f32,
     pub directing: bool,
 }
 
@@ -23,7 +23,7 @@ impl Default for LocationCursor {
         Self {
             at: [0.5, 0.5],
             aim: [0.5, 0.5],
-            yaw: 0.0,
+            heading_deg: 0.0,
             directing: false,
         }
     }
@@ -47,21 +47,21 @@ impl LocationCursor {
     /// Applies this frame's mouse movement and returns the three bytes the command carries:
     /// the cursor's x and y, and the direction. Without `directing` the mouse drags the cursor
     /// and the arrow follows it; with it the cursor stays and the arrow swings around it.
-    pub(super) fn step(&mut self, sensitivity: f32, mouse: (f32, f32), directing: bool) -> [u8; 3] {
-        let scale = MOUSE_REACH * sensitivity * COUNTS_TO_MAP;
+    pub(super) fn step(&mut self, mouse_gain: f32, mouse: (f32, f32), directing: bool) -> [u8; 3] {
+        let scale = MOUSE_REACH * mouse_gain * COUNTS_TO_MAP;
         let moved = [mouse.0 * scale, mouse.1 * scale];
         self.directing = directing;
         if directing {
             self.aim = nudged(self.aim, moved);
             let away = [self.aim[0] - self.at[0], self.aim[1] - self.at[1]];
             if away != [0.0, 0.0] {
-                self.yaw = (-away[0]).atan2(-away[1]).to_degrees().rem_euclid(360.0);
+                self.heading_deg = (-away[0]).atan2(-away[1]).to_degrees().rem_euclid(360.0);
             }
         } else {
             self.at = nudged(self.at, moved);
             self.aim = self.at;
         }
-        [axis_byte(self.at[0]), axis_byte(self.at[1]), yaw_byte(self.yaw)]
+        [axis_byte(self.at[0]), axis_byte(self.at[1]), yaw_byte(self.heading_deg)]
     }
 }
 
@@ -72,8 +72,8 @@ impl LocationCursor {
 /// already a pick, so that only the first one of a held press is logged.
 pub(super) fn steer_command(
     cursor: &mut LocationCursor,
-    cmd: &mut UserCmd,
-    sensitivity: f32,
+    cmd: &mut InputCommand,
+    mouse_gain: f32,
     mouse: Option<(f32, f32)>,
     choose_direction: Option<bool>,
     already_picking: bool,
@@ -91,16 +91,16 @@ pub(super) fn steer_command(
         buttons::ADS | buttons::MELEE_CHARGE
     };
 
-    cmd.selected_location = cursor.step(sensitivity, mouse, directing);
+    cmd.chosen_map_spot = cursor.step(mouse_gain, mouse, directing);
     if !picks_direction {
-        cmd.selected_location[2] = 0;
+        cmd.chosen_map_spot[2] = 0;
     }
-    cmd.buttons &= buttons::CROUCH | buttons::PRONE;
+    cmd.buttons &= buttons::DUCK_BUTTON_BIT | buttons::LYING_FLAT;
     if held & buttons::ATTACK != 0 {
         if !already_picking {
-            diag::info!(Net, "bo2mp location: pick at {:?}", cmd.selected_location);
+            diag::info!(WireLink, "bo2mp location: pick at {:?}", cmd.chosen_map_spot);
         }
-        cmd.buttons |= buttons::LOCATION_SELECT;
+        cmd.buttons |= buttons::MAP_TARGET_PICK;
     } else if held & cancel_keys != 0 {
         cmd.buttons |= buttons::LOCATION_CANCEL;
     }
@@ -117,7 +117,7 @@ mod tests {
         let cursor = LocationCursor::default();
         assert_eq!(cursor.at, [0.5, 0.5]);
         assert_eq!(cursor.aim, [0.5, 0.5]);
-        assert_eq!(cursor.yaw, 0.0);
+        assert_eq!(cursor.heading_deg, 0.0);
         assert!(!cursor.directing);
     }
 
@@ -161,7 +161,7 @@ mod tests {
         assert!(cursor.directing);
         assert_eq!(cursor.at, [0.5, 0.5]);
         assert_eq!(cursor.aim, [1.0, 0.5]);
-        assert!((cursor.yaw - 270.0).abs() < 1.0e-3, "yaw was {}", cursor.yaw);
+        assert!((cursor.heading_deg - 270.0).abs() < 1.0e-3, "yaw was {}", cursor.heading_deg);
         assert_eq!(bytes, [255, 255, 192]);
     }
 
@@ -177,20 +177,20 @@ mod tests {
     fn the_arrow_keeps_its_last_direction_while_it_sits_on_the_cursor() {
         let mut cursor = LocationCursor::default();
         cursor.step(5.0, (FAR, 0.0), true);
-        let turned = cursor.yaw;
+        let turned = cursor.heading_deg;
         cursor.aim = cursor.at;
         cursor.step(5.0, (0.0, 0.0), true);
-        assert_eq!(cursor.yaw, turned);
+        assert_eq!(cursor.heading_deg, turned);
     }
 
-    const FIRE: u32 = buttons::ATTACK;
+    const TRIGGER_SLOT: u32 = buttons::ATTACK;
 
-    fn command_holding(keys: u32) -> UserCmd {
-        UserCmd { buttons: keys, ..Default::default() }
+    fn command_holding(keys: u32) -> InputCommand {
+        InputCommand { buttons: keys, ..Default::default() }
     }
 
-    fn steered(keys: u32, choose_direction: Option<bool>, already_picking: bool) -> (UserCmd, LocationCursor) {
-        let mut cursor = LocationCursor { yaw: 90.0, ..Default::default() };
+    fn steered(keys: u32, choose_direction: Option<bool>, already_picking: bool) -> (InputCommand, LocationCursor) {
+        let mut cursor = LocationCursor { heading_deg: 90.0, ..Default::default() };
         let mut cmd = command_holding(keys);
         steer_command(&mut cursor, &mut cmd, 5.0, Some((0.0, 0.0)), choose_direction, already_picking);
         (cmd, cursor)
@@ -200,33 +200,33 @@ mod tests {
     fn without_the_overlay_the_cursor_forgets_and_the_command_is_left_alone() {
         let mut cursor = LocationCursor::default();
         cursor.step(5.0, (300.0, 300.0), false);
-        let mut cmd = command_holding(FIRE | buttons::RELOAD);
+        let mut cmd = command_holding(TRIGGER_SLOT | buttons::RELOAD);
         steer_command(&mut cursor, &mut cmd, 5.0, None, Some(true), false);
         assert_eq!(cursor, LocationCursor::default());
-        assert_eq!(cmd.buttons, FIRE | buttons::RELOAD);
-        assert_eq!(cmd.selected_location, [0; 3]);
+        assert_eq!(cmd.buttons, TRIGGER_SLOT | buttons::RELOAD);
+        assert_eq!(cmd.chosen_map_spot, [0; 3]);
     }
 
     #[test]
     fn only_the_stance_and_the_pick_survive_on_the_overlay() {
-        let keys = buttons::CROUCH | buttons::PRONE | buttons::RELOAD | buttons::ADS;
+        let keys = buttons::DUCK_BUTTON_BIT | buttons::LYING_FLAT | buttons::RELOAD | buttons::ADS;
         let (cmd, _) = steered(keys, Some(false), false);
         // ADS cancels a fixed-direction pick, so the stance stays and the cancel is added.
-        assert_eq!(cmd.buttons, buttons::CROUCH | buttons::PRONE | buttons::LOCATION_CANCEL);
+        assert_eq!(cmd.buttons, buttons::DUCK_BUTTON_BIT | buttons::LYING_FLAT | buttons::LOCATION_CANCEL);
         let (cmd, _) = steered(buttons::RELOAD, Some(false), false);
         assert_eq!(cmd.buttons, 0);
     }
 
     #[test]
     fn the_fire_key_picks_the_spot() {
-        let (cmd, _) = steered(FIRE | buttons::CROUCH, Some(false), false);
-        assert_eq!(cmd.buttons, buttons::CROUCH | buttons::LOCATION_SELECT);
+        let (cmd, _) = steered(TRIGGER_SLOT | buttons::DUCK_BUTTON_BIT, Some(false), false);
+        assert_eq!(cmd.buttons, buttons::DUCK_BUTTON_BIT | buttons::MAP_TARGET_PICK);
     }
 
     #[test]
     fn a_pick_beats_a_cancel_held_at_the_same_time() {
-        let (cmd, _) = steered(FIRE | buttons::MELEE_CHARGE, Some(false), true);
-        assert_eq!(cmd.buttons, buttons::LOCATION_SELECT);
+        let (cmd, _) = steered(TRIGGER_SLOT | buttons::MELEE_CHARGE, Some(false), true);
+        assert_eq!(cmd.buttons, buttons::MAP_TARGET_PICK);
     }
 
     #[test]
@@ -241,9 +241,9 @@ mod tests {
     #[test]
     fn the_direction_byte_is_only_sent_when_the_player_chooses_it() {
         let (fixed, _) = steered(0, Some(false), false);
-        assert_eq!(fixed.selected_location[2], 0);
+        assert_eq!(fixed.chosen_map_spot[2], 0);
         let (chosen, _) = steered(0, Some(true), false);
-        assert_eq!(chosen.selected_location[2], 64);
+        assert_eq!(chosen.chosen_map_spot[2], 64);
     }
 
     #[test]
@@ -252,6 +252,6 @@ mod tests {
         let mut cmd = command_holding(0);
         steer_command(&mut cursor, &mut cmd, 5.0, Some((FAR, 0.0)), Some(false), false);
         assert_eq!(cursor.at, [1.0, 0.5]);
-        assert_eq!(cmd.selected_location, [127, 255, 0]);
+        assert_eq!(cmd.chosen_map_spot, [127, 255, 0]);
     }
 }

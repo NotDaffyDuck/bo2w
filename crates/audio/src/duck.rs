@@ -9,19 +9,19 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use asset_audio::{CapturedAlias, SndDuck, SoundCatalog};
-use asset_core::AssetNamespace;
+use asset_audio::{AudioRoster, SnapshotSoundAlias, SndDuck};
+use asset_core::AssetCategoryScope;
 use bevy::{audio::Volume, prelude::*};
-use frame::{ClientSet, MatchTornDown};
-use net::{LocalPresentClient, PresentedSnapshot};
+use frame::{ClientStep, GameSessionClosed};
+use net::{HostViewClient, ShownWorldFrame};
 
-use crate::ambient::{MapAmbient, MapEmitter};
-use crate::backend::{AudioScope, MatchEpoch, Voice};
-use crate::clip_store::{ClipStore, clip_keys_for_alias};
-use crate::messages::{AliasCommand, PlayAlias, SND_ENT_LOCAL};
-use crate::pcm::{LoopingPcmAudio, PcmAudio};
-use crate::playback::{AmbientListener, Channel3d, MissingAliasGaps, SoundBank};
-use crate::space::transform_inches;
+use crate::map_sound_set::{LevelBackdropSound, LevelSoundSource};
+use crate::backend::{GameRoundSerial, PlayingCue, SoundAudience};
+use crate::clip_bank::{ClipRepository, waveforms_for_cue};
+use crate::alerts::{AliasCommand, SOUND_SOURCE_SELF, TriggerCueMsg};
+use crate::sample_feed::{ClipPcm, LoopedPcm};
+use crate::play_core::{AudioCatalogRes, BackgroundHearer, SpatialVoice, UnknownCueHoles};
+use crate::distance::inches_of;
 
 /// Black Ops II's "zero" for duck times, amounts and distances.
 pub(crate) const EPS: f32 = 1.52879e-05;
@@ -53,75 +53,86 @@ pub struct DuckGroup(pub u8);
 #[derive(Component, Debug)]
 pub(crate) struct DuckSource {
     duck: u32,
+    begun: bool,
     /// The alias is 3D (flags bit 1): the duck follows the sound and may weaken with distance.
     positional: bool,
     /// The alias loops (flags bit 0): its duck lasts until the sound is stopped.
-    looping: bool,
+    repeats: bool,
     /// The clip's length (not scaled by pitch, as Black Ops II).
     total_ms: i64,
-    started: bool,
 }
 
 /// Tags a new sound with its alias's duck group and duck.
-pub(crate) fn tag(e: &mut EntityCommands, row: Option<&CapturedAlias>, total_ms: i64) {
-    let Some(row) = row else {
-        return;
-    };
-    if let Some(group) = row.duck_group {
+pub(crate) fn tag(e: &mut EntityCommands, row: Option<&SnapshotSoundAlias>, total_ms: i64) {
+    if let Some(group) = row.and_then(|r| r.duck_group) {
         e.insert(DuckGroup(group));
     }
-    if let Some(duck) = row.duck {
-        let flags = row.flags.unwrap_or(0);
-        e.insert(DuckSource {
-            duck,
-            positional: flags & 2 != 0,
-            looping: flags & 1 != 0,
-            total_ms,
-            started: false,
-        });
-    }
+    let Some((duck, flags)) = row.and_then(|r| Some((r.duck?, r.alias_bits.unwrap_or(0)))) else {
+        return;
+    };
+    e.insert(DuckSource {
+        begun: false,
+        total_ms,
+        positional: flags & 0b10 != 0,
+        repeats: flags & 0b01 != 0,
+        duck,
+    });
 }
 
 /// A clip's length in milliseconds.
-pub(crate) fn clip_ms(pcm: &PcmAudio) -> i64 {
-    let channels = u64::from(pcm.channel_count().max(1));
-    let rate = u64::from(pcm.rate().max(1));
-    let frames = pcm.samples().len() as u64 / channels;
-    (frames * 1000 / rate) as i64
+pub(crate) fn clip_ms(pcm: &ClipPcm) -> i64 {
+    let frames = pcm.data().len() as u64 / u64::from(pcm.lane_count().max(1));
+    let millis = frames * 1000 / u64::from(pcm.hz().max(1));
+    millis as i64
 }
 
 #[derive(Clone, Debug)]
 struct Active {
     duck: SndDuck,
-    start_ms: i64,
+    began_ms: i64,
     /// 0 = no end yet.
     end_ms: i64,
-    amount: f32,
     effect: f32,
     voice: Option<Entity>,
-    position: [f32; 3],
+    heard_at: [f32; 3],
+    strength: f32,
+}
+
+impl Active {
+    /// A duck that has just begun, not tied to a voice and not yet in effect.
+    fn begin(duck: &SndDuck, now: i64, end_ms: i64) -> Self {
+        Self {
+            duck: duck.clone(),
+            began_ms: now,
+            end_ms,
+            effect: 0.0,
+            voice: None,
+            heard_at: [0.0; 3],
+            strength: 1.0,
+        }
+    }
 }
 
 /// The duck slots and the duck groups' volumes.
 #[derive(Resource)]
 pub struct DuckMixer {
-    slots: Vec<Option<Active>>,
+    slot_list: Vec<Option<Active>>,
     category_index: [Option<usize>; CATEGORIES],
     value: [f32; GROUPS],
     linear: [f32; GROUPS],
     /// A group's volume moved this frame: sounds that are not rescaled every frame are.
-    pub(crate) changed: bool,
+    pub(crate) dirty: bool,
     warned: HashSet<String>,
 }
 
 impl Default for DuckMixer {
     fn default() -> Self {
         Self {
-            slots: vec![None; SLOTS],
+            slot_list: vec![None; SLOTS],
             category_index: [None; CATEGORIES],
             value: [1.0; GROUPS],
             linear: [1.0; GROUPS],
-            changed: false,
+            dirty: false,
             warned: HashSet::new(),
         }
     }
@@ -133,20 +144,19 @@ fn is_default(duck: &SndDuck) -> bool {
 
 impl DuckMixer {
     /// The volume scale for a sound in this duck group (1 for none).
-    pub fn linear(&self, group: Option<u8>) -> f32 {
-        group
+    pub fn linear(&self, band: Option<u8>) -> f32 {
+        band
             .and_then(|g| self.linear.get(usize::from(g)))
-            .copied()
-            .unwrap_or(1.0)
+            .map_or(1.0, |&scale| scale)
     }
 
+    /// Back to no ducks, keeping the warnings already given; every group's
+    /// volume counts as moved so sounds pick up the reset.
     pub(crate) fn reset(&mut self) {
-        let warned = std::mem::take(&mut self.warned);
-        *self = Self {
-            warned,
-            changed: true,
-            ..Self::default()
-        };
+        let already_warned = std::mem::take(&mut self.warned);
+        *self = Self::default();
+        self.warned = already_warned;
+        self.dirty = true;
     }
 
     fn warn_once(&mut self, line: String) {
@@ -157,7 +167,7 @@ impl DuckMixer {
 
     /// `SND_SetDuck(category, name, 0, 1)`: holds `name` on the category ("default", or
     /// an empty name, lets the category's duck go).
-    pub(crate) fn set_duck(&mut self, bank: &SoundCatalog, category: usize, name: &str, now: i64) {
+    pub(crate) fn set_duck(&mut self, bank: &AudioRoster, category: usize, name: &str, now: i64) {
         let name = if name.is_empty() { "default" } else { name };
         let Some(duck) = bank
             .ducks
@@ -171,16 +181,16 @@ impl DuckMixer {
         self.set_duck_by_category(category, &duck, 1.0, now);
     }
 
-    fn set_duck_by_category(&mut self, category: usize, duck: &SndDuck, amount: f32, now: i64) {
-        if category == CATEGORY_ALIAS || category >= CATEGORIES || duck.distance > EPS {
+    fn set_duck_by_category(&mut self, category: usize, duck: &SndDuck, duck_amt: f32, now: i64) {
+        if category == CATEGORY_ALIAS || category >= CATEGORIES || duck.fade_range > EPS {
             return;
         }
         match self.category_index[category] {
             None if is_default(duck) => return,
-            Some(i) => {
-                if let Some(active) = self.slots[i].as_mut() {
-                    if active.duck.id == duck.id && amount > EPS {
-                        active.amount = amount;
+            Some(slot_no) => {
+                if let Some(active) = self.slot_list[slot_no].as_mut() {
+                    if active.duck.id == duck.id && duck_amt > EPS {
+                        active.strength = duck_amt;
                         return;
                     }
                     if active.duck.length < EPS {
@@ -191,28 +201,20 @@ impl DuckMixer {
             }
             None => {}
         }
-        if is_default(duck) || amount < EPS {
+        if is_default(duck) || duck_amt < EPS {
             return;
         }
-        let Some(free) = self.slots.iter().position(Option::is_none) else {
+        let Some(free) = self.slot_list.iter().position(Option::is_none) else {
             self.warn_once("SOUND: no free sound ducks.".to_owned());
             return;
         };
         let timed = duck.length >= EPS;
-        self.slots[free] = Some(Active {
-            duck: duck.clone(),
-            start_ms: now,
-            end_ms: if timed {
-                now + (duck.length * 1000.0) as i64
-            } else {
-                0
-            },
-            amount,
-            effect: 0.0,
-            voice: None,
-            position: [0.0; 3],
+        let end_ms = timed.then(|| now + (duck.length * 1000.0) as i64);
+        self.slot_list[free] = Some(Active {
+            strength: duck_amt,
+            ..Active::begin(duck, now, end_ms.unwrap_or(0))
         });
-        if !timed {
+        if end_ms.is_none() {
             self.category_index[category] = Some(free);
         }
     }
@@ -223,36 +225,32 @@ impl DuckMixer {
         duck: &SndDuck,
         voice: Entity,
         source: &DuckSource,
-        alias: &str,
+        cue_id: &str,
         position: [f32; 3],
         now: i64,
     ) {
-        if duck.distance > EPS && !source.positional {
+        if duck.fade_range > EPS && !source.positional {
             self.warn_once(format!(
-                "SOUND: cannot use a duck with distance ({}) on a 2d sound ({alias})",
+                "SOUND: cannot use a duck with distance ({}) on a 2d sound ({cue_id})",
                 duck.name
             ));
             return;
         }
-        let Some(free) = self.slots.iter().position(Option::is_none) else {
+        let Some(free) = self.slot_list.iter().position(Option::is_none) else {
             self.warn_once("SOUND: no free sound ducks.".to_owned());
             return;
         };
         let end_ms = if duck.length > EPS {
             now + (duck.length * 1000.0) as i64
-        } else if !source.looping {
-            now + source.total_ms - (duck.fade_out * 1000.0) as i64
+        } else if !source.repeats {
+            now + source.total_ms - (duck.ease_off * 1000.0) as i64
         } else {
             0
         };
-        self.slots[free] = Some(Active {
-            duck: duck.clone(),
-            start_ms: now,
-            end_ms,
-            amount: 1.0,
-            effect: 0.0,
+        self.slot_list[free] = Some(Active {
             voice: Some(voice),
-            position,
+            heard_at: position,
+            ..Active::begin(duck, now, end_ms)
         });
     }
 
@@ -260,7 +258,7 @@ impl DuckMixer {
     /// it fades out from now.
     fn end_voice(&mut self, voice: Entity, now: i64) {
         for i in 0..SLOTS {
-            let Some(active) = self.slots[i].as_mut().filter(|a| a.voice == Some(voice)) else {
+            let Some(active) = self.slot_list[i].as_mut().filter(|a| a.voice == Some(voice)) else {
                 continue;
             };
             if active.effect < EPS {
@@ -275,42 +273,42 @@ impl DuckMixer {
     /// A looping sound is faded out over `fade_ms`: its duck (with no end of its own)
     /// ends so that it is gone when the sound is.
     pub(crate) fn fade_stop_voice(&mut self, voice: Entity, fade_ms: i64, now: i64) {
-        for active in self.slots.iter_mut().flatten() {
+        for active in self.slot_list.iter_mut().flatten() {
             if active.voice == Some(voice) && active.end_ms == 0 && active.duck.length < EPS {
-                active.end_ms = now - (active.duck.fade_out * 1000.0) as i64 + fade_ms;
+                active.end_ms = now - (active.duck.ease_off * 1000.0) as i64 + fade_ms;
             }
         }
     }
 
-    fn stop(&mut self, slot: usize) {
+    fn stop(&mut self, lane_no: usize) {
         for index in &mut self.category_index {
-            if *index == Some(slot) {
+            if *index == Some(lane_no) {
                 *index = None;
             }
         }
-        self.slots[slot] = None;
+        self.slot_list[lane_no] = None;
     }
 
     /// One frame: each duck's effect, then each group's volume moves toward the lowest
     /// any duck asks for, by at most a tenth (`dt` x 10) a frame.
-    fn update(&mut self, now: i64, dt: f32, listener: Option<[f32; 3]>) {
+    fn refresh(&mut self, now: i64, dt: f32, listener: Option<[f32; 3]>) {
         let mut target = [1.0f32; GROUPS];
         for i in 0..SLOTS {
-            let Some(active) = self.slots[i].as_mut() else {
+            let Some(active) = self.slot_list[i].as_mut() else {
                 continue;
             };
-            let Some(time) = time_effect(&active.duck, active.start_ms, active.end_ms, now) else {
+            let Some(time) = time_effect(&active.duck, active.began_ms, active.end_ms, now) else {
                 self.stop(i);
                 continue;
             };
-            let distance = distance_effect(&active.duck, active.position, listener);
-            active.effect = active.amount * time.min(distance);
+            let distance = distance_effect(&active.duck, active.heard_at, listener);
+            active.effect = active.strength * time.min(distance);
             for (t, att) in target.iter_mut().zip(&active.duck.attenuation) {
                 *t = t.min(1.0 - active.effect * (1.0 - att));
             }
         }
         let rate = (dt * 10.0).min(0.1);
-        let mut changed = false;
+        let mut any_moved = false;
         for (j, t) in target.iter().enumerate() {
             let v = self.value[j];
             let next = if *t > v {
@@ -320,10 +318,10 @@ impl DuckMixer {
             };
             self.value[j] = next;
             let linear = next * next * next;
-            changed |= linear != self.linear[j];
+            any_moved |= linear != self.linear[j];
             self.linear[j] = linear;
         }
-        self.changed = changed;
+        self.dirty = any_moved;
     }
 }
 
@@ -333,33 +331,33 @@ fn time_effect(duck: &SndDuck, start_ms: i64, end_ms: i64, now: i64) -> Option<f
     if end_ms == 0 || now <= end_ms {
         return Some(if t < 0.0 {
             0.0
-        } else if t >= duck.fade_in {
+        } else if t >= duck.ease_on {
             1.0
         } else {
-            t / duck.fade_in
+            t / duck.ease_on
         });
     }
     let e = (now - end_ms) as f32 / 1000.0;
-    if t < 0.0 || e > duck.fade_out {
+    if t < 0.0 || e > duck.ease_off {
         None
-    } else if t >= duck.fade_in {
-        Some(1.0 - e / duck.fade_out)
+    } else if t >= duck.ease_on {
+        Some(1.0 - e / duck.ease_off)
     } else {
-        Some((1.0 - ((1.0 - t / duck.fade_in) * duck.fade_out + e) / duck.fade_out).max(0.0))
+        Some((1.0 - ((1.0 - t / duck.ease_on) * duck.ease_off + e) / duck.ease_off).max(0.0))
     }
 }
 
 /// A duck with a distance weakens from full at its sound to nothing at that distance.
-fn distance_effect(duck: &SndDuck, position: [f32; 3], listener: Option<[f32; 3]>) -> f32 {
-    if duck.distance <= EPS {
+fn distance_effect(duck: &SndDuck, at: [f32; 3], listener: Option<[f32; 3]>) -> f32 {
+    if duck.fade_range <= EPS {
         return 1.0;
     }
     let Some(ear) = listener else {
         return 0.0;
     };
-    let d2: f32 = (0..3).map(|k| (position[k] - ear[k]).powi(2)).sum();
-    if d2 < duck.distance * duck.distance {
-        1.0 - d2.sqrt() / duck.distance
+    let d2: f32 = (0..3).map(|k| (at[k] - ear[k]).powi(2)).sum();
+    if d2 < duck.fade_range * duck.fade_range {
+        1.0 - d2.sqrt() / duck.fade_range
     } else {
         0.0
     }
@@ -368,89 +366,99 @@ fn distance_effect(duck: &SndDuck, position: [f32; 3], listener: Option<[f32; 3]
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct DuckSet;
 
-pub(crate) fn register(app: &mut App) {
+pub(crate) fn wire_up(app: &mut App) {
     app.init_resource::<DuckMixer>().add_systems(
         Update,
         (
             (
-                crate::shellshock::update_shellshock_sound_t6
-                    .run_if(crate::shellshock::bank_is_t6),
+                crate::shock_sound::update_shellshock_sound_t6.run_if(crate::shock_sound::bank_is_t6),
                 script_sound_notifies,
                 update_mixer,
             )
                 .chain()
                 .in_set(DuckSet)
-                .after(crate::shellshock::update_shellshock_tinnitus),
-            crate::shellshock::update_shock_loop_volume_t6.after(DuckSet),
+                .after(crate::shock_sound::update_tinnitus),
+            crate::shock_sound::update_shock_loop_volume_t6.after(DuckSet),
         )
-            .in_set(ClientSet::Effects),
+            .in_set(ClientStep::Effects),
     );
 }
 
-pub(crate) fn now_ms(time: &Time<Real>) -> i64 {
+pub(crate) fn clock_millis(time: &Time<Real>) -> i64 {
     time.elapsed().as_millis() as i64
 }
 
 #[allow(clippy::type_complexity)]
 fn update_mixer(
-    time: Res<Time<Real>>,
-    mut torn: MessageReader<MatchTornDown>,
+    clock: Res<Time<Real>>,
+    mut torn: MessageReader<GameSessionClosed>,
     mut mixer: ResMut<DuckMixer>,
-    bank: Option<Res<SoundBank>>,
-    listeners: Query<&Transform, With<AmbientListener>>,
+    bank: Option<Res<AudioCatalogRes>>,
+    ears_q: Query<&Transform, With<BackgroundHearer>>,
     mut sources: Query<(
         Entity,
         &mut DuckSource,
-        Has<Voice>,
-        Option<&Channel3d>,
-        Option<&MapEmitter>,
-        Option<&crate::playback::AliasPlayback>,
+        Has<PlayingCue>,
+        Option<&SpatialVoice>,
+        Option<&LevelSoundSource>,
+        Option<&crate::play_core::AliasPlayback>,
     )>,
 ) {
-    if torn.read().count() > 0 {
+    let session_closed = torn.read().count() > 0;
+    if session_closed {
         mixer.reset();
     }
-    let now = now_ms(&time);
+    let now = clock_millis(&clock);
     // A voice that stopped (or was despawned) ends its duck.
     let ended: Vec<Entity> = mixer
-        .slots
+        .slot_list
         .iter()
         .flatten()
         .filter_map(|a| a.voice)
-        .filter(|&e| sources.get(e).map_or(true, |(_, _, has_voice, ..)| !has_voice))
+        .filter(|&e| {
+            sources
+                .get(e)
+                .map_or(true, |(_, _, has_voice, ..)| !has_voice)
+        })
         .collect();
     for voice in ended {
         mixer.end_voice(voice, now);
     }
-    for (entity, mut source, has_voice, ch, emitter, playback) in &mut sources {
+    for (ent, mut source, has_voice, ch, emitter, playback) in &mut sources {
         let position = ch
-            .map(|c| c.origin_inches)
-            .or_else(|| emitter.map(|m| m.origin_inches))
-            .unwrap_or([0.0; 3]);
+            .map(|c| c.position_in_inches)
+            .or_else(|| emitter.map(|m| m.position_in_inches))
+            .unwrap_or_default();
         if !has_voice {
-            source.started = false;
+            source.begun = false;
             continue;
         }
-        if !source.started {
-            source.started = true;
-            let Some(duck) = bank.as_ref().and_then(|b| b.0.ducks.get(&source.duck)).cloned()
+        if !source.begun {
+            source.begun = true;
+            let Some(duck) = bank
+                .as_ref()
+                .and_then(|b| b.0.ducks.get(&source.duck))
+                .cloned()
             else {
                 continue;
             };
             let alias = playback.map_or("", |p| p.alias.as_str());
-            mixer.start_voice(&duck, entity, &source, alias, position, now);
+            mixer.start_voice(&duck, ent, &source, alias, position, now);
             continue;
         }
         if source.positional {
-            for active in mixer.slots.iter_mut().flatten() {
-                if active.voice == Some(entity) {
-                    active.position = position;
+            for active in mixer.slot_list.iter_mut().flatten() {
+                if active.voice == Some(ent) {
+                    active.heard_at = position;
                 }
             }
         }
     }
-    let listener = listeners.iter().next().map(|t| transform_inches(t.translation));
-    mixer.update(now, time.delta_secs(), listener);
+    let listener = ears_q
+        .iter()
+        .next()
+        .map(|t| inches_of(t.translation));
+    mixer.refresh(now, clock.delta_secs(), listener);
 }
 
 /// The Reaper's cockpit loop, while its snapshot is on.
@@ -472,35 +480,37 @@ struct ScriptSound {
 #[allow(clippy::too_many_arguments)]
 fn script_sound_notifies(
     time: Res<Time<Real>>,
-    mut torn: MessageReader<MatchTornDown>,
-    presented: Option<Res<PresentedSnapshot>>,
-    local: Option<Res<LocalPresentClient>>,
-    bank: Option<Res<SoundBank>>,
+    mut torn: MessageReader<GameSessionClosed>,
+    presented: Option<Res<ShownWorldFrame>>,
+    local: Option<Res<HostViewClient>>,
+    bank: Option<Res<AudioCatalogRes>>,
     mut mixer: ResMut<DuckMixer>,
     mut play: MessageWriter<AliasCommand>,
     mut commands: Commands,
-    mut clips: Option<ResMut<ClipStore>>,
-    mut looping_assets: ResMut<Assets<LoopingPcmAudio>>,
-    mut pcm_assets: ResMut<Assets<PcmAudio>>,
-    mut gaps: ResMut<MissingAliasGaps>,
-    epoch: Res<MatchEpoch>,
+    mut clip_repo: Option<ResMut<ClipRepository>>,
+    mut loop_assets: ResMut<Assets<LoopedPcm>>,
+    mut clip_assets: ResMut<Assets<ClipPcm>>,
+    mut gaps: ResMut<UnknownCueHoles>,
+    epoch: Res<GameRoundSerial>,
     beds: Query<Entity, With<ReaperBed>>,
     mut state: Local<ScriptSound>,
 ) {
-    if torn.read().count() > 0 {
+    let session_closed = torn.read().count() > 0;
+    if session_closed {
         *state = ScriptSound::default();
-        for entity in &beds {
-            crate::backend::stop(&mut commands, entity);
+        for bed in &beds {
+            crate::backend::silence_cue(&mut commands, bed);
         }
     }
     let (Some(presented), Some(local), Some(bank)) = (presented, local, bank) else {
         return;
     };
-    let now = now_ms(&time);
+    let now = clock_millis(&time);
     let value = presented
         .snapshot()
-        .map(|snap| {
-            snap.meta
+        .map(|frame| {
+            frame
+                .meta
                 .script_dvars(local.0)
                 .string(SND_NOTIFY_DVAR)
                 .unwrap_or_default()
@@ -519,7 +529,7 @@ fn script_sound_notifies(
             if first + k as u64 <= state.seen {
                 continue;
             }
-            diag::info!(Audio, "audio: script sound notify `{notify}`");
+            diag::info!(Audio, "sound: script notify `{notify}` fired");
             match *notify {
                 "krms" => {
                     set_snapshot(&mut state, &mut mixer, &bank.0, REAPER_SNAPSHOT, now);
@@ -532,12 +542,12 @@ fn script_sound_notifies(
                 "pm" => set_snapshot(&mut state, &mut mixer, &bank.0, POST_MATCH_SNAPSHOT, now),
                 "pmf" => state.full_at = Some(now + POST_MATCH_FULL_DELAY_MS),
                 "fkcb" => {
-                    play.write(AliasCommand::Play(PlayAlias {
-                        namespace: AssetNamespace::T6,
+                    play.write(AliasCommand::Play(TriggerCueMsg {
+                        cue_ns: AssetCategoryScope::T6,
                         alias: FINAL_KILLCAM_STING.to_owned(),
                         fallback: None,
-                        origin_inches: None,
-                        snd_ent: Some(SND_ENT_LOCAL),
+                        position_in_inches: None,
+                        source_entity_no: Some(SOUND_SOURCE_SELF),
                     }));
                 }
                 _ => {}
@@ -547,19 +557,25 @@ fn script_sound_notifies(
     }
     if state.full_at.is_some_and(|at| now >= at) {
         state.full_at = None;
-        set_snapshot(&mut state, &mut mixer, &bank.0, POST_MATCH_FULL_SNAPSHOT, now);
+        set_snapshot(
+            &mut state,
+            &mut mixer,
+            &bank.0,
+            POST_MATCH_FULL_SNAPSHOT,
+            now,
+        );
     }
     if !state.want_bed {
-        for entity in &beds {
-            crate::backend::stop(&mut commands, entity);
+        for bed in &beds {
+            crate::backend::silence_cue(&mut commands, bed);
         }
     } else if beds.is_empty() {
         start_reaper_bed(
             &mut commands,
             &bank,
-            clips.as_deref_mut(),
-            &mut looping_assets,
-            &mut pcm_assets,
+            clip_repo.as_deref_mut(),
+            &mut loop_assets,
+            &mut clip_assets,
             &mut gaps,
             epoch.0,
         );
@@ -570,7 +586,7 @@ fn script_sound_notifies(
 fn set_snapshot(
     state: &mut ScriptSound,
     mixer: &mut DuckMixer,
-    bank: &SoundCatalog,
+    bank: &AudioRoster,
     next: &str,
     now: i64,
 ) {
@@ -590,78 +606,79 @@ fn set_snapshot(
 /// flat, a 3D one from that point.
 fn start_reaper_bed(
     commands: &mut Commands,
-    bank: &SoundBank,
-    clips: Option<&mut ClipStore>,
-    looping_assets: &mut Assets<LoopingPcmAudio>,
-    pcm_assets: &mut Assets<PcmAudio>,
-    gaps: &mut MissingAliasGaps,
+    bank: &AudioCatalogRes,
+    store: Option<&mut ClipRepository>,
+    loop_assets: &mut Assets<LoopedPcm>,
+    clip_assets: &mut Assets<ClipPcm>,
+    gaps: &mut UnknownCueHoles,
     epoch: u64,
 ) {
-    let Some(clips) = clips else {
+    let Some(store) = store else {
         return;
     };
-    let Some(key) = clip_keys_for_alias(&bank.0, AssetNamespace::T6, REAPER_LOOP)
+    let Some(key) = waveforms_for_cue(&bank.0, AssetCategoryScope::T6, REAPER_LOOP)
         .into_iter()
         .next()
     else {
-        gaps.record(REAPER_LOOP);
+        gaps.note_miss(REAPER_LOOP);
         return;
     };
-    clips.request(key.clone());
-    let Some(Ok(pcm)) = clips.ready(&key) else {
+    store.req_in(key.clone());
+    let Some(Ok(pcm)) = store.ready_pcm(&key) else {
         return;
     };
-    let row = bank
+    let entry = bank
         .0
-        .sound_in(AssetNamespace::T6, REAPER_LOOP)
-        .and_then(|s| s.aliases.first());
-    let volume = row.map_or(1.0, |a| a.vol_min.max(0.0));
-    let positional = row.and_then(|a| a.flags).is_some_and(|f| f & 2 != 0);
+        .entry_in(AssetCategoryScope::T6, REAPER_LOOP)
+        .and_then(|sound| sound.aliases.first());
+    let volume = entry.map_or(1.0, |a| a.volume_low.max(0.0));
+    let positional = entry.and_then(|a| a.alias_bits).is_some_and(|f| f & 2 != 0);
     let mut e = if positional {
-        let row = row.expect("positional row");
-        let knots: Arc<[[f32; 2]]> = row
+        let entry = entry.expect("positional row");
+        let knots: Arc<[[f32; 2]]> = entry
             .volume_falloff
             .as_ref()
             .map(|c| c.knots.iter().map(|&(x, y)| [x, y]).collect::<Vec<_>>())
             .unwrap_or_default()
             .into();
         commands.spawn((
-            MapAmbient,
-            MapEmitter {
-                origin_inches: [0.0; 3],
-                dist_min: row.dist_min,
-                dist_max: row.dist_max,
+            LevelBackdropSound,
+            LevelSoundSource {
+                position_in_inches: [0.0; 3],
+                reach_lower: entry.reach_lower,
+                reach_upper: entry.reach_upper,
                 knots,
-                base_gain: volume,
-                pcm: pcm_assets.add(pcm),
+                rest_gain: volume,
+                pcm: clip_assets.add(pcm),
                 speed: 1.0,
-                live_pan: None,
-                fixed_pan: row.stereo_pan,
-                category: row.menu_category,
+                active_stereo_handle: None,
+                fixed_pan: entry.stereo_pan,
+                category: entry.menu_category,
+                line_end_inches: None,
             },
             Transform::default(),
         ))
     } else {
-        let pcm = crate::pcm::with_stereo_pan(pcm, row.and_then(|a| a.stereo_pan));
-        let handle = looping_assets.add(pcm.into_looping());
-        let entity = crate::backend::spawn_loop(
+        let pcm = crate::sample_feed::with_stereo_pan(pcm, entry.and_then(|a| a.stereo_pan));
+        let handle = loop_assets.add(pcm.looped());
+        let entity = crate::backend::begin_repeating_cue(
             commands,
             handle,
             Volume::Linear(volume),
             epoch,
-            AudioScope::Match,
+            SoundAudience::Match,
         );
         let mut e = commands.entity(entity);
-        if let Some(category) = row.and_then(|a| a.menu_category) {
+        if let Some(category) = entry.and_then(|a| a.menu_category) {
             e.insert(crate::MenuVolume {
-                category,
+                cat_ix: category,
                 base: volume,
             });
         }
         e
     };
     e.insert(ReaperBed);
-    tag(&mut e, row, 0);
+    tag(&mut e, entry, 0);
     diag::info!(
         Audio,
         "audio: Reaper cockpit loop at {volume:.2} ({})",
@@ -673,17 +690,19 @@ fn start_reaper_bed(
 mod tests {
     use super::*;
 
-    fn duck(name: &str, fade_in: f32, fade_out: f32, length: f32, distance: f32) -> SndDuck {
+    fn duck(name: &str, ease_on: f32, ease_off: f32, length: f32, distance: f32) -> SndDuck {
         let mut attenuation = [1.0; 32];
         attenuation[3] = 0.0;
         attenuation[5] = 0.5;
         SndDuck {
             name: name.to_owned(),
-            id: name.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b))),
-            fade_in,
-            fade_out,
+            id: name
+                .bytes()
+                .fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b))),
+            ease_on,
+            ease_off,
             start_delay: 0.0,
-            distance,
+            fade_range: distance,
             length,
             update_while_paused: false,
             attenuation,
@@ -691,8 +710,8 @@ mod tests {
         }
     }
 
-    fn catalog(ducks: &[SndDuck]) -> SoundCatalog {
-        let mut c = SoundCatalog::default();
+    fn catalog(ducks: &[SndDuck]) -> AudioRoster {
+        let mut c = AudioRoster::default();
         for d in ducks {
             c.ducks.insert(d.id, d.clone());
         }
@@ -702,7 +721,7 @@ mod tests {
     fn settle(m: &mut DuckMixer, from: i64, to: i64) {
         let mut now = from;
         while now <= to {
-            m.update(now, 0.016, Some([0.0; 3]));
+            m.refresh(now, 0.016, Some([0.0; 3]));
             now += 16;
         }
     }
@@ -735,10 +754,10 @@ mod tests {
         assert_eq!(m.linear(Some(4)), 1.0);
         // Setting the same duck again keeps the one slot.
         m.set_duck(&bank, CATEGORY_SHELLSHOCK, "snap", 1000);
-        assert_eq!(m.slots.iter().flatten().count(), 1);
+        assert_eq!(m.slot_list.iter().flatten().count(), 1);
         m.set_duck(&bank, CATEGORY_SHELLSHOCK, "default", 1000);
         settle(&mut m, 1016, 3000);
-        assert_eq!(m.slots.iter().flatten().count(), 0);
+        assert_eq!(m.slot_list.iter().flatten().count(), 0);
         assert_eq!(m.linear(Some(3)), 1.0);
     }
 
@@ -751,7 +770,7 @@ mod tests {
         settle(&mut m, 0, 100);
         assert!(m.linear(Some(3)) < 1.0);
         settle(&mut m, 116, 1000);
-        assert_eq!(m.slots.iter().flatten().count(), 0);
+        assert_eq!(m.slot_list.iter().flatten().count(), 0);
         assert_eq!(m.linear(Some(3)), 1.0);
     }
 
@@ -760,10 +779,10 @@ mod tests {
         let bank = catalog(&[duck("snap", 0.0, 0.5, 0.0, 0.0)]);
         let mut m = DuckMixer::default();
         m.set_duck(&bank, CATEGORY_SCRIPT, "snap", 0);
-        m.update(0, 0.5, None);
+        m.refresh(0, 0.5, None);
         assert!((m.value[3] - 0.9).abs() < 1e-6);
         assert!((m.linear(Some(3)) - 0.729).abs() < 1e-5);
-        m.update(16, 0.005, None);
+        m.refresh(16, 0.005, None);
         assert!((m.value[3] - 0.85).abs() < 1e-5);
     }
 
@@ -777,7 +796,7 @@ mod tests {
         let bank = catalog(&[d]);
         let mut m = DuckMixer::default();
         m.set_duck(&bank, CATEGORY_SCRIPT, "near", 0);
-        assert_eq!(m.slots.iter().flatten().count(), 0);
+        assert_eq!(m.slot_list.iter().flatten().count(), 0);
     }
 
     #[test]
@@ -788,25 +807,25 @@ mod tests {
         let source = DuckSource {
             duck: d.id,
             positional: false,
-            looping: false,
+            repeats: false,
             total_ms: 1000,
-            started: true,
+            begun: true,
         };
         m.start_voice(&d, voice, &source, "shot", [0.0; 3], 0);
-        let a = m.slots.iter().flatten().next().unwrap();
+        let a = m.slot_list.iter().flatten().next().unwrap();
         assert_eq!(a.end_ms, 750);
         // A 2D sound may not carry a duck with a distance.
         let far = duck("far", 0.0, 0.25, 0.0, 500.0);
         m.start_voice(&far, voice, &source, "shot", [0.0; 3], 0);
-        assert_eq!(m.slots.iter().flatten().count(), 1);
+        assert_eq!(m.slot_list.iter().flatten().count(), 1);
         // The voice stops before its duck took effect: the duck goes at once.
         m.end_voice(voice, 0);
-        assert_eq!(m.slots.iter().flatten().count(), 0);
+        assert_eq!(m.slot_list.iter().flatten().count(), 0);
         // Stopped once it had: it fades out from then.
         m.start_voice(&d, voice, &source, "shot", [0.0; 3], 0);
-        m.update(16, 0.016, None);
+        m.refresh(16, 0.016, None);
         m.end_voice(voice, 100);
-        let a = m.slots.iter().flatten().next().unwrap();
+        let a = m.slot_list.iter().flatten().next().unwrap();
         assert_eq!((a.end_ms, a.voice), (100, None));
     }
 
@@ -818,13 +837,27 @@ mod tests {
         let source = DuckSource {
             duck: d.id,
             positional: true,
-            looping: true,
+            repeats: true,
             total_ms: 300,
-            started: true,
+            begun: true,
         };
         m.start_voice(&d, voice, &source, "loop", [0.0; 3], 0);
-        assert_eq!(m.slots.iter().flatten().next().unwrap().end_ms, 0);
+        assert_eq!(m.slot_list.iter().flatten().next().unwrap().end_ms, 0);
         m.fade_stop_voice(voice, 2000, 5000);
-        assert_eq!(m.slots.iter().flatten().next().unwrap().end_ms, 6000);
+        assert_eq!(m.slot_list.iter().flatten().next().unwrap().end_ms, 6000);
+    }
+
+    #[test]
+    fn clip_ms_counts_frames_not_samples() {
+        let mono = ClipPcm::from_parts(Arc::from(vec![0.0f32; 8_000]), 1, 8_000).expect("mono");
+        let stereo = ClipPcm::from_parts(Arc::from(vec![0.0f32; 8_000]), 2, 8_000).expect("stereo");
+        assert_eq!(clip_ms(&mono), 1000);
+        assert_eq!(clip_ms(&stereo), 500);
+    }
+
+    #[test]
+    fn clip_ms_truncates_a_partial_millisecond() {
+        let short = ClipPcm::from_parts(Arc::from(vec![0.0f32; 7]), 1, 8_000).expect("short");
+        assert_eq!(clip_ms(&short), 0);
     }
 }

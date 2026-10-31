@@ -3,7 +3,7 @@
 Inputs (read-only, on the developer's machine): the T6 asset-structure
 header and zone-load rules of an OpenAssetTools checkout. Facts only: type
 layouts (cross-checked against 32-bit MSVC by layoutcheck.py), and per member
-the counts, conditions, blocks and reuse rules. The output is our own Rust.
+the counts, when each one applies, its blocks and reuse rules. The output is our own Rust.
 
 usage: python t6gen.py <oat checkout> <out walk_gen.rs> [<layout check .cpp>]
 """
@@ -787,7 +787,7 @@ class Emitter:
         k = len(indices)
         off = self.slot_offset(mi, indices)
         comb = self.combined_index(mi, indices)
-        slot = 'p.at(%d)' % off
+        slot = 'base.at(%d)' % off
         tname = mi.type.name if mi.type else None
         asset = mi.type is not None and mi.type.asset is not None
         reusable = 'true' if mi.reusable else 'false'
@@ -858,7 +858,7 @@ class Emitter:
                 if dynamic_member(mi.type) is not None:
                     raise GenError('array of dynamic structs %s.%s' % (si.name, mi.name))
                 out.append('%s        w.load_at(b, n * %d)?;' % (ind, size))
-                out.append('%s        for i in 0..n { ld_%s(w, b.at(i * %d), false)?; }' % (ind, tname, size))
+                out.append('%s        for ix in 0..n { ld_%s(w, b.at(ix * %d), false)?; }' % (ind, tname, size))
                 out.append('%s        Ok(())' % ind)
             else:
                 out.append('%s        w.load_at(b, n * %d)' % (ind, size))
@@ -882,7 +882,7 @@ class Emitter:
             else:
                 n = str(mi.mods[k][1])
             if not mi.is_leaf:
-                out.append('%s{ let n = %s; for i in 0..n { ld_%s(w, %s.at(i * %d), %s)?; } }'
+                out.append('%s{ let n = %s; for ix in 0..n { ld_%s(w, %s.at(ix * %d), %s)?; } }'
                            % (ind, n, tname, slot, esz, 'true' if apl else 'false'))
             elif apl:
                 out.append('%s{ let n = %s; w.load_at(%s, n * %d)?; }' % (ind, n, slot, esz))
@@ -894,7 +894,7 @@ class Emitter:
             out.append('%s    let n = w.count(%s)?;' % (ind, self.expr(mi.dynsize[k])))
             out.append('%s    w.load_at(%s, n * %d)?;' % (ind, slot, esz))
             if mi.type is not None and not mi.type.is_leaf:
-                out.append('%s    for i in 0..n { ld_%s(w, %s.at(i * %d), false)?; }' % (ind, tname, slot, esz))
+                out.append('%s    for ix in 0..n { ld_%s(w, %s.at(ix * %d), false)?; }' % (ind, tname, slot, esz))
             out.append('%s}' % ind)
             return
 
@@ -910,16 +910,16 @@ class Emitter:
         """Elements of a pointer array whose pointers sit at `b` (count `n`)."""
         tname = mi.type.name if mi.type else None
         if mi.type is not None and mi.type.asset is not None:
-            out.append('%sfor i in 0..n { lp_%s(w, b.at(i * 4))?; }' % (ind, tname))
+            out.append('%sfor ix in 0..n { lp_%s(w, b.at(ix * 4))?; }' % (ind, tname))
             return
         reusable = 'true' if mi.reusable else 'false'
         size = self.pointee_size(mi, k)
         align = self.elem_alloc_align(mi)
         if mi.type is not None and not mi.type.is_leaf:
-            out.append('%sfor i in 0..n { w.elem_ptr(b.at(i * 4), %s, %d, |w, e| ld_%s(w, e, true))?; }'
+            out.append('%sfor ix in 0..n { w.elem_ptr(b.at(ix * 4), %s, %d, |w, e| ld_%s(w, e, true))?; }'
                        % (ind, reusable, align, tname))
         else:
-            out.append('%sfor i in 0..n { w.elem_ptr(b.at(i * 4), %s, %d, |w, e| w.load_at(e, %d))?; }'
+            out.append('%sfor ix in 0..n { w.elem_ptr(b.at(ix * 4), %s, %d, |w, e| w.load_at(e, %d))?; }'
                        % (ind, reusable, align, size))
 
     # -- per-structure functions -----------------------------------------
@@ -928,11 +928,11 @@ class Emitter:
             raise GenError('union %s has more than one member without a condition' % si.name)
         out = []
         dyn = dynamic_member(si)
-        out.append("fn ld_%s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {" % si.name)
-        out.append('    w.enter(%d, p)?;' % si.id)
+        out.append("fn ld_%s(w: &mut Walker<'_, '_>, base: Ptr, at_start: bool) -> LoadResult<()> {" % si.name)
+        out.append('    w.enter(%d, base)?;' % si.id)
         if not (si.is_union and dyn is not None):
             size = si.rec.size if dyn is None else dyn.m.offset
-            out.append('    if at_start { w.load_at(p, %d)?; }' % size)
+            out.append('    if at_start { w.load_at(base, %d)?; }' % size)
         else:
             out.append('    let _ = at_start;')
         push = None
@@ -981,8 +981,8 @@ class Emitter:
     def asset_fn(self, si):
         temp = si.block is not None and si.block.kind == 'temp'
         return [
-            "fn lp_%s(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {" % si.name,
-            '    w.asset_ptr(slot, %d, %s, %d, ld_%s)' % (si.id, 'true' if temp else 'false',
+            "fn lp_%s(w: &mut Walker<'_, '_>, ref_at: Ptr) -> LoadResult<()> {" % si.name,
+            '    w.asset_ptr(ref_at, %d, %s, %d, ld_%s)' % (si.id, 'true' if temp else 'false',
                                                        self.struct_alloc_align(si), si.name),
             '}',
         ]
@@ -995,9 +995,9 @@ class Emitter:
             '// rules. Do not edit by hand: change the generator and run it again.',
             '#![allow(non_snake_case, unused_variables, unused_parens, unused_imports, dead_code, clippy::all)]',
             '',
-            'use crate::asset_type::AssetType;',
-            'use crate::walk::{Kind, Walker};',
-            'use crate::zone::{Ptr, Result, ZoneError, ZonePtr};',
+            'use crate::xasset_kind::AssetType;',
+            'use crate::zone_walk::{Kind, Walker};',
+            'use crate::zone_core::{Ptr, LoadResult, ZoneError, ZonePtr};',
             '',
             'pub(crate) const TYPE_COUNT: usize = %d;' % len(infos),
             '',
@@ -1012,11 +1012,11 @@ class Emitter:
             out.append('    %s,' % ('Some(AssetType::%s)' % a if a else 'None'))
         out.append('];')
         out.append('')
-        out.append("pub(crate) fn load_xasset(w: &mut Walker<'_, '_>, ty: AssetType, slot: Ptr) -> Result<()> {")
-        out.append('    match ty {')
+        out.append("pub(crate) fn load_xasset(w: &mut Walker<'_, '_>, asset_kind: AssetType, ref_at: Ptr) -> LoadResult<()> {")
+        out.append('    match asset_kind {')
         for variant, struct in ASSET_DISPATCH:
-            out.append('        AssetType::%s => lp_%s(w, slot),' % (variant, struct))
-        out.append('        other => Err(ZoneError::NoAssetLoader(other)),')
+            out.append('        AssetType::%s => lp_%s(w, ref_at),' % (variant, struct))
+        out.append('        unknown => Err(ZoneError::NoWalkForType(unknown)),')
         out.append('    }')
         out.append('}')
         reach = self.reachable()

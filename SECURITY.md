@@ -1,38 +1,37 @@
-# Reporting a security issue
+# Reporting a security problem
 
-Use GitHub's **Report a vulnerability** button under the repository's Security
-tab. It opens a private advisory that only the maintainer can see. Please use it
-instead of a public issue when the report contains exploitation detail.
+Please report through the **Report a vulnerability** button on the repository's Security tab. That
+opens a private advisory which only the maintainer can read, and it is the right place whenever
+the report contains details someone could use to attack a player.
 
-This is a channel, not a program: there is no bounty, no triage SLA and no
-promised fix date. A single maintainer reads the reports.
+This is a way to reach the maintainer, not a program. There is no bounty, no response deadline and
+no promised fix date; one person reads the reports.
 
-## What is in scope
+## In scope
 
-IW4L is an experimental runtime and its network is meant for arranged playtests
-between people who agreed to play. Reports are most useful where a problem
-reaches past that:
+bo2mp is an experimental runtime. Its network exists for playtests that people have agreed to join.
+A report is most useful when the problem reaches beyond that:
 
-* code execution or file writes outside `iw4l-artifacts/` from map data, a
-  replay, a demo file or another client's traffic
-* anything that writes to, patches or deletes files in an original game
-  installation — IW4L reads those, and only reads them
-* the update path: a way for something other than the release host to deliver a
-  binary that the launcher accepts
-* leaking the machine's files, credentials or private keys to a peer or to the
-  master
+* running code, or writing files outside `bo2mp-artifacts/`, because of map data, a replay, a demo
+  file or another client's packets
+* anything that changes, patches or removes files in a Black Ops II installation. bo2mp opens
+  those files for reading and for nothing else
+* the update path: any way for something other than the release host to hand the launcher a
+  binary it will accept
+* sending the machine's files, credentials or private keys to another player or to the master
+  server
 
-## What is already known and not a finding
+## Known and not a finding
 
-* The protocol is unversioned across builds and unstable by design; two
-  different releases failing to talk to each other is expected.
-* The master relays between clients and vouches for nobody. Connecting to a
-  match means trusting who you are playing with, as stated in `README.md`.
-* IW4L parses game data that a local user chose to supply. Malformed data from
-  your own install crashing the runtime is a bug, not a vulnerability.
+* The wire protocol is not versioned between builds and changes freely, so two different releases
+  failing to connect is expected.
+* The master server passes traffic between clients and vouches for none of them. Joining a match
+  means trusting the people in it, as `README.md` says.
+* The runtime parses game data that the local user chose to point it at. If your own install's
+  malformed data crashes it, that is a bug but not a vulnerability.
 
-## What a report needs
+## What to include
 
-The commit or release, the OS, what data reproduced it, and the steps. A crash
-backtrace or the offending file is more useful than a description of it. Do not
-send `.env`, private keys, or copies of game files.
+Give the commit or release, the operating system, the data that reproduces it and the steps. A
+crash backtrace or the file that triggers it beats a description. Never attach `.env`, private
+keys or any game files.

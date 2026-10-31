@@ -6,52 +6,53 @@ use std::sync::Arc;
 
 use bevy::prelude::*;
 
-use crate::anim::model_materials::PreparedModelMaterials;
-use crate::anim::scene_submission::{AnimDObjSceneSkels, AnimDObjSceneSubmission, AnimSceneSubmit};
-use crate::anim::xmodel_pose::PosedModelSurface;
-use crate::occupancy::script_model::pose_script_dobj_with_materials;
+use crate::motion::model_materials::PreparedModelMaterials;
+use crate::motion::scene_feed::{SceneBonePoseSet, SkeletonSceneHandoff, SkeletonSceneStage};
+use crate::motion::figure_pose::SkinnedMeshFacet;
+use crate::occupancy::script_prop::pose_script_skeleton_and_materials;
 use crate::occupancy::t6_body::SlowGuard;
 use crate::{
-    ItemAssetDraw, ItemDrawPlan, ItemOwnerDraw, XMODEL_OBJECT_ID_ITEM_BASE, append_item_surfaces,
-    radius_lighting_box_half, stamp_plan_geometry, topology_fingerprint,
+    PickupMeshPaint, PickupPaintPlan, ModelOwnerPaint, PAINT_ID_FIRST_PICKUP, push_pickup_surfaces,
+    bump_plan_mesh_rev, ix_layout_digest,
 };
-use entity_t6::{EntityState, et, evaluate_trajectory};
-use frame::{RenderSet, WorkerCmdSet};
-use playerstate_t6::game::PERK_SCAVENGER;
+use lighting_t6::illum_query_half_size;
+use entity_t6::{EntitySnapshot, et, evaluate_trajectory};
+use frame::{DrawPassStage, JobQueueStage};
+use playerstate_t6::perks::PERK_SCAVENGER;
 use render_scene::{
-    GfxScene, HostGfxScene, ModelLightingOwner, ModelLightingRequest, ModelLightingRequests,
-    SmodelPassMaterial, TessMaterials, WorldModelLightingAtlas, WorldPresentFacts,
-    XModelSurfaceDraw, scene_quat_from_angles,
+    VisualStage, HostVisualStage, ModelIllumOwner, ModelIllumRequest, ModelIllumRequests,
+    PropPassMaterial, StitchMaterials, LevelModelIllumAtlas, LevelPresentFacts,
+    FigureFacetDraw, orientation_quat_from_euler,
 };
 
-mod compose;
-mod draw;
+mod item_build;
+mod draw_out;
 mod occupy;
 mod place;
 mod pose;
-use self::compose::*;
-use self::draw::*;
+use self::item_build::*;
+use self::draw_out::*;
 use self::occupy::*;
 pub use self::place::*;
 use self::pose::*;
 
-#[cfg(test)]
 mod tests;
 
 /// How far above an item its light sample is taken.
-pub const ITEM_LIGHTING_Z_OFS: f32 = 4.0;
+pub const ITEM_LIGHT_LIFT: f32 = 4.0;
 
 /// Entity flag: the item is not shown.
 const FLAG_ITEM_HIDDEN: i32 = 0x20;
 
 /// A dropped item's weapon model and attachments, assembled into one object.
 struct ItemComposition {
-    name: String,
-    model: assets::WorldWeaponIndex,
-    attachments: Vec<assets::WorldWeaponIndex>,
+    /// The compiled object the attachments hang off.
+    pub(super) dobj: xmodel_runtime::PosedSkeleton,
     /// Model and attachment names joined, identifying the posed result.
-    key: String,
-    dobj: xmodel_runtime::DObj,
+    pub(super) key: String,
+    attachments: Vec<assets::WorldWeaponSlot>,
+    mdl: assets::WorldWeaponSlot,
+    name: String,
 }
 
 /// Compositions for every weapon, valid for one loaded weapon set.
@@ -63,97 +64,105 @@ struct PreparedItemCompositions {
 
 impl PreparedItemCompositions {
     fn built_for(
-        weapons: &assets::PreparedWeapons,
-        world: &assets::PreparedWorldWeapons,
+        weapons: &assets::StagedWeapons,
+        world: &assets::ReadiedWorldWeapons,
     ) -> (usize, u64) {
-        (Arc::as_ptr(&weapons.0) as usize, world.0.identity())
+        let weapon_set = Arc::as_ptr(&weapons.0) as usize;
+        let world_set = world.0.identity();
+        (weapon_set, world_set)
     }
 
     fn matches(
         &self,
-        weapons: &assets::PreparedWeapons,
-        world: &assets::PreparedWorldWeapons,
+        weapons: &assets::StagedWeapons,
+        world: &assets::ReadiedWorldWeapons,
     ) -> bool {
-        self.built_for == Some(Self::built_for(weapons, world))
+        let Some(stamp) = self.built_for else {
+            return false;
+        };
+        stamp == Self::built_for(weapons, world)
     }
 }
 
 /// Items submitted to the scene this frame.
 #[derive(Resource, Default)]
-struct ItemOccupancy {
-    rows: Vec<OccupiedItem>,
+pub(super) struct ItemRows {
+    pub(super) rows: Vec<ItemRow>,
 }
 
-struct OccupiedItem {
-    /// Position among this frame's item entities.
-    slot: usize,
-    entnum: i32,
-    origin: [f32; 3],
-    angles: [f32; 3],
+pub(super) struct ItemRow {
     composition: Arc<ItemComposition>,
-    lighting_origin: [f32; 3],
+    pub(super) entnum: i32,
+    /// Position among this frame's item entities.
+    seat: usize,
+    illum_origin: [f32; 3],
+    angs: [f32; 3],
+    pos: [f32; 3],
 }
 
 /// Posed surfaces for each distinct composition, and who uses them.
 #[derive(Resource, Default)]
-struct ItemPoseProduct {
-    assets: Vec<ItemPosedAsset>,
-    owners: Vec<ItemPosedOwner>,
+pub(super) struct ItemPosed {
+    pub(super) owners: Vec<ItemPosedOwner>,
+    pub(super) assets: Vec<ItemPosedAsset>,
 }
 
-struct ItemPosedAsset {
-    key: String,
-    models: Vec<assets::WorldWeaponIndex>,
-    surfaces: Vec<PosedModelSurface>,
+pub(super) struct ItemPosedAsset {
+    surfaces: Vec<SkinnedMeshFacet>,
+    models: Vec<assets::WorldWeaponSlot>,
+    pub(super) key: String,
 }
 
-struct ItemPosedOwner {
-    asset_index: usize,
-    slot: usize,
-    entnum: u32,
-    origin: [f32; 3],
-    angles: [f32; 3],
+pub(super) struct ItemPosedOwner {
+    illum_origin: [f32; 3],
+    mdl: assets::WorldWeaponSlot,
     name: String,
-    model: assets::WorldWeaponIndex,
-    lighting_origin: [f32; 3],
+    rot: [f32; 3],
+    spot: [f32; 3],
+    ent_num: u32,
+    ix: usize,
+    pub(super) draw_asset_slot: usize,
 }
 
-pub fn register_item_systems(app: &mut App) {
-    app.init_resource::<ItemDrawPlan>()
-        .init_resource::<ItemOccupancy>()
-        .init_resource::<PreparedItemCompositions>()
-        .init_resource::<ItemPoseProduct>()
-        .add_systems(Update, build_item_compositions.in_set(net::ClientSet::Load))
-        .add_systems(
-            Update,
-            occupy_item_scene_ents
-                .in_set(RenderSet::Anim)
-                .before(WorkerCmdSet::CellDynModel)
-                .in_set(render_scene::GfxSceneAdd)
-                .in_set(AnimSceneSubmit),
-        )
-        .add_systems(
-            Update,
-            (pose_items, append_item_draws)
-                .chain()
-                .after(WorkerCmdSet::CellSceneEnt)
-                .after(WorkerCmdSet::DpvsEnt)
-                .before(WorkerCmdSet::CellDynModel)
-                .in_set(WorkerCmdSet::SkinModel),
-        );
+pub fn add_item_systems(application: &mut App) {
+    application.init_resource::<PreparedItemCompositions>();
+    application.init_resource::<ItemRows>();
+    application.init_resource::<ItemPosed>();
+    application.init_resource::<PickupPaintPlan>();
+
+    let dyn_model_cmds = JobQueueStage::CellDynModel;
+    application.add_systems(Update, build_item_compositions.in_set(net::ClientStep::Load));
+    let occupy_stage = occupy_item_scene_ents
+        .in_set(render_scene::RenderSceneInsert)
+        .in_set(SkeletonSceneStage)
+        .in_set(DrawPassStage::Anim);
+    application.add_systems(Update, occupy_stage.before(dyn_model_cmds));
+    let scene_ready = JobQueueStage::CellSceneEnt;
+    let pose_then_draw = (pose_items, append_item_draws).chain();
+    application.add_systems(
+        Update,
+        pose_then_draw
+            .in_set(JobQueueStage::SkinModel)
+            .after(JobQueueStage::DpvsEnt)
+            .after(scene_ready)
+            .before(dyn_model_cmds),
+    );
 }
 
 /// The scene state of one item's entity slot.
 struct SceneSlot<'a> {
-    hidden: bool,
-    skin_entries: &'a [dpvs_t6::SceneEntSkinEntry],
+    concealed: bool,
+    skin_jobs: &'a [dpvs_t6::EntitySkinSlotRecord],
 }
 
-fn scene_slot(scene: &GfxScene, entnum: u32) -> SceneSlot<'_> {
+fn scene_slot(scene: &VisualStage, entnum: u32) -> SceneSlot<'_> {
+    let skipped = scene.entity_not_drawn(entnum);
+    let rows: &[dpvs_t6::EntitySkinSlotRecord] = match scene.entity_bone_surface_set(entnum) {
+        Some(surfs) => surfs.entries.as_slice(),
+        None => &[],
+    };
     SceneSlot {
-        hidden: scene.scene_ent_skips_draw(entnum),
-        skin_entries: scene
-            .scene_ent_skinned_surfs(entnum)
-            .map_or(&[][..], |surfs| surfs.entries.as_slice()),
+        skin_jobs: rows,
+        concealed: skipped,
     }
 }

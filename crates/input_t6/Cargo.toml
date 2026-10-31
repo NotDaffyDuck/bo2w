@@ -2,7 +2,7 @@
 name = "input_t6"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
+publish.workspace = true
 description = "Black Ops II client input: the keys and the buttons they hold, bound commands, the stance and switch-weapon holds, turning, and the user command."
 
 [dependencies]

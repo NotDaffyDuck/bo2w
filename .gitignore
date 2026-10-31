@@ -11,3 +11,5 @@ bo2mp-artifacts
 # Local working material: notes, extracted assets, reverse-engineering tools
 # and their databases. None of it is part of the source.
 /context/
+
+__pycache__/

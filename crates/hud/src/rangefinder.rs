@@ -4,14 +4,15 @@
 //! 2-4). The renderer places the diamonds through the viewmodel's tag_hud
 //! (hud_t6::rangefinder::diamond_rect) and draws the screen into the UI3D texture.
 use bevy::prelude::*;
-use hud_t6::rangefinder as rf;
-use net::{CEntity, CEntityRuntime, FrameClock, LocalPresentClient, PresentedSnapshot};
-use playerstate_t6::game::{eflags, get_viewmodel_weapon_index};
+use hud_t6::rangefinder::{COLOR_CHANGE_DELAY_MS, MIN_ENEMY_SPOTTING_DIST, PERK_IMMUNE_RANGEFINDER, PERK_NONAME, SpotLatch, Stance, TRACE_RANGE, TraceTarget, active, draws_screen, spotted, stance_height};
+use net::{ClientEntityRecord, ClientEntityPoseState, FrameClock, HostViewClient, ShownWorldFrame};
+use playerstate_t6::game::{entity_flag_bits, get_viewmodel_weapon_index};
 
-use crate::overhead_names::{
-    OverheadPosedHead, OverheadPosedPlayerFrame, OverheadPosedPlayerFramePublished,
-    aimed_distance, head_visible, live_other_player, name_trace,
+use crate::name_tags::{
+    NameplateSkullPose, NameplateBodyPose, NameplateBodyPoseShared,
+    crosshair_hit_distance, clear_line_to, markable_player, tag_trace,
 };
+use bevy::app::Update;
 
 /// One frame of the Target Finder's sight screen. `draws_screen` off: nothing to draw.
 #[derive(Resource, Debug, Default, Clone, PartialEq)]
@@ -20,26 +21,23 @@ pub struct RangefinderSpots {
     /// The colour change: the targeting element list, red.
     pub targeting: bool,
     /// Enemies that get a diamond: origin and stance.
-    pub spots: Vec<([f32; 3], rf::Stance)>,
+    pub spots: Vec<([f32; 3], Stance)>,
 }
 
-pub(crate) fn register(app: &mut App) {
-    app.init_resource::<RangefinderSpots>().add_systems(
-        Update,
-        update_rangefinder_spots
-            .after(OverheadPosedPlayerFramePublished)
-            .in_set(frame::LifeFrontPublished),
-    );
+pub(crate) fn install_rangefinder(app: &mut App) {
+    let after_poses = update_rangefinder_spots.after(NameplateBodyPoseShared);
+    app.init_resource::<RangefinderSpots>()
+        .add_systems(Update, after_poses.in_set(frame::LifeStatePosted));
 }
 
 // Our wire's stance bits (playerstate_t6::game::eflags); the heights are BO2's (facts section 3).
-fn stance(e_flags: u32) -> rf::Stance {
-    if e_flags & eflags::PRONE != 0 {
-        rf::Stance::Prone
-    } else if e_flags & eflags::DUCK != 0 {
-        rf::Stance::Crouch
+fn stance(e_flags: u32) -> Stance {
+    if e_flags & entity_flag_bits::LYING_FLAT != 0 {
+        Stance::Prone
+    } else if e_flags & entity_flag_bits::CROUCH_BIT != 0 {
+        Stance::Crouch
     } else {
-        rf::Stance::Stand
+        Stance::Stand
     }
 }
 
@@ -47,86 +45,127 @@ fn has_perk(perks: u64, perk: u32) -> bool {
     perks & (1u64 << perk) != 0
 }
 
-#[allow(clippy::too_many_arguments)]
-fn update_rangefinder_spots(
-    presented: Res<PresentedSnapshot>,
-    local: Res<LocalPresentClient>,
-    posed: Res<OverheadPosedPlayerFrame>,
-    players: Query<(&CEntity, &CEntityRuntime)>,
-    cg_clock: Res<FrameClock>,
-    weapons: Option<Res<assets::PreparedWeapons>>,
-    cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
-    prediction: Option<Res<net::ClientPredictionState>>,
-    mut out: ResMut<RangefinderSpots>,
-    mut latch: Local<rf::SpotLatch>,
+/// The head to test a player's box with: the posed one when the render side
+/// has it, else a stance-height guess above the origin.
+fn marked_head(pose: Option<NameplateSkullPose>, feet: Vec3, stance: Stance) -> Vec3 {
+    match pose {
+        Some(NameplateSkullPose::TrueSceneSpace(at)) => Vec3::from_array(at),
+        _ => feet + Vec3::Z * stance_height(stance),
+    }
+}
+
+/// Keeps the nearest player box the view ray enters before the wall.
+fn nearer_aim(
+    best: &mut Option<(f32, TraceTarget)>,
+    hit: Option<f32>,
+    wall_dist: f32,
+    target: TraceTarget,
 ) {
-    let mut next = RangefinderSpots::default();
-    let spotted = 'frame: {
-        let Some(snapshot) = presented.snapshot() else { break 'frame false };
-        let Some(ps) = presented.alive_player(local.0) else { break 'frame false };
-        let has = weapons
-            .as_ref()
-            .and_then(|w| w.0.facts_of(get_viewmodel_weapon_index(ps)))
-            .is_some_and(|facts| facts.rangefinder);
-        // EMP-jammed: the same playerstate bit the weapon bar's emp_jammed reads.
-        let emp_jammed = ps.other_flags & 0x400 != 0;
-        next.draws_screen = rf::draws_screen(has, ps.f_weapon_pos_frac, emp_jammed);
-        if !next.draws_screen {
-            break 'frame false;
-        }
-        let Some(local_meta) = snapshot.meta.for_client(local.0) else { break 'frame false };
-        let Some((_, transform)) = cameras.iter().find(|(c, _)| c.is_active) else {
-            break 'frame false;
+    if let Some(d) = hit
+        && d <= wall_dist
+        && best.is_none_or(|(held, _)| d < held)
+    {
+        *best = Some((d, target));
+    }
+}
+
+/// One frame of the Target Finder survey. Fills `next` and says whether an
+/// enemy is spotted; `None` when something it needs is missing, in which case
+/// nothing is spotted.
+#[allow(clippy::too_many_arguments)]
+fn survey(
+    next: &mut RangefinderSpots,
+    presented: &ShownWorldFrame,
+    me: sim::ClientId,
+    heads: &NameplateBodyPose,
+    others: &Query<(&ClientEntityRecord, &ClientEntityPoseState)>,
+    armory: Option<&assets::StagedWeapons>,
+    eye_at: Option<&GlobalTransform>,
+    prediction: Option<&net::ClientGuessState>,
+) -> Option<bool> /* None: nothing to survey */ {
+    let snapshot = presented.snapshot()?;
+    let ps = presented.living_participant(me)?;
+    let has_finder = armory
+        .and_then(|w| w.0.summary_for(get_viewmodel_weapon_index(ps)))
+        .is_some_and(|facts| facts.rangefinder);
+    // EMP-jammed: the same playerstate bit the weapon bar's emp_jammed reads.
+    let emp_jammed = ps.secondary_state_bits & 0x400 != 0;
+    next.draws_screen = draws_screen(has_finder, ps.weapon_raise_fraction, emp_jammed);
+    if !next.draws_screen {
+        return None;
+    }
+    let my_meta = snapshot.meta.for_client(me)?;
+    let transform = eye_at?;
+    let world = prediction
+        .filter(|p| p.0.world().has_static_collision() && p.0.is_forecast_live())
+        .map(|p| p.0.world())?;
+    let eye = transform.translation();
+    let forward = *transform.forward();
+    let free_for_all = my_meta.client_state_team == 0;
+    // The view trace: the world's distance along the aim, then the nearest player box before it.
+    let wall_dist = tag_trace(world, eye, eye + forward * TRACE_RANGE).0 * TRACE_RANGE;
+    let mut aimed: Option<(f32, TraceTarget)> = None;
+    for (ident, live) in others {
+        let Some(meta) = markable_player(snapshot, me, ident, live).map(|found| found.1) else {
+            continue;
         };
-        let Some(world) = prediction
-            .as_ref()
-            .filter(|p| p.0.is_armed() && p.0.world().has_world_clip())
-            .map(|p| p.0.world())
-        else {
-            break 'frame false;
-        };
-        let eye = transform.translation();
-        let forward = *transform.forward();
-        let ffa = local_meta.client_state_team == 0;
-        // The view trace: the world's distance along the aim, then the nearest player box before it.
-        let wall_dist = name_trace(world, eye, eye + forward * rf::TRACE_RANGE).0 * rf::TRACE_RANGE;
-        let mut aimed: Option<(f32, rf::TraceTarget)> = None;
-        for (identity, runtime) in &players {
-            let Some((_, meta)) = live_other_player(snapshot, local.0, identity, runtime) else {
-                continue;
-            };
-            let enemy = ffa || meta.client_state_team != local_meta.client_state_team;
-            let origin = Vec3::from_array(runtime.origin);
-            let stance = stance(runtime.next_state.lerp.e_flags as u32);
-            let head = match posed.get(identity.number()) {
-                Some(OverheadPosedHead::ExactWorld(head)) => Vec3::from_array(head),
-                _ => origin + Vec3::Z * rf::stance_height(stance),
-            };
-            if let Some(d) = aimed_distance(eye, forward, origin, head)
-                && d <= wall_dist
-                && aimed.is_none_or(|(best, _)| d < best)
-            {
-                // Perk 42 PERK_NONAME blocks spotting (facts section 4).
-                let has_noname = has_perk(meta.t6_perks, rf::PERK_NONAME);
-                aimed = Some((d, rf::TraceTarget { is_client: true, enemy, has_noname }));
-            }
-            // Perk 35 PERK_IMMUNERANGEFINDER: no diamond (facts section 3).
-            if enemy
-                && !has_perk(meta.t6_perks, rf::PERK_IMMUNE_RANGEFINDER)
-                && head_visible(world, eye, head)
-            {
-                next.spots.push((runtime.origin, stance));
-            }
+        let enemy = free_for_all || meta.client_state_team != my_meta.client_state_team;
+        let origin = Vec3::from_array(live.origin);
+        let stance = stance(live.upcoming_condition.lerp.e_flags as u32);
+        let head = marked_head(heads.get(ident.number()), origin, stance);
+        // Perk 42 PERK_NONAME blocks spotting (facts section 4).
+        let has_noname = has_perk(meta.t6_perks, PERK_NONAME);
+        let target = TraceTarget { is_client: true, enemy, has_noname };
+        nearer_aim(&mut aimed, crosshair_hit_distance(eye, forward, origin, head), wall_dist, target);
+        // Perk 35 PERK_IMMUNERANGEFINDER: no diamond (facts section 3).
+        if enemy
+            && !has_perk(meta.t6_perks, PERK_IMMUNE_RANGEFINDER)
+            && clear_line_to(world, eye, head)
+        {
+            next.spots.push((live.origin, stance));
         }
-        rf::active(has, ps.f_weapon_pos_frac)
-            && rf::spotted(
+    }
+    Some(
+        active(has_finder, ps.weapon_raise_fraction)
+            && spotted(
                 aimed.map(|a| a.1),
                 false,
                 aimed.map_or(0.0, |a| a.0),
-                rf::MIN_ENEMY_SPOTTING_DIST,
-            )
-    };
-    next.targeting = latch.update(spotted, cg_clock.time(), rf::COLOR_CHANGE_DELAY_MS);
+                MIN_ENEMY_SPOTTING_DIST,
+            ),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_rangefinder_spots(
+    shown_frame: Res<ShownWorldFrame>,
+    local: Res<HostViewClient>,
+    heads: Res<NameplateBodyPose>,
+    others: Query<(&ClientEntityRecord, &ClientEntityPoseState)>,
+    game_clock: Res<FrameClock>,
+    armory: Option<Res<assets::StagedWeapons>>,
+    view_cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    prediction: Option<Res<net::ClientGuessState>>,
+    mut out: ResMut<RangefinderSpots>,
+    mut latch: Local<SpotLatch>,
+) {
+    let mut next = RangefinderSpots::default();
+    let eye_at = view_cameras
+        .iter()
+        .find(|(camera, _)| camera.is_active)
+        .map(|(_, transform)| transform);
+    let spotted = survey(
+        &mut next,
+        &shown_frame,
+        local.0,
+        &heads,
+        &others,
+        armory.as_deref(),
+        eye_at,
+        prediction.as_deref(),
+    )
+    .unwrap_or(false);
+    next.targeting = latch.feed(spotted, game_clock.time(), COLOR_CHANGE_DELAY_MS);
     if *out != next {
         *out = next;
     }
@@ -136,17 +175,50 @@ fn update_rangefinder_spots(
 mod tests {
     use super::*;
 
+    fn target(enemy: bool) -> TraceTarget {
+        TraceTarget { is_client: true, enemy, has_noname: false }
+    }
+
     #[test]
     fn stance_reads_our_wire_bits() {
-        assert_eq!(stance(0), rf::Stance::Stand);
-        assert_eq!(stance(eflags::DUCK), rf::Stance::Crouch);
-        assert_eq!(stance(eflags::PRONE | eflags::DUCK), rf::Stance::Prone);
+        assert_eq!(stance(0), Stance::Stand);
+        assert_eq!(stance(entity_flag_bits::CROUCH_BIT), Stance::Crouch);
+        assert_eq!(stance(entity_flag_bits::LYING_FLAT | entity_flag_bits::CROUCH_BIT), Stance::Prone);
     }
 
     #[test]
     fn perk_bits_are_perk_numbers() {
-        assert!(has_perk(1 << 35, rf::PERK_IMMUNE_RANGEFINDER));
-        assert!(!has_perk(1 << 35, rf::PERK_NONAME));
-        assert!(has_perk(1 << 42, rf::PERK_NONAME));
+        assert!(has_perk(1 << 35, PERK_IMMUNE_RANGEFINDER));
+        assert!(!has_perk(1 << 35, PERK_NONAME));
+        assert!(has_perk(1 << 42, PERK_NONAME));
+    }
+
+    #[test]
+    fn posed_head_wins_over_the_stance_guess() {
+        let origin = Vec3::new(10.0, 20.0, 30.0);
+        let posed = Some(NameplateSkullPose::TrueSceneSpace([1.0, 2.0, 3.0]));
+        assert_eq!(marked_head(posed, origin, Stance::Stand), Vec3::new(1.0, 2.0, 3.0));
+        let guess = marked_head(None, origin, Stance::Prone);
+        assert_eq!(guess, origin + Vec3::Z * stance_height(Stance::Prone));
+        let unposed = Some(NameplateSkullPose::MissingBodyOrSkull);
+        assert_eq!(marked_head(unposed, origin, Stance::Crouch), marked_head(None, origin, Stance::Crouch));
+    }
+
+    #[test]
+    fn aim_keeps_the_nearest_box_before_the_wall() {
+        let mut kept = None;
+        nearer_aim(&mut kept, Some(500.0), 400.0, target(true));
+        assert!(kept.is_none(), "behind the wall");
+        nearer_aim(&mut kept, None, 400.0, target(true));
+        assert!(kept.is_none(), "no hit");
+        nearer_aim(&mut kept, Some(300.0), 400.0, target(true));
+        nearer_aim(&mut kept, Some(350.0), 400.0, target(false));
+        let (distance, held) = kept.unwrap();
+        assert_eq!(distance, 300.0);
+        assert!(held.enemy);
+        nearer_aim(&mut kept, Some(100.0), 400.0, target(false));
+        let (distance, held) = kept.unwrap();
+        assert_eq!(distance, 100.0);
+        assert!(!held.enemy);
     }
 }

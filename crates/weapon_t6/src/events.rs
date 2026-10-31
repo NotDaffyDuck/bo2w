@@ -20,7 +20,7 @@ pub const EV_NOAMMO: u16 = 13;
 pub const EV_NOAMMO_LEFT: u16 = 14;
 pub const EV_EMPTYCLIP: u16 = 15;
 pub const EV_EMPTY_OFFHAND: u16 = 16;
-pub const EV_RESET_ADS: u16 = 17;
+pub const SIGNAL_SCOPE_RESTART: u16 = 17;
 pub const EV_RELOAD: u16 = 18;
 pub const EV_RELOAD_FROM_EMPTY: u16 = 19;
 pub const EV_RELOAD_START: u16 = 20;
@@ -145,7 +145,7 @@ pub fn name(id: u16) -> &'static str {
         EV_NOAMMO_LEFT => "NOAMMO_LEFT",
         EV_EMPTYCLIP => "EMPTYCLIP",
         EV_EMPTY_OFFHAND => "EMPTY_OFFHAND",
-        EV_RESET_ADS => "RESET_ADS",
+        SIGNAL_SCOPE_RESTART => "RESET_ADS",
         EV_RELOAD => "RELOAD",
         EV_RELOAD_FROM_EMPTY => "RELOAD_FROM_EMPTY",
         EV_RELOAD_START => "RELOAD_START",

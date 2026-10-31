@@ -1,8 +1,11 @@
 //! BO2's ten stock classes: the five preset classes, then the five a reset
-//! custom class holds. The perks and deathstreak come from the legacy menu
-//! catalog and are unverified.
+//! custom class holds. Their perks are not here: the stats table's "default
+//! classes" column names them, and the session fills them in from there.
 
-use frame::ClassPreset;
+use frame::KitTemplate;
+
+/// A loadout slot with nothing fitted.
+const NO_ATTACHMENTS: &[&str] = &[];
 
 /// A class with a primary, a secondary and the shared equipment of a stock
 /// custom class: `frag_grenade` and `concussion_grenade`.
@@ -10,152 +13,94 @@ const fn custom(
     name: &'static str,
     primary: &'static str,
     secondary: &'static str,
-    perks: [&'static str; 3],
-    deathstreak: &'static str,
-) -> ClassPreset {
-    ClassPreset {
+) -> KitTemplate {
+    KitTemplate {
         name,
         primary,
-        primary_attachments: &[],
+        main_gun_parts: &[],
         secondary,
-        secondary_attachments: &[],
+        side_gun_parts: NO_ATTACHMENTS,
         lethal: "t6:weapon/frag_grenade_mp",
         tactical: "t6:weapon/concussion_grenade_mp",
-        perks,
-        deathstreak,
+        perks: [""; 3],
     }
 }
 
-pub static CLASSES: [ClassPreset; 10] = [
-    ClassPreset {
+pub static CLASSES: [KitTemplate; 10] = [
+    KitTemplate {
         name: "class_smg",
         primary: "t6:weapon/evoskorpion_mp",
-        primary_attachments: &["extclip", "grip"],
+        main_gun_parts: &["extclip", "grip"],
         secondary: "t6:weapon/beretta93r_mp",
-        secondary_attachments: &["steadyaim"],
+        side_gun_parts: &["steadyaim"],
         lethal: "t6:weapon/satchel_charge_mp",
         tactical: "t6:weapon/willy_pete_mp",
-        perks: [
-            "specialty_marathon",
-            "specialty_lightweight",
-            "specialty_extendedmelee",
-        ],
-        deathstreak: "specialty_finalstand",
+        perks: [""; 3],
     },
-    ClassPreset {
+    KitTemplate {
         name: "class_cqb",
         primary: "t6:weapon/srm1216_mp",
-        primary_attachments: &["steadyaim"],
+        main_gun_parts: &["steadyaim"],
         secondary: "t6:weapon/crossbow_mp",
-        secondary_attachments: &[],
+        side_gun_parts: NO_ATTACHMENTS,
         lethal: "t6:weapon/hatchet_mp",
         tactical: "t6:weapon/tactical_insertion_mp",
-        perks: [
-            "specialty_marathon",
-            "specialty_coldblooded",
-            "specialty_extendedmelee",
-        ],
-        deathstreak: "specialty_combathigh",
+        perks: [""; 3],
     },
-    ClassPreset {
+    KitTemplate {
         name: "class_assault",
         primary: "t6:weapon/hk416_mp",
-        primary_attachments: &["reflex", "dualclip"],
+        main_gun_parts: &["reflex", "dualclip"],
         secondary: "t6:weapon/fhj18_mp",
-        secondary_attachments: &[],
+        side_gun_parts: NO_ATTACHMENTS,
         lethal: "t6:weapon/frag_grenade_mp",
         tactical: "t6:weapon/proximity_grenade_mp",
-        perks: [
-            "specialty_fastreload",
-            "specialty_bulletdamage",
-            "specialty_bulletaccuracy",
-        ],
-        deathstreak: "specialty_combathigh",
+        perks: [""; 3],
     },
-    ClassPreset {
+    KitTemplate {
         name: "class_lmg",
         primary: "t6:weapon/lsat_mp",
-        primary_attachments: &["rangefinder", "fastads", "fmj"],
+        main_gun_parts: &["rangefinder", "fastads", "fmj"],
         secondary: "",
-        secondary_attachments: &[],
+        side_gun_parts: NO_ATTACHMENTS,
         lethal: "t6:weapon/sticky_grenade_mp",
         tactical: "t6:weapon/trophy_system_mp",
-        perks: [
-            "specialty_bling",
-            "specialty_bulletdamage",
-            "specialty_detectexplosive",
-        ],
-        deathstreak: "specialty_copycat",
+        perks: [""; 3],
     },
-    ClassPreset {
+    KitTemplate {
         name: "class_sniper",
         primary: "t6:weapon/as50_mp",
-        primary_attachments: &["swayreduc", "vzoom"],
+        main_gun_parts: &["swayreduc", "vzoom"],
         secondary: "t6:weapon/kard_mp",
-        secondary_attachments: &["dw"],
+        side_gun_parts: &["dw"],
         lethal: "t6:weapon/bouncingbetty_mp",
         tactical: "t6:weapon/sensor_grenade_mp",
-        perks: [
-            "specialty_bling",
-            "specialty_coldblooded",
-            "specialty_localjammer",
-        ],
-        deathstreak: "specialty_copycat",
+        perks: [""; 3],
     },
     custom(
         "class_custom_smg",
         "t6:weapon/mp7_mp",
         "t6:weapon/fiveseven_mp",
-        [
-            "specialty_marathon",
-            "specialty_coldblooded",
-            "specialty_heartbreaker",
-        ],
-        "specialty_finalstand",
     ),
     custom(
         "class_custom_cqb",
         "t6:weapon/870mcs_mp",
         "t6:weapon/smaw_mp",
-        [
-            "specialty_marathon",
-            "specialty_lightweight",
-            "specialty_extendedmelee",
-        ],
-        "specialty_grenadepulldeath",
     ),
     custom(
         "class_custom_assault",
         "t6:weapon/tar21_mp",
         "t6:weapon/smaw_mp",
-        [
-            "specialty_fastreload",
-            "specialty_lightweight",
-            "specialty_bulletaccuracy",
-        ],
-        "specialty_copycat",
     ),
     custom(
         "class_custom_lmg",
         "t6:weapon/mk48_mp",
         "t6:weapon/smaw_mp",
-        [
-            "specialty_scavenger",
-            "specialty_hardline",
-            "specialty_bulletaccuracy",
-        ],
-        "specialty_copycat",
     ),
     custom(
         "class_custom_sniper",
         "t6:weapon/svu_mp",
         "t6:weapon/fiveseven_mp",
-        [
-            "specialty_marathon",
-            "specialty_coldblooded",
-            "specialty_heartbreaker",
-        ],
-        "specialty_finalstand",
     ),
 ];
 
@@ -189,12 +134,11 @@ mod tests {
     }
 
     #[test]
-    fn every_class_has_a_primary_and_the_three_perk_slots_filled() {
+    fn every_class_has_a_primary_and_equipment_and_leaves_its_perks_to_the_stats_table() {
         for class in &CLASSES {
             assert!(!class.primary.is_empty(), "{}", class.name);
             assert!(!class.lethal.is_empty() && !class.tactical.is_empty());
-            assert!(class.perks.iter().all(|p| !p.is_empty()), "{}", class.name);
-            assert!(!class.deathstreak.is_empty(), "{}", class.name);
+            assert!(class.perks.iter().all(|p| p.is_empty()), "{}", class.name);
         }
     }
 
@@ -226,8 +170,8 @@ mod tests {
         for class in &CLASSES[5..] {
             assert_eq!(class.lethal, "t6:weapon/frag_grenade_mp", "{}", class.name);
             assert_eq!(class.tactical, "t6:weapon/concussion_grenade_mp");
-            assert!(class.primary_attachments.is_empty());
-            assert!(class.secondary_attachments.is_empty());
+            assert!(class.main_gun_parts.is_empty());
+            assert!(class.side_gun_parts.is_empty());
         }
     }
 
@@ -235,8 +179,8 @@ mod tests {
     fn the_smg_preset_carries_its_attachments() {
         let smg = &CLASSES[0];
         assert_eq!(smg.name, "class_smg");
-        assert_eq!(smg.primary_attachments, ["extclip", "grip"]);
-        assert_eq!(smg.secondary_attachments, ["steadyaim"]);
+        assert_eq!(smg.main_gun_parts, ["extclip", "grip"]);
+        assert_eq!(smg.side_gun_parts, ["steadyaim"]);
     }
 
     /// The only test that writes the process-wide table, so the others in
@@ -246,6 +190,6 @@ mod tests {
         register();
         assert_eq!(frame::showcase_classes(), &CLASSES[..]);
         assert_eq!(frame::pick_showcase(11, 10).len(), 10);
-        assert_eq!(frame::HostClassLoadouts::default().slots.len(), 5);
+        assert_eq!(frame::ServerKitRoster::default().slots.len(), 5);
     }
 }

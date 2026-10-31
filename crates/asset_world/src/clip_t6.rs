@@ -1,4 +1,4 @@
-//! bo2zm: Black Ops II clipMap_t -> ClipCollision. Not part of the upstream engine.
+//! bo2zm: Black Ops II clipMap_t -> CollisionClipData. Not part of the upstream engine.
 //!
 //! T6 brushes and collision triangles follow T5's shapes (box + extra side
 //! planes; triangles in partitions under an AABB tree), so this mirrors the
@@ -11,53 +11,56 @@
 
 use asset_t6::{ClipBrushRef, ClipLeafRef, ClipRef, XModelCollSurfRef, XModelRef};
 use clipmap_t6::{
-    AabbTree, CModel, CPlane, ClipMap, ClipMaterial, ClipStore, Leaf, Node, Partition, StaticModelStore, StaticWorld,
-    StoreError, StoredBrush, StoredCollSurf, StoredLeafBrushNode, StoredStaticModel, StoredXModel, XModelCollTri,
+    AabbTree, CModel, PlaneEquation, ClipMap, ClipMaterial, ClipRepository, Leaf, Node, Partition, StaticModelStore, StaticWorld,
+    StoreError, StoredBrush, StoredCollSurf, StoredLeafBrushNode, StoredStaticModel, StoredXModel, ModelHitTriangle,
 };
-use trace_t6::{BrushSide, Plane};
+use trace_t6::{Brush, BrushSide, Plane};
 
-use crate::clip_error::ClipCollisionError;
+use crate::clip_error::SolidsTraceFault;
+
 use crate::clip_flags::{t5_axial_plane_flags, t5_surface_flags};
 use crate::clip_leafbrush::{LEAFBRUSH_NODE_MAX_DEPTH, leafbrush_node_visits, leafbrush_range};
 use crate::clip_tables::{
-    ClipBrush, ClipBspLeaf, ClipBspNode, ClipCmodel, ClipCollision, ClipMapMaterial,
+    CollisionSolid, ClipLeafRow, ClipNodeRow, CollisionSubmodel, CollisionClipData, ClipMaterialRow,
 };
 
+fn truncated() -> SolidsTraceFault {
+    SolidsTraceFault::Truncated
+}
+
 /// Append the brush list under one leaf's brush node (0 = none) and return
-/// its range in `out`.
+/// its range in `listed`.
 fn append_leaf_brushes(
     clip: &ClipRef,
     leaf: &ClipLeafRef,
-    out: &mut Vec<u16>,
-) -> Result<(u32, u16), ClipCollisionError> {
-    let first_len = out.len();
-    if leaf.leaf_brush_node > 0 {
-        let mut pending = vec![(leaf.leaf_brush_node as usize, 0)];
-        while let Some((index, depth)) = pending.pop() {
-            if depth > LEAFBRUSH_NODE_MAX_DEPTH {
-                return Err(ClipCollisionError::Truncated);
-            }
-            let node = clip
-                .leafbrush_nodes
-                .get(index)
-                .ok_or(ClipCollisionError::Truncated)?;
-            if node.leaf_brush_count > 0 {
-                out.extend_from_slice(&node.brushes);
-            } else {
-                pending.extend(
-                    leafbrush_node_visits(
-                        index,
-                        node.leaf_brush_count,
-                        usize::from(node.child_offset[0]),
-                        usize::from(node.child_offset[1]),
-                    )
-                    .into_iter()
-                    .map(|i| (i, depth + 1)),
-                );
-            }
-        }
+    listed: &mut Vec<u16>,
+) -> Result<(u32, u16), SolidsTraceFault> {
+    let before = Vec::len(listed);
+    if let Some(root) = usize::try_from(leaf.brush_leaf_link).ok().filter(|&root| root > 0) {
+        gather_node_brushes(clip, root, 0, listed)?;
     }
-    leafbrush_range(first_len, out.len())
+    leafbrush_range(before, listed.len())
+}
+
+/// The brushes of the node at `at` and of every node its chain reaches,
+/// last-listed branch first, `depth` nodes down from the leaf's own.
+fn gather_node_brushes(
+    clip: &ClipRef,
+    at: usize,
+    hops: usize,
+    out: &mut Vec<u16>,
+) -> Result<(), SolidsTraceFault> {
+    (hops <= LEAFBRUSH_NODE_MAX_DEPTH).then_some(()).ok_or_else(truncated)?;
+    let entry = clip.leafbrush_nodes.get(at).ok_or_else(truncated)?;
+    if entry.leaf_solid_total > 0 {
+        out.extend_from_slice(&entry.brushes);
+        return Ok(());
+    }
+    let [jump_a, jump_b] = entry.child_offset.map(usize::from);
+    leafbrush_node_visits(at, entry.leaf_solid_total, jump_a, jump_b)
+        .into_iter()
+        .rev()
+        .try_for_each(|next| gather_node_brushes(clip, next, hops + 1, out))
 }
 
 /// codmp: what `attach_t6_glass_brushes` did, for the load report.
@@ -79,344 +82,392 @@ pub struct T6GlassClipCensus {
 /// `CM_TransformedBoxTrace` at this origin, turned by these angles.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct T6GlassPlacement {
-    pub brush_model: u32,
+    pub solid_model: u32,
     pub origin: [f32; 3],
     pub angles: [f32; 3],
     /// Which of the map's windows this is (its index in the capture's).
     pub glass: usize,
 }
 
+fn dot_product(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a.into_iter().zip(b).map(|(x, y)| x * y).fold(0.0, |sum, term| sum + term)
+}
+
+/// A window's frame: model space -> world is origin + x*axis[0] + y*axis[1] + z*axis[2].
+struct PaneFrame {
+    origin: [f32; 3],
+    axes: [[f32; 3]; 3],
+}
+
+impl PaneFrame {
+    fn of(place: &T6GlassPlacement) -> Self {
+        Self { origin: place.origin, axes: game_math::euler_to_rows(place.angles) }
+    }
+
+    /// `v` (model space) turned to the world's axes, no shift.
+    fn turn(&self, v: [f32; 3]) -> [f32; 3] {
+        std::array::from_fn(|k| self.axes.iter().zip(v).fold(0.0, |sum, (axis, part)| sum + part * axis[k]))
+    }
+
+    fn world_point(&self, pt: [f32; 3]) -> [f32; 3] {
+        std::array::from_fn(|k| self.axes.iter().zip(pt).fold(self.origin[k], |sum, (axis, part)| sum + part * axis[k]))
+    }
+
+    /// The side plane n.x <= d in model space is n'.w <= d + n'.origin in the
+    /// world, n' the normal turned by the axis.
+    fn world_plane(&self, side: [f32; 4]) -> [f32; 4] {
+        let [facing_x, facing_y, facing_z, d] = side;
+        let turned = self.turn([facing_x, facing_y, facing_z]);
+        let offset = turned.iter().zip(self.origin).fold(d, |sum, (t, o)| sum + t * o);
+        [turned[0], turned[1], turned[2], offset]
+    }
+
+    /// The world box around a model box's eight corners.
+    fn level_bounds(&self, (box_lo, box_hi): ([f32; 3], [f32; 3])) -> ([f32; 3], [f32; 3]) {
+        (0..8u32)
+            .map(|corner| self.world_point(std::array::from_fn(|k| if corner >> k & 1 == 1 { box_hi[k] } else { box_lo[k] })))
+            .fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), pt| {
+                (std::array::from_fn(|k| lo[k].min(pt[k])), std::array::from_fn(|k| hi[k].max(pt[k])))
+            })
+    }
+}
+
+/// Move a window brush into the world and tag it; the world box it now fills.
+fn plant_glass_brush(brush: &mut CollisionSolid, frame: &PaneFrame, tag: u16) -> ([f32; 3], [f32; 3]) {
+    brush.glass_hit_code = tag;
+    let p = &brush.planes;
+    let model_box = ([-p[1][3], -p[3][3], -p[5][3]], [p[0][3], p[2][3], p[4][3]]);
+    brush.planes.iter_mut().for_each(|plane| *plane = frame.world_plane(*plane));
+    frame.level_bounds(model_box)
+}
+
+/// Every leaf slot the box `lo..hi` reaches, in the order a depth-first walk
+/// of the tree (second child pushed last, visited first) meets them. A map
+/// with no tree is one leaf.
+fn leaf_slots_reached(nodes: &[ClipNodeRow], lo: [f32; 3], hi: [f32; 3]) -> Result<Vec<usize>, SolidsTraceFault> {
+    let Some(_) = nodes.first() else {
+        return Ok(vec![0]);
+    };
+    let centre: [f32; 3] = std::array::from_fn(|k| (lo[k] + hi[k]) * 0.5);
+    let extent: [f32; 3] = std::array::from_fn(|k| (hi[k] - lo[k]) * 0.5 + 0.125);
+    let (mut pending, mut slots, mut budget) = (vec![0i32], Vec::new(), 1usize << 20);
+    while let Some(cursor) = pending.pop() {
+        budget = budget.checked_sub(1).ok_or_else(truncated)?;
+        if cursor < 0 {
+            slots.push((!cursor) as usize);
+            continue;
+        }
+        let Some(split) = nodes.get(cursor as usize) else { continue };
+        let normal = [split.plane[0], split.plane[1], split.plane[2]];
+        let dist = dot_product(normal, centre) - split.plane[3];
+        let reach = dot_product(extent, normal.map(f32::abs));
+        let reaches = [dist + reach >= 0.0, dist - reach < 0.0];
+        pending.extend(split.children.iter().zip(reaches).filter(|&(_, yes)| yes).map(|(&child, _)| child));
+    }
+    Ok(slots)
+}
+
+/// The brush lists `ranges` name in `table`, one list per range.
+fn lists_in(table: &[u16], ranges: impl Iterator<Item = (u32, u16)>) -> Vec<Vec<u16>> {
+    ranges
+        .map(|(start, count)| {
+            let from = start as usize;
+            table.get(from..from + usize::from(count)).unwrap_or_default().to_vec()
+        })
+        .collect()
+}
+
+/// Lay `lists` end to end in `merged`, writing each one's range into its slot.
+fn pack_lists<'s>(
+    lists: &[Vec<u16>],
+    slots: impl Iterator<Item = (&'s mut u32, &'s mut u16)>,
+    merged: &mut Vec<u16>,
+) -> Result<(), SolidsTraceFault> {
+    for (list, (first, count)) in lists.iter().zip(slots) {
+        let before = merged.len();
+        merged.extend_from_slice(list);
+        (*first, *count) = leafbrush_range(before, merged.len())?;
+    }
+    Ok(())
+}
+
 /// codmp: Black Ops II's windows stand until they break. Each window's
 /// brushes belong to its brush model (`*N`), which no world leaf lists, so
 /// nothing was stopped by them. Move each brush to where its window stands
-/// (`placements[pane]`), tag it with its pane (`glass_encoded` = pane + 1,
+/// (`placements[pane]`), tag it with its pane (`glass_hit_code` = pane + 1,
 /// what a trace asks the glass state about) and list it in every world leaf
 /// its box reaches.
 pub fn attach_t6_glass_brushes(
-    out: &mut ClipCollision,
+    out: &mut CollisionClipData,
     placements: &[T6GlassPlacement],
-) -> Result<T6GlassClipCensus, ClipCollisionError> {
+) -> Result<T6GlassClipCensus, SolidsTraceFault> {
     let mut census = T6GlassClipCensus::default();
-    let range = |first: u32, num: u16| first as usize..first as usize + usize::from(num);
-    let mut leaf_lists: Vec<Vec<u16>> = out
-        .leaves
-        .iter()
-        .map(|l| out.leafbrushes.get(range(l.first_brush, l.num_brushes)).unwrap_or(&[]).to_vec())
-        .collect();
-    let model_lists: Vec<Vec<u16>> = out
-        .cmodels
-        .iter()
-        .map(|m| out.leafbrushes.get(range(m.first_brush, m.num_brushes)).unwrap_or(&[]).to_vec())
-        .collect();
-    for (pane, place) in placements.iter().enumerate() {
-        let Ok(encoded) = u16::try_from(pane + 1) else {
-            break;
+    let mut leaf_lists = lists_in(&out.brush_leaf_indices, out.leaves.iter().map(|lf| (lf.initial_convex_solid, lf.solid_volume_total)));
+    let model_lists = lists_in(&out.brush_leaf_indices, out.cmodels.iter().map(|cm| (cm.initial_convex_solid, cm.solid_volume_total)));
+    // Panes are tagged 1, 2, ..; the tag is a u16, so the 65536th window ends the walk.
+    for (tag, place) in (1..=u16::MAX).zip(placements) {
+        let members = match place.solid_model {
+            0 => None,
+            model => model_lists.get(model as usize),
         };
-        let model = place.brush_model;
-        let Some(list) = model_lists.get(model as usize).filter(|_| model != 0) else {
+        let Some(members) = members else {
             census.missing_models += 1;
             continue;
         };
         census.panes += 1;
-        // `AnglesToAxis`: model space -> world is origin + x*axis[0] + y*axis[1] + z*axis[2].
-        let axis = game_math::angles_to_axis(place.angles);
-        let o = place.origin;
-        let to_world = |l: [f32; 3]| {
-            [0, 1, 2].map(|j| o[j] + l[0] * axis[0][j] + l[1] * axis[1][j] + l[2] * axis[2][j])
-        };
-        for &b in list {
-            let Some(brush) = out.brushes.get_mut(usize::from(b)) else {
+        let frame = PaneFrame::of(place);
+        for &brush_id in members {
+            let Some(solid) = out.brushes.get_mut(usize::from(brush_id)).filter(|b| b.planes.len() >= 6) else {
                 continue;
             };
-            if brush.planes.len() < 6 {
-                continue;
-            }
-            if brush.glass_encoded != 0 {
+            if solid.glass_hit_code != 0 {
                 census.shared_brushes += 1;
                 continue;
             }
-            brush.glass_encoded = encoded;
             if census.brushes == 0 {
-                census.contents = brush.contents;
+                census.contents = solid.contents;
             }
             census.brushes += 1;
-            let p = &brush.planes;
-            let local_mins = [-p[1][3], -p[3][3], -p[5][3]];
-            let local_maxs = [p[0][3], p[2][3], p[4][3]];
-            // Each side plane n.x <= d in model space is n'.w <= d + n'.origin in the
-            // world, n' the normal turned by the axis.
-            for plane in &mut brush.planes {
-                let n = [0, 1, 2]
-                    .map(|j| plane[0] * axis[0][j] + plane[1] * axis[1][j] + plane[2] * axis[2][j]);
-                let d = plane[3] + n[0] * o[0] + n[1] * o[1] + n[2] * o[2];
-                *plane = [n[0], n[1], n[2], d];
-            }
-            // The world box around the model box's eight corners.
-            let mut mins = [f32::MAX; 3];
-            let mut maxs = [f32::MIN; 3];
-            for corner in 0..8 {
-                let pick = |i: usize| if corner >> i & 1 == 0 { local_mins[i] } else { local_maxs[i] };
-                let w = to_world([pick(0), pick(1), pick(2)]);
-                for j in 0..3 {
-                    mins[j] = mins[j].min(w[j]);
-                    maxs[j] = maxs[j].max(w[j]);
-                }
-            }
-            let center = [0, 1, 2].map(|i| (mins[i] + maxs[i]) * 0.5);
-            let half = [0, 1, 2].map(|i| (maxs[i] - mins[i]) * 0.5 + 0.125);
-            let mut pending = vec![0i32];
-            let mut steps = 0usize;
-            while let Some(num) = pending.pop() {
-                steps += 1;
-                if steps > 1 << 20 {
-                    return Err(ClipCollisionError::Truncated);
-                }
-                if out.nodes.is_empty() || num < 0 {
-                    let leaf = if out.nodes.is_empty() { 0 } else { (!num) as usize };
-                    if let Some(l) = leaf_lists.get_mut(leaf) {
-                        if !l.contains(&b) {
-                            l.push(b);
-                            census.leaf_links += 1;
-                        }
-                    }
-                    continue;
-                }
-                let Some(node) = out.nodes.get(num as usize) else {
+            let (lo, hi) = plant_glass_brush(solid, &frame, tag);
+            for slot in leaf_slots_reached(&out.nodes, lo, hi)? {
+                let Some(list) = leaf_lists.get_mut(slot).filter(|l| !l.contains(&brush_id)) else {
                     continue;
                 };
-                let n = [node.plane[0], node.plane[1], node.plane[2]];
-                let d = n[0] * center[0] + n[1] * center[1] + n[2] * center[2] - node.plane[3];
-                let r = half[0] * n[0].abs() + half[1] * n[1].abs() + half[2] * n[2].abs();
-                if d + r >= 0.0 {
-                    pending.push(node.children[0]);
-                }
-                if d - r < 0.0 {
-                    pending.push(node.children[1]);
-                }
+                list.push(brush_id);
+                census.leaf_links += 1;
             }
         }
     }
-    if census.brushes == 0 {
-        return Ok(census);
+    if census.brushes > 0 {
+        let mut merged = Vec::with_capacity(out.brush_leaf_indices.len() + census.leaf_links);
+        pack_lists(&leaf_lists, out.leaves.iter_mut().map(|lf| (&mut lf.initial_convex_solid, &mut lf.solid_volume_total)), &mut merged)?;
+        pack_lists(&model_lists, out.cmodels.iter_mut().map(|cm| (&mut cm.initial_convex_solid, &mut cm.solid_volume_total)), &mut merged)?;
+        out.brush_leaf_indices = merged;
     }
-    let mut leafbrushes = Vec::with_capacity(out.leafbrushes.len() + census.leaf_links);
-    for (leaf, list) in out.leaves.iter_mut().zip(&leaf_lists) {
-        let first = leafbrushes.len();
-        leafbrushes.extend_from_slice(list);
-        (leaf.first_brush, leaf.num_brushes) = leafbrush_range(first, leafbrushes.len())?;
-    }
-    for (m, list) in out.cmodels.iter_mut().zip(&model_lists) {
-        let first = leafbrushes.len();
-        leafbrushes.extend_from_slice(list);
-        (m.first_brush, m.num_brushes) = leafbrush_range(first, leafbrushes.len())?;
-    }
-    out.leafbrushes = leafbrushes;
     Ok(census)
 }
 
-pub fn build_t6_clip_collision(clip: &ClipRef) -> Result<ClipCollision, ClipCollisionError> {
-    if clip.brushes.is_empty() && clip.tri_indices.is_empty() {
-        return Err(ClipCollisionError::MissingTables);
-    }
-    let mut out = ClipCollision {
-        brushes: Vec::with_capacity(clip.brushes.len()),
-        ..ClipCollision::default()
-    };
+/// The flags of the material named "caulk" (a map without one has none to skip).
+fn caulk_surface_flags(clip: &ClipRef) -> u32 {
+    let named_caulk = clip.materials.iter().find(|mat| mat.name == "caulk");
+    named_caulk.map_or(u32::MAX, |mat| mat.surface_flags as u32)
+}
+
+pub fn build_t6_clip_collision(clip: &ClipRef) -> Result<CollisionClipData, SolidsTraceFault> {
+    let has_geometry = [clip.brushes.len(), clip.tri_index_list.len()].iter().any(|&n| n > 0);
+    has_geometry.then_some(()).ok_or(SolidsTraceFault::NoBrushTables)?;
     // bo2mp: BO2's player collision skips caulk faces when it picks the face
-    // a brush hit reports; caulk is the flags of the material named "caulk"
-    // (a map without one has no face to skip).
-    let caulk = clip
-        .materials
+    // a brush hit reports.
+    let caulk = caulk_surface_flags(clip);
+    let mut brush_leaf_indices = Vec::new();
+    let leaves = clip
+        .leaves
         .iter()
-        .find(|m| m.name == "caulk")
-        .map_or(u32::MAX, |m| m.surface_flags as u32);
-    out.brushes.extend(clip.brushes.iter().map(|b| t6_brush(b, caulk)));
-
-    for m in &clip.materials {
-        out.materials.push(ClipMapMaterial {
-            name: m.name.clone(),
-            surface_flags: t5_surface_flags(m.surface_flags as u32),
-            content_flags: m.content_flags as u32,
-        });
-    }
-
-    for n in &clip.nodes {
-        out.nodes.push(ClipBspNode {
-            plane: n.plane,
-            children: [i32::from(n.children[0]), i32::from(n.children[1])],
-        });
-    }
-    for leaf in &clip.leaves {
-        let (first_brush, num_brushes) = append_leaf_brushes(clip, leaf, &mut out.leafbrushes)?;
-        out.leaves.push(ClipBspLeaf {
-            first_brush,
-            num_brushes,
-            first_coll_aabb_index: leaf.first_coll_aabb_index,
-            coll_aabb_count: leaf.coll_aabb_count,
-        });
-    }
-    for m in &clip.cmodels {
-        let (first_brush, num_brushes) = if m.shares_map_info {
-            append_leaf_brushes(clip, &m.leaf, &mut out.leafbrushes)?
-        } else {
-            leafbrush_range(out.leafbrushes.len(), out.leafbrushes.len())?
-        };
-        out.cmodels.push(ClipCmodel {
-            mins: m.mins,
-            maxs: m.maxs,
-            radius: m.radius,
-            first_brush,
-            num_brushes,
-        });
-        out.cmodel_mesh_roots
-            .push((m.leaf.first_coll_aabb_index, m.leaf.coll_aabb_count));
-    }
-    // bo2mp: the clip map BO2's traces read comes from the same tables; a map
-    // whose tables point outside themselves does not load.
-    out.t6 = Some(t6_clip_map(clip).map_err(ClipCollisionError::Store)?);
-    Ok(out)
+        .map(|leaf| {
+            let (start, count) = append_leaf_brushes(clip, leaf, &mut brush_leaf_indices)?;
+            Ok(ClipLeafRow {
+                initial_convex_solid: start,
+                solid_volume_total: count,
+                first_collision_box_slot: leaf.first_collision_box_slot,
+                collision_box_total: leaf.collision_box_total,
+            })
+        })
+        .collect::<Result<Vec<_>, SolidsTraceFault>>()?;
+    let (cmodels, cmodel_mesh_roots): (Vec<_>, Vec<_>) = clip
+        .sub_models
+        .iter()
+        .map(|model| {
+            let (start, count) = if model.shares_map_info {
+                append_leaf_brushes(clip, &model.leaf, &mut brush_leaf_indices)?
+            } else {
+                leafbrush_range(brush_leaf_indices.len(), brush_leaf_indices.len())?
+            };
+            let collision_geometry = CollisionSubmodel {
+                initial_convex_solid: start,
+                solid_volume_total: count,
+                radius: model.radius,
+                lo: model.lo_corner, hi: model.hi_corner,
+            };
+            Ok((collision_geometry, (model.leaf.first_collision_box_slot, model.leaf.collision_box_total)))
+        })
+        .collect::<Result<Vec<_>, SolidsTraceFault>>()?
+        .into_iter()
+        .unzip();
+    Ok(CollisionClipData {
+        brushes: clip.brushes.iter().map(|brush| t6_brush(brush, caulk)).collect(),
+        materials: clip
+            .materials
+            .iter()
+            .map(|mat| ClipMaterialRow {
+                pack_presence_bits: mat.pack_presence_bits as u32,
+                face_bits: t5_surface_flags(mat.surface_flags as u32),
+                name: mat.name.clone(),
+            })
+            .collect(),
+        nodes: clip.nodes.iter().map(|node| ClipNodeRow { children: node.children.map(i32::from), plane: node.plane }).collect(),
+        leaves,
+        brush_leaf_indices,
+        cmodels,
+        cmodel_mesh_roots,
+        // bo2mp: the clip map BO2's traces read comes from the same tables; a
+        // map whose tables point outside themselves does not load.
+        t6: Some(t6_clip_map(clip).map_err(SolidsTraceFault::Store)?),
+        ..Default::default()
+    })
 }
 
 /// bo2mp: `cLeaf_s` as BO2's traces read it.
-fn t6_leaf(l: &ClipLeafRef) -> Leaf {
-    Leaf {
-        first_coll_aabb: l.first_coll_aabb_index,
-        coll_aabb_count: l.coll_aabb_count,
-        brush_contents: l.brush_contents as u32,
-        terrain_contents: l.terrain_contents as u32,
-        mins: l.mins,
-        maxs: l.maxs,
-        leaf_brush_node: l.leaf_brush_node,
-        cluster: l.cluster,
+fn t6_leaf(src: &ClipLeafRef) -> Leaf {
+    let mut leaf = Leaf::default();
+    leaf.cluster = src.cluster;
+    leaf.brush_leaf_link = src.brush_leaf_link;
+    (leaf.mins, leaf.maxs) = (src.lo_corner, src.hi_corner);
+    (leaf.terrain_contents, leaf.solid_content_flags) = (src.ground_mask as u32, src.solid_content_flags as u32);
+    (leaf.first_coll_aabb, leaf.collision_box_total) = (src.first_collision_box_slot, src.collision_box_total);
+    leaf
+}
+
+fn as_u32_sides(rows: [[i32; 3]; 2]) -> [[u32; 3]; 2] {
+    rows.map(|row| row.map(|v| v as u32))
+}
+
+/// The pooled brush ids and the nodes over them, each node pointing at where its
+/// own brushes start in the pool.
+fn t6_leaf_brush_tables(clip: &ClipRef) -> Result<(Vec<u16>, Vec<StoredLeafBrushNode>), StoreError> {
+    let mut pool: Vec<u16> = Vec::new();
+    let mut nodes = Vec::with_capacity(clip.leafbrush_nodes.len());
+    for (index, node) in clip.leafbrush_nodes.iter().enumerate() {
+        let pool_start = pool.len() as u32;
+        if node.leaf_solid_total > 0 {
+            if node.brushes.len() != node.leaf_solid_total as usize {
+                return Err(StoreError { table: "leaf_brush_nodes", index });
+            }
+            pool.extend(node.brushes.iter().copied());
+        }
+        nodes.push(StoredLeafBrushNode {
+            initial_convex_solid: pool_start,
+            contents: node.contents as u32,
+            leaf_solid_total: node.leaf_solid_total,
+            child_offset: node.child_offset, range: node.range,
+            dist: node.plane_dist, axis: node.axis,
+        });
     }
+    Ok((pool, nodes))
+}
+
+/// The brushes and the pooled sides they index.
+fn t6_brush_tables(clip: &ClipRef) -> Result<(Vec<StoredBrush>, Vec<BrushSide>), StoreError> {
+    t6_brush_rows(&clip.brushes)
+}
+
+/// `brushes` as `cbrush_t` rows, their sides in one table.
+fn t6_brush_rows(brushes: &[ClipBrushRef]) -> Result<(Vec<StoredBrush>, Vec<BrushSide>), StoreError> {
+    let mut sides: Vec<BrushSide> = Vec::new();
+    let brushes = brushes
+        .iter()
+        .enumerate()
+        .map(|(index, b)| {
+            if b.side_cflags.len() != b.sides.len() {
+                return Err(StoreError { table: "brushes", index });
+            }
+            let first_side = sides.len() as u32;
+            for (&(normal, dist, sflags), &cflags) in b.sides.iter().zip(&b.side_cflags) {
+                let plane = Plane { normal, plane_offset: dist };
+                sides.push(BrushSide { plane, cflags: cflags as u32, sflags: sflags as u32 });
+            }
+            Ok(StoredBrush {
+                first_side,
+                side_count: b.sides.len() as u32,
+                mins: b.lo_corner,
+                maxs: b.hi_corner,
+                contents: b.contents as u32,
+                axial_cflags: as_u32_sides(b.axial_cflags),
+                axial_sflags: as_u32_sides(b.axial_sflags),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((brushes, sides))
 }
 
 /// bo2mp: `clip`'s tables as BO2's traces read them, with BO2's own surface
 /// flags (no T5 translation). A brush model that does not share the map's
 /// tables gets no brushes, as `build_t6_clip_collision` gives it.
-pub fn t6_clip_store(clip: &ClipRef) -> Result<ClipStore, StoreError> {
-    let flags = |f: [[i32; 3]; 2]| f.map(|side| side.map(|v| v as u32));
-    let mut store = ClipStore {
-        nodes: clip
-            .nodes
-            .iter()
-            .map(|n| Node {
-                plane: CPlane {
-                    normal: [n.plane[0], n.plane[1], n.plane[2]],
-                    dist: n.plane[3],
-                    kind: n.plane_type,
-                    signbits: n.plane_signbits,
-                },
-                children: n.children,
-            })
-            .collect(),
+pub fn t6_clip_store(clip: &ClipRef) -> Result<ClipRepository, StoreError> {
+    let (leaf_brushes, leaf_brush_nodes) = t6_leaf_brush_tables(clip)?;
+    let (brush_rows, side_rows) = t6_brush_tables(clip)?;
+    let node = |n: &asset_t6::ClipNodeRef| Node {
+        plane: PlaneEquation {
+            normal: [n.plane[0], n.plane[1], n.plane[2]],
+            dist: n.plane[3],
+            kind: n.plane_type,
+            signbits: n.plane_signbits,
+        },
+        children: n.children };
+    let collision_geometry = |m: &asset_t6::ClipCmodelRef| {
+        let mut leaf = t6_leaf(&m.leaf);
+        if !m.shares_map_info {
+            leaf = Leaf { solid_content_flags: 0, brush_leaf_link: 0, ..leaf };
+        }
+        CModel { mins: m.lo_corner, maxs: m.hi_corner, radius: m.radius, leaf }
+    };
+    Ok(ClipRepository {
+        nodes: clip.nodes.iter().map(node).collect(),
         leafs: clip.leaves.iter().map(t6_leaf).collect(),
         materials: clip
             .materials
             .iter()
-            .map(|m| ClipMaterial {
-                surface_flags: m.surface_flags as u32,
-                content_flags: m.content_flags as u32,
-            })
+            .map(|m| ClipMaterial { surface_flags: m.surface_flags as u32, pack_presence_bits: m.pack_presence_bits as u32 })
             .collect(),
         aabb_trees: clip
-            .aabb_trees
+            .box_trees
             .iter()
             .map(|t| AabbTree {
-                origin: t.origin,
-                material_index: t.material_index,
-                child_count: t.child_count,
-                half_size: t.half_size,
                 u: t.u as u32,
+                origin: t.origin,
+                half_size: t.half_extent,
+                sub_element_total: t.sub_element_total,
+                material_index: t.material_slot,
             })
             .collect(),
-        partitions: clip
-            .partitions
-            .iter()
-            .map(|&(tri_count, first_tri)| Partition { tri_count, first_tri })
-            .collect(),
-        verts: clip.verts.clone(),
-        tri_indices: clip.tri_indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect(),
+        partitions: clip.partitions.iter().map(|&(tri_tally, leading_triangle)| Partition { tri_tally, leading_triangle }).collect(),
+        vertex_points: clip.vertex_points.clone(),
+        tri_indices: clip.tri_index_list.chunks_exact(3).filter_map(|t| <[u16; 3]>::try_from(t).ok()).collect(),
         tri_edge_is_walkable: clip.tri_edge_is_walkable.clone(),
-        cmodels: clip
-            .cmodels
-            .iter()
-            .map(|m| {
-                let mut leaf = t6_leaf(&m.leaf);
-                if !m.shares_map_info {
-                    leaf.brush_contents = 0;
-                    leaf.leaf_brush_node = 0;
-                }
-                CModel {
-                    mins: m.mins,
-                    maxs: m.maxs,
-                    radius: m.radius,
-                    leaf,
-                }
-            })
-            .collect(),
+        cmodels: clip.sub_models.iter().map(collision_geometry).collect(),
         box_brush_node: u32::try_from(clip.box_leaf_brush_node).ok().filter(|&i| i > 0),
-        ..ClipStore::default()
-    };
-    for (index, n) in clip.leafbrush_nodes.iter().enumerate() {
-        let first_brush = store.leaf_brushes.len() as u32;
-        if n.leaf_brush_count > 0 {
-            if n.brushes.len() != n.leaf_brush_count as usize {
-                return Err(StoreError {
-                    table: "leaf_brush_nodes",
-                    index,
-                });
-            }
-            store.leaf_brushes.extend_from_slice(&n.brushes);
-        }
-        store.leaf_brush_nodes.push(StoredLeafBrushNode {
-            axis: n.axis,
-            leaf_brush_count: n.leaf_brush_count,
-            contents: n.contents as u32,
-            first_brush,
-            dist: n.dist,
-            range: n.range,
-            child_offset: n.child_offset,
-        });
+        leaf_brushes,
+        leaf_brush_nodes,
+        brushes: brush_rows,
+        brush_sides: side_rows,
+        ..ClipRepository::default()
+    })
+}
+
+/// The value kept under `name` in `cache`, built (and filed) by `build` the
+/// first time that name is asked for.
+fn kept_under<T: Copy>(
+    cache: &std::sync::Mutex<Vec<(String, T)>>,
+    name: &str,
+    build: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    let mut filed = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(value) = filed.iter().find_map(|(kept, value)| (kept == name).then_some(value)) {
+        return Ok(*value);
     }
-    for (index, b) in clip.brushes.iter().enumerate() {
-        if b.side_cflags.len() != b.sides.len() {
-            return Err(StoreError { table: "brushes", index });
-        }
-        let first_side = store.brush_sides.len() as u32;
-        store
-            .brush_sides
-            .extend(b.sides.iter().zip(&b.side_cflags).map(|(&(normal, dist, sflags), &cflags)| BrushSide {
-                plane: Plane { normal, dist },
-                cflags: cflags as u32,
-                sflags: sflags as u32,
-            }));
-        store.brushes.push(StoredBrush {
-            mins: b.mins,
-            maxs: b.maxs,
-            contents: b.contents as u32,
-            first_side,
-            side_count: b.sides.len() as u32,
-            axial_cflags: flags(b.axial_cflags),
-            axial_sflags: flags(b.axial_sflags),
-        });
-    }
-    Ok(store)
+    let value = build()?;
+    filed.push((name.to_owned(), value));
+    Ok(value)
 }
 
 /// bo2mp: the BO2 clip map of `clip`, built and checked the first time its
 /// map name is asked for and kept for the rest of the run.
 pub fn t6_clip_map(clip: &ClipRef) -> Result<&'static ClipMap<'static>, StoreError> {
     static KEPT: std::sync::Mutex<Vec<(String, &'static ClipMap<'static>)>> = std::sync::Mutex::new(Vec::new());
-    let mut kept = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(&(_, map)) = kept.iter().find(|(name, _)| *name == clip.name) {
-        return Ok(map);
-    }
-    let store = t6_clip_store(clip)?;
-    store.check()?;
-    let map = store.leak();
-    kept.push((clip.name.clone(), map));
-    Ok(map)
+    kept_under(&KEPT, &clip.name, || {
+        let store = t6_clip_store(clip)?;
+        store.check()?;
+        Ok(store.leak())
+    })
 }
 
 /// bo2mp: the placed models of `clip` (`staticModelList`: cars, fences,
@@ -425,17 +476,17 @@ pub fn t6_clip_map(clip: &ClipRef) -> Result<&'static ClipMap<'static>, StoreErr
 /// time its map name is asked for and kept for the rest of the run, as
 /// `out.t6_static`. Returns how many models are placed.
 pub fn attach_t6_static_world(
-    out: &mut ClipCollision,
+    out: &mut CollisionClipData,
     clip: &ClipRef,
     xmodels: &[XModelRef],
 ) -> Result<usize, StoreError> {
     let world = t6_static_world(clip, |i| {
-        let key = clip.static_models[i].model?;
-        let m = xmodels.get(key.index)?;
-        Some((key.index, i32::from(m.coll_lod), m.coll_surfs.as_slice()))
+        let key = clip.prop_set[i].model?;
+        xmodels
+            .get(key.index)
+            .map(|m| (key.index, i32::from(m.collision_detail_tier), m.collision_faces.as_slice()))
     })?;
-    out.t6_static = Some(world);
-    Ok(world.models.len())
+    Ok(out.t6_static.insert(world).models.len())
 }
 
 /// The kept static world of `clip`, each placement's model from `coll` by
@@ -445,15 +496,33 @@ fn t6_static_world<'a>(
     coll: impl Fn(usize) -> Option<(usize, i32, &'a [XModelCollSurfRef])>,
 ) -> Result<&'static StaticWorld, StoreError> {
     static KEPT: std::sync::Mutex<Vec<(String, &'static StaticWorld)>> = std::sync::Mutex::new(Vec::new());
-    let mut kept = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(&(_, world)) = kept.iter().find(|(name, _)| *name == clip.name) {
-        return Ok(world);
+    kept_under(&KEPT, &clip.name, || {
+        let store = t6_static_store(clip, coll);
+        store.check()?;
+        Ok(store.leak(t6_clip_map(clip)?))
+    })
+}
+
+/// File one model's collision surfaces and their triangles; the model's index.
+fn push_xmodel(store: &mut StaticModelStore, collision_detail_tier: i32, surfs: &[XModelCollSurfRef]) -> u32 {
+    let index = store.xmodels.len() as u32;
+    let lead_skin = store.surfs.len() as u32;
+    for s in surfs {
+        let leading_triangle = store.triangle_list.len() as u32;
+        let triangle_list = s.triangle_list.iter().map(|&[plane, surface_tangent, surface_bitangent]| ModelHitTriangle { plane, surface_tangent, surface_bitangent });
+        store.triangle_list.extend(triangle_list);
+        store.surfs.push(StoredCollSurf {
+            leading_triangle,
+            tri_tally: s.triangle_list.len() as u32,
+            mins: s.lo_corner,
+            maxs: s.hi_corner,
+            joint_position: s.joint_position,
+            contents: s.contents,
+            face_property_bits: s.face_property_bits,
+        });
     }
-    let store = t6_static_store(clip, coll);
-    store.check()?;
-    let world = store.leak(t6_clip_map(clip)?);
-    kept.push((clip.name.clone(), world));
-    Ok(world)
+    store.xmodels.push(StoredXModel { collision_detail_tier, lead_skin, facet_amount: surfs.len() as u32 });
+    index
 }
 
 /// `clip`'s static models as a store, each placed model's collision added
@@ -463,42 +532,16 @@ fn t6_static_store<'a>(
     coll: impl Fn(usize) -> Option<(usize, i32, &'a [XModelCollSurfRef])>,
 ) -> StaticModelStore {
     let mut store = StaticModelStore::default();
-    let mut added: Vec<(usize, u32)> = Vec::new();
-    for (index, sm) in clip.static_models.iter().enumerate() {
-        let xmodel = coll(index).map(|(key, coll_lod, surfs)| {
-            if let Some(&(_, at)) = added.iter().find(|(k, _)| *k == key) {
-                return at;
-            }
-            let at = store.xmodels.len() as u32;
-            store.xmodels.push(StoredXModel {
-                coll_lod,
-                first_surf: store.surfs.len() as u32,
-                surf_count: surfs.len() as u32,
-            });
-            for s in surfs {
-                store.surfs.push(StoredCollSurf {
-                    first_tri: store.tris.len() as u32,
-                    tri_count: s.tris.len() as u32,
-                    mins: s.mins,
-                    maxs: s.maxs,
-                    bone_idx: s.bone_idx,
-                    contents: s.contents,
-                    surf_flags: s.surf_flags,
-                });
-                store.tris.extend(s.tris.iter().map(|t| XModelCollTri {
-                    plane: t[0],
-                    svec: t[1],
-                    tvec: t[2],
-                }));
-            }
-            added.push((key, at));
-            at
+    let mut filed_at = std::collections::HashMap::new();
+    for (index, sm) in clip.prop_set.iter().enumerate() {
+        let xmodel = coll(index).map(|(key, collision_detail_tier, surfs)| {
+            *filed_at.entry(key).or_insert_with(|| push_xmodel(&mut store, collision_detail_tier, surfs))
         });
         store.models.push(StoredStaticModel {
             xmodel,
             contents: sm.contents,
             origin: sm.origin,
-            inv_scaled_axis: sm.inv_scaled_axis,
+            reverse_scaled_basis: sm.reverse_scaled_basis,
             absmin: sm.absmin,
             absmax: sm.absmax,
         });
@@ -510,42 +553,61 @@ fn t6_static_store<'a>(
 /// flags), then every extra side.
 /// `caulk`: the surface flags of the map's caulk material, the faces a hit
 /// never reports (`u32::MAX`: none to skip).
-fn t6_brush(b: &ClipBrushRef, caulk: u32) -> ClipBrush {
-    let (mins, maxs) = (b.mins, b.maxs);
-    let mut planes = Vec::with_capacity(6 + b.sides.len());
-    planes.push([1.0, 0.0, 0.0, maxs[0]]);
-    planes.push([-1.0, 0.0, 0.0, -mins[0]]);
-    planes.push([0.0, 1.0, 0.0, maxs[1]]);
-    planes.push([0.0, -1.0, 0.0, -mins[1]]);
-    planes.push([0.0, 0.0, 1.0, maxs[2]]);
-    planes.push([0.0, 0.0, -1.0, -mins[2]]);
-    let axial = [
-        b.axial_sflags[0][0] as u32,
-        b.axial_sflags[0][1] as u32,
-        b.axial_sflags[0][2] as u32,
-        b.axial_sflags[1][0] as u32,
-        b.axial_sflags[1][1] as u32,
-        b.axial_sflags[1][2] as u32,
-    ];
-    let mut plane_surface_flags = Vec::with_capacity(planes.capacity());
-    plane_surface_flags.extend_from_slice(&t5_axial_plane_flags(axial.map(t5_surface_flags)));
-    for &(normal, dist, sflags) in &b.sides {
-        planes.push([normal[0], normal[1], normal[2], dist]);
-        plane_surface_flags.push(t5_surface_flags(sflags as u32));
-    }
+fn t6_brush(b: &ClipBrushRef, caulk: u32) -> CollisionSolid {
+    // Per axis: the +1 face at the box's top, then the -1 face at its bottom.
+    let face = |axis: usize, sign: f32, bound: f32| {
+        let mut plane = [0.0f32; 4];
+        plane[axis] = sign;
+        plane[3] = bound;
+        plane
+    };
+    let mut planes: Vec<[f32; 4]> = (0..3)
+        .flat_map(|axis| [face(axis, 1.0, b.hi_corner[axis]), face(axis, -1.0, -b.lo_corner[axis])])
+        .collect();
+    planes.extend(b.sides.iter().map(|&([facing_x, facing_y, facing_z], dist, _)| [facing_x, facing_y, facing_z, dist]));
+
+    let axial_flags: [u32; 6] = std::array::from_fn(|i| t5_surface_flags(b.axial_sflags[i / 3][i % 3] as u32));
+    let mut side_flags = t5_axial_plane_flags(axial_flags).to_vec();
+    side_flags.extend(b.sides.iter().map(|&(_, _, sflags)| t5_surface_flags(sflags as u32)));
+
     let hit_surface_flags = movement_t6::gjk::brush_surface_flags(
-        b.axial_sflags.map(|side| side.map(|f| f as u32)),
+        as_u32_sides(b.axial_sflags),
         b.sides.iter().map(|&(normal, _, sflags)| (normal[2], sflags as u32)),
         caulk,
     );
-    ClipBrush {
-        planes,
-        contents: b.contents as u32,
-        plane_surface_flags,
-        glass_encoded: 0,
-        verts: b.verts.clone(),
+    CollisionSolid {
         hit_surface_flags: t5_surface_flags(hit_surface_flags),
+        vertex_points: b.vertex_points.clone(),
+        glass_hit_code: 0u16,
+        plane_material_flags: side_flags,
+        contents: b.contents as u32,
+        planes,
     }
+}
+
+/// bo2mp: the collision-map brushes of xmodel `name` as BO2's traces read
+/// them, built the first time that name is asked for and kept for the rest
+/// of the run. `SV_ClipHandleForEntity` hands an entity whose model has a
+/// collmap to `CM_TempBrushModel`, which traces these as the temporary
+/// brush model (handle 0x4000).
+fn t6_collmap_brushes(name: &str, brushes: &[ClipBrushRef]) -> Result<&'static [Brush<'static>], StoreError> {
+    static KEPT: std::sync::Mutex<Vec<(String, &'static [Brush<'static>])>> = std::sync::Mutex::new(Vec::new());
+    kept_under(&KEPT, name, || {
+        let (rows, sides) = t6_brush_rows(brushes)?;
+        let sides: &'static [BrushSide] = Box::leak(sides.into_boxed_slice());
+        let views = rows.iter().map(|b| {
+            let first = b.first_side as usize;
+            Brush {
+                lower: b.mins,
+                upper: b.maxs,
+                contents: b.contents,
+                sides: &sides[first..first + b.side_count as usize],
+                axial_cflags: b.axial_cflags,
+                axial_sflags: b.axial_sflags,
+            }
+        });
+        Ok(&*Box::leak(views.collect::<Vec<_>>().into_boxed_slice()))
+    })
 }
 
 /// codmp: what `attach_t6_model_collision` did, for the load report.
@@ -562,47 +624,43 @@ pub struct T6ModelClipCensus {
 /// model space, after the map's: no world leaf lists it, so it stands only
 /// where an entity showing that model links it (`model_cmodels`).
 pub fn attach_t6_model_collision<'a>(
-    out: &mut ClipCollision,
+    out: &mut CollisionClipData,
     models: impl IntoIterator<Item = (&'a str, &'a [ClipBrushRef])>,
 ) -> T6ModelClipCensus {
     let mut census = T6ModelClipCensus::default();
+    let mut added: usize = 0;
     for (name, brushes) in models {
         if brushes.is_empty() || out.model_cmodels.contains_key(name) {
             continue;
         }
-        let first_brush = out.brushes.len();
-        let first_leaf = out.leafbrushes.len();
-        if first_brush + brushes.len() > usize::from(u16::MAX)
-            || u32::try_from(out.cmodels.len()).is_err()
-        {
+        let initial_convex_solid = out.brushes.len();
+        let room = initial_convex_solid + brushes.len() <= usize::from(u16::MAX) && u32::try_from(out.cmodels.len()).is_ok();
+        if !room {
             census.skipped += 1;
             continue;
         }
-        let mut mins = [f32::MAX; 3];
-        let mut maxs = [f32::MIN; 3];
-        for (k, b) in brushes.iter().enumerate() {
-            for i in 0..3 {
-                mins[i] = mins[i].min(b.mins[i]);
-                maxs[i] = maxs[i].max(b.maxs[i]);
-            }
-            out.brushes.push(t6_brush(b, u32::MAX));
-            out.leafbrushes.push((first_brush + k) as u16);
-        }
-        let radius = (0..3)
-            .map(|i| mins[i].abs().max(maxs[i].abs()).powi(2))
-            .sum::<f32>()
-            .sqrt();
-        out.model_cmodels.insert(name.to_owned(), out.cmodels.len() as u32);
-        out.cmodels.push(ClipCmodel {
-            mins,
-            maxs,
-            radius,
-            first_brush: first_leaf as u32,
-            num_brushes: brushes.len() as u16,
+        let first_listed = out.brush_leaf_indices.len();
+        let (mins, maxs) = brushes.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), brush| {
+            (
+                std::array::from_fn(|axis| lo[axis].min(brush.lo_corner[axis])),
+                std::array::from_fn(|axis| hi[axis].max(brush.hi_corner[axis])),
+            )
         });
-        census.models += 1;
+        out.brushes.extend(brushes.iter().map(|brush| t6_brush(brush, u32::MAX)));
+        out.brush_leaf_indices.extend((initial_convex_solid..initial_convex_solid + brushes.len()).map(|id| id as u16));
+        let radius = mins.iter().zip(&maxs).map(|(lo, hi)| lo.abs().max(hi.abs()).powi(2)).sum::<f32>().sqrt();
+        let handle = out.cmodels.len() as u32;
+        out.model_cmodels.insert(name.to_owned(), handle);
+        // A model whose brushes BO2 could not read has none to trace, as it has no collmap.
+        if let Ok(collmap) = t6_collmap_brushes(name, brushes) {
+            out.t6_model_brushes.insert(handle, collmap);
+        }
+        let placed = CollisionSubmodel { solid_volume_total: brushes.len() as u16, initial_convex_solid: first_listed as u32, radius, lo: mins, hi: maxs };
+        out.cmodels.push(placed);
         census.brushes += brushes.len();
+        added += 1;
     }
+    census.models = added;
     census
 }
 
@@ -619,28 +677,28 @@ mod tests {
     // old loader reads as "no brushes".
     fn floor_clip() -> ClipRef {
         let leaf = ClipLeafRef {
-            brush_contents: 1,
-            leaf_brush_node: 1,
-            mins: [-1000.0; 3],
-            maxs: [1000.0; 3],
+            solid_content_flags: 1,
+            brush_leaf_link: 1,
+            lo_corner: [-1000.0; 3],
+            hi_corner: [1000.0; 3],
             ..ClipLeafRef::default()
         };
         ClipRef {
             name: "clip_t6 test floor".to_string(),
             brushes: vec![ClipBrushRef {
-                mins: [-64.0, -64.0, -16.0],
-                maxs: [64.0, 64.0, 0.0],
-                contents: 1,
-                axial_cflags: [[1; 3]; 2],
+                vertex_points: vec![],
+                side_cflags: vec![],
+                sides: vec![],
                 axial_sflags: [[0; 3]; 2],
-                sides: Vec::new(),
-                side_cflags: Vec::new(),
-                verts: Vec::new(),
+                axial_cflags: [[1; 3]; 2],
+                contents: 1,
+                lo_corner: [-64.0, -64.0, -16.0],
+                hi_corner: [64.0, 64.0, 0.0],
             }],
             materials: vec![ClipMaterialRef {
                 name: "floor".to_string(),
-                surface_flags: 0,
-                content_flags: 1,
+                surface_flags: Default::default(),
+                pack_presence_bits: 1,
             }],
             nodes: vec![ClipNodeRef {
                 plane: [1.0, 0.0, 0.0, 1000.0],
@@ -651,27 +709,27 @@ mod tests {
             leaves: vec![leaf],
             leafbrush_nodes: vec![
                 ClipLeafBrushNodeRef {
-                    leaf_brush_count: 0,
+                    leaf_solid_total: 0,
                     brushes: Vec::new(),
                     child_offset: [0; 2],
                     axis: 0,
-                    contents: 0,
-                    dist: 0.0,
+                    contents: Default::default(),
+                    plane_dist: 0.0,
                     range: 0.0,
                 },
                 ClipLeafBrushNodeRef {
-                    leaf_brush_count: 1,
+                    leaf_solid_total: 1,
                     brushes: vec![0],
                     child_offset: [0; 2],
                     axis: 0,
                     contents: 1,
-                    dist: 0.0,
+                    plane_dist: 0.0,
                     range: 0.0,
                 },
             ],
-            cmodels: vec![ClipCmodelRef {
-                mins: [-64.0, -64.0, -16.0],
-                maxs: [64.0, 64.0, 0.0],
+            sub_models: vec![ClipCmodelRef {
+                lo_corner: [-64.0, -64.0, -16.0],
+                hi_corner: [64.0, 64.0, 0.0],
                 radius: 100.0,
                 leaf,
                 shares_map_info: true,
@@ -682,22 +740,22 @@ mod tests {
 
     /// `sweep_box` and BO2's trace on the map's own store agree on fraction,
     /// normal and start solid.
-    fn agree(start: [f32; 3], end: [f32; 3], mins: [f32; 3], maxs: [f32; 3]) {
+    fn agree(start: [f32; 3], stop: [f32; 3], lo: [f32; 3], hi: [f32; 3]) {
         let clip = floor_clip();
-        let old = build_t6_clip_collision(&clip).expect("old build").sweep_box(start, end, mins, maxs, 1);
+        let old = build_t6_clip_collision(&clip).expect("old build").sweep_box(start, stop, lo, hi, 1);
         let store = t6_clip_store(&clip).expect("store");
         store.check().expect("check");
         let mut marks = vec![0u16; store.partitions.len()];
-        let new = store.with_map(|map| map.box_trace(&mut CheckCount::new(&mut marks), start, end, mins, maxs, 0, 1));
+        let new = store.with_map(|map| map.box_trace(&mut CheckCount::new(&mut marks), start, stop, lo, hi, 0, 1));
         assert!(
             (old.fraction - new.fraction).abs() < 1e-3,
-            "{start:?} -> {end:?}: old {} new {}",
+            "{start:?} -> {stop:?}: old {} new {}",
             old.fraction,
             new.fraction
         );
-        assert_eq!(old.startsolid, new.startsolid, "{start:?} -> {end:?}");
+        assert_eq!(old.began_inside, new.starts_inside, "{start:?} -> {stop:?}");
         if new.fraction < 1.0 {
-            assert_eq!(old.normal, new.normal, "{start:?} -> {end:?}");
+            assert_eq!(old.normal, new.normal, "{start:?} -> {stop:?}");
         }
     }
 
@@ -742,7 +800,7 @@ mod tests {
         // brushes, as BO2's zones store it; only that node may.
         let mut boxed = clip.clone();
         boxed.leafbrush_nodes.push(ClipLeafBrushNodeRef {
-            leaf_brush_count: 1,
+            leaf_solid_total: 1,
             brushes: vec![1],
             ..boxed.leafbrush_nodes[1].clone()
         });
@@ -767,7 +825,7 @@ mod tests {
             })
         );
         let mut bad = clip;
-        bad.leaves[0].leaf_brush_node = 2;
+        bad.leaves[0].brush_leaf_link = 2;
         assert_eq!(
             t6_clip_store(&bad).and_then(|s| s.check()),
             Err(StoreError { table: "leafs", index: 0 })
@@ -780,29 +838,29 @@ mod tests {
     #[test]
     fn static_models_are_kept_and_traced() {
         let wall = [XModelCollSurfRef {
-            tris: vec![[[-1.0, 0.0, 0.0, 0.0], [0.0, 0.1, 0.0, 0.0], [0.0, 0.0, 0.1, 0.0]]],
-            mins: [-1.0; 3],
-            maxs: [10.0; 3],
-            bone_idx: 0,
+            triangle_list: vec![[[-1.0, 0.0, 0.0, 0.0], [0.0, 0.1, 0.0, 0.0], [0.0, 0.0, 0.1, 0.0]]],
+            lo_corner: [-1.0; 3],
+            hi_corner: [10.0; 3],
+            joint_position: 0,
             contents: 1,
-            surf_flags: 0x50,
+            face_property_bits: 0x50,
         }];
         let placed = |x: f32| ClipStaticModelRef {
-            model: None,
+            model: Option::default(),
             contents: 1,
             origin: [x, 0.0, -8.0],
-            inv_scaled_axis: clipmap_t6::inv_scaled_axis([0.0; 3], 1.0),
+            reverse_scaled_basis: clipmap_t6::reverse_scaled_basis([0.0; 3], 1.0),
             absmin: [x - 4.0, -4.0, -12.0],
             absmax: [x + 4.0, 4.0, -4.0],
         };
         let mut clip = floor_clip();
         clip.name = "clip_t6 test static models".into();
-        clip.static_models = vec![placed(40.0), placed(0.0), placed(-40.0)];
+        clip.prop_set = vec![placed(40.0), placed(0.0), placed(-40.0)];
         // Placements 0 and 2 place xmodel 3; placement 1 places none.
         let coll = |i: usize| (i != 1).then_some((3, 0, &wall[..]));
 
         let store = t6_static_store(&clip, coll);
-        assert_eq!((store.models.len(), store.xmodels.len(), store.surfs.len(), store.tris.len()), (3, 1, 1, 1));
+        assert_eq!((store.models.len(), store.xmodels.len(), store.surfs.len(), store.triangle_list.len()), (3, 1, 1, 1));
         assert_eq!(store.models[1].xmodel, None);
         let world = t6_static_world(&clip, coll).expect("kept");
         assert!(std::ptr::eq(world, t6_static_world(&clip, coll).expect("kept again")));
@@ -819,33 +877,27 @@ mod tests {
         let Ok(dir) = std::env::var("T6_ZONE_DIR") else {
             return;
         };
-        let mut failed = Vec::new();
-        for map in ["mp_nuketown_2020", "mp_la"] {
+        let check_map = |map: &str| -> Result<(), String> {
             let path = std::path::Path::new(&dir).join(format!("{map}.ff"));
             let capture = asset_t6::capture_zone(&path).unwrap_or_else(|e| panic!("{map}: {e}"));
             let clip = capture.clip.as_ref().unwrap_or_else(|| panic!("{map}: no clipMap"));
-            let store = match t6_clip_store(clip) {
-                Ok(store) => store,
-                Err(e) => {
-                    failed.push(format!("{map}: {e}; {}", refused_row(clip, e)));
-                    continue;
-                }
-            };
-            if let Err(e) = store.check() {
-                failed.push(format!("{map}: {e}; {}; every bad row: {}", refused_row(clip, e), every_bad(&store)));
-                continue;
-            }
-            let mut out = ClipCollision::default();
-            if let Err(e) = attach_t6_static_world(&mut out, clip, &capture.xmodels) {
-                failed.push(format!("{map} static world: {e}"));
-            }
-        }
-        assert!(failed.is_empty(), "{failed:?}");
+            let store = t6_clip_store(clip).map_err(|e| format!("{map}: {e}; {}", refused_row(clip, e)))?;
+            store.check().map_err(|e| {
+                let bad_rows = every_bad(&store);
+                format!("{map}: {e}; {}; every bad row: {bad_rows}", refused_row(clip, e))
+            })?;
+            let mut out = CollisionClipData::default();
+            attach_t6_static_world(&mut out, clip, &capture.xmodels)
+                .map(drop)
+                .map_err(|e| format!("{map} static world: {e}"))
+        };
+        let problems: Vec<String> = ["mp_nuketown_2020", "mp_la"].into_iter().filter_map(|map| check_map(map).err()).collect();
+        assert_eq!(problems, Vec::<String>::new());
     }
 
-    /// How many rows of each table break `ClipStore::check`'s rule, and the
+    /// How many rows of each table break `ClipRepository::check`'s rule, and the
     /// first of each, so one run shows every table that is read wrong.
-    fn every_bad(s: &ClipStore) -> String {
+    fn every_bad(s: &ClipRepository) -> String {
         let mut out = Vec::new();
         let mut note = |table: &str, bad: Vec<usize>| {
             if let Some(&first) = bad.first() {
@@ -854,10 +906,10 @@ mod tests {
         };
         let rows = |ok: &dyn Fn(usize) -> bool, len: usize| (0..len).filter(|&i| !ok(i)).collect::<Vec<_>>();
         let leaf_ok = |l: &Leaf| {
-            usize::from(l.first_coll_aabb) + usize::from(l.coll_aabb_count) <= s.aabb_trees.len()
-                && l.leaf_brush_node >= 0
-                && ((l.leaf_brush_node as usize) < s.leaf_brush_nodes.len()
-                    || (l.leaf_brush_node == 0 && l.brush_contents == 0))
+            usize::from(l.first_coll_aabb) + usize::from(l.collision_box_total) <= s.aabb_trees.len()
+                && l.brush_leaf_link >= 0
+                && ((l.brush_leaf_link as usize) < s.leaf_brush_nodes.len()
+                    || (l.brush_leaf_link == 0 && l.solid_content_flags == 0))
         };
         note(
             "nodes",
@@ -882,12 +934,12 @@ mod tests {
             rows(
                 &|i| {
                     let n = &s.leaf_brush_nodes[i];
-                    if n.leaf_brush_count > 0 {
-                        n.first_brush as usize + n.leaf_brush_count as usize <= s.leaf_brushes.len()
+                    if n.leaf_solid_total > 0 {
+                        n.initial_convex_solid as usize + n.leaf_solid_total as usize <= s.leaf_brushes.len()
                     } else {
                         n.axis < 3
                             && n.child_offset.iter().all(|&o| i + usize::from(o) < lbn)
-                            && (n.leaf_brush_count == 0 || i + 1 < lbn)
+                            && (n.leaf_solid_total == 0 || i + 1 < lbn)
                     }
                 },
                 lbn,
@@ -896,7 +948,7 @@ mod tests {
         let box_run = s
             .box_brush_node
             .and_then(|i| s.leaf_brush_nodes.get(i as usize))
-            .map(|n| n.first_brush as usize..n.first_brush as usize + n.leaf_brush_count.max(0) as usize);
+            .map(|n| n.initial_convex_solid as usize..n.initial_convex_solid as usize + n.leaf_solid_total.max(0) as usize);
         note(
             "leaf_brushes",
             rows(
@@ -920,8 +972,8 @@ mod tests {
                 &|i| {
                     let t = &s.aabb_trees[i];
                     usize::from(t.material_index) < s.materials.len()
-                        && if t.child_count > 0 {
-                            t.u as usize + usize::from(t.child_count) <= s.aabb_trees.len()
+                        && if t.sub_element_total > 0 {
+                            t.u as usize + usize::from(t.sub_element_total) <= s.aabb_trees.len()
                         } else {
                             (t.u as usize) < s.partitions.len()
                         }
@@ -934,14 +986,14 @@ mod tests {
             rows(
                 &|i| {
                     let p = &s.partitions[i];
-                    p.first_tri >= 0 && p.first_tri as usize + usize::from(p.tri_count) <= s.tri_indices.len()
+                    p.leading_triangle >= 0 && p.leading_triangle as usize + usize::from(p.tri_tally) <= s.tri_indices.len()
                 },
                 s.partitions.len(),
             ),
         );
         note(
             "tri_indices",
-            rows(&|i| s.tri_indices[i].iter().all(|&v| usize::from(v) < s.verts.len()), s.tri_indices.len()),
+            rows(&|i| s.tri_indices[i].iter().all(|&v| usize::from(v) < s.vertex_points.len()), s.tri_indices.len()),
         );
         if s.tri_edge_is_walkable.len() * 8 < s.tri_indices.len() * 3 {
             note("tri_edge_is_walkable", vec![s.tri_edge_is_walkable.len()]);
@@ -950,7 +1002,7 @@ mod tests {
     }
 
     /// Where the out-of-range leaf brushes come from: the nodes holding them,
-    /// and how their lists sit against BO2's own `leafbrushes` table.
+    /// and how their lists sit against BO2's own `brush_leaf_indices` table.
     fn leaf_brushes_report(clip: &ClipRef) -> String {
         let nb = clip.brushes.len();
         let table = &clip.leaf_brushes;
@@ -971,8 +1023,8 @@ mod tests {
         let mut pending: Vec<usize> = clip
             .leaves
             .iter()
-            .map(|l| l.leaf_brush_node)
-            .chain(clip.cmodels.iter().map(|m| m.leaf.leaf_brush_node))
+            .map(|l| l.brush_leaf_link)
+            .chain(clip.sub_models.iter().map(|m| m.leaf.brush_leaf_link))
             .filter(|&n| n > 0)
             .map(|n| n as usize)
             .collect();
@@ -981,8 +1033,8 @@ mod tests {
             if std::mem::replace(&mut reachable[i], true) {
                 continue;
             }
-            if n.leaf_brush_count <= 0 {
-                if n.leaf_brush_count < 0 {
+            if n.leaf_solid_total <= 0 {
+                if n.leaf_solid_total < 0 {
                     pending.push(i + 1);
                 }
                 pending.extend(n.child_offset.iter().filter(|&&o| o != 0).map(|&o| i + usize::from(o)));
@@ -991,7 +1043,7 @@ mod tests {
         let mut bad_reachable = 0;
         let mut bad_contents0 = 0;
         for (i, n) in clip.leafbrush_nodes.iter().enumerate() {
-            if n.leaf_brush_count <= 0 {
+            if n.leaf_solid_total <= 0 {
                 continue;
             }
             let at = clip.leafbrush_node_brushes_at.get(i).copied().flatten();
@@ -1016,7 +1068,7 @@ mod tests {
             if first_bad.is_none() {
                 first_bad = Some(format!(
                     "first bad node {i}: count {} contents {:#x} brushes {:?} at {at:?} slot {:?}",
-                    n.leaf_brush_count,
+                    n.leaf_solid_total,
                     n.contents,
                     &n.brushes[..n.brushes.len().min(12)],
                     slot(at, n.brushes.len())
@@ -1037,29 +1089,22 @@ mod tests {
         let i = e.index;
         let sizes = format!(
             "nodes {} leafs {} lbnodes {} brushes {} aabb {} partitions {} materials {} tris {} verts {} walkable {} cmodels {}",
-            clip.nodes.len(),
-            clip.leaves.len(),
-            clip.leafbrush_nodes.len(),
-            clip.brushes.len(),
-            clip.aabb_trees.len(),
-            clip.partitions.len(),
-            clip.materials.len(),
-            clip.tri_indices.len() / 3,
-            clip.verts.len(),
-            clip.tri_edge_is_walkable.len(),
-            clip.cmodels.len(),
+            clip.nodes.len(), clip.leaves.len(), clip.leafbrush_nodes.len(),
+            clip.brushes.len(), clip.box_trees.len(), clip.partitions.len(),
+            clip.materials.len(), clip.tri_index_list.len() / 3, clip.vertex_points.len(),
+            clip.tri_edge_is_walkable.len(), clip.sub_models.len(),
         );
         let row = match e.table {
             "nodes" => format!("{:?}", clip.nodes.get(i).map(|n| n.children)),
             "leafs" => format!("{:?}", clip.leaves.get(i)),
             "cmodels" => format!(
                 "{:?}",
-                clip.cmodels.get(i).map(|m| (m.shares_map_info, m.leaf.clone()))
+                clip.sub_models.get(i).map(|m| (m.shares_map_info, m.leaf.clone()))
             ),
             "leaf_brush_nodes" => format!(
                 "{:?}; with contents 0: {}",
                 clip.leafbrush_nodes.get(i).map(|n| (
-                    n.leaf_brush_count,
+                    n.leaf_solid_total,
                     n.brushes.len(),
                     n.axis,
                     n.contents,
@@ -1074,7 +1119,7 @@ mod tests {
             ),
             "aabb_trees" => format!(
                 "{:?}",
-                clip.aabb_trees.get(i).map(|t| (t.material_index, t.child_count, t.u))
+                clip.box_trees.get(i).map(|t| (t.material_slot, t.sub_element_total, t.u))
             ),
             "partitions" => format!("{:?}", clip.partitions.get(i)),
             _ => String::new(),

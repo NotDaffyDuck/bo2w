@@ -12,7 +12,7 @@
 
 use core::f32::consts::PI;
 
-use crate::bridge::GroundTraceInput;
+use crate::bridge::SweepAsk;
 
 use crate::gjk::{Bo2Collision, MoverBrush, vehicle_slide_move};
 
@@ -32,8 +32,8 @@ const DRIFT_SPEED: f32 = 4.0;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct HeliDef {
     /// Top speed and acceleration, flat and up or down.
-    pub max_speed: f32,
-    pub accel: f32,
+    pub top_velocity: f32,
+    pub speed_up_rate: f32,
     pub max_speed_vertical: f32,
     pub accel_vertical: f32,
     /// `rotRate`, `rotAccel`: the most degrees a second it turns, and how
@@ -75,7 +75,7 @@ pub struct HeliState {
     pub angles: [f32; 3],
     pub velocity: [f32; 3],
     /// How fast it turns (degrees a second).
-    pub yaw_speed: f32,
+    pub heading_turn_rate: f32,
     /// Its lean (-1..1, forward then sideways) and how fast that changes.
     pub tilt: [f32; 2],
     pub tilt_vel: [f32; 2],
@@ -95,20 +95,20 @@ pub struct HeliControls {
     pub up: bool,
     pub down: bool,
     /// Where he looks (yaw, degrees): it turns to face it.
-    pub view_yaw: f32,
+    pub look_heading: f32,
 }
 
 /// What a helicopter flies through.
 pub trait HeliWorld {
-    /// Where a point traced from `start` to `end` stops when it meets
-    /// something; None when it gets all the way.
-    fn point_trace(&self, start: [f32; 3], end: [f32; 3]) -> Option<[f32; 3]>;
+    /// Height at which a point dropped (or raised) straight from `at` to
+    /// height `to_z` first meets something; None when nothing is in the way.
+    fn vertical_hit(&self, at: [f32; 3], to_z: f32) -> Option<f32>;
     /// Its slide from `origin` along `velocity` for `dt`: where it ends up
     /// and its velocity after.
-    fn slide(&self, origin: [f32; 3], velocity: [f32; 3], dt: f32) -> ([f32; 3], [f32; 3]);
+    fn slide(&self, at_pos: [f32; 3], motion: [f32; 3], dt: f32) -> ([f32; 3], [f32; 3]);
 }
 
-/// A helicopter in BO2's collision: its brush slid through `collision`
+/// A helicopter in BO2's collision: its brush slid through `hull_hits`
 /// ([`vehicle_slide_move`], no gravity) when `gjk`; otherwise (a map without
 /// its brushes' corners) its brush's box traced, stopping where it meets
 /// something.
@@ -119,31 +119,31 @@ pub struct HeliCollision<'a, C: Bo2Collision> {
 }
 
 impl<C: Bo2Collision> HeliWorld for HeliCollision<'_, C> {
-    fn point_trace(&self, start: [f32; 3], end: [f32; 3]) -> Option<[f32; 3]> {
-        let t = self.collision.trace(GroundTraceInput {
-            start,
-            end,
-            mins: [0.0; 3],
-            maxs: [0.0; 3],
-            tracemask: HELI_CLIP_MASK,
+    fn vertical_hit(&self, at: [f32; 3], to_z: f32) -> Option<f32> {
+        let t = self.collision.trace(SweepAsk {
+            start: at,
+            end: [at[0], at[1], to_z],
+            lo_corner: [0.0; 3],
+            hi_corner: [0.0; 3],
+            collide_filter: HELI_CLIP_MASK,
         });
-        (t.fraction < 1.0).then(|| core::array::from_fn(|i| start[i] + (end[i] - start[i]) * t.fraction))
+        (t.fraction < 1.0).then(|| at[2] + (to_z - at[2]) * t.fraction)
     }
 
-    fn slide(&self, origin: [f32; 3], velocity: [f32; 3], dt: f32) -> ([f32; 3], [f32; 3]) {
+    fn slide(&self, from: [f32; 3], motion: [f32; 3], dt: f32) -> ([f32; 3], [f32; 3]) {
         if self.gjk {
-            let (pos, vel, _) = vehicle_slide_move(self.collision, &self.brush, origin, velocity, HELI_CLIP_MASK, dt, None);
-            return (pos, vel);
+            let (pos, motion_vec, _) = vehicle_slide_move(self.collision, &self.brush, from, motion, HELI_CLIP_MASK, dt, None);
+            return (pos, motion_vec);
         }
-        let (mins, maxs) = self.brush.bounds();
-        let end = core::array::from_fn(|i| origin[i] + velocity[i] * dt);
-        let t = self.collision.trace(GroundTraceInput { start: origin, end, mins, maxs, tracemask: HELI_CLIP_MASK });
-        if t.startsolid {
-            return (origin, [0.0; 3]);
+        let (box_lo, box_hi) = self.brush.bounds();
+        let end = core::array::from_fn(|i| from[i] + motion[i] * dt);
+        let t = self.collision.trace(SweepAsk { start: from, end, lo_corner: box_lo, hi_corner: box_hi, collide_filter: HELI_CLIP_MASK });
+        if t.starts_inside {
+            return (from, [0.0; 3]);
         }
         let f = clampf(t.fraction, 0.0, 1.0);
-        let pos = core::array::from_fn(|i| origin[i] + (end[i] - origin[i]) * f);
-        (pos, if f < 1.0 { [0.0; 3] } else { velocity })
+        let pos = core::array::from_fn(|i| from[i] + (end[i] - from[i]) * f);
+        (pos, if f < 1.0 { [0.0; 3] } else { motion })
     }
 }
 
@@ -155,22 +155,22 @@ pub fn angle_wrap180(a: f32) -> f32 {
 
 /// BO2's DiffTrack: `cur` eased toward `tgt` by `(tgt - cur) * rate * dt`,
 /// snapping to it when within 0.001 or when the step would pass it.
-pub fn diff_track(tgt: f32, cur: f32, rate: f32, dt: f32) -> f32 {
+pub fn diff_track(tgt: f32, cur: f32, rate: f32, secs: f32) -> f32 {
     let gap = tgt - cur;
-    let step = gap * rate * dt;
+    let step = gap * rate * secs;
     if gap.abs() > 0.001 && step.abs() <= gap.abs() { cur + step } else { tgt }
 }
 
 /// [`diff_track`] for angles: the target brought within 180 of `cur`
 /// first; the result 0..360.
-pub fn diff_track_angle(mut tgt: f32, cur: f32, rate: f32, dt: f32) -> f32 {
+pub fn diff_track_angle(mut tgt: f32, cur: f32, rate: f32, secs: f32) -> f32 {
     while tgt - cur > 180.0 {
         tgt -= 360.0;
     }
     while tgt - cur < -180.0 {
         tgt += 360.0;
     }
-    let t = diff_track(tgt, cur, rate, dt) * (1.0 / 360.0);
+    let t = diff_track(tgt, cur, rate, secs) * (1.0 / 360.0);
     (t - libm::floorf(t)) * 360.0
 }
 
@@ -234,9 +234,9 @@ pub fn cmd_scale(clamp_diag: bool, m: [i8; 4]) -> [f32; 4] {
 pub fn maintain_height_accel<W: HeliWorld>(def: &HeliDef, st: &mut HeliState, world: &W) -> f32 {
     let o = st.origin;
     let mut too_low = false;
-    let down = [o[0], o[1], o[2] - def.height_max];
-    let ground = world.point_trace(o, down);
-    let gz = ground.map_or(down[2], |p| p[2]);
+    let floor_z = o[2] - def.height_max;
+    let ground = world.vertical_hit(o, floor_z);
+    let gz = ground.unwrap_or(floor_z);
     if def.maintain_height && ground.is_some() {
         if st.last_ground == 0.0 && st.height_delta == 0.0 {
             st.last_ground = gz;
@@ -255,7 +255,7 @@ pub fn maintain_height_accel<W: HeliWorld>(def: &HeliDef, st: &mut HeliState, wo
         }
     }
     let ceiling = if def.ceiling_min > 0.001 {
-        world.point_trace([o[0], o[1], o[2] + def.ceiling_min], o).map(|p| p[2])
+        world.vertical_hit([o[0], o[1], o[2] + def.ceiling_min], o[2])
     } else {
         None
     };
@@ -310,20 +310,20 @@ pub fn calc_accel(
     def: &HeliDef,
     st: &mut HeliState,
     body_vel: [f32; 3],
-    cmd: [f32; 4],
-    view_yaw: f32,
+    ucmd: [f32; 4],
+    look_heading: f32,
     prev_yaw: f32,
     dt: f32,
 ) -> ([f32; 3], [f32; 3]) {
-    let acc = [def.accel, def.accel, def.accel_vertical];
-    let max_s = [def.max_speed, def.max_speed, def.max_speed_vertical];
-    let k_flat = if def.max_speed == 0.0 { 1.0 } else { def.accel / def.max_speed };
+    let acc = [def.speed_up_rate, def.speed_up_rate, def.accel_vertical];
+    let max_s = [def.top_velocity, def.top_velocity, def.max_speed_vertical];
+    let k_flat = if def.top_velocity == 0.0 { 1.0 } else { def.speed_up_rate / def.top_velocity };
     let k = [
         k_flat,
         k_flat,
         if def.max_speed_vertical == 0.0 { 1.0 } else { def.accel_vertical / def.max_speed_vertical },
     ];
-    let desired = [max_s[0] * cmd[0], max_s[1] * cmd[1], cmd[2] * max_s[2]];
+    let desired = [max_s[0] * ucmd[0], max_s[1] * ucmd[1], ucmd[2] * max_s[2]];
     // Its speed along where the stick points, and across it.
     let h2 = desired[0] * desired[0] + desired[1] * desired[1];
     let len = if h2 > 0.0 { libm::sqrtf(h2) } else { 1.0 };
@@ -361,20 +361,20 @@ pub fn calc_accel(
     body_accel[2] = clampf((diff_track(desired[2], vz, rate_v, dt) - vz) / dt, -acc[2], acc[2]);
     // Its turn toward his view.
     let kr = def.rot_accel / def.rot_rate;
-    let toward = diff_track_angle(view_yaw, prev_yaw, kr, dt);
+    let toward = diff_track_angle(look_heading, prev_yaw, kr, dt);
     let mut want = clampf(angle_wrap180(toward - prev_yaw) / dt, -def.rot_rate, def.rot_rate);
-    if st.yaw_speed.abs() < want.abs() {
-        want = diff_track(want, st.yaw_speed, kr, dt);
+    if st.heading_turn_rate.abs() < want.abs() {
+        want = diff_track(want, st.heading_turn_rate, kr, dt);
     }
-    let yaw_accel = clampf((want - st.yaw_speed) / dt, -def.rot_accel, def.rot_accel);
+    let yaw_accel = clampf((want - st.heading_turn_rate) / dt, -def.rot_accel, def.rot_accel);
     // Its lean: from slowing, speeding up, its speed and the stick; sideways
     // also from turning at speed.
-    let inv = 1.0 / max_s[0];
+    let stow_kind = 1.0 / max_s[0];
     let tx = clampf(
         dec_acc[0] / acc[0] * def.tilt_from_decel[0]
             + acc_acc[0] / acc[0] * def.tilt_from_accel[0]
-            + inv * body_vel[0] * def.tilt_from_vel[0]
-            + desired[0] * inv * def.tilt_from_axes,
+            + stow_kind * body_vel[0] * def.tilt_from_vel[0]
+            + desired[0] * stow_kind * def.tilt_from_axes,
         -1.0,
         1.0,
     );
@@ -386,10 +386,10 @@ pub fn calc_accel(
         -1.0,
         1.0,
     );
-    if body_vel[0] > 0.0 && st.yaw_speed.abs() > 0.0 {
-        let f = body_vel[0] * inv;
+    if body_vel[0] > 0.0 && st.heading_turn_rate.abs() > 0.0 {
+        let f = body_vel[0] * stow_kind;
         let f = if f >= def.vel_at_max_tilt { 1.0 } else { f / def.vel_at_max_tilt };
-        ty += (-1.0 / def.rot_rate) * st.yaw_speed * def.tilt_from_fwd_yaw * f;
+        ty += (-1.0 / def.rot_rate) * st.heading_turn_rate * def.tilt_from_fwd_yaw * f;
     }
     let ty = clampf(ty, -1.0, 1.0);
     // The lean follows on a spring.
@@ -420,7 +420,7 @@ pub fn calc_accel(
 /// seconds. A def with no top speed or acceleration (none loaded) does not
 /// move.
 pub fn heli_move<W: HeliWorld>(def: &HeliDef, st: &mut HeliState, c: &HeliControls, dt: f32, world: &W) {
-    if dt <= 0.0 || def.max_speed <= 0.0 || def.accel <= 0.0 || def.rot_rate <= 0.0 || def.tilt_momentum <= 0.0 {
+    if dt <= 0.0 || def.top_velocity <= 0.0 || def.speed_up_rate <= 0.0 || def.rot_rate <= 0.0 || def.tilt_momentum <= 0.0 {
         return;
     }
     let prev_z = st.origin[2];
@@ -433,20 +433,20 @@ pub fn heli_move<W: HeliWorld>(def: &HeliDef, st: &mut HeliState, c: &HeliContro
         v[0] * right[0] + v[1] * right[1],
         v[2],
     ];
-    let cmd = cmd_scale(true, [c.forward, c.right, vertical, 0]);
-    let (accel, rot) = calc_accel(def, st, body_vel, cmd, c.view_yaw, prev_yaw, dt);
-    st.yaw_speed += dt * rot[1];
-    let yaw = angle_wrap180(prev_yaw + dt * st.yaw_speed);
-    st.angles = [rot[0], yaw, rot[2]];
+    let ucmd = cmd_scale(true, [c.forward, c.right, vertical, 0]);
+    let (speed_up_rate, turn_matrix) = calc_accel(def, st, body_vel, ucmd, c.look_heading, prev_yaw, dt);
+    st.heading_turn_rate += dt * turn_matrix[1];
+    let yaw = angle_wrap180(prev_yaw + dt * st.heading_turn_rate);
+    st.angles = [turn_matrix[0], yaw, turn_matrix[2]];
     let (fwd, right) = flat_axes(yaw);
     for i in 0..3 {
-        let up = if i == 2 { accel[2] } else { 0.0 };
-        st.velocity[i] += (fwd[i] * accel[0] + right[i] * accel[1] + up) * dt;
+        let up = if i == 2 { speed_up_rate[2] } else { 0.0 };
+        st.velocity[i] += (fwd[i] * speed_up_rate[0] + right[i] * speed_up_rate[1] + up) * dt;
     }
     if st.velocity != [0.0; 3] {
-        let (pos, vel) = world.slide(st.origin, st.velocity, dt);
+        let (pos, motion_vec) = world.slide(st.origin, st.velocity, dt);
         st.origin = pos;
-        st.velocity = vel;
+        st.velocity = motion_vec;
         update_height(st, c, prev_z);
     }
 }
@@ -462,8 +462,8 @@ mod tests {
     /// The Dragonfire's own values (qrdrone_mp).
     fn dragonfire() -> HeliDef {
         HeliDef {
-            max_speed: 352.0,
-            accel: 440.0,
+            top_velocity: 352.0,
+            speed_up_rate: 440.0,
             max_speed_vertical: 193.6,
             accel_vertical: 369.6,
             rot_rate: 200.0,
@@ -489,29 +489,29 @@ mod tests {
 
     /// A floor (solid below it), maybe a thin ceiling, maybe a wall across
     /// x; the drone is a 16 x 16 brush, 15.5 under its origin.
-    struct Room {
+    struct Cage {
         floor: Cell<f32>,
         ceiling: Option<f32>,
         wall_x: Option<f32>,
     }
 
-    impl Room {
+    impl Cage {
         fn open(floor: f32) -> Self {
-            Room { floor: Cell::new(floor), ceiling: None, wall_x: None }
+            Cage { floor: Cell::new(floor), ceiling: None, wall_x: None }
         }
     }
 
-    impl HeliWorld for Room {
-        fn point_trace(&self, s: [f32; 3], e: [f32; 3]) -> Option<[f32; 3]> {
+    impl HeliWorld for Cage {
+        fn vertical_hit(&self, s: [f32; 3], e_z: f32) -> Option<f32> {
             let mut best: Option<f32> = None;
             for z in [Some(self.floor.get()), self.ceiling].into_iter().flatten() {
-                let crosses = (s[2] > z && e[2] <= z) || (s[2] < z && e[2] >= z);
+                let crosses = (s[2] > z && e_z <= z) || (s[2] < z && e_z >= z);
                 if crosses {
-                    let t = (s[2] - z) / (s[2] - e[2]);
+                    let t = (s[2] - z) / (s[2] - e_z);
                     best = Some(best.map_or(t, |b: f32| b.min(t)));
                 }
             }
-            best.map(|t| core::array::from_fn(|i| s[i] + (e[i] - s[i]) * t))
+            best.map(|t| s[2] + (e_z - s[2]) * t)
         }
 
         fn slide(&self, o: [f32; 3], v: [f32; 3], dt: f32) -> ([f32; 3], [f32; 3]) {
@@ -533,19 +533,22 @@ mod tests {
     }
 
     fn at(z: f32) -> HeliState {
-        HeliState { origin: [0.0, 0.0, z], ..HeliState::default() }
+        // A resting helicopter lifted straight up to height z.
+        let mut st = HeliState::default();
+        st.origin[2] = z;
+        st
     }
 
-    fn fly(st: &mut HeliState, room: &Room, c: HeliControls, frames: usize) {
+    fn fly(st: &mut HeliState, room: &Cage, c: HeliControls, frames: usize) {
         fly_as(&dragonfire(), st, room, c, frames);
     }
 
-    fn fly_as(def: &HeliDef, st: &mut HeliState, room: &Room, c: HeliControls, frames: usize) {
+    fn fly_as(def: &HeliDef, st: &mut HeliState, room: &Cage, c: HeliControls, frames: usize) {
         for _ in 0..frames {
             heli_move(def, st, &c, DT, room);
             assert!(st.tilt.iter().all(|t| (-1.0..=1.0).contains(t)), "{st:?}");
             assert!(st.angles[0].abs() <= 20.0 + 1e-4 && st.angles[2].abs() <= 25.0 + 1e-4, "{st:?}");
-            assert!(st.yaw_speed.abs() <= 200.0 + 1e-3, "{st:?}");
+            assert!(st.heading_turn_rate.abs() <= 200.0 + 1e-3, "{st:?}");
         }
     }
 
@@ -580,7 +583,7 @@ mod tests {
 
     #[test]
     fn it_hovers_where_it_is() {
-        let room = Room::open(0.0);
+        let room = Cage::open(0.0);
         let mut st = at(100.0);
         fly(&mut st, &room, HeliControls::default(), 100);
         assert!(near(st.origin[2], 100.0, 1e-3), "{st:?}");
@@ -590,7 +593,7 @@ mod tests {
 
     #[test]
     fn full_forward_speeds_it_up_nose_down() {
-        let room = Room::open(0.0);
+        let room = Cage::open(0.0);
         let mut st = at(100.0);
         let c = HeliControls { forward: 127, ..HeliControls::default() };
         fly(&mut st, &room, c, 1);
@@ -616,9 +619,9 @@ mod tests {
 
     #[test]
     fn it_turns_to_his_view_no_faster_than_its_turn_rate() {
-        let room = Room::open(0.0);
+        let room = Cage::open(0.0);
         let mut st = at(100.0);
-        let c = HeliControls { view_yaw: 90.0, ..HeliControls::default() };
+        let c = HeliControls { look_heading: 90.0, ..HeliControls::default() };
         let mut last = 0.0;
         for _ in 0..60 {
             fly(&mut st, &room, c, 1);
@@ -627,26 +630,26 @@ mod tests {
         }
         assert!(near(st.angles[1], 90.0, 0.5), "{st:?}");
         // Over the 180 line it goes the short way.
-        let mut st = HeliState { angles: [0.0, 170.0, 0.0], ..at(100.0) };
-        let c = HeliControls { view_yaw: -170.0, ..HeliControls::default() };
+        let mut st = HeliState { angles: [0.0_f32, 170.0, 0.0], ..at(100.0) };
+        let c = HeliControls { look_heading: -170.0, ..HeliControls::default() };
         fly(&mut st, &room, c, 60);
         assert!(near(angle_wrap180(st.angles[1] + 170.0), 0.0, 0.5), "{st:?}");
     }
 
     #[test]
     fn turning_at_speed_banks_into_the_turn() {
-        let room = Room::open(0.0);
+        let room = Cage::open(0.0);
         let mut st = at(100.0);
         fly(&mut st, &room, HeliControls { forward: 127, ..HeliControls::default() }, 40);
-        let c = HeliControls { forward: 127, view_yaw: 90.0, ..HeliControls::default() };
+        let c = HeliControls { forward: 127, look_heading: 90.0, ..HeliControls::default() };
         fly(&mut st, &room, c, 5);
         // Turning left (yaw going up) leans it left.
-        assert!(st.yaw_speed > 0.0 && st.angles[2] < -1.0, "{st:?}");
+        assert!(st.heading_turn_rate > 0.0 && st.angles[2] < -1.0, "{st:?}");
     }
 
     #[test]
     fn up_climbs_and_letting_go_holds_the_new_height() {
-        let room = Room::open(0.0);
+        let room = Cage::open(0.0);
         let mut st = at(100.0);
         fly(&mut st, &room, HeliControls { up: true, ..HeliControls::default() }, 20);
         assert!(st.velocity[2] > 150.0, "{st:?}");
@@ -663,7 +666,7 @@ mod tests {
     #[test]
     fn it_follows_a_step_up_in_the_ground() {
         // (A ground at exactly 0 reads as no ground seen yet, as in BO2.)
-        let room = Room::open(50.0);
+        let room = Cage::open(50.0);
         let mut st = at(150.0);
         fly(&mut st, &room, HeliControls::default(), 10);
         assert!(near(st.origin[2], 150.0, 1e-3), "{st:?}");
@@ -680,7 +683,7 @@ mod tests {
         // A ground that jumps up more than it follows at once leaves it
         // under its least height (here 40): it climbs at full speed.
         let def = HeliDef { height_min: 40.0, ..dragonfire() };
-        let room = Room::open(50.0);
+        let room = Cage::open(50.0);
         let mut st = at(120.0);
         fly_as(&def, &mut st, &room, HeliControls::default(), 10);
         room.floor.set(100.0);
@@ -694,7 +697,7 @@ mod tests {
 
     #[test]
     fn it_keeps_room_under_a_ceiling() {
-        let room = Room { ceiling: Some(130.0), ..Room::open(0.0) };
+        let room = Cage { ceiling: Some(130.0), ..Cage::open(0.0) };
         let mut st = at(100.0);
         fly(&mut st, &room, HeliControls::default(), 80);
         assert!(st.origin[2] < 90.0 && st.origin[2] > 70.0, "{st:?}");
@@ -702,7 +705,7 @@ mod tests {
 
     #[test]
     fn a_wall_stops_it() {
-        let room = Room { wall_x: Some(200.0), ..Room::open(0.0) };
+        let room = Cage { wall_x: Some(200.0), ..Cage::open(0.0) };
         let mut st = at(100.0);
         fly(&mut st, &room, HeliControls { forward: 127, ..HeliControls::default() }, 60);
         assert!(near(st.origin[0], 184.0, 1e-3), "{st:?}");

@@ -3,11 +3,12 @@
 //! which entity types keep a ring, and the ring reader on seeded states. Everything is folded into one FNV-1a hash.
 
 use entity_t6::{
-    EntityEventKind, EntityState, bullet_hit_event, consume_entity_events, entity_event_action, gunner_fire_event,
+    EventCode, EntitySnapshot, bullet_hit_event, drain_entity_events, entity_event_action, gunner_fire_event,
     packet_entity_uses_event_ring, predicted_weapon_fire_event,
 };
 
-const EXPECTED: u64 = 0xad26_61b6_3cdd_c51b;
+// Re-pinned 10-24 when the ring reader moved to BO2's 8-bit sequence wrap (77857a3f).
+const EXPECTED: u64 = 0x871b_41db_e36d_9584;
 
 struct Fold(u64);
 
@@ -17,11 +18,11 @@ impl Fold {
             self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
-    fn eat_text(&mut self, text: &str) {
-        text.bytes().for_each(|b| self.eat(b.into()));
+    fn eat_text(&mut self, chunk: &str) {
+        chunk.bytes().for_each(|b| self.eat(b.into()));
     }
-    fn eat_maybe(&mut self, value: Option<i32>) {
-        self.eat(value.map_or(u32::MAX, |v| v as u32));
+    fn eat_maybe(&mut self, maybe_num: Option<i32>) {
+        self.eat(maybe_num.map_or(u32::MAX, |v| v as u32));
     }
 }
 
@@ -42,22 +43,22 @@ impl Dice {
 
 fn table(out: &mut Fold) {
     for number in (-8..=0x120).chain([i32::MIN, i32::MAX]) {
-        let event = EntityEventKind(number);
+        let event = EventCode(number);
         match entity_event_action(event) {
             Ok(action) => out.eat_text(&format!("{action:?}")),
             Err(unsupported) => out.eat(!(unsupported.0.0 as u32)),
         }
-        out.eat_maybe(event.landing_surface_index());
-        out.eat(u32::from(event.on_the_wire()) | u32::from(event.is_landing_pain()) << 1);
+        out.eat_maybe(event.touchdown_material_index());
+        out.eat(u32::from(event.on_the_wire()) | u32::from(event.hurts_on_landing()) << 1);
     }
     for impact in -2..=12 {
-        for local in [false, true] {
-            out.eat_maybe(bullet_hit_event(impact, local).map(|e| e.0));
+        for is_local in [false, true] {
+            out.eat_maybe(bullet_hit_event(impact, is_local).map(|e| e.0));
         }
     }
     for hand in -1..=2 {
-        for last_shot in [false, true] {
-            out.eat(predicted_weapon_fire_event(hand, last_shot).0 as u32);
+        for prior_shot in [false, true] {
+            out.eat(predicted_weapon_fire_event(hand, prior_shot).0 as u32);
         }
     }
     for gunner in 0..4 {
@@ -73,7 +74,7 @@ fn table(out: &mut Fold) {
 fn ring(out: &mut Fold) {
     let mut dice = Dice(0x9e37_79b9_7f4a_7c15);
     for _ in 0..20_000 {
-        let mut state = EntityState::default();
+        let mut state = EntitySnapshot::default();
         state.event_sequence = if dice.below(9) == 0 { 0 } else { (dice.below(2_200) - 60) as i16 };
         for slot in 0..4 {
             state.events[slot] = dice.roll() as u8;
@@ -86,10 +87,10 @@ fn ring(out: &mut Fold) {
             2 => 0,
             _ => dice.below(10_000) - 5_000,
         };
-        consume_entity_events(&state, &mut seen, |e| {
-            out.eat(e.sequence as u32);
-            out.eat(e.event.0 as u32);
-            out.eat(e.event_parm as u32);
+        drain_entity_events(&state, &mut seen, |e| {
+            out.eat(e.ring_seq as u32);
+            out.eat(e.code.0 as u32);
+            out.eat(e.parm_value as u32);
         });
         out.eat(seen as u32);
     }

@@ -1,47 +1,47 @@
 //! Every game button a client's keys can hold.
 
-use crate::Kbutton;
+use crate::HeldKeyLatch;
 
 /// The hold buttons, each named after the command that drives it (`+attack` drives `attack`).
 #[derive(Clone, Copy, Debug, Default)]
-pub struct KbuttonSet {
-    pub attack: Kbutton,
-    pub melee: Kbutton,
-    pub frag: Kbutton,
-    pub smoke: Kbutton,
-    pub usereload: Kbutton,
+pub struct HeldKeyLatchBank {
+    pub attack: HeldKeyLatch,
+    pub melee: HeldKeyLatch,
+    pub frag: HeldKeyLatch,
+    pub smoke: HeldKeyLatch,
+    pub usereload: HeldKeyLatch,
     /// `+speed_throw`: aims while held.
-    pub speed: Kbutton,
-    pub gostand: Kbutton,
-    pub forward: Kbutton,
-    pub back: Kbutton,
-    pub moveleft: Kbutton,
-    pub moveright: Kbutton,
-    pub movedown: Kbutton,
-    pub left: Kbutton,
-    pub right: Kbutton,
-    pub lookup: Kbutton,
-    pub lookdown: Kbutton,
-    pub strafe: Kbutton,
-    pub holdbreath: Kbutton,
-    pub activate: Kbutton,
-    pub reload: Kbutton,
-    pub prone: Kbutton,
-    pub mlook: Kbutton,
-    pub throw_btn: Kbutton,
-    pub sprint: Kbutton,
-    pub scores: Kbutton,
-    pub talk: Kbutton,
-    pub stance: Kbutton,
+    pub speed: HeldKeyLatch,
+    pub gostand: HeldKeyLatch,
+    pub forward: HeldKeyLatch,
+    pub back: HeldKeyLatch,
+    pub moveleft: HeldKeyLatch,
+    pub moveright: HeldKeyLatch,
+    pub movedown: HeldKeyLatch,
+    pub left: HeldKeyLatch,
+    pub right: HeldKeyLatch,
+    pub lookup: HeldKeyLatch,
+    pub lookdown: HeldKeyLatch,
+    pub strafe: HeldKeyLatch,
+    pub holdbreath: HeldKeyLatch,
+    pub activate: HeldKeyLatch,
+    pub reload: HeldKeyLatch,
+    pub prone: HeldKeyLatch,
+    pub mlook: HeldKeyLatch,
+    pub throw_btn: HeldKeyLatch,
+    pub sprint: HeldKeyLatch,
+    pub scores: HeldKeyLatch,
+    pub talk: HeldKeyLatch,
+    pub stance: HeldKeyLatch,
     /// Pushed down by the fire key's jam roll; comes up with the fire key.
-    pub jam: Kbutton,
+    pub jam: HeldKeyLatch,
 }
 
-impl KbuttonSet {
-    /// Calls `f` with the hold command of each button that is down or was pressed since the
+impl HeldKeyLatchBank {
+    /// Calls `visit` with the hold command of each button that is down or was pressed since the
     /// last command, for the movement debug overlay. Buttons that neither move nor act
     /// (strafe, mlook, the menus, the stance press, the throw and jam halves) are not shown.
-    pub fn visit_active_names(&self, mut f: impl FnMut(&'static str)) {
+    pub fn each_held_command(&self, mut visit: impl FnMut(&'static str)) {
         let shown = [
             ("+attack", &self.attack),
             ("+melee", &self.melee),
@@ -66,13 +66,13 @@ impl KbuttonSet {
         ];
         for (name, held) in shown {
             if held.down_or_tapped() {
-                f(name);
+                visit(name);
             }
         }
     }
 
     /// Forgets the presses the last command sent; buttons still held stay active.
-    pub fn clear_was_pressed(&mut self) {
+    pub fn forget_tap(&mut self) {
         let every = [
             &mut self.attack,
             &mut self.melee,
@@ -104,7 +104,7 @@ impl KbuttonSet {
             &mut self.jam,
         ];
         for held in every {
-            held.was_pressed = false;
+            held.tapped_since_clear = false;
         }
     }
 }

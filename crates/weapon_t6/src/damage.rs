@@ -9,17 +9,22 @@ use crate::hitloc::HITLOC_COUNT;
 /// TODO(fact): read BO2's numbers straight from the def and drop the remap.
 pub mod catalog {
     /// Bullet, grenade and projectile keep BO2's numbers (weapon-hits-pen-t6.md 2.8).
-    pub const WEAPTYPE_BULLET: i32 = 0;
-    pub const WEAPTYPE_GRENADE: i32 = 1;
-    pub const WEAPTYPE_PROJECTILE: i32 = 2;
+    pub const GUN_FAMILY_HITSCAN: i32 = 0;
+    pub const GUN_FAMILY_THROWN: i32 = 1;
+    pub const GUN_FAMILY_ROCKET: i32 = 2;
+    /// BO2 `WEAPTYPE_RIOTSHIELD` (8), which `remap_t6_weap_type` writes as 3.
+    pub const WEAPTYPE_RIOTSHIELD: i32 = 3;
+
+    /// BO2 `IMPACT_TYPE_BLADE`: the raw `impactType` of a ballistic or throwing knife.
+    pub const IMPACT_TYPE_BLADE: i32 = 15;
 
     /// BO2 spread and pistol spread.
     pub const WEAPCLASS_SPREAD: i32 = 4;
     /// BO2 grenade.
-    pub const WEAPCLASS_GRENADE: i32 = 6;
+    pub const GUN_GROUP_THROWABLE: i32 = 6;
 }
 
-use catalog::{WEAPCLASS_GRENADE, WEAPTYPE_BULLET, WEAPTYPE_GRENADE, WEAPTYPE_PROJECTILE};
+use catalog::{GUN_GROUP_THROWABLE, GUN_FAMILY_HITSCAN, GUN_FAMILY_THROWN, GUN_FAMILY_ROCKET};
 
 /// dvar bulletrange's default: how far a bullet goes (weapon-hits-pen-t6.md 3.13).
 pub const BULLET_MAX_RANGE: f32 = 8192.0;
@@ -94,9 +99,9 @@ impl DamageSteps {
     /// up to its range, the last point's past its range, and in between a
     /// straight line from the last used point at or under `dist` to the
     /// next used point past it, cut to a whole number.
-    pub fn damage_at(&self, dist: f32) -> i32 {
+    pub fn damage_at(&self, range: f32) -> i32 {
         let s = self.range_scale;
-        let dd = dist * dist;
+        let dd = range * range;
         let first = self.range[0] * s;
         if dd <= first * first {
             return self.damage[0];
@@ -115,7 +120,7 @@ impl DamageSteps {
                 below = next;
                 continue;
             }
-            let t = (dist - self.range[below] * s) / ((self.range[next] - self.range[below]) * s);
+            let t = (range - self.range[below] * s) / ((self.range[next] - self.range[below]) * s);
             return (self.damage[below] as f32 * (1.0 - t) + self.damage[next] as f32 * t) as i32;
         }
         self.damage[0]
@@ -123,24 +128,24 @@ impl DamageSteps {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FireWeaponKind {
+pub enum ShotOriginKind {
     Bullet,
-    ThrownGrenade,
-    GrenadeLauncher,
+    HandTossedExplosive,
+    TubeLauncher,
     Missile,
 }
 
 /// What a weapon of this type and (catalog) class fires.
 #[must_use]
-pub const fn fire_weapon_kind(weap_type: i32, weap_class: i32) -> Option<FireWeaponKind> {
-    match weap_type {
-        WEAPTYPE_BULLET => Some(FireWeaponKind::Bullet),
-        WEAPTYPE_GRENADE => Some(FireWeaponKind::ThrownGrenade),
-        WEAPTYPE_PROJECTILE => {
-            if weap_class == WEAPCLASS_GRENADE {
-                Some(FireWeaponKind::GrenadeLauncher)
+pub const fn fire_weapon_kind(gun_family_code: i32, weap_class: i32) -> Option<ShotOriginKind> {
+    match gun_family_code {
+        GUN_FAMILY_HITSCAN => Some(ShotOriginKind::Bullet),
+        GUN_FAMILY_THROWN => Some(ShotOriginKind::HandTossedExplosive),
+        GUN_FAMILY_ROCKET => {
+            if weap_class == GUN_GROUP_THROWABLE {
+                Some(ShotOriginKind::TubeLauncher)
             } else {
-                Some(FireWeaponKind::Missile)
+                Some(ShotOriginKind::Missile)
             }
         }
         _ => None,

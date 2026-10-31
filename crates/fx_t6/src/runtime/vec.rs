@@ -33,27 +33,27 @@ pub(super) fn vec3_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 }
 
 /// How far apart two points are.
-pub fn vec3_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
-    libm::sqrtf(vec3_length_sq([b[0] - a[0], b[1] - a[1], b[2] - a[2]]))
+pub fn vec3_distance(from: [f32; 3], dst: [f32; 3]) -> f32 {
+    libm::sqrtf(vec3_length_sq([dst[0] - from[0], dst[1] - from[1], dst[2] - from[2]]))
 }
 
 /// A unit vector at right angles to `v`: the one built from the axis `v`
 /// points along least.
-pub fn perpendicular_vector(v: [f32; 3]) -> [f32; 3] {
-    let squares = [v[0] * v[0], v[1] * v[1], v[2] * v[2]];
+pub fn perpendicular_vector(w: [f32; 3]) -> [f32; 3] {
+    let squares = [w[0] * w[0], w[1] * w[1], w[2] * w[2]];
     let mut weakest = usize::from(squares[1] < squares[0]);
     if squares[2] < squares[weakest] {
         weakest = 2;
     }
-    let k = -v[weakest];
-    let mut out = [k * v[0], k * v[1], k * v[2]];
+    let k = -w[weakest];
+    let mut out = [k * w[0], k * w[1], k * w[2]];
     out[weakest] += 1.0;
     vec3_normalize(out)
 }
 
 /// A right-handed frame `[forward, right, up]` around `forward`. A forward
 /// with no direction gives the identity frame.
-pub fn vector_vectors(forward: [f32; 3]) -> [[f32; 3]; 3] {
+pub fn contact_facing_basis(forward: [f32; 3]) -> [[f32; 3]; 3] {
     let f = vec3_normalize(forward);
     if vec3_length_sq(f) < TOO_SHORT_SQ {
         return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -64,9 +64,9 @@ pub fn vector_vectors(forward: [f32; 3]) -> [[f32; 3]; 3] {
 
 /// The turn, in radians, between two frames, going whichever way round is
 /// shorter.
-pub fn effect_orient_arc(last_axis: [[f32; 3]; 3], now_axis: [[f32; 3]; 3]) -> f32 {
+pub fn effect_orient_arc(last_axis: [[f32; 3]; 3], cur_turn: [[f32; 3]; 3]) -> f32 {
     let last = axis_to_quat(last_axis);
-    let now = axis_to_quat(now_axis);
+    let now = axis_to_quat(cur_turn);
     let dot = last[0] * now[0] + last[1] * now[1] + last[2] * now[2] + last[3] * now[3];
     let angle = 2.0 * libm::acosf(dot.clamp(-1.0, 1.0));
     let other_way = TAU - angle;
@@ -104,9 +104,9 @@ mod tests {
 
     #[test]
     fn the_frame_around_a_direction_starts_with_that_direction() {
-        let frame = vector_vectors([0.0, 0.0, 2.0]);
+        let frame = contact_facing_basis([0.0, 0.0, 2.0]);
         assert_eq!(frame[0], [0.0, 0.0, 1.0]);
-        assert_eq!(vector_vectors([0.0; 3]), IDENTITY);
+        assert_eq!(contact_facing_basis([0.0; 3]), IDENTITY);
     }
 
     #[test]

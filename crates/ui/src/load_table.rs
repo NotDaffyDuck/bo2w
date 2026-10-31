@@ -13,7 +13,7 @@ use bevy::prelude::Color;
 pub(crate) enum RowState {
     Running,
     Done,
-    Reused,
+    Recycled,
     Skipped,
     Cancelled,
     Abandoned,
@@ -25,7 +25,7 @@ impl RowState {
     fn tag(self) -> &'static str {
         match self {
             Self::Running | Self::Done => "",
-            Self::Reused => " (reused)",
+            Self::Recycled => " (reused)",
             Self::Skipped => " (skipped)",
             Self::Cancelled => " (canceled)",
             Self::Abandoned => " (interrupted)",
@@ -37,7 +37,7 @@ impl RowState {
         match self {
             Self::Running => Color::srgb(1.0, 0.72, 0.28),
             Self::Done => Color::srgb(0.62, 0.92, 0.68),
-            Self::Reused | Self::Skipped => Color::srgb(0.52, 0.56, 0.62),
+            Self::Recycled | Self::Skipped => Color::srgb(0.52, 0.56, 0.62),
             Self::Cancelled | Self::Abandoned => Color::srgb(0.86, 0.72, 0.42),
             Self::Failed => Color::srgb(1.0, 0.35, 0.25),
         }
@@ -207,9 +207,9 @@ impl Group<'_> {
             RowState::Skipped
         } else if outcomes
             .iter()
-            .all(|o| matches!(o, StageOutcome::Reused | StageOutcome::Skipped))
+            .all(|o| matches!(o, StageOutcome::Recycled | StageOutcome::Skipped))
         {
-            RowState::Reused
+            RowState::Recycled
         } else {
             RowState::Done
         }

@@ -40,23 +40,23 @@ impl ButtonBits {
 /// (CL_CmdButtons, CL_KeyMove, CL_AddCurrentStanceToCmd, and the cgame's
 /// extra buttons).
 pub mod button {
-    pub const ATTACK: u32 = 0;
+    pub const FIRE_BIT: u32 = 0;
     pub const SPRINT: u32 = 1;
-    pub const MELEE: u32 = 2;
-    pub const USE: u32 = 3;
+    pub const CLOSE_COMBAT: u32 = 2;
+    pub const INTERACT_KEY: u32 = 3;
     pub const RELOAD: u32 = 4;
     /// Use pressed through the reload key (`usebuttonpressed` takes either).
-    pub const USE_RELOAD: u32 = 5;
+    pub const INTERACT_RELOAD_KEY: u32 = 5;
     /// The stance the client asks for: prone, or crouch.
-    pub const PRONE: u32 = 8;
-    pub const CROUCH: u32 = 9;
-    pub const JUMP: u32 = 10;
-    pub const ADS: u32 = 11;
+    pub const LYING_FLAT: u32 = 8;
+    pub const DUCK_BUTTON_BIT: u32 = 9;
+    pub const LEAP: u32 = 10;
+    pub const AIM_BIT: u32 = 11;
     /// The crouch or prone key is held down (not toggled).
-    pub const STANCE_HELD: u32 = 12;
+    pub const STANCE_LOCK_BIT: u32 = 12;
     /// Hold breath (`+breath`).
-    pub const BREATH: u32 = 13;
-    pub const FRAG: u32 = 14;
+    pub const STEADY_AIM_HOLD_BIT: u32 = 13;
+    pub const SAMPLE_FRAG_ASSET: u32 = 14;
     pub const SECONDARY_OFFHAND: u32 = 15;
     /// The location selector's pick is made.
     pub const LOCATION_CONFIRM: u32 = 16;
@@ -103,32 +103,32 @@ pub mod last_input {
 /// BO2's `usercmd_s` (less the Wii U pointer fields, which the PC game
 /// never fills).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct UserCmd {
-    pub server_time: i32,
+pub struct InputCommand {
+    pub authority_clock_ms: i32,
     pub button_bits: ButtonBits,
     /// View angles in BO2's 16-bit short-angle units.
     pub angles: [i32; 3],
     pub weapon: Weapon,
     pub off_hand_weapon: Weapon,
     pub last_weapon_alt_mode_switch: Weapon,
-    pub forwardmove: i8,
-    pub rightmove: i8,
+    pub thrust_ahead: i8,
+    pub thrust_lateral: i8,
     pub upmove: i8,
     pub pitchmove: i8,
     pub yawmove: i8,
-    pub gun_pitch: i16,
-    pub gun_yaw: i16,
+    pub weapon_tilt_angle: i16,
+    pub weapon_swing_angle: i16,
     /// The knife lunge's target entity.
     pub melee_charge_ent: u16,
-    pub melee_charge_dist: u8,
+    pub lunge_reach: u8,
     pub rollmove: f32,
-    pub selected_location: [i8; 2],
+    pub chosen_map_spot: [i8; 2],
     pub selected_yaw: u8,
     pub airburst_mark_distance: u16,
     pub last_input: u16,
 }
 
-impl UserCmd {
+impl InputCommand {
     /// Is this button held in this command?
     #[must_use]
     pub const fn held(&self, button: u32) -> bool {
@@ -143,21 +143,21 @@ mod tests {
     #[test]
     fn button_bits_are_bo2s_order() {
         let mut b = ButtonBits::default();
-        b.set(button::ATTACK);
+        b.set(button::FIRE_BIT);
         assert_eq!(b.0, [0x8000_0000, 0]);
-        b.set(button::ADS);
+        b.set(button::AIM_BIT);
         assert_eq!(b.0[0] >> 20 & 1, 1);
         b.set(button::STANCE);
         assert_eq!(b.0[1] >> 1 & 1, 1);
         b.set(button::INVENTORY);
         assert_eq!(b.0[1] & 0x400, 0x400);
-        assert!(b.test(button::STANCE) && !b.test(button::JUMP));
+        assert!(b.test(button::STANCE) && !b.test(button::LEAP));
         let mut stance = ButtonBits::default();
-        stance.set(button::CROUCH);
-        stance.set(button::STANCE_HELD);
+        stance.set(button::DUCK_BUTTON_BIT);
+        stance.set(button::STANCE_LOCK_BIT);
         stance.set(button::DIVE_TO_PRONE);
         assert_eq!(stance.0, [0x0040_0000 | 0x0008_0000, 0x0008_0000]);
-        b.reset(button::ATTACK);
-        assert!(!b.test(button::ATTACK) && b.any());
+        b.reset(button::FIRE_BIT);
+        assert!(!b.test(button::FIRE_BIT) && b.any());
     }
 }

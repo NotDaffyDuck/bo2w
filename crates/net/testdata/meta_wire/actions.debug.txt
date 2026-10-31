@@ -1,6 +1,6 @@
 [
     (
-        ClientId(
+        SeatNo(
             0,
         ),
         JoinMatch {
@@ -8,7 +8,7 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             3,
         ),
         LeaveMatch {
@@ -16,12 +16,12 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             6,
         ),
-        SelectClass {
+        PickLoadout {
             request_id: 3,
-            class_id: ClassId(
+            class_id: LoadoutClass(
                 7,
             ),
             revision: 41,
@@ -37,21 +37,20 @@
                     22,
                     33,
                 ],
-                deathstreak: 3,
             },
         },
     ),
     (
-        ClientId(
+        SeatNo(
             9,
         ),
-        GiveWeapon {
+        HandOutGun {
             request_id: 4,
-            weapon: 16909060,
+            gun: 16909060,
         },
     ),
     (
-        ClientId(
+        SeatNo(
             12,
         ),
         ChangeWeaponConfiguration {
@@ -61,7 +60,7 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             15,
         ),
         ForceDeath {
@@ -69,7 +68,7 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             18,
         ),
         SpawnClient {
@@ -77,7 +76,7 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             21,
         ),
         ForceSpawn {
@@ -88,7 +87,7 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             24,
         ),
         ForceSpawn {
@@ -104,7 +103,7 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             27,
         ),
         SpawnIntermission {
@@ -112,43 +111,43 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             30,
         ),
-        SetMatchPhase {
+        StageMatch {
             request_id: 11,
             phase: Warmup,
         },
     ),
     (
-        ClientId(
+        SeatNo(
             33,
         ),
-        SetMatchPhase {
+        StageMatch {
             request_id: 12,
             phase: Playing,
         },
     ),
     (
-        ClientId(
+        SeatNo(
             36,
         ),
-        SetMatchPhase {
+        StageMatch {
             request_id: 13,
             phase: Intermission,
         },
     ),
     (
-        ClientId(
+        SeatNo(
             39,
         ),
-        SetMatchPhase {
+        StageMatch {
             request_id: 14,
             phase: PostGame,
         },
     ),
     (
-        ClientId(
+        SeatNo(
             42,
         ),
         Move {
@@ -166,25 +165,25 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             45,
         ),
-        BeginScriptMoverRotateVelocity {
+        SpinMover {
             request_id: 16,
             speed: -45.75,
         },
     ),
     (
-        ClientId(
+        SeatNo(
             48,
         ),
-        DebugDamage {
+        TestHarm {
             request_id: 17,
             amount: -250,
         },
     ),
     (
-        ClientId(
+        SeatNo(
             51,
         ),
         SetName {
@@ -210,7 +209,7 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             54,
         ),
         UseCopycat {
@@ -218,7 +217,7 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             57,
         ),
         ActionSlot {
@@ -227,7 +226,7 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             60,
         ),
         ChooseDefaultClass {
@@ -236,7 +235,7 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             63,
         ),
         MenuResponse {
@@ -344,7 +343,7 @@
         },
     ),
     (
-        ClientId(
+        SeatNo(
             66,
         ),
         GiveKillstreak {

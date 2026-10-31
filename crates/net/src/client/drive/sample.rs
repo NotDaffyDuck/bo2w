@@ -5,7 +5,7 @@
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use playerstate_t6::game::{buttons, last_input};
-use sim::ClientAction;
+use sim::PlayerIntent;
 
 use super::location_cursor::{LocationCursor, steer_command};
 use super::look_input::{
@@ -14,187 +14,190 @@ use super::look_input::{
 };
 use super::melee_pick::aim_melee_charge;
 use super::pad_assist::steer_pad_look;
-use super::stores::{ClientCmdTemplate, ClientPhaseTrace, ClientPredictionState, note_phase};
-use super::gun_pick::{WeaponSelect, follow_held_weapon_select};
+use super::stores::{PlayerMoveBlueprint, ReceiverStageLog, ClientGuessState, note_phase};
+use super::gun_pick::{WeaponSelect, follow_held_weapon_select, out_of_ammo_change};
 use super::weapon_keys::{
     ActionRequests, Held, breath_key_switches_optic, hybrid_optic, inventory_key, offhand_choice, press_slots,
     run_cycles, track_held_mapping,
 };
-use crate::authority::runtime::AuthorityInputGate;
+use crate::host_tick::tick_systems::HostInputValve;
 use crate::client::frame_clock::FrameClock;
-use crate::client::input::{
-    ClientActionInput, LookState, build_usercmd, frame_time_msec, key_frame_msec, remote_control_axes,
+use crate::client::local_input::{
+    PlayerControlSnapshot, ViewAimAccumulator, assemble_input_record, frame_time_msec, pressed_frame_millis, remote_control_axes,
 };
-use crate::client::presentation::presented::{LocalPresentClient, PresentedSnapshot};
+use crate::client::presentation::shown_frame::{HostViewClient, ShownWorldFrame};
 use crate::client::realtime::ClientRealtime;
 
 /// What the frame already knows, none of it changed here.
 #[derive(SystemParam)]
 pub struct FrameFacts<'w> {
     time: Res<'w, Time>,
-    prediction: Res<'w, ClientPredictionState>,
-    presented: Res<'w, PresentedSnapshot>,
-    local: Res<'w, LocalPresentClient>,
+    forecast: Res<'w, ClientGuessState>,
+    world_view: Res<'w, ShownWorldFrame>,
+    own_id: Res<'w, HostViewClient>,
     cls: Res<'w, ClientRealtime>,
     clock: Res<'w, FrameClock>,
-    view: Option<Res<'w, frame::ViewSubject>>,
+    view: Option<Res<'w, frame::EyeSubject>>,
 }
 
 /// The input state the sampler keeps and rewrites.
 #[derive(SystemParam)]
 pub struct InputState<'w> {
-    actions: ResMut<'w, ClientActionInput>,
-    look: ResMut<'w, LookState>,
-    template: ResMut<'w, ClientCmdTemplate>,
+    ctl: ResMut<'w, PlayerControlSnapshot>,
+    look: ResMut<'w, ViewAimAccumulator>,
+    template: ResMut<'w, PlayerMoveBlueprint>,
     select: ResMut<'w, WeaponSelect>,
     cursor: ResMut<'w, LocationCursor>,
 }
 
-pub fn sample_client_input(
+pub fn poll_receiver_controls(
     facts: FrameFacts,
     input: InputState,
-    gate: Res<AuthorityInputGate>,
+    gate: Res<HostInputValve>,
     mut requests: ActionRequests,
-    trace: Option<ResMut<ClientPhaseTrace>>,
+    trace: Option<ResMut<ReceiverStageLog>>,
 ) {
     note_phase(trace, "Input");
-    let FrameFacts { time, prediction, presented, local, cls, clock, view } = facts;
-    let InputState { mut actions, mut look, mut template, mut select, mut cursor } = input;
+    let FrameFacts { time, forecast, world_view, own_id, cls, clock, view } = facts;
+    let InputState { mut ctl, look: mut aim_state, template: mut blueprint, select: mut gun_choice, mut cursor } = input;
 
     if !gate.local_cmds_enabled {
-        if !actions.client.weapon_cycles.is_empty() {
-            diag::info!(Net, "bo2mp cycle: dropped, local commands are off");
+        if !ctl.client.gun_swap_steps.is_empty() {
+            diag::info!(WireLink, "bo2mp cycle: dropped, local commands are off");
         }
-        actions.client.weapon_cycles.clear();
-        actions.client.action_slots.clear();
+        ctl.client.gun_swap_steps.clear();
+        ctl.client.action_slots.clear();
         return;
     }
-    actions.frame_msec = key_frame_msec(time.delta_secs());
-    actions.now_msec = frame_time_msec(time.elapsed_secs());
+    ctl.tick_span_ms = pressed_frame_millis(time.delta_secs());
+    ctl.present_tick_ms = frame_time_msec(time.elapsed_secs());
 
-    let me = local.0;
-    let world = prediction.0.world();
-    let cg_time = clock.time();
-    let ps = prediction.0.predicted_local().or_else(|| presented.player(me));
-    let my_row = presented.snapshot().and_then(|snapshot| snapshot.meta.for_client(me));
-    read_key_context(&mut actions.client, ps, presented.player(me), world);
+    let me = own_id.0;
+    let world = forecast.0.world();
+    let scene_clock_ms = clock.time();
+    let own_state = forecast.0.predicted_local().or_else(|| world_view.player(me));
+    let my_row = world_view.snapshot().and_then(|snapshot| snapshot.meta.for_client(me));
+    read_key_context(&mut ctl.client, own_state, world_view.player(me), world);
 
     // What the gun brain runs on: the predicted raw weapon state and grenade, or the last
     // snapshot's state with no grenade before prediction has started the brain.
-    let frozen = is_frozen(ps, my_row);
+    let frozen = is_frozen(own_state, my_row);
     let offhand = world
         .client_meta(me)
         .and_then(|meta| meta.t6_offhand())
         .or_else(|| my_row.and_then(|row| row.t6_view).map(|shown| (shown.weaponstate, 0)));
     let guiding = is_guiding_missile(my_row);
-    gate_raw_input(&mut actions, guiding, is_setting_down_shield(offhand), frozen);
+    gate_raw_input(&mut ctl, guiding, is_setting_down_shield(offhand), frozen);
 
-    match ps {
-        Some(ps) => steer_pad_look(&mut actions, ps, me, look.angles, cls.frametime_secs(), &presented, world),
-        None => actions.pad_look_delta = [0.0; 2],
+    match own_state {
+        Some(ps) => steer_pad_look(&mut ctl, ps, me, aim_state.angles, cls.step_duration_seconds(), &world_view, world),
+        None => ctl.pad_look_delta = [0.0; 2],
     }
     if frozen {
-        actions.pad_look_delta = [0.0; 2];
+        ctl.pad_look_delta = [0.0; 2];
     }
 
     let choose_direction = my_row
         .and_then(|row| row.location_selection.as_ref())
         .map(|selection| selection.choose_direction);
-    let location_mouse = take_cursor_mouse(&mut actions, choose_direction.is_some());
-    let remote_mouse = take_missile_steering(&mut actions, guiding);
+    let location_mouse = take_cursor_mouse(&mut ctl, choose_direction.is_some());
+    let remote_mouse = take_missile_steering(&mut ctl, guiding);
 
-    apply_shellshock(&mut actions, ps, me, &presented, cg_time);
-    turn_view(&mut actions, &mut look, ps, cls.frametime_secs(), frozen);
-    let life_sequence = my_row.map_or(0, |row| row.life_sequence.0);
-    latch_stance(&mut actions, ps, life_sequence);
-    follow_held_weapon_select(&mut select, ps.map_or(0, |ps| ps.weapon), life_sequence, cg_time);
+    apply_shellshock(&mut ctl, own_state, me, &world_view, scene_clock_ms);
+    turn_view(&mut ctl, &mut aim_state, own_state, cls.step_duration_seconds(), frozen);
+    let life_no = my_row.map_or(0, |row| row.life_sequence.0);
+    latch_stance(&mut ctl, own_state, life_no);
+    follow_held_weapon_select(&mut gun_choice, own_state.map_or(0, |ps| ps.weapon), life_no, scene_clock_ms);
+    if let Some(own_state) = own_state {
+        out_of_ammo_change(&mut gun_choice, own_state, world, scene_clock_ms);
+    }
 
-    let held = ps.map(|ps| Held { ps, world, now: cg_time, offhand, frozen });
+    let held = own_state.map(|ps| Held { ps, sim_world: world, now: scene_clock_ms, offhand, scripted_hold: frozen });
     if let Some(held) = &held {
-        track_held_mapping(&mut select, held);
+        track_held_mapping(&mut gun_choice, held);
     }
 
     // A slot press is always passed on to the host; picking the gun it names is only for a
     // player who can move.
-    let slots = std::mem::take(&mut actions.client.action_slots);
+    let slots = std::mem::take(&mut ctl.client.action_slots);
     for &slot in &slots {
-        requests.push(me, "action_slot", |request_id| ClientAction::ActionSlot { request_id, slot: slot as u8 });
+        requests.push(me, "action_slot", |request_id| PlayerIntent::ActionSlot { request_id, slot: slot as u8 });
     }
-    if let Some(held) = held.as_ref().filter(|held| !held.frozen) {
-        press_slots(&mut select, &mut actions.client, held, &slots);
+    if let Some(held) = held.as_ref().filter(|held| !held.scripted_hold) {
+        press_slots(&mut gun_choice, &mut ctl.client, held, &slots);
     }
     if let Some(held) = &held
-        && breath_key_switches_optic(&actions.client, &look, frozen)
+        && breath_key_switches_optic(&ctl.client, &aim_state, frozen)
     {
-        hybrid_optic(&mut select, held);
+        hybrid_optic(&mut gun_choice, held);
     }
 
-    let cycles = std::mem::take(&mut actions.client.weapon_cycles);
+    let cycles = std::mem::take(&mut ctl.client.gun_swap_steps);
     // The switch-weapon key is Black Ops II's change-seat button too, on the press.
-    let change_seat = std::mem::take(&mut actions.client.change_seat_press);
-    let in_killcam = view.is_some_and(|view| view.in_killcam());
+    let change_seat = std::mem::take(&mut ctl.client.change_seat_press);
+    let replaying_final_death = view.is_some_and(|view| view.replaying_final_death());
     match &held {
-        Some(held) => run_cycles(&mut select, &mut actions.client, held, &cycles, in_killcam, &mut requests, me),
-        None if !cycles.is_empty() => diag::info!(Net, "bo2mp cycle: dropped, no player state yet"),
+        Some(held) => run_cycles(&mut gun_choice, &mut ctl.client, held, &cycles, replaying_final_death, &mut requests, me),
+        None if !cycles.is_empty() => diag::info!(WireLink, "bo2mp cycle: dropped, no player state yet"),
         None => {}
     }
 
-    kick_view(&mut look, frozen);
-    melee_key_to_zoom(&mut actions, &mut look);
+    kick_view(&mut aim_state, frozen);
+    melee_key_to_zoom(&mut ctl, &mut aim_state);
 
     // Flying a drone, Ctrl is "down" while held, so its toggle is dropped and the held key goes
     // as crouch.
-    let drone = is_flying_drone(presented.snapshot(), me);
+    let drone = is_flying_drone(world_view.snapshot(), me);
     if drone {
-        actions.client.stance_latch = 0;
+        ctl.client.posture_hold = 0;
     }
-    let mut cmd = build_usercmd(&mut actions, &look, 0);
-    if drone && input_t6::lower_key_held(&actions.client) {
-        cmd.buttons |= buttons::CROUCH;
+    let mut cmd = assemble_input_record(&mut ctl, &aim_state, 0);
+    if drone && input_t6::lower_key_held(&ctl.client) {
+        cmd.buttons |= buttons::DUCK_BUTTON_BIT;
     }
-    cmd.last_input = if actions.last_input_pad { last_input::GAMEPAD } else { last_input::MOUSECLICK };
-    if cmd.buttons & buttons::USE_RELOAD != 0 && ps.is_some_and(|ps| ps.cursor_hint == 0) {
+    cmd.last_input = if ctl.last_input_pad { last_input::GAMEPAD } else { last_input::MOUSECLICK };
+    if cmd.buttons & buttons::INTERACT_RELOAD_KEY != 0 && own_state.is_some_and(|ps| ps.hint_kind == 0) {
         cmd.buttons |= buttons::RELOAD;
     }
-    look.angles = cmd.angles;
-    if let Some((mouse_x, mouse_y, pad_look)) = remote_mouse {
-        cmd.remote_control = remote_control_axes(&actions, mouse_x, mouse_y, pad_look);
+    aim_state.angles = cmd.angles;
+    if let Some((pointer_delta_horizontal, pointer_delta_vertical, pad_look)) = remote_mouse {
+        cmd.remote_operated = remote_control_axes(&ctl, pointer_delta_horizontal, pointer_delta_vertical, pad_look);
         cmd.buttons |= buttons::REMOTE_CONTROL;
     }
     if change_seat {
         cmd.buttons |= buttons::CHANGE_SEAT;
     }
 
-    let inventory_request = std::mem::take(&mut actions.client.inventory_request);
+    let inventory_request = std::mem::take(&mut ctl.client.inventory_request);
     if let Some(held) = &held {
         // The snapshot's own state of him, not the predicted one the rest reads.
-        let server_state = presented
+        let server_state = world_view
             .snapshot()
             .and_then(|snapshot| snapshot.players.iter().find(|(id, _)| *id == me))
-            .map(|(_, state)| state);
-        if inventory_key(&mut select, &mut actions.client, held, inventory_request, server_state) {
+            .map(|(_, sv)| sv);
+        if inventory_key(&mut gun_choice, &mut ctl.client, held, inventory_request, server_state) {
             cmd.buttons |= buttons::INVENTORY;
         }
     }
-    cmd.weapon = select.index as u16;
-    cmd.weapon_mapped = select.mapped_index as u16;
+    cmd.weapon = gun_choice.index as u16;
+    cmd.weapon_slot_code = gun_choice.mapped_index as u16;
     if let Some(loadout) = my_row.and_then(|row| row.loadout.as_ref())
         && let Some(grenade) = offhand_choice(
-            &actions.client.kb.frag,
-            &actions.client.kb.smoke,
+            &ctl.client.pressed_key_latch.frag,
+            &ctl.client.pressed_key_latch.smoke,
             loadout.lethal as u16,
             loadout.tactical as u16,
         )
     {
-        cmd.off_hand_index = grenade;
+        cmd.secondary_hand_slot = grenade;
     }
 
-    let already_picking = template.cmd.buttons & buttons::LOCATION_SELECT != 0;
-    steer_command(&mut cursor, &mut cmd, actions.sensitivity, location_mouse, choose_direction, already_picking);
-    aim_melee_charge(&mut cmd, ps, me, presented.snapshot(), &presented, world);
+    let already_picking = blueprint.cmd.buttons & buttons::MAP_TARGET_PICK != 0;
+    steer_command(&mut cursor, &mut cmd, ctl.sensitivity, location_mouse, choose_direction, already_picking);
+    aim_melee_charge(&mut cmd, own_state, me, world_view.snapshot(), &world_view, world);
 
-    template.cmd = cmd;
-    template.ready = true;
+    blueprint.cmd = cmd;
+    blueprint.prefilled = true;
 }
 
 #[cfg(test)]
@@ -204,25 +207,25 @@ mod tests {
     use sim::ClientId;
 
     use super::*;
-    use crate::{ActionRequestIds, authority::inbox::ClientActionInbox};
+    use crate::{ActionRequestCounter, host_tick::peer_mail::PlayerActionIntake};
 
     const ME: ClientId = ClientId(1);
 
     fn app(commands_on: bool) -> App {
         let mut app = App::new();
         app.insert_resource(Time::<()>::default())
-            .init_resource::<ClientActionInput>()
-            .init_resource::<LookState>()
-            .init_resource::<ClientCmdTemplate>()
+            .init_resource::<PlayerControlSnapshot>()
+            .init_resource::<ViewAimAccumulator>()
+            .init_resource::<PlayerMoveBlueprint>()
             .init_resource::<WeaponSelect>()
             .init_resource::<LocationCursor>()
-            .init_resource::<ClientPredictionState>()
-            .init_resource::<PresentedSnapshot>()
-            .insert_resource(LocalPresentClient(ME))
-            .insert_resource(AuthorityInputGate { local_cmds_enabled: commands_on })
+            .init_resource::<ClientGuessState>()
+            .init_resource::<ShownWorldFrame>()
+            .insert_resource(HostViewClient(ME))
+            .insert_resource(HostInputValve { local_cmds_enabled: commands_on })
             .init_resource::<ClientRealtime>()
             .init_resource::<FrameClock>()
-            .add_systems(Update, sample_client_input);
+            .add_systems(Update, poll_receiver_controls);
         app
     }
 
@@ -231,32 +234,32 @@ mod tests {
         app.update();
     }
 
-    fn actions(app: &mut App) -> Mut<'_, ClientActionInput> {
-        app.world_mut().resource_mut::<ClientActionInput>()
+    fn ctl(app: &mut App) -> Mut<'_, PlayerControlSnapshot> {
+        app.world_mut().resource_mut::<PlayerControlSnapshot>()
     }
 
-    fn template(app: &App) -> &ClientCmdTemplate {
-        app.world().resource::<ClientCmdTemplate>()
+    fn template(app: &App) -> &PlayerMoveBlueprint {
+        app.world().resource::<PlayerMoveBlueprint>()
     }
 
     #[test]
     fn with_local_commands_off_the_queued_presses_are_dropped_and_no_command_is_built() {
         let mut app = app(false);
-        actions(&mut app).client.weapon_cycles.push(true);
-        actions(&mut app).client.action_slots.push(2);
+        ctl(&mut app).client.gun_swap_steps.push(true);
+        ctl(&mut app).client.action_slots.push(2);
         frame(&mut app);
-        assert!(actions(&mut app).client.weapon_cycles.is_empty());
-        assert!(actions(&mut app).client.action_slots.is_empty());
-        assert!(!template(&app).ready);
+        assert!(ctl(&mut app).client.gun_swap_steps.is_empty());
+        assert!(ctl(&mut app).client.action_slots.is_empty());
+        assert!(!template(&app).prefilled);
     }
 
     #[test]
     fn the_phase_is_traced_whether_or_not_commands_are_on() {
         for commands_on in [false, true] {
             let mut app = app(commands_on);
-            app.insert_resource(ClientPhaseTrace::default());
+            app.insert_resource(ReceiverStageLog::default());
             frame(&mut app);
-            assert_eq!(app.world().resource::<ClientPhaseTrace>().0, ["Input"]);
+            assert_eq!(app.world().resource::<ReceiverStageLog>().0, ["Input"]);
         }
     }
 
@@ -264,8 +267,8 @@ mod tests {
     fn a_frame_before_any_player_state_still_leaves_a_ready_command() {
         let mut app = app(true);
         frame(&mut app);
-        assert!(template(&app).ready);
-        assert_eq!(actions(&mut app).frame_msec, key_frame_msec(0.016));
+        assert!(template(&app).prefilled);
+        assert_eq!(ctl(&mut app).tick_span_ms, pressed_frame_millis(0.016));
     }
 
     #[test]
@@ -277,25 +280,25 @@ mod tests {
             select.mapped_index = 9;
         }
         frame(&mut app);
-        assert_eq!((template(&app).cmd.weapon, template(&app).cmd.weapon_mapped), (7, 9));
+        assert_eq!((template(&app).cmd.weapon, template(&app).cmd.weapon_slot_code), (7, 9));
     }
 
     #[test]
     fn a_player_the_match_has_no_row_for_gets_no_mouse() {
         let mut app = app(true);
-        actions(&mut app).mouse_x = 9.0;
-        actions(&mut app).mouse_y = -3.0;
+        ctl(&mut app).pointer_delta_horizontal = 9.0;
+        ctl(&mut app).pointer_delta_vertical = -3.0;
         frame(&mut app);
-        assert_eq!((actions(&mut app).mouse_x, actions(&mut app).mouse_y), (0.0, 0.0));
+        assert_eq!((ctl(&mut app).pointer_delta_horizontal, ctl(&mut app).pointer_delta_vertical), (0.0, 0.0));
     }
 
     #[test]
     fn the_command_says_which_device_was_used_last() {
         let mut app = app(true);
-        actions(&mut app).last_input_pad = true;
+        ctl(&mut app).last_input_pad = true;
         frame(&mut app);
         assert_eq!(template(&app).cmd.last_input, last_input::GAMEPAD);
-        actions(&mut app).last_input_pad = false;
+        ctl(&mut app).last_input_pad = false;
         frame(&mut app);
         assert_eq!(template(&app).cmd.last_input, last_input::MOUSECLICK);
     }
@@ -303,7 +306,7 @@ mod tests {
     #[test]
     fn the_seat_change_press_rides_one_command_only() {
         let mut app = app(true);
-        actions(&mut app).client.change_seat_press = true;
+        ctl(&mut app).client.change_seat_press = true;
         frame(&mut app);
         assert_ne!(template(&app).cmd.buttons & buttons::CHANGE_SEAT, 0);
         frame(&mut app);
@@ -313,31 +316,31 @@ mod tests {
     #[test]
     fn cycles_with_no_player_state_are_dropped_and_leave_the_gun_alone() {
         let mut app = app(true);
-        actions(&mut app).client.weapon_cycles.extend([true, false]);
+        ctl(&mut app).client.gun_swap_steps.extend([true, false]);
         frame(&mut app);
-        assert!(actions(&mut app).client.weapon_cycles.is_empty());
+        assert!(ctl(&mut app).client.gun_swap_steps.is_empty());
         assert_eq!(app.world().resource::<WeaponSelect>().index, 0);
     }
 
     #[test]
     fn an_inventory_press_is_used_up_even_with_nobody_to_switch() {
         let mut app = app(true);
-        actions(&mut app).client.inventory_request = true;
+        ctl(&mut app).client.inventory_request = true;
         frame(&mut app);
-        assert!(!actions(&mut app).client.inventory_request);
+        assert!(!ctl(&mut app).client.inventory_request);
         assert_eq!(template(&app).cmd.buttons & buttons::INVENTORY, 0);
     }
 
     #[test]
     fn a_slot_press_is_queued_for_the_host_with_or_without_a_player_state() {
         let mut app = app(true);
-        app.init_resource::<ClientActionInbox>().init_resource::<ActionRequestIds>();
-        actions(&mut app).client.action_slots.extend([3, 1]);
+        app.init_resource::<PlayerActionIntake>().init_resource::<ActionRequestCounter>();
+        ctl(&mut app).client.action_slots.extend([3, 1]);
         frame(&mut app);
-        let queued = app.world().resource::<ClientActionInbox>().pending().to_vec();
+        let queued = app.world().resource::<PlayerActionIntake>().pending().to_vec();
         assert_eq!(queued.len(), 2);
-        assert!(matches!(queued[0], (ME, ClientAction::ActionSlot { slot: 3, .. })));
-        assert!(matches!(queued[1], (ME, ClientAction::ActionSlot { slot: 1, .. })));
-        assert!(actions(&mut app).client.action_slots.is_empty());
+        assert!(matches!(queued[0], (ME, PlayerIntent::ActionSlot { slot: 3, .. })));
+        assert!(matches!(queued[1], (ME, PlayerIntent::ActionSlot { slot: 1, .. })));
+        assert!(ctl(&mut app).client.action_slots.is_empty());
     }
 }

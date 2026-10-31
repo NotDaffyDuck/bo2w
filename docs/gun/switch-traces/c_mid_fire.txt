@@ -1,0 +1,14 @@
+# WAITS for the frame's reload and fire (windows 3 and 4): pm::reload / pm::fire are still empty stubs.
+# C. Swap mid-fire: the switch waits out the shot's fire time (AN-94 96 ms), then drops. Read the printed ticks.
+msec 50
+spawn an94_mp
+give mp7_mp
+run 2
+hold attack
+run 1
+release attack
+select mp7_mp
+run 1
+run 1
+run 1
+expect state DROPPING

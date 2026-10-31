@@ -2,237 +2,454 @@ use std::collections::HashMap;
 
 use asset_game::FxDefinitions;
 use bevy::prelude::*;
-use fx::FxSystemHost;
-use fx_t6::FxPostLight;
+use fx::EffectSystemHost;
+use fx_t6::AfterglowSprite;
 
-use crate::present::FxElemInfoCache;
+use crate::effect_play::EffectElementInfoMemo;
 
-#[derive(Resource, Default)]
-pub struct PreparedFxCatalog(pub FxDefinitions);
-
-#[derive(Resource, Default)]
-pub struct PreparedFxModels(pub asset_game::FxModelCatalog);
-
-#[derive(Resource, Default)]
-pub struct PreparedFxElemInfos(pub FxElemInfoCache);
-
-#[derive(Resource, Default)]
-pub struct PreparedImpactFx(pub Option<asset_game::OwnedFxImpactTable>);
-
-#[derive(Resource, Default)]
-pub struct FxWorldColorImages {
-    pub motion_tracker: [Option<crate::drawsurf::tess::fx::FxPassMaterial>; 4],
-    pub colors: HashMap<String, Handle<Image>>,
-    pub keys: HashMap<String, (u8, u16)>,
-    pub colors_by_asset: HashMap<usize, Handle<Image>>,
-    pub keys_by_asset: HashMap<usize, (u8, u16)>,
-    pub mark_colors_by_asset: HashMap<usize, Handle<Image>>,
-    pub mark_keys_by_asset: HashMap<usize, (u8, u16)>,
+/// Declares the resources that wrap the effect data prepared when a world loads; each
+/// starts empty and is dropped again when the match is torn down.
+macro_rules! prepared_resources {
+    ($($(#[$note:meta])* $name:ident($data:ty);)*) => {$(
+        $(#[$note])*
+        #[derive(Resource, Default)]
+        pub struct $name(pub $data);
+    )*};
 }
 
-#[derive(Resource, Debug)]
-pub struct FxDumpRequest {
-    pub pending: bool,
-    pub radius: f32,
+prepared_resources! {
+    /// Every effect definition the loaded world can name.
+    ReadyFxBook(FxDefinitions);
+    /// The models effects attach to their elements.
+    ReadyFxProps(asset_game::EffectMeshRoster);
+    /// Per-definition element facts, filled as effects play.
+    PreparedFxElemTable(EffectElementInfoMemo);
+    /// The impact table, when the world carries one of its own.
+    ReadyHitFx(Option<asset_game::SelfContainedImpactFxTable>);
 }
 
-impl Default for FxDumpRequest {
+/// Declares a kind of event and the table that counts each kind in its own saturating slot.
+macro_rules! counter_table {
+    (
+        $(#[$kind_note:meta])* $kind:ident;
+        $(#[$table_note:meta])* $table:ident;
+        $($(#[$note:meta])* $variant:ident),+ $(,)?
+    ) => {
+        $(#[$kind_note])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum $kind {
+            $($(#[$note])* $variant),+
+        }
+
+        impl $kind {
+            const ALL: &'static [$kind] = &[$($kind::$variant),+];
+        }
+
+        $(#[$table_note])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct $table([u32; $kind::ALL.len()]);
+
+        impl Default for $table {
+            fn default() -> Self {
+                Self([0; $kind::ALL.len()])
+            }
+        }
+
+        impl $table {
+            pub fn count_of(&self, kind: $kind) -> u32 {
+                self.0[kind as usize]
+            }
+
+            /// The counter itself, for code that adds to it through a reference.
+            pub fn slot(&mut self, kind: $kind) -> &mut u32 {
+                &mut self.0[kind as usize]
+            }
+
+            pub fn add_to(&mut self, kind: $kind, times: u32) {
+                let slot = self.slot(kind);
+                *slot = slot.saturating_add(times);
+            }
+
+            pub fn bump(&mut self, kind: $kind) {
+                self.add_to(kind, 1);
+            }
+        }
+    };
+}
+
+/// Colour handles and sort keys for one way of naming a material.
+#[derive(Debug)]
+pub struct ColorMaps<K> {
+    pub colors: HashMap<K, Handle<Image>>,
+    pub sort_keys: HashMap<K, u8>,
+}
+
+impl<K> Default for ColorMaps<K> {
     fn default() -> Self {
         Self {
-            pending: false,
-            radius: 800.0,
+            colors: HashMap::new(),
+            sort_keys: HashMap::new(),
         }
     }
 }
 
-#[derive(Resource, Clone, Copy, Debug)]
-pub struct FxMarkDvars {
-    pub fx_marks: bool,
-    pub fx_marks_smodels: bool,
-    pub fx_marks_ents: bool,
-    pub fx_mark_profile: bool,
-
-    pub fx_cull_elem_draw: bool,
+impl<K> ColorMaps<K> {
+    pub fn is_empty(&self) -> bool {
+        self.colors.is_empty() && self.sort_keys.is_empty()
+    }
 }
 
-impl Default for FxMarkDvars {
+/// The map's materials as effects name them: by name, or by asset id.
+#[derive(Resource, Default)]
+pub struct EffectLevelColorImages {
+    pub by_name: ColorMaps<String>,
+    pub by_asset: ColorMaps<usize>,
+}
+
+impl EffectLevelColorImages {
+    /// Whether no material has a colour image yet: the world's are not prepared.
+    pub fn is_empty(&self) -> bool {
+        self.by_name.colors.is_empty() && self.by_asset.colors.is_empty()
+    }
+}
+
+/// How far around the camera, in inches, an `fx_dump` report looks unless told otherwise.
+const DEFAULT_DUMP_RADIUS: f32 = 800.0;
+
+/// A report the console asked for, held until the next frame fills it. The radius asked for
+/// last is the one the next request without a radius uses.
+#[derive(Resource, Debug)]
+pub struct EffectDumpRequest {
+    reach: f32,
+    waiting: bool,
+}
+
+impl Default for EffectDumpRequest {
     fn default() -> Self {
         Self {
-            fx_marks: true,
-            fx_marks_smodels: true,
-            fx_marks_ents: true,
-            fx_mark_profile: false,
-            fx_cull_elem_draw: true,
+            reach: DEFAULT_DUMP_RADIUS,
+            waiting: false,
         }
+    }
+}
+
+impl EffectDumpRequest {
+    /// Queues a report, around `reach` when one is given, and says how far it will look.
+    pub fn queue(&mut self, reach: Option<f32>) -> f32 {
+        self.reach = reach.unwrap_or(self.reach);
+        self.waiting = true;
+        self.reach
+    }
+
+    /// How far the next report looks.
+    pub fn reach(&self) -> f32 {
+        self.reach
+    }
+
+    pub fn is_queued(&self) -> bool {
+        self.waiting
+    }
+
+    /// Takes the queued report: the radius it looks around, or nothing when none was asked for.
+    pub fn take(&mut self) -> Option<f32> {
+        std::mem::take(&mut self.waiting).then_some(self.reach)
+    }
+}
+
+/// One of the dvars that switch decal marks and element culling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkSwitch {
+    /// `fx_marks`: the outer gate of every impact mark.
+    Marks,
+    /// `fx_marks_smodels`: marks on static models.
+    StaticModels,
+    /// `fx_marks_ents`: marks on entities.
+    Entities,
+    /// `fx_mark_profile`: the mark census.
+    Profile,
+    /// `fx_cull_elem_draw`: culling of elements before they draw.
+    CullElemDraw,
+}
+
+impl MarkSwitch {
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// Which mark switches are on; all are, except the profiling census.
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EffectStainTunables(u8);
+
+impl Default for EffectStainTunables {
+    fn default() -> Self {
+        Self(
+            MarkSwitch::Marks.bit()
+                | MarkSwitch::StaticModels.bit()
+                | MarkSwitch::Entities.bit()
+                | MarkSwitch::CullElemDraw.bit(),
+        )
+    }
+}
+
+impl EffectStainTunables {
+    pub const fn is_on(self, switch: MarkSwitch) -> bool {
+        self.0 & switch.bit() != 0
+    }
+
+    pub fn set(&mut self, switch: MarkSwitch, on: bool) {
+        if on {
+            self.0 |= switch.bit();
+        } else {
+            self.0 &= !switch.bit();
+        }
+    }
+
+    /// These switches with `switch` put to `on`.
+    pub fn with(mut self, switch: MarkSwitch, on: bool) -> Self {
+        self.set(switch, on);
+        self
     }
 }
 
 /// The laser sight's dvars, BO2's defaults (fx_t6 `FxLaserDvars`).
 #[derive(Resource, Clone, Copy, Debug, Default)]
-pub struct LaserDvars(pub fx_t6::FxLaserDvars);
+pub struct LaserSettings(pub fx_t6::FxLaserDvars);
 
+/// The dynamic lights effects hand to the scene this frame, up to the scene's cap.
 #[derive(Resource, Clone, Debug, Default)]
-pub struct HostFxDlights {
-    pub scene: Vec<lighting_t6::GfxLightPack>,
-    pub cap_full: u32,
+pub struct EffectsDynamicLightSet {
+    pub scene: Vec<lighting_t6::LampRecord>,
+    over_cap: u32,
 }
 
-#[derive(Resource, Clone, Debug, Default)]
-pub struct HostFxPostLights {
-    pub queued: Vec<FxPostLight>,
-    pub cap_full: u32,
-    pub drawn: u32,
-    pub skipped_short: u32,
+impl EffectsDynamicLightSet {
+    /// Forgets last frame's lights.
+    pub fn begin_frame(&mut self) {
+        self.scene.clear();
+        self.over_cap = 0;
+    }
 
-    pub miss_material: u32,
-}
-
-impl HostFxPostLights {
-    pub fn add(&mut self, light: FxPostLight) {
-        if !fx_t6::post_light_add_allows(self.queued.len()) {
-            self.cap_full = self.cap_full.saturating_add(1);
-            return;
+    /// Adds the light `pack` builds, if the scene admits one of this radius; a light turned
+    /// away only because the scene is full is counted.
+    pub fn admit(
+        &mut self,
+        level_present: bool,
+        reach_r: f32,
+        pack: impl FnOnce() -> lighting_t6::LampRecord,
+    ) {
+        let live = self.scene.len() as u32;
+        match lighting_t6::add_omni_light_to_scene_allows(level_present, reach_r, live) {
+            Ok(()) => self.scene.push(pack()),
+            Err(lighting_t6::PointLampRefusal::Cap) => {
+                self.over_cap = self.over_cap.saturating_add(1);
+            }
+            Err(_) => {}
         }
-        self.queued.push(light);
+    }
+
+    /// How many lights this frame the scene turned away for being full.
+    pub fn over_cap(&self) -> u32 {
+        self.over_cap
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PresentedVehicleFxRow {
-    pub fx_spawn: Option<&'static str>,
-    pub fx_spawn_def: Option<String>,
+/// What became of a post light.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostLightFate {
+    /// More lights than the post pass takes.
+    Declined,
+    /// Too short to make any geometry.
+    TooShort,
+    /// Its material has no colour image.
+    Unbound,
+    /// In the plan.
+    Drawn,
 }
 
-#[derive(Resource, Default, Debug)]
-pub struct PresentedVehicleFx {
-    pub by_id: HashMap<u32, PresentedVehicleFxRow>,
+/// The lights effects ask the post pass to draw this frame, and what became of them.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct PostEffectLightSet {
+    pub lights: Vec<AfterglowSprite>,
+    fates: [u32; 4],
+}
+
+impl PostEffectLightSet {
+    pub fn bump_by(&mut self, light: AfterglowSprite) {
+        if fx_t6::post_light_add_allows(self.lights.len()) {
+            self.lights.push(light);
+        } else {
+            self.log_fate(PostLightFate::Declined);
+        }
+    }
+
+    pub fn log_fate(&mut self, fate: PostLightFate) {
+        let count = &mut self.fates[fate as usize];
+        *count = count.saturating_add(1);
+    }
+
+    pub fn count(&self, fate: PostLightFate) -> u32 {
+        self.fates[fate as usize]
+    }
+
+    /// Starts the effects tick over: the lights asked for and the ones refused are forgotten.
+    pub fn begin_tick(&mut self) {
+        self.lights.clear();
+        self.fates[PostLightFate::Declined as usize] = 0;
+    }
+
+    /// Starts the frame over, forgetting every light and what became of it.
+    pub fn begin_frame(&mut self) {
+        self.lights.clear();
+        self.fates = [0; 4];
+    }
 }
 
 #[derive(Resource)]
-pub struct HostFxSystem(pub FxSystemHost);
+pub struct EffectsSystemHandle(pub EffectSystemHost);
 
-impl Default for HostFxSystem {
+impl Default for EffectsSystemHandle {
     fn default() -> Self {
-        Self(FxSystemHost::new())
+        Self(EffectSystemHost::new())
     }
 }
 
-#[derive(Resource, Default)]
-pub struct FxJournalCursor {
-    pub logged: bool,
-    pub impact_played: u32,
-    pub impact_miss_table: u32,
-    pub impact_miss_def: u32,
-    pub impact_miss_def_warned: bool,
-    pub boom_played: u32,
-    pub muzzle_gap: u32,
-    pub tracer_gap: u32,
-    pub tracer_skip_interval: u32,
-    pub tracer_skip_short: u32,
-    pub tracer_skip_no_def: u32,
-    pub fire_sound_gap: u32,
-    pub explosion_sound_gap: u32,
-    pub explosion_gap: u32,
-    pub muzzle_played: u32,
-    pub muzzle_bolted: u32,
-    pub tracer_from_tag: u32,
-    pub brass_gap: u32,
-    pub brass_played: u32,
-
-    pub pellet_played: u32,
-    pub createfx_miss: u32,
-    pub createfx_booted: bool,
-
-    pub createfx_boot_msec: Option<i32>,
-    pub draw_logged: bool,
-    pub draw_miss_material: u32,
-    pub skipped_no_ordinal: u32,
-    pub skipped_not_emissive: u32,
+counter_table! {
+    /// What the effects journal counts.
+    JournalCount;
+    /// The running tallies of the effects the game events asked for.
+    JournalCounts;
+    MuzzlePlayed,
+    MuzzleMissed,
+    /// Flashes that rode the weapon's bone rather than a fixed spot.
+    MuzzleBolted,
+    BrassPlayed,
+    BrassMissed,
+    Pellets,
+    ImpactPlayed,
+    ImpactMissed,
+    ImpactTableMisses,
+    BlastPlayed,
+    BlastMissed,
+    BlastSoundMissed,
+    FireSoundMissed,
+    TracerSpawned,
+    /// The tracers that left the weapon's flash tag rather than the aim ray.
+    TracerFromTag,
+    TracerSkippedInterval,
+    TracerSkippedShort,
+    TracerSkippedNoDef,
+    /// Placed one-shots that named no loaded effect.
+    CreateFxMissedDefs,
+    /// Effect meshes left out of a frame for want of a material in the sorted catalog.
+    MeshNoOrdinal,
+    /// Effect meshes whose material draws in another region than the emissive pass.
+    MeshNotEmissive,
+    /// Sprites and trails drawn without a material.
+    UnboundDraws,
 }
 
+impl JournalCounts {
+    /// The tracers that were not spawned, whatever the reason.
+    pub fn tracers_skipped(&self) -> u32 {
+        [
+            JournalCount::TracerSkippedInterval,
+            JournalCount::TracerSkippedShort,
+            JournalCount::TracerSkippedNoDef,
+        ]
+        .into_iter()
+        .fold(0, |sum, kind| sum.saturating_add(self.count_of(kind)))
+    }
+}
+
+/// The map's placed one-shots: whether they have been played, and when.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CreateFxLedger {
+    pub done: bool,
+    pub ms_now: Option<i32>,
+}
+
+/// What the effects journal has seen so far, and what it has already said about it.
+#[derive(Resource, Debug, Default)]
+pub struct EffectJournalCursor {
+    counts: JournalCounts,
+    pub createfx: CreateFxLedger,
+    summary_logged: bool,
+    impact_warned: bool,
+}
+
+impl EffectJournalCursor {
+    pub fn tally_of(&self, kind: JournalCount) -> u32 {
+        self.counts.count_of(kind)
+    }
+
+    /// The counter itself, for code that adds to it through a reference.
+    pub fn slot(&mut self, kind: JournalCount) -> &mut u32 {
+        self.counts.slot(kind)
+    }
+
+    pub fn bump(&mut self, kind: JournalCount) {
+        self.counts.bump(kind);
+    }
+
+    pub fn add(&mut self, kind: JournalCount, times: u32) {
+        self.counts.add_to(kind, times);
+    }
+
+    /// The tracers that were not spawned, whatever the reason.
+    pub fn tracers_skipped(&self) -> u32 {
+        self.counts.tracers_skipped()
+    }
+
+    /// Forgets the placed one-shots, so the map's are played again.
+    pub fn reset_createfx(&mut self) {
+        self.createfx = CreateFxLedger::default();
+        *self.slot(JournalCount::CreateFxMissedDefs) = 0;
+    }
+
+    /// True the first time it is asked: the summary line is logged once.
+    pub fn claim_summary(&mut self) -> bool {
+        !std::mem::replace(&mut self.summary_logged, true)
+    }
+
+    /// True the first time it is asked: an impact table gap is warned about once.
+    pub fn claim_impact_warning(&mut self) -> bool {
+        !std::mem::replace(&mut self.impact_warned, true)
+    }
+}
+
+counter_table! {
+    /// What became of a tracer beam.
+    BeamFate;
+    /// One frame's tracer beams: how many were queued, drawn, and why the rest were not.
+    BeamReport;
+    Queued,
+    Drawn,
+    NoMaterial,
+    NoColor,
+    NoOrdinal,
+    NoGlow,
+    Unprepared,
+}
+
+/// The tracer the last shot looked up.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TracerSample {
+    pub name: Option<String>,
+    pub shader: Option<String>,
+    pub bind: Option<String>,
+    pub has_color: Option<bool>,
+    pub speed: Option<f32>,
+    pub ray_extent: Option<f32>,
+}
+
+/// What the `fx_dump` report says about tracers.
 #[derive(Resource, Clone, Debug, Default)]
-pub struct CombatFxDump {
-    pub muzzle_gap: u32,
-    pub muzzle_played: u32,
-
-    pub muzzle_bolted: u32,
-
-    pub tracer_from_tag: u32,
-    pub tracer_gap: u32,
-    pub brass_gap: u32,
-    pub brass_played: u32,
-    pub last_brass_name: Option<String>,
-
-    pub pellet_played: u32,
-    pub explosion_played: u32,
-    pub explosion_gap: u32,
-    pub last_explosion_name: Option<String>,
-
-    pub last_explosion_table: Option<String>,
-
-    pub last_explosion_slot: Option<String>,
-    pub impact_played: u32,
-    pub impact_miss_table: u32,
-    pub impact_miss_def: u32,
-    pub last_surf: Option<i64>,
-    pub last_row: Option<i64>,
-    pub last_surf_flags: Option<i64>,
-    pub last_surf_name: Option<String>,
-    pub last_impact_def: Option<String>,
-
-    pub last_impact_miss_why: Option<String>,
-
-    pub last_impact_cell_empty: Option<i64>,
-
-    pub last_weapon_tracer_edge: Option<String>,
-
-    pub last_weapon_flash_edge: Option<String>,
-
-    pub last_weapon_brass_edge: Option<String>,
-
-    pub last_weapon_explosion_edge: Option<String>,
-    pub last_tracer_name: Option<String>,
-    pub last_muzzle_name: Option<String>,
-
-    pub last_fire_player_view: Option<i64>,
-
-    pub fire_sound_gap: u32,
-
-    pub last_fire_alias: Option<String>,
-
-    pub last_fire_lastshot: Option<i64>,
-
-    pub last_brass_lastshot: Option<i64>,
-    pub last_tracer_material: Option<String>,
-    pub last_tracer_bind: Option<String>,
-
-    pub last_tracer_mat_edge: Option<String>,
-
-    pub last_tracer_mat_index: Option<i64>,
-    pub last_tracer_has_color: Option<i64>,
-    pub last_tracer_speed: Option<f32>,
-    pub last_tracer_beam_length: Option<f32>,
-    pub last_tracer_draw_interval: Option<i64>,
-
-    pub muzzle_msec: Option<i32>,
-
-    pub impact_msec: Option<i32>,
-
-    pub explosion_msec: Option<i32>,
-    pub tracer_spawned: u32,
-    pub tracer_skip_interval: u32,
-    pub tracer_skip_short: u32,
-    pub tracer_skip_no_def: u32,
-    pub tracer_live: u32,
-    pub beam_queued: u32,
-    pub beam_drawn: u32,
-    pub beam_miss_material: u32,
-    pub beam_miss_color: u32,
-    pub beam_miss_ordinal: u32,
-    pub beam_miss_emissive: u32,
-
-    pub beam_miss_unprepared: u32,
+pub struct BattleEffectsSnapshot {
+    pub streak_live: u32,
+    pub beams: BeamReport,
+    pub sample: TracerSample,
 }
 
 #[derive(Resource, Default)]
-pub struct FxCameraOrigin(pub [f32; 3]);
+pub struct EffectsEyePosition(pub [f32; 3]);

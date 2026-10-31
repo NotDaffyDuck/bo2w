@@ -1,0 +1,36 @@
+# G: knife lunge on a gun (AN-94). The aim assist names a target 120 units away, past the 55 unit
+# melee reach: the swing is the lunge (knife_mp: 1160 ms, hit at 100 ms). Then the same target at
+# 40 units (inside reach) and in the air: both plain swings.
+msec 50
+spawn an94_mp
+lunge 1 120
+hold melee
+run 1
+expect state MELEE_INIT
+expect anim MELEE_CHARGE
+release melee
+run 2
+expect state MELEE_FIRE
+run 21
+expect state MELEE_FIRE
+run 1
+expect state MELEE_END
+expect anim QUICK_RAISE
+run 8
+expect state READY
+# The lunge ends in movement (its timer or distance runs out); this frame has no movement, so clear it here.
+pmflags 0
+lunge 1 40
+hold melee
+run 1
+expect state MELEE_INIT
+expect anim MELEE_ATTACK
+release melee
+run 24
+expect state READY
+lunge 1 120
+ground 0
+hold melee
+run 1
+expect state MELEE_INIT
+expect anim MELEE_ATTACK

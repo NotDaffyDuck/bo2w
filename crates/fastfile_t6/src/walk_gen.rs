@@ -2,9 +2,9 @@
 // rules. Do not edit by hand: change the generator and run it again.
 #![allow(non_snake_case, unused_variables, unused_parens, unused_imports, dead_code, clippy::all)]
 
-use crate::asset_type::AssetType;
-use crate::walk::{Kind, Walker};
-use crate::zone::{Ptr, Result, ZoneError, ZonePtr};
+use crate::xasset_kind::XAssetKind;
+use crate::zone_walk::{Kind, Walker};
+use crate::zone_core::{RawRef, LoadResult, ZoneReadFault, StreamRef};
 
 pub(crate) const TYPE_COUNT: usize = 381;
 
@@ -392,7 +392,7 @@ pub(crate) static TYPE_NAMES: [&str; TYPE_COUNT] = [
     "MenuCell",
 ];
 
-pub(crate) static ASSET_OF_TYPE: [Option<AssetType>; TYPE_COUNT] = [
+pub(crate) static ASSET_OF_TYPE: [Option<XAssetKind>; TYPE_COUNT] = [
     None,
     None,
     None,
@@ -403,47 +403,47 @@ pub(crate) static ASSET_OF_TYPE: [Option<AssetType>; TYPE_COUNT] = [
     None,
     None,
     None,
-    Some(AssetType::PhysPreset),
+    Some(XAssetKind::PhysPreset),
     None,
-    Some(AssetType::PhysConstraints),
-    Some(AssetType::DestructibleDef),
+    Some(XAssetKind::PhysConstraints),
+    Some(XAssetKind::Destructible),
     None,
-    Some(AssetType::XAnimParts),
+    Some(XAssetKind::XAnimParts),
     None,
     None,
     None,
-    Some(AssetType::XModel),
+    Some(XAssetKind::XModel),
     None,
     None,
     None,
-    Some(AssetType::Material),
+    Some(XAssetKind::Material),
     None,
     None,
     None,
     None,
     None,
     None,
-    Some(AssetType::TechniqueSet),
+    Some(XAssetKind::TechniqueSet),
     None,
     None,
     None,
     None,
-    Some(AssetType::Image),
+    Some(XAssetKind::Image),
     None,
     None,
     None,
-    Some(AssetType::Sound),
-    Some(AssetType::SoundPatch),
+    Some(XAssetKind::Sound),
+    Some(XAssetKind::SoundPatch),
     None,
     None,
     None,
-    Some(AssetType::ClipMapPvs),
-    Some(AssetType::ComWorld),
+    Some(XAssetKind::ClipMapPvs),
+    Some(XAssetKind::ComWorld),
     None,
-    Some(AssetType::GameWorldSp),
-    Some(AssetType::GameWorldMp),
+    Some(XAssetKind::GameWorldSp),
+    Some(XAssetKind::GameWorldMp),
     None,
-    Some(AssetType::MapEnts),
+    Some(XAssetKind::MapEnts),
     None,
     None,
     None,
@@ -458,42 +458,42 @@ pub(crate) static ASSET_OF_TYPE: [Option<AssetType>; TYPE_COUNT] = [
     None,
     None,
     None,
-    Some(AssetType::GfxWorld),
+    Some(XAssetKind::GfxWorld),
     None,
-    Some(AssetType::LightDef),
-    Some(AssetType::Font),
-    Some(AssetType::FontIcon),
-    Some(AssetType::MenuList),
+    Some(XAssetKind::LightDef),
+    Some(XAssetKind::Font),
+    Some(XAssetKind::FontIcon),
+    Some(XAssetKind::MenuList),
     None,
     None,
     None,
-    Some(AssetType::Menu),
-    Some(AssetType::Localize),
-    Some(AssetType::Attachment),
-    Some(AssetType::AttachmentUnique),
+    Some(XAssetKind::Menu),
+    Some(XAssetKind::Localize),
+    Some(XAssetKind::Attachment),
+    Some(XAssetKind::AttachmentUnique),
     None,
-    Some(AssetType::WeaponCamo),
-    Some(AssetType::SndDriverGlobals),
+    Some(XAssetKind::WeaponCamo),
+    Some(XAssetKind::SndDriverGlobals),
     None,
-    Some(AssetType::Fx),
-    Some(AssetType::ImpactFx),
-    Some(AssetType::RawFile),
-    Some(AssetType::StringTable),
-    Some(AssetType::Leaderboard),
+    Some(XAssetKind::Fx),
+    Some(XAssetKind::ImpactFx),
+    Some(XAssetKind::RawFile),
+    Some(XAssetKind::StringTable),
+    Some(XAssetKind::Leaderboard),
     None,
     None,
-    Some(AssetType::XGlobals),
-    Some(AssetType::Ddl),
-    Some(AssetType::Glasses),
+    Some(XAssetKind::XGlobals),
+    Some(XAssetKind::Ddl),
+    Some(XAssetKind::Glasses),
     None,
     None,
     None,
     None,
     None,
     None,
-    Some(AssetType::EmblemSet),
-    Some(AssetType::ScriptParseTree),
-    Some(AssetType::KeyValuePairs),
+    Some(XAssetKind::EmblemSet),
+    Some(XAssetKind::ScriptParseTree),
+    Some(XAssetKind::KeyValuePairs),
     None,
     None,
     None,
@@ -501,19 +501,19 @@ pub(crate) static ASSET_OF_TYPE: [Option<AssetType>; TYPE_COUNT] = [
     None,
     None,
     None,
-    Some(AssetType::VehicleDef),
+    Some(XAssetKind::VehicleDef),
     None,
-    Some(AssetType::MemoryBlock),
+    Some(XAssetKind::MemoryBlock),
     None,
-    Some(AssetType::AddonMapEnts),
-    Some(AssetType::Tracer),
-    Some(AssetType::SkinnedVerts),
-    Some(AssetType::Qdb),
-    Some(AssetType::Slug),
-    Some(AssetType::FootstepTable),
-    Some(AssetType::FootstepFxTable),
+    Some(XAssetKind::AddonMapEnts),
+    Some(XAssetKind::Tracer),
+    Some(XAssetKind::SkinnedVerts),
+    Some(XAssetKind::Qdb),
+    Some(XAssetKind::Slug),
+    Some(XAssetKind::FootstepTable),
+    Some(XAssetKind::FootstepFxTable),
     None,
-    Some(AssetType::ZBarrier),
+    Some(XAssetKind::ZBarrier),
     None,
     None,
     None,
@@ -640,7 +640,7 @@ pub(crate) static ASSET_OF_TYPE: [Option<AssetType>; TYPE_COUNT] = [
     None,
     None,
     None,
-    Some(AssetType::Weapon),
+    Some(XAssetKind::Weapon),
     None,
     None,
     None,
@@ -776,70 +776,70 @@ pub(crate) static ASSET_OF_TYPE: [Option<AssetType>; TYPE_COUNT] = [
     None,
 ];
 
-pub(crate) fn load_xasset(w: &mut Walker<'_, '_>, ty: AssetType, slot: Ptr) -> Result<()> {
-    match ty {
-        AssetType::PhysPreset => lp_PhysPreset(w, slot),
-        AssetType::PhysConstraints => lp_PhysConstraints(w, slot),
-        AssetType::DestructibleDef => lp_DestructibleDef(w, slot),
-        AssetType::XAnimParts => lp_XAnimParts(w, slot),
-        AssetType::XModel => lp_XModel(w, slot),
-        AssetType::Material => lp_Material(w, slot),
-        AssetType::TechniqueSet => lp_MaterialTechniqueSet(w, slot),
-        AssetType::Image => lp_GfxImage(w, slot),
-        AssetType::Sound => lp_SndBank(w, slot),
-        AssetType::SoundPatch => lp_SndPatch(w, slot),
-        AssetType::ClipMap => lp_clipMap_t(w, slot),
-        AssetType::ClipMapPvs => lp_clipMap_t(w, slot),
-        AssetType::ComWorld => lp_ComWorld(w, slot),
-        AssetType::GameWorldSp => lp_GameWorldSp(w, slot),
-        AssetType::GameWorldMp => lp_GameWorldMp(w, slot),
-        AssetType::MapEnts => lp_MapEnts(w, slot),
-        AssetType::GfxWorld => lp_GfxWorld(w, slot),
-        AssetType::LightDef => lp_GfxLightDef(w, slot),
-        AssetType::Font => lp_Font_s(w, slot),
-        AssetType::FontIcon => lp_FontIcon(w, slot),
-        AssetType::MenuList => lp_MenuList(w, slot),
-        AssetType::Menu => lp_menuDef_t(w, slot),
-        AssetType::Localize => lp_LocalizeEntry(w, slot),
-        AssetType::Weapon => lp_WeaponVariantDef(w, slot),
-        AssetType::Attachment => lp_WeaponAttachment(w, slot),
-        AssetType::AttachmentUnique => lp_WeaponAttachmentUnique(w, slot),
-        AssetType::WeaponCamo => lp_WeaponCamo(w, slot),
-        AssetType::SndDriverGlobals => lp_SndDriverGlobals(w, slot),
-        AssetType::Fx => lp_FxEffectDef(w, slot),
-        AssetType::ImpactFx => lp_FxImpactTable(w, slot),
-        AssetType::RawFile => lp_RawFile(w, slot),
-        AssetType::StringTable => lp_StringTable(w, slot),
-        AssetType::Leaderboard => lp_LeaderboardDef(w, slot),
-        AssetType::XGlobals => lp_XGlobals(w, slot),
-        AssetType::Ddl => lp_ddlRoot_t(w, slot),
-        AssetType::Glasses => lp_Glasses(w, slot),
-        AssetType::EmblemSet => lp_EmblemSet(w, slot),
-        AssetType::ScriptParseTree => lp_ScriptParseTree(w, slot),
-        AssetType::KeyValuePairs => lp_KeyValuePairs(w, slot),
-        AssetType::VehicleDef => lp_VehicleDef(w, slot),
-        AssetType::MemoryBlock => lp_MemoryBlock(w, slot),
-        AssetType::AddonMapEnts => lp_AddonMapEnts(w, slot),
-        AssetType::Tracer => lp_TracerDef(w, slot),
-        AssetType::SkinnedVerts => lp_SkinnedVertsDef(w, slot),
-        AssetType::Qdb => lp_Qdb(w, slot),
-        AssetType::Slug => lp_Slug(w, slot),
-        AssetType::FootstepTable => lp_FootstepTableDef(w, slot),
-        AssetType::FootstepFxTable => lp_FootstepFXTableDef(w, slot),
-        AssetType::ZBarrier => lp_ZBarrierDef(w, slot),
-        other => Err(ZoneError::NoAssetLoader(other)),
+pub(crate) fn load_xasset(w: &mut Walker<'_, '_>, asset_kind: XAssetKind, ref_at: RawRef) -> LoadResult<()> {
+    match asset_kind {
+        XAssetKind::PhysPreset => lp_PhysPreset(w, ref_at),
+        XAssetKind::PhysConstraints => lp_PhysConstraints(w, ref_at),
+        XAssetKind::Destructible => lp_DestructibleDef(w, ref_at),
+        XAssetKind::XAnimParts => lp_XAnimParts(w, ref_at),
+        XAssetKind::XModel => lp_XModel(w, ref_at),
+        XAssetKind::Material => lp_Material(w, ref_at),
+        XAssetKind::TechniqueSet => lp_MaterialTechniqueSet(w, ref_at),
+        XAssetKind::Image => lp_GfxImage(w, ref_at),
+        XAssetKind::Sound => lp_SndBank(w, ref_at),
+        XAssetKind::SoundPatch => lp_SndPatch(w, ref_at),
+        XAssetKind::ClipMap => lp_clipMap_t(w, ref_at),
+        XAssetKind::ClipMapPvs => lp_clipMap_t(w, ref_at),
+        XAssetKind::ComWorld => lp_ComWorld(w, ref_at),
+        XAssetKind::GameWorldSp => lp_GameWorldSp(w, ref_at),
+        XAssetKind::GameWorldMp => lp_GameWorldMp(w, ref_at),
+        XAssetKind::MapEnts => lp_MapEnts(w, ref_at),
+        XAssetKind::GfxWorld => lp_GfxWorld(w, ref_at),
+        XAssetKind::LightDef => lp_GfxLightDef(w, ref_at),
+        XAssetKind::Font => lp_Font_s(w, ref_at),
+        XAssetKind::FontIcon => lp_FontIcon(w, ref_at),
+        XAssetKind::MenuList => lp_MenuList(w, ref_at),
+        XAssetKind::Menu => lp_menuDef_t(w, ref_at),
+        XAssetKind::Localize => lp_LocalizeEntry(w, ref_at),
+        XAssetKind::Weapon => lp_WeaponVariantDef(w, ref_at),
+        XAssetKind::Attachment => lp_WeaponAttachment(w, ref_at),
+        XAssetKind::AttachmentUnique => lp_WeaponAttachmentUnique(w, ref_at),
+        XAssetKind::WeaponCamo => lp_WeaponCamo(w, ref_at),
+        XAssetKind::SndDriverGlobals => lp_SndDriverGlobals(w, ref_at),
+        XAssetKind::Fx => lp_FxEffectDef(w, ref_at),
+        XAssetKind::ImpactFx => lp_FxImpactTable(w, ref_at),
+        XAssetKind::RawFile => lp_RawFile(w, ref_at),
+        XAssetKind::StringTable => lp_StringTable(w, ref_at),
+        XAssetKind::Leaderboard => lp_LeaderboardDef(w, ref_at),
+        XAssetKind::XGlobals => lp_XGlobals(w, ref_at),
+        XAssetKind::Ddl => lp_ddlRoot_t(w, ref_at),
+        XAssetKind::Glasses => lp_Glasses(w, ref_at),
+        XAssetKind::EmblemSet => lp_EmblemSet(w, ref_at),
+        XAssetKind::ScriptParseTree => lp_ScriptParseTree(w, ref_at),
+        XAssetKind::KeyValuePairs => lp_KeyValuePairs(w, ref_at),
+        XAssetKind::VehicleDef => lp_VehicleDef(w, ref_at),
+        XAssetKind::MemoryBlock => lp_MemoryBlock(w, ref_at),
+        XAssetKind::AddonMapEnts => lp_AddonMapEnts(w, ref_at),
+        XAssetKind::Tracer => lp_TracerDef(w, ref_at),
+        XAssetKind::SkinnedVerts => lp_SkinnedVertsDef(w, ref_at),
+        XAssetKind::Qdb => lp_Qdb(w, ref_at),
+        XAssetKind::Slug => lp_Slug(w, ref_at),
+        XAssetKind::FootstepTable => lp_FootstepTableDef(w, ref_at),
+        XAssetKind::FootstepFxTable => lp_FootstepFXTableDef(w, ref_at),
+        XAssetKind::ZBarrier => lp_ZBarrierDef(w, ref_at),
+        unknown => Err(ZoneReadFault::NoWalkForType(unknown)),
     }
 }
 
-fn ld_XModelPieces(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(8, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.xstring(p.at(0))?;
+fn ld_XModelPieces(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(8, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(8, 4, Kind::I32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 16)?;
-            for i in 0..n { ld_XModelPiece(w, b.at(i * 16), false)?; }
+            for ix in 0..n { ld_XModelPiece(w, b.shifted_by(ix * 16), false)?; }
             Ok(())
         })?;
     }
@@ -847,62 +847,62 @@ fn ld_XModelPieces(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn lp_PhysPreset(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 10, true, 4, ld_PhysPreset)
+fn lp_PhysPreset(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 10, true, 4, ld_PhysPreset)
 }
 
-fn ld_PhysPreset(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(10, p)?;
-    if at_start { w.load_at(p, 84)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(28))?;
+fn ld_PhysPreset(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(10, base)?;
+    if at_start { w.load_at(base, 84)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(28))?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_PhysConstraint(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(11, p)?;
-    if at_start { w.load_at(p, 168)?; }
-    w.xstring(p.at(20))?;
-    w.xstring(p.at(36))?;
-    lp_Material(w, p.at(140))?;
+fn ld_PhysConstraint(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(11, base)?;
+    if at_start { w.load_at(base, 168)?; }
+    w.xstring(base.shifted_by(20))?;
+    w.xstring(base.shifted_by(36))?;
+    lp_Material(w, base.shifted_by(140))?;
     w.leave();
     Ok(())
 }
 
-fn lp_PhysConstraints(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 12, true, 4, ld_PhysConstraints)
+fn lp_PhysConstraints(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 12, true, 4, ld_PhysConstraints)
 }
 
-fn ld_PhysConstraints(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(12, p)?;
-    if at_start { w.load_at(p, 2696)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    { let n = 16; for i in 0..n { ld_PhysConstraint(w, p.at(8).at(i * 168), false)?; } }
+fn ld_PhysConstraints(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(12, base)?;
+    if at_start { w.load_at(base, 2696)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    { let n = 16; for ix in 0..n { ld_PhysConstraint(w, base.shifted_by(8).shifted_by(ix * 168), false)?; } }
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn lp_DestructibleDef(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 13, true, 4, ld_DestructibleDef)
+fn lp_DestructibleDef(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 13, true, 4, ld_DestructibleDef)
 }
 
-fn ld_DestructibleDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(13, p)?;
-    if at_start { w.load_at(p, 24)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    lp_XModel(w, p.at(4))?;
-    lp_XModel(w, p.at(8))?;
+fn ld_DestructibleDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(13, base)?;
+    if at_start { w.load_at(base, 24)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    lp_XModel(w, base.shifted_by(4))?;
+    lp_XModel(w, base.shifted_by(8))?;
     {
         let n = w.count(w.rd(13, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(16), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), false, false, 4, |w, b| {
             w.load_at(b, n * 312)?;
-            for i in 0..n { ld_DestructiblePiece(w, b.at(i * 312), false)?; }
+            for ix in 0..n { ld_DestructiblePiece(w, b.shifted_by(ix * 312), false)?; }
             Ok(())
         })?;
     }
@@ -911,13 +911,13 @@ fn ld_DestructibleDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<
     Ok(())
 }
 
-fn ld_XAnimIndices(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(14, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_XAnimIndices(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(14, base)?;
+    if at_start { w.load_at(base, 4)?; }
     if ((w.rd(15, 14, Kind::U16)? < (256i64)) as i64) != 0 {
         {
             let n = w.count(w.rd(15, 44, Kind::U32)?)?;
-            w.member_ptr(p.at(0), false, false, 1, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 1, |w, b| {
                 w.load_at(b, n * 1)
             })?;
         }
@@ -925,7 +925,7 @@ fn ld_XAnimIndices(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     else {
         {
             let n = w.count(w.rd(15, 44, Kind::U32)?)?;
-            w.member_ptr(p.at(0), false, false, 2, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 2, |w, b| {
                 w.load_at(b, n * 2)
             })?;
         }
@@ -934,223 +934,223 @@ fn ld_XAnimIndices(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn lp_XAnimParts(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 15, true, 4, ld_XAnimParts)
+fn lp_XAnimParts(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 15, true, 4, ld_XAnimParts)
 }
 
-fn ld_XAnimParts(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(15, p)?;
-    if at_start { w.load_at(p, 104)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_XAnimParts(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(15, base)?;
+    if at_start { w.load_at(base, 104)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(15, 24 + ((9i64) as usize) * 1, Kind::U8)?)?;
-        w.member_ptr(p.at(64), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(64), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count(w.rd(15, 34, Kind::U8)?)?;
-        w.member_ptr(p.at(96), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(96), false, false, 4, |w, b| {
             w.load_at(b, n * 8)?;
-            for i in 0..n { ld_XAnimNotifyInfo(w, b.at(i * 8), false)?; }
+            for ix in 0..n { ld_XAnimNotifyInfo(w, b.shifted_by(ix * 8), false)?; }
             Ok(())
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(100), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(100), false, false, 4, |w, b| {
             ld_XAnimDeltaPart(w, b, true)
         })?;
     }
     {
         let n = w.count(w.rd(15, 4, Kind::U16)?)?;
-        w.member_ptr(p.at(68), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(68), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count(w.rd(15, 6, Kind::U16)?)?;
-        w.member_ptr(p.at(72), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(72), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count(w.rd(15, 8, Kind::U16)?)?;
-        w.member_ptr(p.at(76), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(76), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     {
         let n = w.count(w.rd(15, 40, Kind::U32)?)?;
-        w.member_ptr(p.at(80), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(80), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count(w.rd(15, 10, Kind::U16)?)?;
-        w.member_ptr(p.at(84), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(84), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count(w.rd(15, 12, Kind::U16)?)?;
-        w.member_ptr(p.at(88), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(88), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
-    ld_XAnimIndices(w, p.at(92), false)?;
+    ld_XAnimIndices(w, base.shifted_by(92), false)?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn lp_XModel(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 19, true, 4, ld_XModel)
+fn lp_XModel(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 19, true, 4, ld_XModel)
 }
 
-fn ld_XModel(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(19, p)?;
-    if at_start { w.load_at(p, 248)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_XModel(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(19, base)?;
+    if at_start { w.load_at(base, 248)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(19, 4, Kind::U8)?)?;
-        w.member_ptr(p.at(8), true, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(8), true, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count((w.rd(19, 4, Kind::U8)? - w.rd(19, 5, Kind::U8)?))?;
-        w.member_ptr(p.at(12), true, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(12), true, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count((w.rd(19, 4, Kind::U8)? - w.rd(19, 5, Kind::U8)?))?;
-        w.member_ptr(p.at(16), true, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(16), true, false, 2, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
     {
         let n = w.count(((w.rd(19, 4, Kind::U8)? - w.rd(19, 5, Kind::U8)?) * (4i64)))?;
-        w.member_ptr(p.at(20), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(20), true, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     {
         let n = w.count(w.rd(19, 4, Kind::U8)?)?;
-        w.member_ptr(p.at(24), true, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(24), true, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count(w.rd(19, 4, Kind::U8)?)?;
-        w.member_ptr(p.at(28), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(28), true, false, 4, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
     {
         let n = w.count(w.rd(19, 6, Kind::U8)?)?;
-        w.member_ptr(p.at(32), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(32), false, false, 16, |w, b| {
             w.load_at(b, n * 80)?;
-            for i in 0..n { ld_XSurface(w, b.at(i * 80), false)?; }
+            for ix in 0..n { ld_XSurface(w, b.shifted_by(ix * 80), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(19, 6, Kind::U8)?)?;
-        w.member_ptr(p.at(36), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(36), false, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { lp_Material(w, b.at(i * 4))?; }
+            for ix in 0..n { lp_Material(w, b.shifted_by(ix * 4))?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(19, 156, Kind::I32)?)?;
-        w.member_ptr(p.at(152), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(152), false, false, 4, |w, b| {
             w.load_at(b, n * 44)?;
-            for i in 0..n { ld_XModelCollSurf_s(w, b.at(i * 44), false)?; }
+            for ix in 0..n { ld_XModelCollSurf_s(w, b.shifted_by(ix * 44), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(19, 4, Kind::U8)?)?;
-        w.member_ptr(p.at(164), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(164), false, false, 4, |w, b| {
             w.load_at(b, n * 44)
         })?;
     }
     {
         let n = w.count(w.rd(19, 6, Kind::U8)?)?;
-        w.member_ptr(p.at(200), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(200), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
-    lp_PhysPreset(w, p.at(216))?;
+    lp_PhysPreset(w, base.shifted_by(216))?;
     {
         let n = w.count(w.rd(19, 220, Kind::U8)?)?;
-        w.member_ptr(p.at(224), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(224), false, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { ld_Collmap(w, b.at(i * 4), false)?; }
+            for ix in 0..n { ld_Collmap(w, b.shifted_by(ix * 4), false)?; }
             Ok(())
         })?;
     }
-    lp_PhysConstraints(w, p.at(228))?;
+    lp_PhysConstraints(w, base.shifted_by(228))?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_MaterialInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(22, p)?;
-    if at_start { w.load_at(p, 48)?; }
-    w.xstring(p.at(0))?;
+fn ld_MaterialInfo(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(22, base)?;
+    if at_start { w.load_at(base, 48)?; }
+    w.xstring(base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn lp_Material(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 23, true, 4, ld_Material)
+fn lp_Material(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 23, true, 4, ld_Material)
 }
 
-fn ld_Material(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(23, p)?;
-    if at_start { w.load_at(p, 112)?; }
-    w.push(5)?;
-    ld_MaterialInfo(w, p.at(0), false)?;
-    lp_MaterialTechniqueSet(w, p.at(92))?;
+fn ld_Material(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(23, base)?;
+    if at_start { w.load_at(base, 112)?; }
+    w.put(5)?;
+    ld_MaterialInfo(w, base.shifted_by(0), false)?;
+    lp_MaterialTechniqueSet(w, base.shifted_by(92))?;
     {
         let n = w.count(w.rd(23, 84, Kind::U8)?)?;
-        w.member_ptr(p.at(96), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(96), true, false, 4, |w, b| {
             w.load_at(b, n * 16)?;
-            for i in 0..n { ld_MaterialTextureDef(w, b.at(i * 16), false)?; }
+            for ix in 0..n { ld_MaterialTextureDef(w, b.shifted_by(ix * 16), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(23, 85, Kind::U8)?)?;
-        w.member_ptr(p.at(100), true, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(100), true, false, 16, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
     {
         let n = w.count(w.rd(23, 86, Kind::U8)?)?;
-        w.member_ptr(p.at(104), true, false, 8, |w, b| {
+        w.member_ptr(base.shifted_by(104), true, false, 8, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
-    lp_Material(w, p.at(108))?;
+    lp_Material(w, base.shifted_by(108))?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_GfxPixelShaderLoadDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(24, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_GfxPixelShaderLoadDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(24, base)?;
+    if at_start { w.load_at(base, 8)?; }
     {
         let n = w.count(w.rd(24, 4, Kind::U32)?)?;
-        w.member_ptr(p.at(0), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -1158,29 +1158,29 @@ fn ld_GfxPixelShaderLoadDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> R
     Ok(())
 }
 
-fn ld_MaterialPixelShaderProgram(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(25, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    ld_GfxPixelShaderLoadDef(w, p.at(4), false)?;
+fn ld_MaterialPixelShaderProgram(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(25, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    ld_GfxPixelShaderLoadDef(w, base.shifted_by(4), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_MaterialPixelShader(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(26, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    w.xstring(p.at(0))?;
-    ld_MaterialPixelShaderProgram(w, p.at(4), false)?;
+fn ld_MaterialPixelShader(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(26, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    w.xstring(base.shifted_by(0))?;
+    ld_MaterialPixelShaderProgram(w, base.shifted_by(4), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_GfxVertexShaderLoadDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(27, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_GfxVertexShaderLoadDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(27, base)?;
+    if at_start { w.load_at(base, 8)?; }
     {
         let n = w.count(w.rd(27, 4, Kind::U32)?)?;
-        w.member_ptr(p.at(0), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -1188,50 +1188,50 @@ fn ld_GfxVertexShaderLoadDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> 
     Ok(())
 }
 
-fn ld_MaterialVertexShaderProgram(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(28, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    ld_GfxVertexShaderLoadDef(w, p.at(4), false)?;
+fn ld_MaterialVertexShaderProgram(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(28, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    ld_GfxVertexShaderLoadDef(w, base.shifted_by(4), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_MaterialVertexShader(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(29, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    w.xstring(p.at(0))?;
-    ld_MaterialVertexShaderProgram(w, p.at(4), false)?;
+fn ld_MaterialVertexShader(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(29, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    w.xstring(base.shifted_by(0))?;
+    ld_MaterialVertexShaderProgram(w, base.shifted_by(4), false)?;
     w.leave();
     Ok(())
 }
 
-fn lp_MaterialTechniqueSet(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 30, true, 4, ld_MaterialTechniqueSet)
+fn lp_MaterialTechniqueSet(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 30, true, 4, ld_MaterialTechniqueSet)
 }
 
-fn ld_MaterialTechniqueSet(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(30, p)?;
-    if at_start { w.load_at(p, 152)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_MaterialTechniqueSet(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(30, base)?;
+    if at_start { w.load_at(base, 152)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = 36;
-        let b = p.at(8);
-        for i in 0..n { w.elem_ptr(b.at(i * 4), true, 4, |w, e| ld_MaterialTechnique(w, e, true))?; }
+        let b = base.shifted_by(8);
+        for ix in 0..n { w.elem_ptr(b.shifted_by(ix * 4), true, 4, |w, e| ld_MaterialTechnique(w, e, true))?; }
     }
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_GfxTexture(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(31, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_GfxTexture(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(31, base)?;
+    if at_start { w.load_at(base, 4)?; }
     {
-        w.push(0)?;
+        w.put(0)?;
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), true, true, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), true, true, 4, |w, b| {
                 ld_GfxImageLoadDef(w, b, true)
             })?;
         }
@@ -1241,44 +1241,44 @@ fn ld_GfxTexture(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_GfxImage(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 35, true, 4, ld_GfxImage)
+fn lp_GfxImage(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 35, true, 4, ld_GfxImage)
 }
 
-fn ld_GfxImage(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(35, p)?;
-    if at_start { w.load_at(p, 80)?; }
-    w.push(5)?;
-    w.xstring(p.at(72))?;
-    ld_GfxTexture(w, p.at(0), false)?;
+fn ld_GfxImage(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(35, base)?;
+    if at_start { w.load_at(base, 80)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(72))?;
+    ld_GfxTexture(w, base.shifted_by(0), false)?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_SndRuntimeAssetBank(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(37, p)?;
-    if at_start { w.load_at(p, 2338)?; }
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(4))?;
+fn ld_SndRuntimeAssetBank(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(37, base)?;
+    if at_start { w.load_at(base, 2338)?; }
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(4))?;
     w.leave();
     Ok(())
 }
 
-fn ld_SndLoadedAssets(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(38, p)?;
-    if at_start { w.load_at(p, 28)?; }
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(4))?;
+fn ld_SndLoadedAssets(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(38, base)?;
+    if at_start { w.load_at(base, 28)?; }
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(4))?;
     {
         let n = w.count(w.rd(38, 12, Kind::U32)?)?;
-        w.member_ptr(p.at(16), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), false, false, 4, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
     {
         let n = w.count(w.rd(38, 20, Kind::U32)?)?;
-        w.member_ptr(p.at(24), false, false, 2048, |w, b| {
+        w.member_ptr(base.shifted_by(24), false, false, 2048, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -1286,49 +1286,49 @@ fn ld_SndLoadedAssets(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<
     Ok(())
 }
 
-fn lp_SndBank(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 39, true, 4, ld_SndBank)
+fn lp_SndBank(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 39, true, 4, ld_SndBank)
 }
 
-fn ld_SndBank(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(39, p)?;
-    if at_start { w.load_at(p, 4756)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_SndBank(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(39, base)?;
+    if at_start { w.load_at(base, 4756)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(39, 4, Kind::U32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 20)?;
-            for i in 0..n { ld_SndAliasList(w, b.at(i * 20), false)?; }
+            for ix in 0..n { ld_SndAliasList(w, b.shifted_by(ix * 20), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(39, 4, Kind::U32)?)?;
-        w.member_ptr(p.at(12), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     {
         let n = w.count(w.rd(39, 16, Kind::U32)?)?;
-        w.member_ptr(p.at(20), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(20), false, false, 4, |w, b| {
             w.load_at(b, n * 100)
         })?;
     }
     {
         let n = w.count(w.rd(39, 24, Kind::U32)?)?;
-        w.member_ptr(p.at(28), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(28), false, false, 4, |w, b| {
             w.load_at(b, n * 76)?;
-            for i in 0..n { ld_SndDuck(w, b.at(i * 76), false)?; }
+            for ix in 0..n { ld_SndDuck(w, b.shifted_by(ix * 76), false)?; }
             Ok(())
         })?;
     }
-    ld_SndRuntimeAssetBank(w, p.at(32), false)?;
-    ld_SndRuntimeAssetBank(w, p.at(2370), false)?;
-    ld_SndLoadedAssets(w, p.at(4708), false)?;
+    ld_SndRuntimeAssetBank(w, base.shifted_by(32), false)?;
+    ld_SndRuntimeAssetBank(w, base.shifted_by(2370), false)?;
+    ld_SndLoadedAssets(w, base.shifted_by(4708), false)?;
     {
         let n = w.count(w.rd(39, 4736, Kind::U32)?)?;
-        w.member_ptr(p.at(4740), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4740), false, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
@@ -1337,18 +1337,18 @@ fn ld_SndBank(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_SndPatch(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 40, true, 4, ld_SndPatch)
+fn lp_SndPatch(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 40, true, 4, ld_SndPatch)
 }
 
-fn ld_SndPatch(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(40, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_SndPatch(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(40, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(40, 4, Kind::U32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
@@ -1357,74 +1357,74 @@ fn ld_SndPatch(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_ClipInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(41, p)?;
-    if at_start { w.load_at(p, 72)?; }
+fn ld_ClipInfo(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(41, base)?;
+    if at_start { w.load_at(base, 72)?; }
     {
         let n = w.count(w.rd(41, 0, Kind::I32)?)?;
-        w.member_ptr(p.at(4), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), true, false, 4, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
     {
         let n = w.count(w.rd(41, 8, Kind::U32)?)?;
-        w.member_ptr(p.at(12), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), true, false, 4, |w, b| {
             w.load_at(b, n * 12)?;
-            for i in 0..n { ld_ClipMaterial(w, b.at(i * 12), false)?; }
+            for ix in 0..n { ld_ClipMaterial(w, b.shifted_by(ix * 12), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(41, 16, Kind::U32)?)?;
-        w.member_ptr(p.at(20), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(20), true, false, 4, |w, b| {
             w.load_at(b, n * 12)?;
-            for i in 0..n { ld_cbrushside_t(w, b.at(i * 12), false)?; }
+            for ix in 0..n { ld_cbrushside_t(w, b.shifted_by(ix * 12), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(41, 24, Kind::U32)?)?;
-        w.member_ptr(p.at(28), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(28), true, false, 4, |w, b| {
             w.load_at(b, n * 20)?;
-            for i in 0..n { ld_cLeafBrushNode_s(w, b.at(i * 20), false)?; }
+            for ix in 0..n { ld_cLeafBrushNode_s(w, b.shifted_by(ix * 20), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(41, 32, Kind::U32)?)?;
-        w.member_ptr(p.at(36), true, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(36), true, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count(w.rd(41, 40, Kind::U32)?)?;
-        w.member_ptr(p.at(44), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(44), false, false, 4, |w, b| {
             w.load_at(b, n * 12)
         })?;
     }
     {
         let n = w.count(w.rd(41, 48, Kind::U32)?)?;
-        w.member_ptr(p.at(52), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(52), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count(w.rd(41, 56, Kind::U16)?)?;
-        w.member_ptr(p.at(60), true, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(60), true, false, 128, |w, b| {
             w.load_at(b, n * 96)?;
-            for i in 0..n { ld_cbrush_t(w, b.at(i * 96), false)?; }
+            for ix in 0..n { ld_cbrush_t(w, b.shifted_by(ix * 96), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(41, 56, Kind::U16)?)?;
-        w.member_ptr(p.at(64), true, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(64), true, false, 128, |w, b| {
             w.load_at(b, n * 24)
         })?;
     }
     {
         let n = w.count(w.rd(41, 56, Kind::U16)?)?;
-        w.member_ptr(p.at(68), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(68), true, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
@@ -1432,13 +1432,13 @@ fn ld_ClipInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_cmodel_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(43, p)?;
-    if at_start { w.load_at(p, 76)?; }
-    w.push(0)?;
+fn ld_cmodel_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(43, base)?;
+    if at_start { w.load_at(base, 76)?; }
+    w.put(0)?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(28), true, true, 4, |w, b| {
+        w.member_ptr(base.shifted_by(28), true, true, 4, |w, b| {
             ld_ClipInfo(w, b, true)
         })?;
     }
@@ -1447,206 +1447,206 @@ fn ld_cmodel_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_clipMap_t(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 44, true, 4, ld_clipMap_t)
+fn lp_clipMap_t(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 44, true, 4, ld_clipMap_t)
 }
 
-fn ld_clipMap_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(44, p)?;
-    if at_start { w.load_at(p, 332)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    ld_ClipInfo(w, p.at(8), false)?;
-    w.push(0)?;
+fn ld_clipMap_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(44, base)?;
+    if at_start { w.load_at(base, 332)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    ld_ClipInfo(w, base.shifted_by(8), false)?;
+    w.put(0)?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(80), true, true, 4, |w, b| {
+        w.member_ptr(base.shifted_by(80), true, true, 4, |w, b| {
             ld_ClipInfo(w, b, true)
         })?;
     }
     w.pop()?;
     {
         let n = w.count(w.rd(44, 84, Kind::U32)?)?;
-        w.member_ptr(p.at(88), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(88), false, false, 4, |w, b| {
             w.load_at(b, n * 84)?;
-            for i in 0..n { ld_cStaticModel_s(w, b.at(i * 84), false)?; }
+            for ix in 0..n { ld_cStaticModel_s(w, b.shifted_by(ix * 84), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(44, 92, Kind::U32)?)?;
-        w.member_ptr(p.at(96), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(96), false, false, 4, |w, b| {
             w.load_at(b, n * 8)?;
-            for i in 0..n { ld_cNode_t(w, b.at(i * 8), false)?; }
+            for ix in 0..n { ld_cNode_t(w, b.shifted_by(ix * 8), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(44, 100, Kind::U32)?)?;
-        w.member_ptr(p.at(104), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(104), false, false, 4, |w, b| {
             w.load_at(b, n * 44)
         })?;
     }
     {
         let n = w.count(w.rd(44, 108, Kind::U32)?)?;
-        w.member_ptr(p.at(112), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(112), false, false, 4, |w, b| {
             w.load_at(b, n * 12)
         })?;
     }
     {
         let n = w.count(w.rd(44, 116, Kind::I32)?)?;
-        w.member_ptr(p.at(120), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(120), false, false, 2, |w, b| {
             w.load_at(b, n * 6)
         })?;
     }
     {
         let n = w.count((Walker::div((((3i64) * w.rd(44, 116, Kind::I32)?) + (31i64)), (32i64))? * (4i64)))?;
-        w.member_ptr(p.at(124), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(124), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count(w.rd(44, 128, Kind::I32)?)?;
-        w.member_ptr(p.at(132), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(132), false, false, 4, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
     {
         let n = w.count(w.rd(44, 136, Kind::I32)?)?;
-        w.member_ptr(p.at(140), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(140), false, false, 16, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
     {
         let n = w.count(w.rd(44, 144, Kind::U32)?)?;
-        w.member_ptr(p.at(148), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(148), false, false, 4, |w, b| {
             w.load_at(b, n * 76)?;
-            for i in 0..n { ld_cmodel_t(w, b.at(i * 76), false)?; }
+            for ix in 0..n { ld_cmodel_t(w, b.shifted_by(ix * 76), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count((w.rd(44, 152, Kind::I32)? * w.rd(44, 156, Kind::I32)?))?;
-        w.member_ptr(p.at(160), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(160), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
-    lp_MapEnts(w, p.at(168))?;
+    lp_MapEnts(w, base.shifted_by(168))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(172), true, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(172), true, false, 16, |w, b| {
             ld_cbrush_t(w, b, true)
         })?;
     }
-    ld_cmodel_t(w, p.at(176), false)?;
+    ld_cmodel_t(w, base.shifted_by(176), false)?;
     {
         let n = w.count(w.rd(44, 254 + ((0i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(264), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(264), false, false, 4, |w, b| {
             w.load_at(b, n * 84)?;
-            for i in 0..n { ld_DynEntityDef(w, b.at(i * 84), false)?; }
+            for ix in 0..n { ld_DynEntityDef(w, b.shifted_by(ix * 84), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(44, 254 + ((1i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(268), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(268), false, false, 4, |w, b| {
             w.load_at(b, n * 84)?;
-            for i in 0..n { ld_DynEntityDef(w, b.at(i * 84), false)?; }
+            for ix in 0..n { ld_DynEntityDef(w, b.shifted_by(ix * 84), false)?; }
             Ok(())
         })?;
     }
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(44, 254 + ((0i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(272), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(272), false, false, 4, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(44, 254 + ((1i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(276), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(276), false, false, 4, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(44, 254 + ((0i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(280), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(280), false, false, 4, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(44, 254 + ((1i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(284), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(284), false, false, 4, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(44, 254 + ((2i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(288), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(288), false, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(44, 254 + ((3i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(292), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(292), false, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(44, 254 + ((0i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(296), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(296), false, false, 4, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(44, 254 + ((1i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(300), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(300), false, false, 4, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(44, 254 + ((2i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(304), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(304), false, false, 4, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(44, 254 + ((3i64) as usize) * 2, Kind::U16)?)?;
-        w.member_ptr(p.at(308), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(308), false, false, 4, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
     w.pop()?;
     {
         let n = w.count(w.rd(44, 312, Kind::I32)?)?;
-        w.member_ptr(p.at(316), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(316), false, false, 4, |w, b| {
             w.load_at(b, n * 168)?;
-            for i in 0..n { ld_PhysConstraint(w, b.at(i * 168), false)?; }
+            for ix in 0..n { ld_PhysConstraint(w, b.shifted_by(ix * 168), false)?; }
             Ok(())
         })?;
     }
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(44, 320, Kind::I32)?)?;
-        w.member_ptr(p.at(324), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(324), false, false, 4, |w, b| {
             w.load_at(b, n * 3188)
         })?;
     }
@@ -1656,20 +1656,20 @@ fn ld_clipMap_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_ComWorld(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 45, true, 4, ld_ComWorld)
+fn lp_ComWorld(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 45, true, 4, ld_ComWorld)
 }
 
-fn ld_ComWorld(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(45, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_ComWorld(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(45, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(45, 8, Kind::U32)?)?;
-        w.member_ptr(p.at(12), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 4, |w, b| {
             w.load_at(b, n * 196)?;
-            for i in 0..n { ld_ComPrimaryLight(w, b.at(i * 196), false)?; }
+            for ix in 0..n { ld_ComPrimaryLight(w, b.shifted_by(ix * 196), false)?; }
             Ok(())
         })?;
     }
@@ -1678,42 +1678,42 @@ fn ld_ComWorld(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_PathData(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(46, p)?;
-    if at_start { w.load_at(p, 40)?; }
+fn ld_PathData(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(46, base)?;
+    if at_start { w.load_at(base, 40)?; }
     {
         let n = w.count((w.rd(46, 0, Kind::U32)? + (128i64)))?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 144)?;
-            for i in 0..n { ld_pathnode_t(w, b.at(i * 144), false)?; }
+            for ix in 0..n { ld_pathnode_t(w, b.shifted_by(ix * 144), false)?; }
             Ok(())
         })?;
     }
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count((w.rd(46, 0, Kind::U32)? + (128i64)))?;
-        w.member_ptr(p.at(12), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 16, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
     w.pop()?;
     {
         let n = w.count(w.rd(46, 16, Kind::I32)?)?;
-        w.member_ptr(p.at(20), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(20), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count(w.rd(46, 24, Kind::I32)?)?;
-        w.member_ptr(p.at(28), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(28), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count(w.rd(46, 32, Kind::I32)?)?;
-        w.member_ptr(p.at(36), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(36), false, false, 4, |w, b| {
             w.load_at(b, n * 16)?;
-            for i in 0..n { ld_pathnode_tree_t(w, b.at(i * 16), false)?; }
+            for ix in 0..n { ld_pathnode_tree_t(w, b.shifted_by(ix * 16), false)?; }
             Ok(())
         })?;
     }
@@ -1721,54 +1721,54 @@ fn ld_PathData(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_GameWorldSp(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 47, true, 4, ld_GameWorldSp)
+fn lp_GameWorldSp(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 47, true, 4, ld_GameWorldSp)
 }
 
-fn ld_GameWorldSp(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(47, p)?;
-    if at_start { w.load_at(p, 44)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    ld_PathData(w, p.at(4), false)?;
+fn ld_GameWorldSp(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(47, base)?;
+    if at_start { w.load_at(base, 44)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    ld_PathData(w, base.shifted_by(4), false)?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn lp_GameWorldMp(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 48, true, 4, ld_GameWorldMp)
+fn lp_GameWorldMp(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 48, true, 4, ld_GameWorldMp)
 }
 
-fn ld_GameWorldMp(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(48, p)?;
-    if at_start { w.load_at(p, 44)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    ld_PathData(w, p.at(4), false)?;
+fn ld_GameWorldMp(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(48, base)?;
+    if at_start { w.load_at(base, 44)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    ld_PathData(w, base.shifted_by(4), false)?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_MapTriggers(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(49, p)?;
-    if at_start { w.load_at(p, 24)?; }
+fn ld_MapTriggers(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(49, base)?;
+    if at_start { w.load_at(base, 24)?; }
     {
         let n = w.count(w.rd(49, 0, Kind::U32)?)?;
-        w.member_ptr(p.at(4), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), true, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
     {
         let n = w.count(w.rd(49, 8, Kind::U32)?)?;
-        w.member_ptr(p.at(12), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), true, false, 4, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
     {
         let n = w.count(w.rd(49, 16, Kind::U32)?)?;
-        w.member_ptr(p.at(20), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(20), true, false, 4, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
@@ -1776,39 +1776,39 @@ fn ld_MapTriggers(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> 
     Ok(())
 }
 
-fn lp_MapEnts(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 50, true, 4, ld_MapEnts)
+fn lp_MapEnts(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 50, true, 4, ld_MapEnts)
 }
 
-fn ld_MapEnts(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(50, p)?;
-    if at_start { w.load_at(p, 36)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_MapEnts(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(50, base)?;
+    if at_start { w.load_at(base, 36)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(50, 8, Kind::I32)?)?;
-        w.member_ptr(p.at(4), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
-    ld_MapTriggers(w, p.at(12), false)?;
+    ld_MapTriggers(w, base.shifted_by(12), false)?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_GfxWorldStreamInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(51, p)?;
-    if at_start { w.load_at(p, 16)?; }
+fn ld_GfxWorldStreamInfo(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(51, base)?;
+    if at_start { w.load_at(base, 16)?; }
     {
         let n = w.count(w.rd(51, 0, Kind::I32)?)?;
-        w.member_ptr(p.at(4), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 16, |w, b| {
             w.load_at(b, n * 48)
         })?;
     }
     {
         let n = w.count(w.rd(51, 8, Kind::I32)?)?;
-        w.member_ptr(p.at(12), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
@@ -1816,25 +1816,25 @@ fn ld_GfxWorldStreamInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Resu
     Ok(())
 }
 
-fn ld_GfxWorldDpvsPlanes(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(56, p)?;
-    if at_start { w.load_at(p, 16)?; }
+fn ld_GfxWorldDpvsPlanes(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(56, base)?;
+    if at_start { w.load_at(base, 16)?; }
     {
         let n = w.count(w.rd(65, 8, Kind::I32)?)?;
-        w.member_ptr(p.at(4), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), true, false, 4, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
     {
         let n = w.count(w.rd(65, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(8), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count((w.rd(56, 0, Kind::I32)? * (512i64)))?;
-        w.member_ptr(p.at(12), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
@@ -1843,12 +1843,12 @@ fn ld_GfxWorldDpvsPlanes(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Resu
     Ok(())
 }
 
-fn ld_GfxWorldVertexData0(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(57, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_GfxWorldVertexData0(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(57, base)?;
+    if at_start { w.load_at(base, 8)?; }
     {
         let n = w.count(w.rd(59, 32, Kind::U32)?)?;
-        w.member_ptr(p.at(0), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -1856,12 +1856,12 @@ fn ld_GfxWorldVertexData0(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Res
     Ok(())
 }
 
-fn ld_GfxWorldVertexData1(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(58, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_GfxWorldVertexData1(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(58, base)?;
+    if at_start { w.load_at(base, 8)?; }
     {
         let n = w.count(w.rd(59, 44, Kind::U32)?)?;
-        w.member_ptr(p.at(0), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -1869,54 +1869,54 @@ fn ld_GfxWorldVertexData1(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Res
     Ok(())
 }
 
-fn ld_GfxWorldDraw(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(59, p)?;
-    if at_start { w.load_at(p, 68)?; }
+fn ld_GfxWorldDraw(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(59, base)?;
+    if at_start { w.load_at(base, 68)?; }
     {
         let n = w.count(w.rd(59, 0, Kind::U32)?)?;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             w.load_at(b, n * 76)?;
-            for i in 0..n { ld_GfxReflectionProbe(w, b.at(i * 76), false)?; }
+            for ix in 0..n { ld_GfxReflectionProbe(w, b.shifted_by(ix * 76), false)?; }
             Ok(())
         })?;
     }
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(59, 0, Kind::U32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     w.pop()?;
     {
         let n = w.count(w.rd(59, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(16), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), false, false, 4, |w, b| {
             w.load_at(b, n * 8)?;
-            for i in 0..n { ld_GfxLightmapArray(w, b.at(i * 8), false)?; }
+            for ix in 0..n { ld_GfxLightmapArray(w, b.shifted_by(ix * 8), false)?; }
             Ok(())
         })?;
     }
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(59, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(20), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(20), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(59, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(24), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(24), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     w.pop()?;
-    ld_GfxWorldVertexData0(w, p.at(36), false)?;
-    ld_GfxWorldVertexData1(w, p.at(48), false)?;
+    ld_GfxWorldVertexData0(w, base.shifted_by(36), false)?;
+    ld_GfxWorldVertexData1(w, base.shifted_by(48), false)?;
     {
         let n = w.count(w.rd(59, 56, Kind::I32)?)?;
-        w.member_ptr(p.at(60), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(60), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
@@ -1924,42 +1924,42 @@ fn ld_GfxWorldDraw(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn ld_GfxLightGrid(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(60, p)?;
-    if at_start { w.load_at(p, 72)?; }
+fn ld_GfxLightGrid(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(60, base)?;
+    if at_start { w.load_at(base, 72)?; }
     {
         let n = w.count(((w.rd(60, 10 + (w.rd(60, 20, Kind::U32)? as usize) * 2, Kind::U16)? - w.rd(60, 4 + (w.rd(60, 20, Kind::U32)? as usize) * 2, Kind::U16)?) + (1i64)))?;
-        w.member_ptr(p.at(28), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(28), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count(w.rd(60, 32, Kind::U32)?)?;
-        w.member_ptr(p.at(36), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(36), false, false, 4, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count(w.rd(60, 40, Kind::U32)?)?;
-        w.member_ptr(p.at(44), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(44), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     {
         let n = w.count(w.rd(60, 48, Kind::U32)?)?;
-        w.member_ptr(p.at(52), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(52), false, false, 4, |w, b| {
             w.load_at(b, n * 168)
         })?;
     }
     {
         let n = w.count(w.rd(60, 56, Kind::U32)?)?;
-        w.member_ptr(p.at(60), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(60), false, false, 4, |w, b| {
             w.load_at(b, n * 54)
         })?;
     }
     {
         let n = w.count(w.rd(60, 64, Kind::U32)?)?;
-        w.member_ptr(p.at(68), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(68), false, false, 4, |w, b| {
             w.load_at(b, n * 40)
         })?;
     }
@@ -1967,136 +1967,136 @@ fn ld_GfxLightGrid(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn ld_sunflare_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(61, p)?;
-    if at_start { w.load_at(p, 96)?; }
-    lp_Material(w, p.at(4))?;
-    lp_Material(w, p.at(8))?;
+fn ld_sunflare_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(61, base)?;
+    if at_start { w.load_at(base, 96)?; }
+    lp_Material(w, base.shifted_by(4))?;
+    lp_Material(w, base.shifted_by(8))?;
     w.leave();
     Ok(())
 }
 
-fn ld_GfxWorldDpvsStatic(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(62, p)?;
-    if at_start { w.load_at(p, 116)?; }
-    w.push(1)?;
+fn ld_GfxWorldDpvsStatic(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(62, base)?;
+    if at_start { w.load_at(base, 116)?; }
+    w.put(1)?;
     {
         let n = w.count(w.rd(62, 40, Kind::U32)?)?;
-        w.member_ptr(p.at(48), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(48), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(62, 40, Kind::U32)?)?;
-        w.member_ptr(p.at(52), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(52), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(62, 40, Kind::U32)?)?;
-        w.member_ptr(p.at(56), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(56), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(62, 44, Kind::U32)?)?;
-        w.member_ptr(p.at(60), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(60), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(62, 44, Kind::U32)?)?;
-        w.member_ptr(p.at(64), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(64), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(62, 44, Kind::U32)?)?;
-        w.member_ptr(p.at(68), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(68), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(62, 40, Kind::U32)?)?;
-        w.member_ptr(p.at(72), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(72), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(62, 44, Kind::U32)?)?;
-        w.member_ptr(p.at(76), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(76), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(62, 44, Kind::U32)?)?;
-        w.member_ptr(p.at(100), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(100), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(62, 44, Kind::U32)?)?;
-        w.member_ptr(p.at(104), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(104), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
     {
         let n = w.count(w.rd(62, 40, Kind::U32)?)?;
-        w.member_ptr(p.at(108), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(108), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count(w.rd(62, 4, Kind::U32)?)?;
-        w.member_ptr(p.at(80), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(80), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count(w.rd(62, 0, Kind::U32)?)?;
-        w.member_ptr(p.at(84), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(84), false, false, 4, |w, b| {
             w.load_at(b, n * 36)
         })?;
     }
     {
         let n = w.count(w.rd(65, 16, Kind::I32)?)?;
-        w.member_ptr(p.at(88), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(88), false, false, 16, |w, b| {
             w.load_at(b, n * 80)?;
-            for i in 0..n { ld_GfxSurface(w, b.at(i * 80), false)?; }
+            for ix in 0..n { ld_GfxSurface(w, b.shifted_by(ix * 80), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(62, 0, Kind::U32)?)?;
-        w.member_ptr(p.at(92), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(92), false, false, 4, |w, b| {
             w.load_at(b, n * 152)?;
-            for i in 0..n { ld_GfxStaticModelDrawInst(w, b.at(i * 152), false)?; }
+            for ix in 0..n { ld_GfxStaticModelDrawInst(w, b.shifted_by(ix * 152), false)?; }
             Ok(())
         })?;
     }
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(62, 4, Kind::U32)?)?;
-        w.member_ptr(p.at(96), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(96), false, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
@@ -2105,69 +2105,69 @@ fn ld_GfxWorldDpvsStatic(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Resu
     Ok(())
 }
 
-fn ld_GfxWorldDpvsDynamic(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(63, p)?;
-    if at_start { w.load_at(p, 52)?; }
-    w.push(1)?;
+fn ld_GfxWorldDpvsDynamic(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(63, base)?;
+    if at_start { w.load_at(base, 52)?; }
+    w.put(1)?;
     {
         let n = w.count((w.rd(63, 0 + ((0i64) as usize) * 4, Kind::U32)? * w.rd(65, 372, Kind::I32)?))?;
-        w.member_ptr(p.at(16), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count((w.rd(63, 0 + ((1i64) as usize) * 4, Kind::U32)? * w.rd(65, 372, Kind::I32)?))?;
-        w.member_ptr(p.at(20), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(20), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(((32i64) * w.rd(63, 0 + ((0i64) as usize) * 4, Kind::U32)?))?;
-        w.member_ptr(p.at(24), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(24), false, false, 16, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(((32i64) * w.rd(63, 0 + ((0i64) as usize) * 4, Kind::U32)?))?;
-        w.member_ptr(p.at(28), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(28), false, false, 16, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(((32i64) * w.rd(63, 0 + ((0i64) as usize) * 4, Kind::U32)?))?;
-        w.member_ptr(p.at(32), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(32), false, false, 16, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(((32i64) * w.rd(63, 0 + ((1i64) as usize) * 4, Kind::U32)?))?;
-        w.member_ptr(p.at(36), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(36), false, false, 16, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(((32i64) * w.rd(63, 0 + ((1i64) as usize) * 4, Kind::U32)?))?;
-        w.member_ptr(p.at(40), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(40), false, false, 16, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(((32i64) * w.rd(63, 0 + ((1i64) as usize) * 4, Kind::U32)?))?;
-        w.member_ptr(p.at(44), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(44), false, false, 16, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -2176,12 +2176,12 @@ fn ld_GfxWorldDpvsDynamic(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Res
     Ok(())
 }
 
-fn ld_GfxWaterBuffer(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(64, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_GfxWaterBuffer(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(64, base)?;
+    if at_start { w.load_at(base, 8)?; }
     {
         let n = w.count(Walker::div(w.rd(64, 0, Kind::U32)?, (16i64))?)?;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
@@ -2189,217 +2189,217 @@ fn ld_GfxWaterBuffer(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     Ok(())
 }
 
-fn lp_GfxWorld(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 65, true, 4, ld_GfxWorld)
+fn lp_GfxWorld(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 65, true, 4, ld_GfxWorld)
 }
 
-fn ld_GfxWorld(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(65, p)?;
-    if at_start { w.load_at(p, 1028)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(4))?;
-    ld_GfxWorldStreamInfo(w, p.at(20), false)?;
-    w.xstring(p.at(36))?;
+fn ld_GfxWorld(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(65, base)?;
+    if at_start { w.load_at(base, 1028)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(4))?;
+    ld_GfxWorldStreamInfo(w, base.shifted_by(20), false)?;
+    w.xstring(base.shifted_by(36))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(256), true, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(256), true, false, 16, |w, b| {
             ld_GfxLight(w, b, true)
         })?;
     }
     {
         let n = w.count(w.rd(65, 268, Kind::U32)?)?;
-        w.member_ptr(p.at(272), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(272), false, false, 4, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
     {
         let n = w.count(w.rd(65, 276, Kind::U32)?)?;
-        w.member_ptr(p.at(280), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(280), false, false, 4, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
     {
         let n = w.count(w.rd(65, 284, Kind::U32)?)?;
-        w.member_ptr(p.at(288), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(288), false, false, 4, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
     {
         let n = w.count(w.rd(65, 292, Kind::U32)?)?;
-        w.member_ptr(p.at(296), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(296), false, false, 4, |w, b| {
             w.load_at(b, n * 24)
         })?;
     }
     {
         let n = w.count(w.rd(65, 300, Kind::U32)?)?;
-        w.member_ptr(p.at(304), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(304), false, false, 4, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
     {
         let n = w.count(w.rd(65, 308, Kind::U32)?)?;
-        w.member_ptr(p.at(312), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(312), false, false, 4, |w, b| {
             w.load_at(b, n * 100)
         })?;
     }
     {
         let n = w.count(w.rd(65, 316, Kind::U32)?)?;
-        w.member_ptr(p.at(320), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(320), false, false, 4, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
     {
         let n = w.count(w.rd(65, 324, Kind::U32)?)?;
-        w.member_ptr(p.at(328), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(328), false, false, 4, |w, b| {
             w.load_at(b, n * 48)
         })?;
     }
     {
         let n = w.count(w.rd(65, 332, Kind::U32)?)?;
-        w.member_ptr(p.at(336), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(336), false, false, 4, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
     {
         let n = w.count(w.rd(65, 340, Kind::U32)?)?;
-        w.member_ptr(p.at(344), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(344), false, false, 4, |w, b| {
             w.load_at(b, n * 36)
         })?;
     }
     {
         let n = w.count(w.rd(65, 348, Kind::U32)?)?;
-        w.member_ptr(p.at(352), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(352), false, false, 4, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
-    ld_GfxWorldDpvsPlanes(w, p.at(372), false)?;
+    ld_GfxWorldDpvsPlanes(w, base.shifted_by(372), false)?;
     {
         let n = w.count(w.rd(65, 372, Kind::I32)?)?;
-        w.member_ptr(p.at(392), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(392), false, false, 4, |w, b| {
             w.load_at(b, n * 48)?;
-            for i in 0..n { ld_GfxCell(w, b.at(i * 48), false)?; }
+            for ix in 0..n { ld_GfxCell(w, b.shifted_by(ix * 48), false)?; }
             Ok(())
         })?;
     }
-    ld_GfxWorldDraw(w, p.at(396), false)?;
-    ld_GfxLightGrid(w, p.at(464), false)?;
+    ld_GfxWorldDraw(w, base.shifted_by(396), false)?;
+    ld_GfxLightGrid(w, base.shifted_by(464), false)?;
     {
         let n = w.count(w.rd(65, 536, Kind::I32)?)?;
-        w.member_ptr(p.at(540), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(540), false, false, 16, |w, b| {
             w.load_at(b, n * 64)
         })?;
     }
     {
         let n = w.count(w.rd(65, 572, Kind::I32)?)?;
-        w.member_ptr(p.at(576), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(576), false, false, 4, |w, b| {
             w.load_at(b, n * 8)?;
-            for i in 0..n { ld_MaterialMemory(w, b.at(i * 8), false)?; }
+            for ix in 0..n { ld_MaterialMemory(w, b.shifted_by(ix * 8), false)?; }
             Ok(())
         })?;
     }
-    ld_sunflare_t(w, p.at(580), false)?;
-    lp_GfxImage(w, p.at(740))?;
-    w.push(1)?;
+    ld_sunflare_t(w, base.shifted_by(580), false)?;
+    lp_GfxImage(w, base.shifted_by(740))?;
+    w.put(1)?;
     {
         let n = w.count((w.rd(65, 372, Kind::I32)? * Walker::div((w.rd(65, 372, Kind::I32)? + (31i64)), (32i64))?))?;
-        w.member_ptr(p.at(744), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(744), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(65, 908 + ((0i64) as usize) * 4, Kind::U32)?)?;
-        w.member_ptr(p.at(748), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(748), false, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count(w.rd(65, 908 + ((1i64) as usize) * 4, Kind::U32)?)?;
-        w.member_ptr(p.at(752), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(752), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count((((w.rd(65, 264, Kind::U32)? - w.rd(65, 260, Kind::U32)?) - (1i64)) * (8192i64)))?;
-        w.member_ptr(p.at(756), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(756), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count((w.rd(65, 908 + ((0i64) as usize) * 4, Kind::U32)? * ((w.rd(65, 264, Kind::U32)? - w.rd(65, 260, Kind::U32)?) - (1i64))))?;
-        w.member_ptr(p.at(760), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(760), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     w.pop()?;
-    w.push(1)?;
+    w.put(1)?;
     {
         let n = w.count((w.rd(65, 908 + ((1i64) as usize) * 4, Kind::U32)? * ((w.rd(65, 264, Kind::U32)? - w.rd(65, 260, Kind::U32)?) - (1i64))))?;
-        w.member_ptr(p.at(764), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(764), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     w.pop()?;
     {
         let n = w.count(w.rd(65, 768, Kind::U32)?)?;
-        w.member_ptr(p.at(772), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(772), false, false, 16, |w, b| {
             w.load_at(b, n * 96)?;
-            for i in 0..n { ld_SSkinInstance(w, b.at(i * 96), false)?; }
+            for ix in 0..n { ld_SSkinInstance(w, b.shifted_by(ix * 96), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(65, 264, Kind::U32)?)?;
-        w.member_ptr(p.at(776), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(776), false, false, 4, |w, b| {
             w.load_at(b, n * 12)?;
-            for i in 0..n { ld_GfxShadowGeometry(w, b.at(i * 12), false)?; }
+            for ix in 0..n { ld_GfxShadowGeometry(w, b.shifted_by(ix * 12), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(65, 264, Kind::U32)?)?;
-        w.member_ptr(p.at(780), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(780), false, false, 4, |w, b| {
             w.load_at(b, n * 8)?;
-            for i in 0..n { ld_GfxLightRegion(w, b.at(i * 8), false)?; }
+            for ix in 0..n { ld_GfxLightRegion(w, b.shifted_by(ix * 8), false)?; }
             Ok(())
         })?;
     }
-    ld_GfxWorldDpvsStatic(w, p.at(784), false)?;
-    ld_GfxWorldDpvsDynamic(w, p.at(900), false)?;
-    { let n = 2; for i in 0..n { ld_GfxWaterBuffer(w, p.at(956).at(i * 8), false)?; } }
-    lp_Material(w, p.at(972))?;
-    lp_Material(w, p.at(976))?;
-    lp_Material(w, p.at(980))?;
-    lp_Material(w, p.at(984))?;
+    ld_GfxWorldDpvsStatic(w, base.shifted_by(784), false)?;
+    ld_GfxWorldDpvsDynamic(w, base.shifted_by(900), false)?;
+    { let n = 2; for ix in 0..n { ld_GfxWaterBuffer(w, base.shifted_by(956).shifted_by(ix * 8), false)?; } }
+    lp_Material(w, base.shifted_by(972))?;
+    lp_Material(w, base.shifted_by(976))?;
+    lp_Material(w, base.shifted_by(980))?;
+    lp_Material(w, base.shifted_by(984))?;
     {
         let n = w.count(w.rd(65, 988, Kind::U32)?)?;
-        w.member_ptr(p.at(992), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(992), false, false, 4, |w, b| {
             w.load_at(b, n * 68)
         })?;
     }
     {
         let n = w.count(w.rd(65, 996, Kind::U32)?)?;
-        w.member_ptr(p.at(1000), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(1000), false, false, 4, |w, b| {
             w.load_at(b, n * 24)
         })?;
     }
     {
         let n = w.count(w.rd(65, 1004, Kind::U32)?)?;
-        w.member_ptr(p.at(1012), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(1012), false, false, 4, |w, b| {
             w.load_at(b, n * 56)
         })?;
     }
     {
         let n = w.count(w.rd(65, 1008, Kind::U32)?)?;
-        w.member_ptr(p.at(1016), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(1016), false, false, 4, |w, b| {
             w.load_at(b, n * 32)
         })?;
     }
@@ -2408,49 +2408,49 @@ fn ld_GfxWorld(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_GfxLightImage(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(66, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    lp_GfxImage(w, p.at(0))?;
+fn ld_GfxLightImage(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(66, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    lp_GfxImage(w, base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn lp_GfxLightDef(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 67, true, 4, ld_GfxLightDef)
+fn lp_GfxLightDef(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 67, true, 4, ld_GfxLightDef)
 }
 
-fn ld_GfxLightDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(67, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    ld_GfxLightImage(w, p.at(4), false)?;
+fn ld_GfxLightDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(67, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    ld_GfxLightImage(w, base.shifted_by(4), false)?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn lp_Font_s(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 68, true, 4, ld_Font_s)
+fn lp_Font_s(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 68, true, 4, ld_Font_s)
 }
 
-fn ld_Font_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(68, p)?;
-    if at_start { w.load_at(p, 36)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    lp_Material(w, p.at(20))?;
-    lp_Material(w, p.at(24))?;
+fn ld_Font_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(68, base)?;
+    if at_start { w.load_at(base, 36)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    lp_Material(w, base.shifted_by(20))?;
+    lp_Material(w, base.shifted_by(24))?;
     {
         let n = w.count(w.rd(68, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(28), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(28), true, false, 4, |w, b| {
             w.load_at(b, n * 24)
         })?;
     }
     {
         let n = w.count(w.rd(68, 16, Kind::I32)?)?;
-        w.member_ptr(p.at(32), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(32), true, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
@@ -2459,26 +2459,26 @@ fn ld_Font_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_FontIcon(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 69, true, 4, ld_FontIcon)
+fn lp_FontIcon(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 69, true, 4, ld_FontIcon)
 }
 
-fn ld_FontIcon(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(69, p)?;
-    if at_start { w.load_at(p, 20)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_FontIcon(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(69, base)?;
+    if at_start { w.load_at(base, 20)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(69, 4, Kind::U32)?)?;
-        w.member_ptr(p.at(12), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), true, false, 4, |w, b| {
             w.load_at(b, n * 24)?;
-            for i in 0..n { ld_FontIconEntry(w, b.at(i * 24), false)?; }
+            for ix in 0..n { ld_FontIconEntry(w, b.shifted_by(ix * 24), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(69, 8, Kind::U32)?)?;
-        w.member_ptr(p.at(16), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), true, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
@@ -2487,20 +2487,20 @@ fn ld_FontIcon(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_MenuList(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 70, true, 4, ld_MenuList)
+fn lp_MenuList(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 70, true, 4, ld_MenuList)
 }
 
-fn ld_MenuList(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(70, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_MenuList(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(70, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(70, 4, Kind::I32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { lp_menuDef_t(w, b.at(i * 4))?; }
+            for ix in 0..n { lp_menuDef_t(w, b.shifted_by(ix * 4))?; }
             Ok(())
         })?;
     }
@@ -2509,25 +2509,25 @@ fn ld_MenuList(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_windowDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(72, p)?;
-    if at_start { w.load_at(p, 164)?; }
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(52))?;
-    lp_Material(w, p.at(160))?;
+fn ld_windowDef_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(72, base)?;
+    if at_start { w.load_at(base, 164)?; }
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(52))?;
+    lp_Material(w, base.shifted_by(160))?;
     w.leave();
     Ok(())
 }
 
-fn ld_ExpressionStatement(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(73, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    w.xstring(p.at(0))?;
+fn ld_ExpressionStatement(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(73, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(73, 8, Kind::I32)?)?;
-        w.member_ptr(p.at(12), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), true, false, 4, |w, b| {
             w.load_at(b, n * 12)?;
-            for i in 0..n { ld_expressionRpn(w, b.at(i * 12), false)?; }
+            for ix in 0..n { ld_expressionRpn(w, b.shifted_by(ix * 12), false)?; }
             Ok(())
         })?;
     }
@@ -2535,38 +2535,38 @@ fn ld_ExpressionStatement(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Res
     Ok(())
 }
 
-fn lp_menuDef_t(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 74, true, 8, ld_menuDef_t)
+fn lp_menuDef_t(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 74, true, 8, ld_menuDef_t)
 }
 
-fn ld_menuDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(74, p)?;
-    if at_start { w.load_at(p, 400)?; }
-    w.push(5)?;
-    ld_windowDef_t(w, p.at(0), false)?;
-    w.xstring(p.at(164))?;
+fn ld_menuDef_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(74, base)?;
+    if at_start { w.load_at(base, 400)?; }
+    w.put(5)?;
+    ld_windowDef_t(w, base.shifted_by(0), false)?;
+    w.xstring(base.shifted_by(164))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(268), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(268), false, false, 4, |w, b| {
             ld_GenericEventHandler(w, b, true)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(272), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(272), false, false, 4, |w, b| {
             ld_ItemKeyHandler(w, b, true)
         })?;
     }
-    ld_ExpressionStatement(w, p.at(276), false)?;
-    w.xstring(p.at(312))?;
-    w.xstring(p.at(316))?;
-    ld_ExpressionStatement(w, p.at(360), false)?;
-    ld_ExpressionStatement(w, p.at(376), false)?;
+    ld_ExpressionStatement(w, base.shifted_by(276), false)?;
+    w.xstring(base.shifted_by(312))?;
+    w.xstring(base.shifted_by(316))?;
+    ld_ExpressionStatement(w, base.shifted_by(360), false)?;
+    ld_ExpressionStatement(w, base.shifted_by(376), false)?;
     {
         let n = w.count(w.rd(74, 176, Kind::I32)?)?;
-        w.member_ptr(p.at(392), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(392), false, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { w.elem_ptr(b.at(i * 4), false, 8, |w, e| ld_itemDef_s(w, e, true))?; }
+            for ix in 0..n { w.elem_ptr(b.shifted_by(ix * 4), false, 8, |w, e| ld_itemDef_s(w, e, true))?; }
             Ok(())
         })?;
     }
@@ -2575,120 +2575,120 @@ fn ld_menuDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_LocalizeEntry(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 75, true, 4, ld_LocalizeEntry)
+fn lp_LocalizeEntry(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 75, true, 4, ld_LocalizeEntry)
 }
 
-fn ld_LocalizeEntry(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(75, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(4))?;
+fn ld_LocalizeEntry(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(75, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(4))?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn lp_WeaponAttachment(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 76, true, 4, ld_WeaponAttachment)
+fn lp_WeaponAttachment(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 76, true, 4, ld_WeaponAttachment)
 }
 
-fn ld_WeaponAttachment(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(76, p)?;
-    if at_start { w.load_at(p, 284)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(4))?;
+fn ld_WeaponAttachment(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(76, base)?;
+    if at_start { w.load_at(base, 284)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(4))?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn lp_WeaponAttachmentUnique(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 77, true, 4, ld_WeaponAttachmentUnique)
+fn lp_WeaponAttachmentUnique(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 77, true, 4, ld_WeaponAttachmentUnique)
 }
 
-fn ld_WeaponAttachmentUnique(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(77, p)?;
-    if at_start { w.load_at(p, 424)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(20))?;
-    w.xstring(p.at(28))?;
+fn ld_WeaponAttachmentUnique(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(77, base)?;
+    if at_start { w.load_at(base, 424)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(20))?;
+    w.xstring(base.shifted_by(28))?;
     {
         let n = w.count((32i64))?;
-        w.member_ptr(p.at(36), true, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(36), true, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
-    lp_XModel(w, p.at(40))?;
-    lp_XModel(w, p.at(44))?;
-    lp_XModel(w, p.at(48))?;
-    lp_XModel(w, p.at(52))?;
-    lp_XModel(w, p.at(56))?;
-    w.xstring(p.at(60))?;
-    w.xstring(p.at(64))?;
-    lp_WeaponCamo(w, p.at(164))?;
-    lp_Material(w, p.at(196))?;
-    lp_Material(w, p.at(200))?;
+    lp_XModel(w, base.shifted_by(40))?;
+    lp_XModel(w, base.shifted_by(44))?;
+    lp_XModel(w, base.shifted_by(48))?;
+    lp_XModel(w, base.shifted_by(52))?;
+    lp_XModel(w, base.shifted_by(56))?;
+    w.xstring(base.shifted_by(60))?;
+    w.xstring(base.shifted_by(64))?;
+    lp_WeaponCamo(w, base.shifted_by(164))?;
+    lp_Material(w, base.shifted_by(196))?;
+    lp_Material(w, base.shifted_by(200))?;
     {
         let n = w.count((88i64))?;
-        w.member_ptr(p.at(232), true, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
+        w.member_ptr(base.shifted_by(232), true, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
     }
     {
         let n = w.count((21i64))?;
-        w.member_ptr(p.at(248), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(248), true, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
-    w.xstring(p.at(256))?;
-    w.xstring(p.at(260))?;
-    w.xstring(p.at(264))?;
-    w.xstring(p.at(268))?;
-    w.xstring(p.at(272))?;
-    w.xstring(p.at(276))?;
-    w.xstring(p.at(280))?;
-    w.xstring(p.at(284))?;
-    w.xstring(p.at(288))?;
-    w.xstring(p.at(292))?;
-    w.xstring(p.at(296))?;
-    w.xstring(p.at(300))?;
-    w.xstring(p.at(304))?;
-    w.xstring(p.at(308))?;
-    lp_FxEffectDef(w, p.at(316))?;
-    lp_FxEffectDef(w, p.at(320))?;
-    lp_TracerDef(w, p.at(324))?;
-    lp_TracerDef(w, p.at(328))?;
+    w.xstring(base.shifted_by(256))?;
+    w.xstring(base.shifted_by(260))?;
+    w.xstring(base.shifted_by(264))?;
+    w.xstring(base.shifted_by(268))?;
+    w.xstring(base.shifted_by(272))?;
+    w.xstring(base.shifted_by(276))?;
+    w.xstring(base.shifted_by(280))?;
+    w.xstring(base.shifted_by(284))?;
+    w.xstring(base.shifted_by(288))?;
+    w.xstring(base.shifted_by(292))?;
+    w.xstring(base.shifted_by(296))?;
+    w.xstring(base.shifted_by(300))?;
+    w.xstring(base.shifted_by(304))?;
+    w.xstring(base.shifted_by(308))?;
+    lp_FxEffectDef(w, base.shifted_by(316))?;
+    lp_FxEffectDef(w, base.shifted_by(320))?;
+    lp_TracerDef(w, base.shifted_by(324))?;
+    lp_TracerDef(w, base.shifted_by(328))?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn lp_WeaponCamo(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 79, true, 4, ld_WeaponCamo)
+fn lp_WeaponCamo(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 79, true, 4, ld_WeaponCamo)
 }
 
-fn ld_WeaponCamo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(79, p)?;
-    if at_start { w.load_at(p, 28)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    lp_GfxImage(w, p.at(4))?;
-    lp_GfxImage(w, p.at(8))?;
+fn ld_WeaponCamo(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(79, base)?;
+    if at_start { w.load_at(base, 28)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    lp_GfxImage(w, base.shifted_by(4))?;
+    lp_GfxImage(w, base.shifted_by(8))?;
     {
         let n = w.count(w.rd(79, 16, Kind::U32)?)?;
-        w.member_ptr(p.at(12), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 4, |w, b| {
             w.load_at(b, n * 20)?;
-            for i in 0..n { ld_WeaponCamoSet(w, b.at(i * 20), false)?; }
+            for ix in 0..n { ld_WeaponCamoSet(w, b.shifted_by(ix * 20), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(79, 24, Kind::U32)?)?;
-        w.member_ptr(p.at(20), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(20), false, false, 4, |w, b| {
             w.load_at(b, n * 8)?;
-            for i in 0..n { ld_WeaponCamoMaterialSet(w, b.at(i * 8), false)?; }
+            for ix in 0..n { ld_WeaponCamoMaterialSet(w, b.shifted_by(ix * 8), false)?; }
             Ok(())
         })?;
     }
@@ -2697,60 +2697,60 @@ fn ld_WeaponCamo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_SndDriverGlobals(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 80, true, 4, ld_SndDriverGlobals)
+fn lp_SndDriverGlobals(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 80, true, 4, ld_SndDriverGlobals)
 }
 
-fn ld_SndDriverGlobals(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(80, p)?;
-    if at_start { w.load_at(p, 68)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_SndDriverGlobals(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(80, base)?;
+    if at_start { w.load_at(base, 68)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(80, 4, Kind::U32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 80)
         })?;
     }
     {
         let n = w.count(w.rd(80, 12, Kind::U32)?)?;
-        w.member_ptr(p.at(16), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), false, false, 4, |w, b| {
             w.load_at(b, n * 100)
         })?;
     }
     {
         let n = w.count(w.rd(80, 20, Kind::U32)?)?;
-        w.member_ptr(p.at(24), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(24), false, false, 4, |w, b| {
             w.load_at(b, n * 60)
         })?;
     }
     {
         let n = w.count(w.rd(80, 28, Kind::U32)?)?;
-        w.member_ptr(p.at(32), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(32), false, false, 4, |w, b| {
             w.load_at(b, n * 36)
         })?;
     }
     {
         let n = w.count(w.rd(80, 36, Kind::U32)?)?;
-        w.member_ptr(p.at(40), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(40), false, false, 4, |w, b| {
             w.load_at(b, n * 36)
         })?;
     }
     {
         let n = w.count(w.rd(80, 44, Kind::U32)?)?;
-        w.member_ptr(p.at(48), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(48), false, false, 4, |w, b| {
             w.load_at(b, n * 240)
         })?;
     }
     {
         let n = w.count(w.rd(80, 52, Kind::U32)?)?;
-        w.member_ptr(p.at(56), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(56), false, false, 4, |w, b| {
             w.load_at(b, n * 60)
         })?;
     }
     {
         let n = w.count(w.rd(80, 60, Kind::U32)?)?;
-        w.member_ptr(p.at(64), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(64), false, false, 4, |w, b| {
             w.load_at(b, n * 100)
         })?;
     }
@@ -2759,20 +2759,20 @@ fn ld_SndDriverGlobals(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result
     Ok(())
 }
 
-fn lp_FxEffectDef(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 82, true, 4, ld_FxEffectDef)
+fn lp_FxEffectDef(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 82, true, 4, ld_FxEffectDef)
 }
 
-fn ld_FxEffectDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(82, p)?;
-    if at_start { w.load_at(p, 76)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_FxEffectDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(82, base)?;
+    if at_start { w.load_at(base, 76)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(((w.rd(82, 8, Kind::I16)? + w.rd(82, 10, Kind::I16)?) + w.rd(82, 12, Kind::I16)?))?;
-        w.member_ptr(p.at(28), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(28), false, false, 4, |w, b| {
             w.load_at(b, n * 292)?;
-            for i in 0..n { ld_FxElemDef(w, b.at(i * 292), false)?; }
+            for ix in 0..n { ld_FxElemDef(w, b.shifted_by(ix * 292), false)?; }
             Ok(())
         })?;
     }
@@ -2781,20 +2781,20 @@ fn ld_FxEffectDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> 
     Ok(())
 }
 
-fn lp_FxImpactTable(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 83, true, 4, ld_FxImpactTable)
+fn lp_FxImpactTable(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 83, true, 4, ld_FxImpactTable)
 }
 
-fn ld_FxImpactTable(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(83, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_FxImpactTable(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(83, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count((21i64))?;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             w.load_at(b, n * 144)?;
-            for i in 0..n { ld_FxImpactEntry(w, b.at(i * 144), false)?; }
+            for ix in 0..n { ld_FxImpactEntry(w, b.shifted_by(ix * 144), false)?; }
             Ok(())
         })?;
     }
@@ -2803,18 +2803,18 @@ fn ld_FxImpactTable(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()
     Ok(())
 }
 
-fn lp_RawFile(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 84, true, 4, ld_RawFile)
+fn lp_RawFile(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 84, true, 4, ld_RawFile)
 }
 
-fn ld_RawFile(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(84, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_RawFile(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(84, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count((w.rd(84, 4, Kind::I32)? + (1i64)))?;
-        w.member_ptr(p.at(8), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 16, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -2823,26 +2823,26 @@ fn ld_RawFile(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_StringTable(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 85, true, 4, ld_StringTable)
+fn lp_StringTable(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 85, true, 4, ld_StringTable)
 }
 
-fn ld_StringTable(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(85, p)?;
-    if at_start { w.load_at(p, 20)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_StringTable(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(85, base)?;
+    if at_start { w.load_at(base, 20)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count((w.rd(85, 4, Kind::I32)? * w.rd(85, 8, Kind::I32)?))?;
-        w.member_ptr(p.at(12), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 4, |w, b| {
             w.load_at(b, n * 8)?;
-            for i in 0..n { ld_StringTableCell(w, b.at(i * 8), false)?; }
+            for ix in 0..n { ld_StringTableCell(w, b.shifted_by(ix * 8), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count((w.rd(85, 4, Kind::I32)? * w.rd(85, 8, Kind::I32)?))?;
-        w.member_ptr(p.at(16), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(16), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
@@ -2851,20 +2851,20 @@ fn ld_StringTable(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> 
     Ok(())
 }
 
-fn lp_LeaderboardDef(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 86, true, 4, ld_LeaderboardDef)
+fn lp_LeaderboardDef(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 86, true, 4, ld_LeaderboardDef)
 }
 
-fn ld_LeaderboardDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(86, p)?;
-    if at_start { w.load_at(p, 36)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_LeaderboardDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(86, base)?;
+    if at_start { w.load_at(base, 36)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(86, 8, Kind::I32)?)?;
-        w.member_ptr(p.at(24), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(24), false, false, 4, |w, b| {
             w.load_at(b, n * 44)?;
-            for i in 0..n { ld_LbColumnDef(w, b.at(i * 44), false)?; }
+            for ix in 0..n { ld_LbColumnDef(w, b.shifted_by(ix * 44), false)?; }
             Ok(())
         })?;
     }
@@ -2873,54 +2873,54 @@ fn ld_LeaderboardDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     Ok(())
 }
 
-fn ld_gump_info_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(87, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    w.xstring(p.at(0))?;
+fn ld_gump_info_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(87, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    w.xstring(base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn ld_overlay_info_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(88, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    w.xstring(p.at(0))?;
+fn ld_overlay_info_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(88, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    w.xstring(base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn lp_XGlobals(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 89, true, 4, ld_XGlobals)
+fn lp_XGlobals(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 89, true, 4, ld_XGlobals)
 }
 
-fn ld_XGlobals(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(89, p)?;
-    if at_start { w.load_at(p, 564)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_XGlobals(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(89, base)?;
+    if at_start { w.load_at(base, 564)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     if (((((w.rd(89, 40, Kind::I32)? >= (0i64)) as i64) != 0) && (((w.rd(89, 40, Kind::I32)? <= (32i64)) as i64) != 0)) as i64) != 0 {
-        { let n = w.count(w.rd(89, 40, Kind::I32)?)?; for i in 0..n { ld_gump_info_t(w, p.at(44).at(i * 8), false)?; } }
+        { let n = w.count(w.rd(89, 40, Kind::I32)?)?; for ix in 0..n { ld_gump_info_t(w, base.shifted_by(44).shifted_by(ix * 8), false)?; } }
     }
     if (((((w.rd(89, 304, Kind::I32)? >= (0i64)) as i64) != 0) && (((w.rd(89, 304, Kind::I32)? <= (32i64)) as i64) != 0)) as i64) != 0 {
-        { let n = w.count(w.rd(89, 304, Kind::I32)?)?; for i in 0..n { ld_overlay_info_t(w, p.at(308).at(i * 8), false)?; } }
+        { let n = w.count(w.rd(89, 304, Kind::I32)?)?; for ix in 0..n { ld_overlay_info_t(w, base.shifted_by(308).shifted_by(ix * 8), false)?; } }
     }
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn lp_ddlRoot_t(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 90, true, 4, ld_ddlRoot_t)
+fn lp_ddlRoot_t(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 90, true, 4, ld_ddlRoot_t)
 }
 
-fn ld_ddlRoot_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(90, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_ddlRoot_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(90, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             ld_ddlDef_t(w, b, true)
         })?;
     }
@@ -2929,20 +2929,20 @@ fn ld_ddlRoot_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_Glasses(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 91, true, 4, ld_Glasses)
+fn lp_Glasses(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 91, true, 4, ld_Glasses)
 }
 
-fn ld_Glasses(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(91, p)?;
-    if at_start { w.load_at(p, 56)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_Glasses(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(91, base)?;
+    if at_start { w.load_at(base, 56)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(91, 4, Kind::U32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 140)?;
-            for i in 0..n { ld_Glass(w, b.at(i * 140), false)?; }
+            for ix in 0..n { ld_Glass(w, b.shifted_by(ix * 140), false)?; }
             Ok(())
         })?;
     }
@@ -2951,108 +2951,108 @@ fn ld_Glasses(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_EmblemCategory(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(93, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(4))?;
+fn ld_EmblemCategory(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(93, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(4))?;
     w.leave();
     Ok(())
 }
 
-fn ld_EmblemIconType(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(94, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(4))?;
+fn ld_EmblemIconType(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(94, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(4))?;
     w.leave();
     Ok(())
 }
 
-fn ld_EmblemBGCategory(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(95, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(4))?;
+fn ld_EmblemBGCategory(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(95, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(4))?;
     w.leave();
     Ok(())
 }
 
-fn ld_EmblemIcon(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(96, p)?;
-    if at_start { w.load_at(p, 36)?; }
-    lp_GfxImage(w, p.at(0))?;
-    w.xstring(p.at(4))?;
+fn ld_EmblemIcon(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(96, base)?;
+    if at_start { w.load_at(base, 36)?; }
+    lp_GfxImage(w, base.shifted_by(0))?;
+    w.xstring(base.shifted_by(4))?;
     w.leave();
     Ok(())
 }
 
-fn ld_EmblemBackground(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(97, p)?;
-    if at_start { w.load_at(p, 36)?; }
-    lp_Material(w, p.at(0))?;
-    w.xstring(p.at(4))?;
+fn ld_EmblemBackground(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(97, base)?;
+    if at_start { w.load_at(base, 36)?; }
+    lp_Material(w, base.shifted_by(0))?;
+    w.xstring(base.shifted_by(4))?;
     w.leave();
     Ok(())
 }
 
-fn lp_EmblemSet(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 98, true, 4, ld_EmblemSet)
+fn lp_EmblemSet(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 98, true, 4, ld_EmblemSet)
 }
 
-fn ld_EmblemSet(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(98, p)?;
-    if at_start { w.load_at(p, 60)?; }
-    w.push(5)?;
+fn ld_EmblemSet(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(98, base)?;
+    if at_start { w.load_at(base, 60)?; }
+    w.put(5)?;
     {
         let n = w.count(w.rd(98, 4, Kind::I32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 12)
         })?;
     }
     {
         let n = w.count(w.rd(98, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(16), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), false, false, 4, |w, b| {
             w.load_at(b, n * 8)?;
-            for i in 0..n { ld_EmblemCategory(w, b.at(i * 8), false)?; }
+            for ix in 0..n { ld_EmblemCategory(w, b.shifted_by(ix * 8), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(98, 20, Kind::I32)?)?;
-        w.member_ptr(p.at(24), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(24), false, false, 4, |w, b| {
             w.load_at(b, n * 8)?;
-            for i in 0..n { ld_EmblemIconType(w, b.at(i * 8), false)?; }
+            for ix in 0..n { ld_EmblemIconType(w, b.shifted_by(ix * 8), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(98, 20, Kind::I32)?)?;
-        w.member_ptr(p.at(32), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(32), false, false, 4, |w, b| {
             w.load_at(b, n * 8)?;
-            for i in 0..n { ld_EmblemBGCategory(w, b.at(i * 8), false)?; }
+            for ix in 0..n { ld_EmblemBGCategory(w, b.shifted_by(ix * 8), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(98, 20, Kind::I32)?)?;
-        w.member_ptr(p.at(40), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(40), false, false, 4, |w, b| {
             w.load_at(b, n * 36)?;
-            for i in 0..n { ld_EmblemIcon(w, b.at(i * 36), false)?; }
+            for ix in 0..n { ld_EmblemIcon(w, b.shifted_by(ix * 36), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(98, 44, Kind::I32)?)?;
-        w.member_ptr(p.at(48), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(48), false, false, 4, |w, b| {
             w.load_at(b, n * 36)?;
-            for i in 0..n { ld_EmblemBackground(w, b.at(i * 36), false)?; }
+            for ix in 0..n { ld_EmblemBackground(w, b.shifted_by(ix * 36), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(98, 52, Kind::I32)?)?;
-        w.member_ptr(p.at(56), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(56), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
@@ -3061,18 +3061,18 @@ fn ld_EmblemSet(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_ScriptParseTree(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 99, true, 4, ld_ScriptParseTree)
+fn lp_ScriptParseTree(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 99, true, 4, ld_ScriptParseTree)
 }
 
-fn ld_ScriptParseTree(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(99, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_ScriptParseTree(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(99, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count((w.rd(99, 4, Kind::I32)? + (1i64)))?;
-        w.member_ptr(p.at(8), false, false, 32, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 32, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -3081,20 +3081,20 @@ fn ld_ScriptParseTree(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<
     Ok(())
 }
 
-fn lp_KeyValuePairs(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 100, true, 4, ld_KeyValuePairs)
+fn lp_KeyValuePairs(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 100, true, 4, ld_KeyValuePairs)
 }
 
-fn ld_KeyValuePairs(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(100, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_KeyValuePairs(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(100, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(100, 4, Kind::U32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 12)?;
-            for i in 0..n { ld_KeyValuePair(w, b.at(i * 12), false)?; }
+            for ix in 0..n { ld_KeyValuePair(w, b.shifted_by(ix * 12), false)?; }
             Ok(())
         })?;
     }
@@ -3103,136 +3103,136 @@ fn ld_KeyValuePairs(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()
     Ok(())
 }
 
-fn ld_VehicleParameter(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(102, p)?;
-    if at_start { w.load_at(p, 252)?; }
-    w.xstring(p.at(116))?;
+fn ld_VehicleParameter(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(102, base)?;
+    if at_start { w.load_at(base, 252)?; }
+    w.xstring(base.shifted_by(116))?;
     w.leave();
     Ok(())
 }
 
-fn ld_VehicleDriveBySound(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(103, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.xstring(p.at(4))?;
+fn ld_VehicleDriveBySound(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(103, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.xstring(base.shifted_by(4))?;
     w.leave();
     Ok(())
 }
 
-fn ld_VehicleEngineSound(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(104, p)?;
-    if at_start { w.load_at(p, 28)?; }
-    w.xstring(p.at(0))?;
+fn ld_VehicleEngineSound(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(104, base)?;
+    if at_start { w.load_at(base, 28)?; }
+    w.xstring(base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn ld_VehicleEngine(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(106, p)?;
-    if at_start { w.load_at(p, 456)?; }
-    { let n = 5; for i in 0..n { ld_VehicleEngineSound(w, p.at(48).at(i * 28), false)?; } }
-    { let n = 5; for i in 0..n { ld_VehicleEngineSound(w, p.at(188).at(i * 28), false)?; } }
+fn ld_VehicleEngine(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(106, base)?;
+    if at_start { w.load_at(base, 456)?; }
+    { let n = 5; for ix in 0..n { ld_VehicleEngineSound(w, base.shifted_by(48).shifted_by(ix * 28), false)?; } }
+    { let n = 5; for ix in 0..n { ld_VehicleEngineSound(w, base.shifted_by(188).shifted_by(ix * 28), false)?; } }
     w.leave();
     Ok(())
 }
 
-fn lp_VehicleDef(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 108, true, 4, ld_VehicleDef)
+fn lp_VehicleDef(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 108, true, 4, ld_VehicleDef)
 }
 
-fn ld_VehicleDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(108, p)?;
-    if at_start { w.load_at(p, 2604)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(364))?;
-    w.xstrings(p.at(412), 4)?;
-    w.xstrings(p.at(664), 2)?;
-    w.xstrings(p.at(680), 3)?;
-    w.xstring(p.at(700))?;
-    w.xstring(p.at(712))?;
+fn ld_VehicleDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(108, base)?;
+    if at_start { w.load_at(base, 2604)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(364))?;
+    w.xstrings(base.shifted_by(412), 4)?;
+    w.xstrings(base.shifted_by(664), 2)?;
+    w.xstrings(base.shifted_by(680), 3)?;
+    w.xstring(base.shifted_by(700))?;
+    w.xstring(base.shifted_by(712))?;
     {
         let n = 4;
-        let b = p.at(748);
-        for i in 0..n { lp_XModel(w, b.at(i * 4))?; }
+        let b = base.shifted_by(748);
+        for ix in 0..n { lp_XModel(w, b.shifted_by(ix * 4))?; }
     }
     {
         let n = 4;
-        let b = p.at(772);
-        for i in 0..n { lp_XModel(w, b.at(i * 4))?; }
+        let b = base.shifted_by(772);
+        for ix in 0..n { lp_XModel(w, b.shifted_by(ix * 4))?; }
     }
-    lp_XModel(w, p.at(804))?;
-    lp_XModel(w, p.at(808))?;
-    lp_XModel(w, p.at(812))?;
-    lp_XModel(w, p.at(816))?;
-    lp_FxEffectDef(w, p.at(824))?;
+    lp_XModel(w, base.shifted_by(804))?;
+    lp_XModel(w, base.shifted_by(808))?;
+    lp_XModel(w, base.shifted_by(812))?;
+    lp_XModel(w, base.shifted_by(816))?;
+    lp_FxEffectDef(w, base.shifted_by(824))?;
     {
         let n = 32;
-        let b = p.at(832);
-        for i in 0..n { lp_FxEffectDef(w, b.at(i * 4))?; }
+        let b = base.shifted_by(832);
+        for ix in 0..n { lp_FxEffectDef(w, b.shifted_by(ix * 4))?; }
     }
-    lp_FxEffectDef(w, p.at(960))?;
-    w.xstring(p.at(968))?;
+    lp_FxEffectDef(w, base.shifted_by(960))?;
+    w.xstring(base.shifted_by(968))?;
     {
         let n = 4;
-        let b = p.at(972);
-        for i in 0..n { lp_FxEffectDef(w, b.at(i * 4))?; }
+        let b = base.shifted_by(972);
+        for ix in 0..n { lp_FxEffectDef(w, b.shifted_by(ix * 4))?; }
     }
-    lp_FxEffectDef(w, p.at(996))?;
-    lp_FxEffectDef(w, p.at(1004))?;
-    w.xstring(p.at(1024))?;
-    w.xstring(p.at(1028))?;
-    w.xstring(p.at(1044))?;
-    w.xstring(p.at(1104))?;
-    lp_Material(w, p.at(1108))?;
-    w.xstring(p.at(1112))?;
-    w.xstring(p.at(1120))?;
-    w.xstring(p.at(1128))?;
-    w.xstring(p.at(1136))?;
-    w.xstring(p.at(1144))?;
-    w.xstring(p.at(1152))?;
-    w.xstring(p.at(1160))?;
-    w.xstring(p.at(1168))?;
-    w.xstring(p.at(1176))?;
-    w.xstring(p.at(1184))?;
-    w.xstring(p.at(1192))?;
-    ld_VehicleParameter(w, p.at(1340), false)?;
-    { let n = 40; for i in 0..n { ld_VehicleDriveBySound(w, p.at(1600).at(i * 12), false)?; } }
-    ld_VehicleEngine(w, p.at(2088), false)?;
-    w.xstring(p.at(2576))?;
+    lp_FxEffectDef(w, base.shifted_by(996))?;
+    lp_FxEffectDef(w, base.shifted_by(1004))?;
+    w.xstring(base.shifted_by(1024))?;
+    w.xstring(base.shifted_by(1028))?;
+    w.xstring(base.shifted_by(1044))?;
+    w.xstring(base.shifted_by(1104))?;
+    lp_Material(w, base.shifted_by(1108))?;
+    w.xstring(base.shifted_by(1112))?;
+    w.xstring(base.shifted_by(1120))?;
+    w.xstring(base.shifted_by(1128))?;
+    w.xstring(base.shifted_by(1136))?;
+    w.xstring(base.shifted_by(1144))?;
+    w.xstring(base.shifted_by(1152))?;
+    w.xstring(base.shifted_by(1160))?;
+    w.xstring(base.shifted_by(1168))?;
+    w.xstring(base.shifted_by(1176))?;
+    w.xstring(base.shifted_by(1184))?;
+    w.xstring(base.shifted_by(1192))?;
+    ld_VehicleParameter(w, base.shifted_by(1340), false)?;
+    { let n = 40; for ix in 0..n { ld_VehicleDriveBySound(w, base.shifted_by(1600).shifted_by(ix * 12), false)?; } }
+    ld_VehicleEngine(w, base.shifted_by(2088), false)?;
+    w.xstring(base.shifted_by(2576))?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_MemoryBlockData(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(109, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_MemoryBlockData(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(109, base)?;
+    if at_start { w.load_at(base, 4)?; }
     if w.rd(110, 4, Kind::U8)? != 0 {
-        w.push(1)?;
+        w.put(1)?;
         {
             let n = w.count(w.rd(110, 8, Kind::U32)?)?;
-            w.member_ptr(p.at(0), false, false, (w.rd(110, 12, Kind::U32)? as usize), |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, (w.rd(110, 12, Kind::U32)? as usize), |w, b| {
                 w.load_at(b, n * 1)
             })?;
         }
         w.pop()?;
     }
     else if w.rd(110, 5, Kind::U8)? != 0 {
-        w.push(2)?;
+        w.put(2)?;
         {
             let n = w.count(w.rd(110, 8, Kind::U32)?)?;
-            w.member_ptr(p.at(0), false, false, (w.rd(110, 12, Kind::U32)? as usize), |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, (w.rd(110, 12, Kind::U32)? as usize), |w, b| {
                 w.load_at(b, n * 1)
             })?;
         }
         w.pop()?;
     }
     else if w.rd(110, 6, Kind::U8)? != 0 {
-        w.push(7)?;
+        w.put(7)?;
         {
             let n = w.count(w.rd(110, 8, Kind::U32)?)?;
-            w.member_ptr(p.at(0), false, false, (w.rd(110, 12, Kind::U32)? as usize), |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, (w.rd(110, 12, Kind::U32)? as usize), |w, b| {
                 w.load_at(b, n * 1)
             })?;
         }
@@ -3242,27 +3242,27 @@ fn ld_MemoryBlockData(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<
     Ok(())
 }
 
-fn lp_MemoryBlock(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 110, true, 4, ld_MemoryBlock)
+fn lp_MemoryBlock(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 110, true, 4, ld_MemoryBlock)
 }
 
-fn ld_MemoryBlock(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(110, p)?;
-    if at_start { w.load_at(p, 20)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    ld_MemoryBlockData(w, p.at(16), false)?;
+fn ld_MemoryBlock(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(110, base)?;
+    if at_start { w.load_at(base, 20)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    ld_MemoryBlockData(w, base.shifted_by(16), false)?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_cmodel_t2(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(111, p)?;
-    if at_start { w.load_at(p, 76)?; }
+fn ld_cmodel_t2(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(111, base)?;
+    if at_start { w.load_at(base, 76)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(28), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(28), true, false, 4, |w, b| {
             ld_ClipInfo(w, b, true)
         })?;
     }
@@ -3270,39 +3270,39 @@ fn ld_cmodel_t2(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_AddonMapEnts(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 112, true, 4, ld_AddonMapEnts)
+fn lp_AddonMapEnts(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 112, true, 4, ld_AddonMapEnts)
 }
 
-fn ld_AddonMapEnts(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(112, p)?;
-    if at_start { w.load_at(p, 52)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_AddonMapEnts(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(112, base)?;
+    if at_start { w.load_at(base, 52)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(112, 8, Kind::I32)?)?;
-        w.member_ptr(p.at(4), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
-    ld_MapTriggers(w, p.at(12), false)?;
+    ld_MapTriggers(w, base.shifted_by(12), false)?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(36), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(36), true, false, 4, |w, b| {
             ld_ClipInfo(w, b, true)
         })?;
     }
     {
         let n = w.count(w.rd(112, 40, Kind::U32)?)?;
-        w.member_ptr(p.at(44), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(44), false, false, 4, |w, b| {
             w.load_at(b, n * 76)?;
-            for i in 0..n { ld_cmodel_t2(w, b.at(i * 76), false)?; }
+            for ix in 0..n { ld_cmodel_t2(w, b.shifted_by(ix * 76), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(112, 40, Kind::U32)?)?;
-        w.member_ptr(p.at(48), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(48), false, false, 16, |w, b| {
             w.load_at(b, n * 64)
         })?;
     }
@@ -3311,47 +3311,47 @@ fn ld_AddonMapEnts(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn lp_TracerDef(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 113, true, 4, ld_TracerDef)
+fn lp_TracerDef(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 113, true, 4, ld_TracerDef)
 }
 
-fn ld_TracerDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(113, p)?;
-    if at_start { w.load_at(p, 128)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    lp_Material(w, p.at(8))?;
+fn ld_TracerDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(113, base)?;
+    if at_start { w.load_at(base, 128)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    lp_Material(w, base.shifted_by(8))?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn lp_SkinnedVertsDef(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 114, true, 4, ld_SkinnedVertsDef)
+fn lp_SkinnedVertsDef(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 114, true, 4, ld_SkinnedVertsDef)
 }
 
-fn ld_SkinnedVertsDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(114, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_SkinnedVertsDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(114, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn lp_Qdb(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 115, true, 4, ld_Qdb)
+fn lp_Qdb(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 115, true, 4, ld_Qdb)
 }
 
-fn ld_Qdb(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(115, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_Qdb(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(115, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count((w.rd(115, 4, Kind::I32)? + (1i64)))?;
-        w.member_ptr(p.at(8), false, false, 32, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 32, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -3360,18 +3360,18 @@ fn ld_Qdb(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_Slug(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 116, true, 4, ld_Slug)
+fn lp_Slug(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 116, true, 4, ld_Slug)
 }
 
-fn ld_Slug(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(116, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_Slug(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(116, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count((w.rd(116, 4, Kind::I32)? + (1i64)))?;
-        w.member_ptr(p.at(8), false, false, 32, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 32, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -3380,130 +3380,130 @@ fn ld_Slug(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn lp_FootstepTableDef(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 117, true, 4, ld_FootstepTableDef)
+fn lp_FootstepTableDef(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 117, true, 4, ld_FootstepTableDef)
 }
 
-fn ld_FootstepTableDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(117, p)?;
-    if at_start { w.load_at(p, 900)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_FootstepTableDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(117, base)?;
+    if at_start { w.load_at(base, 900)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn lp_FootstepFXTableDef(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 118, true, 4, ld_FootstepFXTableDef)
+fn lp_FootstepFXTableDef(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 118, true, 4, ld_FootstepFXTableDef)
 }
 
-fn ld_FootstepFXTableDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(118, p)?;
-    if at_start { w.load_at(p, 132)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_FootstepFXTableDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(118, base)?;
+    if at_start { w.load_at(base, 132)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = 32;
-        let b = p.at(4);
-        for i in 0..n { lp_FxEffectDef(w, b.at(i * 4))?; }
+        let b = base.shifted_by(4);
+        for ix in 0..n { lp_FxEffectDef(w, b.shifted_by(ix * 4))?; }
     }
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_ZBarrierBoard(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(119, p)?;
-    if at_start { w.load_at(p, 80)?; }
-    lp_XModel(w, p.at(0))?;
-    lp_XModel(w, p.at(4))?;
-    lp_XModel(w, p.at(8))?;
-    w.xstring(p.at(12))?;
-    w.xstring(p.at(16))?;
-    lp_FxEffectDef(w, p.at(20))?;
-    lp_FxEffectDef(w, p.at(24))?;
+fn ld_ZBarrierBoard(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(119, base)?;
+    if at_start { w.load_at(base, 80)?; }
+    lp_XModel(w, base.shifted_by(0))?;
+    lp_XModel(w, base.shifted_by(4))?;
+    lp_XModel(w, base.shifted_by(8))?;
+    w.xstring(base.shifted_by(12))?;
+    w.xstring(base.shifted_by(16))?;
+    lp_FxEffectDef(w, base.shifted_by(20))?;
+    lp_FxEffectDef(w, base.shifted_by(24))?;
     w.leave();
     Ok(())
 }
 
-fn lp_ZBarrierDef(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 120, true, 4, ld_ZBarrierDef)
+fn lp_ZBarrierDef(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 120, true, 4, ld_ZBarrierDef)
 }
 
-fn ld_ZBarrierDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(120, p)?;
-    if at_start { w.load_at(p, 560)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
-    { let n = 6; for i in 0..n { ld_ZBarrierBoard(w, p.at(80).at(i * 80), false)?; } }
+fn ld_ZBarrierDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(120, base)?;
+    if at_start { w.load_at(base, 560)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
+    { let n = 6; for ix in 0..n { ld_ZBarrierBoard(w, base.shifted_by(80).shifted_by(ix * 80), false)?; } }
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_XModelPiece(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(121, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    lp_XModel(w, p.at(0))?;
+fn ld_XModelPiece(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(121, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    lp_XModel(w, base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn ld_DestructibleStage(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(122, p)?;
-    if at_start { w.load_at(p, 48)?; }
-    lp_FxEffectDef(w, p.at(16))?;
-    w.xstring(p.at(20))?;
-    w.xstring(p.at(24))?;
-    w.xstring(p.at(28))?;
+fn ld_DestructibleStage(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(122, base)?;
+    if at_start { w.load_at(base, 48)?; }
+    lp_FxEffectDef(w, base.shifted_by(16))?;
+    w.xstring(base.shifted_by(20))?;
+    w.xstring(base.shifted_by(24))?;
+    w.xstring(base.shifted_by(28))?;
     {
         let n = 3;
-        let b = p.at(32);
-        for i in 0..n { lp_XModel(w, b.at(i * 4))?; }
+        let b = base.shifted_by(32);
+        for ix in 0..n { lp_XModel(w, b.shifted_by(ix * 4))?; }
     }
-    lp_PhysPreset(w, p.at(44))?;
+    lp_PhysPreset(w, base.shifted_by(44))?;
     w.leave();
     Ok(())
 }
 
-fn ld_DestructiblePiece(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(123, p)?;
-    if at_start { w.load_at(p, 312)?; }
-    { let n = 5; for i in 0..n { ld_DestructibleStage(w, p.at(0).at(i * 48), false)?; } }
-    lp_PhysConstraints(w, p.at(268))?;
-    w.xstring(p.at(276))?;
-    lp_FxEffectDef(w, p.at(280))?;
-    w.xstring(p.at(284))?;
+fn ld_DestructiblePiece(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(123, base)?;
+    if at_start { w.load_at(base, 312)?; }
+    { let n = 5; for ix in 0..n { ld_DestructibleStage(w, base.shifted_by(0).shifted_by(ix * 48), false)?; } }
+    lp_PhysConstraints(w, base.shifted_by(268))?;
+    w.xstring(base.shifted_by(276))?;
+    lp_FxEffectDef(w, base.shifted_by(280))?;
+    w.xstring(base.shifted_by(284))?;
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimNotifyInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(124, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_XAnimNotifyInfo(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(124, base)?;
+    if at_start { w.load_at(base, 8)?; }
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimDeltaPart(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(125, p)?;
-    if at_start { w.load_at(p, 12)?; }
+fn ld_XAnimDeltaPart(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(125, base)?;
+    if at_start { w.load_at(base, 12)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(0), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
             ld_XAnimPartTrans(w, b, true)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             ld_XAnimDeltaPartQuat2(w, b, true)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             ld_XAnimDeltaPartQuat(w, b, true)
         })?;
     }
@@ -3511,18 +3511,18 @@ fn ld_XAnimDeltaPart(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     Ok(())
 }
 
-fn ld_XSurfaceVertexInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(127, p)?;
-    if at_start { w.load_at(p, 16)?; }
+fn ld_XSurfaceVertexInfo(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(127, base)?;
+    if at_start { w.load_at(base, 16)?; }
     {
         let n = w.count((((w.rd(127, 0 + ((0i64) as usize) * 2, Kind::I16)? + ((3i64) * w.rd(127, 0 + ((1i64) as usize) * 2, Kind::I16)?)) + ((5i64) * w.rd(127, 0 + ((2i64) as usize) * 2, Kind::I16)?)) + ((7i64) * w.rd(127, 0 + ((3i64) as usize) * 2, Kind::I16)?)))?;
-        w.member_ptr(p.at(8), true, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(8), true, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count((((w.rd(127, 0 + ((0i64) as usize) * 2, Kind::I16)? + w.rd(127, 0 + ((1i64) as usize) * 2, Kind::I16)?) + w.rd(127, 0 + ((2i64) as usize) * 2, Kind::I16)?) + w.rd(127, 0 + ((3i64) as usize) * 2, Kind::I16)?))?;
-        w.member_ptr(p.at(12), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), true, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
@@ -3530,29 +3530,29 @@ fn ld_XSurfaceVertexInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Resu
     Ok(())
 }
 
-fn ld_XSurface(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(129, p)?;
-    if at_start { w.load_at(p, 80)?; }
-    ld_XSurfaceVertexInfo(w, p.at(16), false)?;
+fn ld_XSurface(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(129, base)?;
+    if at_start { w.load_at(base, 80)?; }
+    ld_XSurfaceVertexInfo(w, base.shifted_by(16), false)?;
     if (((w.rd(129, 2, Kind::U16)? & (1i64)) == 0) as i64) != 0 {
         {
             let n = w.count(w.rd(129, 4, Kind::U16)?)?;
-            w.member_ptr(p.at(32), true, false, 16, |w, b| {
+            w.member_ptr(base.shifted_by(32), true, false, 16, |w, b| {
                 w.load_at(b, n * 32)
             })?;
         }
     }
     {
         let n = w.count(w.rd(129, 1, Kind::U8)?)?;
-        w.member_ptr(p.at(40), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(40), true, false, 4, |w, b| {
             w.load_at(b, n * 12)?;
-            for i in 0..n { ld_XRigidVertList(w, b.at(i * 12), false)?; }
+            for ix in 0..n { ld_XRigidVertList(w, b.shifted_by(ix * 12), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(129, 6, Kind::U16)?)?;
-        w.member_ptr(p.at(12), true, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(12), true, false, 16, |w, b| {
             w.load_at(b, n * 6)
         })?;
     }
@@ -3560,12 +3560,12 @@ fn ld_XSurface(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_XModelCollSurf_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(130, p)?;
-    if at_start { w.load_at(p, 44)?; }
+fn ld_XModelCollSurf_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(130, base)?;
+    if at_start { w.load_at(base, 44)?; }
     {
         let n = w.count(w.rd(130, 4, Kind::I32)?)?;
-        w.member_ptr(p.at(0), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
             w.load_at(b, n * 48)
         })?;
     }
@@ -3573,12 +3573,12 @@ fn ld_XModelCollSurf_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result
     Ok(())
 }
 
-fn ld_Collmap(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(132, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_Collmap(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(132, base)?;
+    if at_start { w.load_at(base, 4)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(0), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
             ld_PhysGeomList(w, b, true)
         })?;
     }
@@ -3586,40 +3586,40 @@ fn ld_Collmap(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_MaterialTextureDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(134, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    lp_GfxImage(w, p.at(12))?;
+fn ld_MaterialTextureDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(134, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    lp_GfxImage(w, base.shifted_by(12))?;
     w.leave();
     Ok(())
 }
 
-fn ld_MaterialPass(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(140, p)?;
-    if at_start { w.load_at(p, 24)?; }
+fn ld_MaterialPass(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(140, base)?;
+    if at_start { w.load_at(base, 24)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(4), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), true, false, 4, |w, b| {
             ld_MaterialVertexShader(w, b, true)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(0), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(0), true, false, 4, |w, b| {
             w.load_at(b, n * 116)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(8), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), true, false, 4, |w, b| {
             ld_MaterialPixelShader(w, b, true)
         })?;
     }
     {
         let n = w.count(((w.rd(140, 12, Kind::U8)? + w.rd(140, 13, Kind::U8)?) + w.rd(140, 14, Kind::U8)?))?;
-        w.member_ptr(p.at(20), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(20), false, false, 4, |w, b| {
             w.load_at(b, n * 12)?;
-            for i in 0..n { ld_MaterialShaderArgument(w, b.at(i * 12), false)?; }
+            for ix in 0..n { ld_MaterialShaderArgument(w, b.shifted_by(ix * 12), false)?; }
             Ok(())
         })?;
     }
@@ -3627,39 +3627,39 @@ fn ld_MaterialPass(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn ld_MaterialTechnique(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(141, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_MaterialTechnique(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(141, base)?;
+    if at_start { w.load_at(base, 8)?; }
     {
         let n = w.count(w.rd(141, 6, Kind::U16)?)?;
-        w.load_at(p.at(8), n * 24)?;
-        for i in 0..n { ld_MaterialPass(w, p.at(8).at(i * 24), false)?; }
+        w.load_at(base.shifted_by(8), n * 24)?;
+        for ix in 0..n { ld_MaterialPass(w, base.shifted_by(8).shifted_by(ix * 24), false)?; }
     }
-    w.xstring(p.at(0))?;
+    w.xstring(base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn ld_GfxImageLoadDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(142, p)?;
-    if at_start { w.load_at(p, 12)?; }
+fn ld_GfxImageLoadDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(142, base)?;
+    if at_start { w.load_at(base, 12)?; }
     {
         let n = w.count(w.rd(142, 8, Kind::I32)?)?;
-        w.load_at(p.at(12), n * 1)?;
+        w.load_at(base.shifted_by(12), n * 1)?;
     }
     w.leave();
     Ok(())
 }
 
-fn ld_SndAliasList(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(143, p)?;
-    if at_start { w.load_at(p, 20)?; }
-    w.xstring(p.at(0))?;
+fn ld_SndAliasList(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(143, base)?;
+    if at_start { w.load_at(base, 20)?; }
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(143, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(8), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), true, false, 4, |w, b| {
             w.load_at(b, n * 96)?;
-            for i in 0..n { ld_SndAlias(w, b.at(i * 96), false)?; }
+            for ix in 0..n { ld_SndAlias(w, b.shifted_by(ix * 96), false)?; }
             Ok(())
         })?;
     }
@@ -3667,18 +3667,18 @@ fn ld_SndAliasList(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn ld_SndDuck(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(146, p)?;
-    if at_start { w.load_at(p, 76)?; }
+fn ld_SndDuck(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(146, base)?;
+    if at_start { w.load_at(base, 76)?; }
     {
         let n = w.count((32i64))?;
-        w.member_ptr(p.at(64), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(64), false, false, 16, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     {
         let n = w.count((32i64))?;
-        w.member_ptr(p.at(68), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(68), false, false, 16, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
@@ -3686,20 +3686,20 @@ fn ld_SndDuck(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_ClipMaterial(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(150, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.xstring(p.at(0))?;
+fn ld_ClipMaterial(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(150, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.xstring(base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn ld_cbrushside_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(151, p)?;
-    if at_start { w.load_at(p, 12)?; }
+fn ld_cbrushside_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(151, base)?;
+    if at_start { w.load_at(base, 12)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(0), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(0), true, false, 4, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
@@ -3707,12 +3707,12 @@ fn ld_cbrushside_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn ld_cLeafBrushNodeLeaf_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(152, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_cLeafBrushNodeLeaf_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(152, base)?;
+    if at_start { w.load_at(base, 4)?; }
     {
         let n = w.count(w.rd(155, 2, Kind::I16)?)?;
-        w.member_ptr(p.at(0), true, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(0), true, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
@@ -3720,36 +3720,36 @@ fn ld_cLeafBrushNodeLeaf_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Re
     Ok(())
 }
 
-fn ld_cLeafBrushNodeData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(154, p)?;
-    if at_start { w.load_at(p, 12)?; }
+fn ld_cLeafBrushNodeData_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(154, base)?;
+    if at_start { w.load_at(base, 12)?; }
     if ((w.rd(155, 2, Kind::I16)? > (0i64)) as i64) != 0 {
-        ld_cLeafBrushNodeLeaf_t(w, p.at(0), false)?;
+        ld_cLeafBrushNodeLeaf_t(w, base.shifted_by(0), false)?;
     }
     w.leave();
     Ok(())
 }
 
-fn ld_cLeafBrushNode_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(155, p)?;
-    if at_start { w.load_at(p, 20)?; }
-    ld_cLeafBrushNodeData_t(w, p.at(8), false)?;
+fn ld_cLeafBrushNode_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(155, base)?;
+    if at_start { w.load_at(base, 20)?; }
+    ld_cLeafBrushNodeData_t(w, base.shifted_by(8), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_cbrush_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(156, p)?;
-    if at_start { w.load_at(p, 96)?; }
+fn ld_cbrush_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(156, base)?;
+    if at_start { w.load_at(base, 96)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(32), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(32), true, false, 4, |w, b| {
             ld_cbrushside_t(w, b, true)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(88), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(88), true, false, 4, |w, b| {
             w.load_at(b, n * 12)
         })?;
     }
@@ -3757,20 +3757,20 @@ fn ld_cbrush_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_cStaticModel_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(159, p)?;
-    if at_start { w.load_at(p, 84)?; }
-    lp_XModel(w, p.at(4))?;
+fn ld_cStaticModel_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(159, base)?;
+    if at_start { w.load_at(base, 84)?; }
+    lp_XModel(w, base.shifted_by(4))?;
     w.leave();
     Ok(())
 }
 
-fn ld_cNode_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(160, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_cNode_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(160, base)?;
+    if at_start { w.load_at(base, 8)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(0), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(0), true, false, 4, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
@@ -3778,45 +3778,45 @@ fn ld_cNode_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_DynEntityDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(165, p)?;
-    if at_start { w.load_at(p, 84)?; }
-    lp_XModel(w, p.at(32))?;
-    lp_XModel(w, p.at(36))?;
-    lp_FxEffectDef(w, p.at(44))?;
+fn ld_DynEntityDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(165, base)?;
+    if at_start { w.load_at(base, 84)?; }
+    lp_XModel(w, base.shifted_by(32))?;
+    lp_XModel(w, base.shifted_by(36))?;
+    lp_FxEffectDef(w, base.shifted_by(44))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(52), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(52), true, false, 4, |w, b| {
             ld_XModelPieces(w, b, true)
         })?;
     }
-    lp_PhysPreset(w, p.at(56))?;
+    lp_PhysPreset(w, base.shifted_by(56))?;
     w.leave();
     Ok(())
 }
 
-fn ld_rope_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(174, p)?;
-    if at_start { w.load_at(p, 3188)?; }
-    lp_Material(w, p.at(3144))?;
+fn ld_rope_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(174, base)?;
+    if at_start { w.load_at(base, 3188)?; }
+    lp_Material(w, base.shifted_by(3144))?;
     w.leave();
     Ok(())
 }
 
-fn ld_ComPrimaryLight(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(175, p)?;
-    if at_start { w.load_at(p, 196)?; }
-    w.xstring(p.at(192))?;
+fn ld_ComPrimaryLight(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(175, base)?;
+    if at_start { w.load_at(base, 196)?; }
+    w.xstring(base.shifted_by(192))?;
     w.leave();
     Ok(())
 }
 
-fn ld_pathnode_constant_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(176, p)?;
-    if at_start { w.load_at(p, 68)?; }
+fn ld_pathnode_constant_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(176, base)?;
+    if at_start { w.load_at(base, 68)?; }
     {
         let n = w.count(w.rd(176, 60, Kind::U16)?)?;
-        w.member_ptr(p.at(64), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(64), false, false, 4, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
@@ -3824,20 +3824,20 @@ fn ld_pathnode_constant_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Res
     Ok(())
 }
 
-fn ld_pathnode_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(181, p)?;
-    if at_start { w.load_at(p, 144)?; }
-    ld_pathnode_constant_t(w, p.at(0), false)?;
+fn ld_pathnode_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(181, base)?;
+    if at_start { w.load_at(base, 144)?; }
+    ld_pathnode_constant_t(w, base.shifted_by(0), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_pathnode_tree_nodes_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(183, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_pathnode_tree_nodes_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(183, base)?;
+    if at_start { w.load_at(base, 8)?; }
     {
         let n = w.count(w.rd(183, 0, Kind::I32)?)?;
-        w.member_ptr(p.at(4), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
@@ -3845,61 +3845,61 @@ fn ld_pathnode_tree_nodes_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> R
     Ok(())
 }
 
-fn ld_pathnode_tree_info_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(184, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_pathnode_tree_info_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(184, base)?;
+    if at_start { w.load_at(base, 8)?; }
     if ((w.rd(185, 0, Kind::I32)? < (0i64)) as i64) != 0 {
-        ld_pathnode_tree_nodes_t(w, p.at(0), false)?;
+        ld_pathnode_tree_nodes_t(w, base.shifted_by(0), false)?;
     }
     else {
         {
             let n = 2;
-            let b = p.at(0);
-            for i in 0..n { w.elem_ptr(b.at(i * 4), true, 4, |w, e| ld_pathnode_tree_t(w, e, true))?; }
+            let b = base.shifted_by(0);
+            for ix in 0..n { w.elem_ptr(b.shifted_by(ix * 4), true, 4, |w, e| ld_pathnode_tree_t(w, e, true))?; }
         }
     }
     w.leave();
     Ok(())
 }
 
-fn ld_pathnode_tree_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(185, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    ld_pathnode_tree_info_t(w, p.at(8), false)?;
+fn ld_pathnode_tree_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(185, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    ld_pathnode_tree_info_t(w, base.shifted_by(8), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_GfxLight(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(192, p)?;
-    if at_start { w.load_at(p, 352)?; }
-    lp_GfxLightDef(w, p.at(336))?;
+fn ld_GfxLight(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(192, base)?;
+    if at_start { w.load_at(base, 352)?; }
+    lp_GfxLightDef(w, base.shifted_by(336))?;
     w.leave();
     Ok(())
 }
 
-fn ld_GfxCell(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(200, p)?;
-    if at_start { w.load_at(p, 48)?; }
+fn ld_GfxCell(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(200, base)?;
+    if at_start { w.load_at(base, 48)?; }
     {
         let n = w.count(w.rd(200, 24, Kind::I32)?)?;
-        w.member_ptr(p.at(28), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(28), false, false, 4, |w, b| {
             w.load_at(b, n * 40)?;
-            for i in 0..n { ld_GfxAabbTree(w, b.at(i * 40), false)?; }
+            for ix in 0..n { ld_GfxAabbTree(w, b.shifted_by(ix * 40), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(200, 32, Kind::I32)?)?;
-        w.member_ptr(p.at(36), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(36), false, false, 4, |w, b| {
             w.load_at(b, n * 92)?;
-            for i in 0..n { ld_GfxPortal(w, b.at(i * 92), false)?; }
+            for ix in 0..n { ld_GfxPortal(w, b.shifted_by(ix * 92), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(200, 40, Kind::I8)?)?;
-        w.member_ptr(p.at(44), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(44), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -3907,13 +3907,13 @@ fn ld_GfxCell(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_GfxReflectionProbe(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(202, p)?;
-    if at_start { w.load_at(p, 76)?; }
-    lp_GfxImage(w, p.at(60))?;
+fn ld_GfxReflectionProbe(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(202, base)?;
+    if at_start { w.load_at(base, 76)?; }
+    lp_GfxImage(w, base.shifted_by(60))?;
     {
         let n = w.count(w.rd(202, 68, Kind::U32)?)?;
-        w.member_ptr(p.at(64), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(64), false, false, 4, |w, b| {
             w.load_at(b, n * 96)
         })?;
     }
@@ -3921,47 +3921,47 @@ fn ld_GfxReflectionProbe(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Resu
     Ok(())
 }
 
-fn ld_GfxLightmapArray(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(203, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    lp_GfxImage(w, p.at(0))?;
-    lp_GfxImage(w, p.at(4))?;
+fn ld_GfxLightmapArray(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(203, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    lp_GfxImage(w, base.shifted_by(0))?;
+    lp_GfxImage(w, base.shifted_by(4))?;
     w.leave();
     Ok(())
 }
 
-fn ld_MaterialMemory(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(210, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    lp_Material(w, p.at(0))?;
+fn ld_MaterialMemory(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(210, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    lp_Material(w, base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn ld_SSkinInstance(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(219, p)?;
-    if at_start { w.load_at(p, 96)?; }
+fn ld_SSkinInstance(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(219, base)?;
+    if at_start { w.load_at(base, 96)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(64), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(64), true, false, 4, |w, b| {
             ld_SSkinShaders(w, b, true)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(68), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(68), true, false, 4, |w, b| {
             ld_SSkinModel(w, b, true)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(72), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(72), true, false, 4, |w, b| {
             ld_SSkinAnim(w, b, true)
         })?;
     }
     {
         let n = w.count(w.rd_through(219, 68, 0, Kind::I32)?)?;
-        w.member_ptr(p.at(76), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(76), false, false, 4, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
@@ -3969,18 +3969,18 @@ fn ld_SSkinInstance(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()
     Ok(())
 }
 
-fn ld_GfxShadowGeometry(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(220, p)?;
-    if at_start { w.load_at(p, 12)?; }
+fn ld_GfxShadowGeometry(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(220, base)?;
+    if at_start { w.load_at(base, 12)?; }
     {
         let n = w.count(w.rd(220, 0, Kind::U16)?)?;
-        w.member_ptr(p.at(4), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count(w.rd(220, 2, Kind::U16)?)?;
-        w.member_ptr(p.at(8), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
@@ -3988,14 +3988,14 @@ fn ld_GfxShadowGeometry(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Resul
     Ok(())
 }
 
-fn ld_GfxLightRegion(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(221, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_GfxLightRegion(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(221, base)?;
+    if at_start { w.load_at(base, 8)?; }
     {
         let n = w.count(w.rd(221, 0, Kind::U32)?)?;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             w.load_at(b, n * 80)?;
-            for i in 0..n { ld_GfxLightRegionHull(w, b.at(i * 80), false)?; }
+            for ix in 0..n { ld_GfxLightRegionHull(w, b.shifted_by(ix * 80), false)?; }
             Ok(())
         })?;
     }
@@ -4003,20 +4003,20 @@ fn ld_GfxLightRegion(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     Ok(())
 }
 
-fn ld_GfxSurface(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(224, p)?;
-    if at_start { w.load_at(p, 80)?; }
-    lp_Material(w, p.at(48))?;
+fn ld_GfxSurface(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(224, base)?;
+    if at_start { w.load_at(base, 80)?; }
+    lp_Material(w, base.shifted_by(48))?;
     w.leave();
     Ok(())
 }
 
-fn ld_GfxStaticModelLmapVertexInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(227, p)?;
-    if at_start { w.load_at(p, 12)?; }
+fn ld_GfxStaticModelLmapVertexInfo(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(227, base)?;
+    if at_start { w.load_at(base, 12)?; }
     {
         let n = w.count(w.rd(227, 8, Kind::U16)?)?;
-        w.member_ptr(p.at(0), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
@@ -4024,45 +4024,45 @@ fn ld_GfxStaticModelLmapVertexInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: boo
     Ok(())
 }
 
-fn ld_GfxStaticModelDrawInst(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(228, p)?;
-    if at_start { w.load_at(p, 152)?; }
-    lp_XModel(w, p.at(56))?;
-    { let n = 4; for i in 0..n { ld_GfxStaticModelLmapVertexInfo(w, p.at(104).at(i * 12), false)?; } }
+fn ld_GfxStaticModelDrawInst(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(228, base)?;
+    if at_start { w.load_at(base, 152)?; }
+    lp_XModel(w, base.shifted_by(56))?;
+    { let n = 4; for ix in 0..n { ld_GfxStaticModelLmapVertexInfo(w, base.shifted_by(104).shifted_by(ix * 12), false)?; } }
     w.leave();
     Ok(())
 }
 
-fn ld_FontIconName(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(235, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    w.xstring(p.at(0))?;
+fn ld_FontIconName(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(235, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    w.xstring(base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn ld_FontIconEntry(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(236, p)?;
-    if at_start { w.load_at(p, 24)?; }
-    ld_FontIconName(w, p.at(0), false)?;
-    lp_Material(w, p.at(8))?;
+fn ld_FontIconEntry(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(236, base)?;
+    if at_start { w.load_at(base, 24)?; }
+    ld_FontIconName(w, base.shifted_by(0), false)?;
+    lp_Material(w, base.shifted_by(8))?;
     w.leave();
     Ok(())
 }
 
-fn ld_GenericEventHandler(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(238, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.xstring(p.at(0))?;
+fn ld_GenericEventHandler(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(238, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.xstring(base.shifted_by(0))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             ld_GenericEventScript(w, b, true)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             ld_GenericEventHandler(w, b, true)
         })?;
     }
@@ -4070,18 +4070,18 @@ fn ld_GenericEventHandler(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Res
     Ok(())
 }
 
-fn ld_ItemKeyHandler(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(239, p)?;
-    if at_start { w.load_at(p, 12)?; }
+fn ld_ItemKeyHandler(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(239, base)?;
+    if at_start { w.load_at(base, 12)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             ld_GenericEventScript(w, b, true)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             ld_ItemKeyHandler(w, b, true)
         })?;
     }
@@ -4089,49 +4089,49 @@ fn ld_ItemKeyHandler(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     Ok(())
 }
 
-fn ld_operandInternalDataUnion(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(240, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_operandInternalDataUnion(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(240, base)?;
+    if at_start { w.load_at(base, 4)?; }
     if ((w.rd(241, 0, Kind::I32)? == (2i64)) as i64) != 0 {
-        w.xstring(p.at(0))?;
+        w.xstring(base.shifted_by(0))?;
     }
     w.leave();
     Ok(())
 }
 
-fn ld_Operand(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(241, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    ld_operandInternalDataUnion(w, p.at(4), false)?;
+fn ld_Operand(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(241, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    ld_operandInternalDataUnion(w, base.shifted_by(4), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_expressionRpnDataUnion(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(242, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_expressionRpnDataUnion(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(242, base)?;
+    if at_start { w.load_at(base, 8)?; }
     if ((w.rd(243, 0, Kind::I32)? == (0i64)) as i64) != 0 {
-        ld_Operand(w, p.at(0), false)?;
+        ld_Operand(w, base.shifted_by(0), false)?;
     }
     w.leave();
     Ok(())
 }
 
-fn ld_expressionRpn(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(243, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    ld_expressionRpnDataUnion(w, p.at(4), false)?;
+fn ld_expressionRpn(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(243, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    ld_expressionRpnDataUnion(w, base.shifted_by(4), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_itemDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(244, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_itemDefData_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(244, base)?;
+    if at_start { w.load_at(base, 4)?; }
     if ((((((((((((((((((((((((((((((((((((((((((((((((((w.rd(245, 164, Kind::I32)? == (1i64)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (3i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (4i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (5i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (7i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (8i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (9i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (10i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (11i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (12i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (13i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (14i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (15i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (16i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (18i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (20i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (22i64)) as i64) != 0)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 ld_textDef_s(w, b, true)
             })?;
         }
@@ -4139,7 +4139,7 @@ fn ld_itemDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()
     else if ((w.rd(245, 164, Kind::I32)? == (2i64)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 ld_imageDef_s(w, b, true)
             })?;
         }
@@ -4147,7 +4147,7 @@ fn ld_itemDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()
     else if (((((w.rd(245, 164, Kind::I32)? == (19i64)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (21i64)) as i64) != 0)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 ld_focusItemDef_s(w, b, true)
             })?;
         }
@@ -4155,7 +4155,7 @@ fn ld_itemDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()
     else if ((w.rd(245, 164, Kind::I32)? == (6i64)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 ld_ownerDrawDef_s(w, b, true)
             })?;
         }
@@ -4164,32 +4164,32 @@ fn ld_itemDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()
     Ok(())
 }
 
-fn ld_itemDef_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(245, p)?;
-    if at_start { w.load_at(p, 272)?; }
-    ld_windowDef_t(w, p.at(0), false)?;
-    w.xstring(p.at(176))?;
-    w.xstring(p.at(180))?;
-    w.xstring(p.at(184))?;
-    w.xstring(p.at(188))?;
-    ld_itemDefData_t(w, p.at(196), false)?;
+fn ld_itemDef_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(245, base)?;
+    if at_start { w.load_at(base, 272)?; }
+    ld_windowDef_t(w, base.shifted_by(0), false)?;
+    w.xstring(base.shifted_by(176))?;
+    w.xstring(base.shifted_by(180))?;
+    w.xstring(base.shifted_by(184))?;
+    w.xstring(base.shifted_by(188))?;
+    ld_itemDefData_t(w, base.shifted_by(196), false)?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(204), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(204), false, false, 4, |w, b| {
             ld_rectData_s(w, b, true)
         })?;
     }
-    ld_ExpressionStatement(w, p.at(208), false)?;
-    ld_ExpressionStatement(w, p.at(240), false)?;
+    ld_ExpressionStatement(w, base.shifted_by(208), false)?;
+    ld_ExpressionStatement(w, base.shifted_by(240), false)?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(260), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(260), false, false, 4, |w, b| {
             ld_GenericEventHandler(w, b, true)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(264), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(264), false, false, 4, |w, b| {
             ld_UIAnimInfo(w, b, true)
         })?;
     }
@@ -4197,336 +4197,336 @@ fn ld_itemDef_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_WeaponDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(246, p)?;
-    if at_start { w.load_at(p, 2448)?; }
-    w.xstring(p.at(0))?;
+fn ld_WeaponDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(246, base)?;
+    if at_start { w.load_at(base, 2448)?; }
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count((16i64))?;
-        w.member_ptr(p.at(4), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), true, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { lp_XModel(w, b.at(i * 4))?; }
+            for ix in 0..n { lp_XModel(w, b.shifted_by(ix * 4))?; }
             Ok(())
         })?;
     }
-    lp_XModel(w, p.at(8))?;
-    w.xstring(p.at(12))?;
+    lp_XModel(w, base.shifted_by(8))?;
+    w.xstring(base.shifted_by(12))?;
     {
         let n = w.count((20i64))?;
-        w.member_ptr(p.at(16), true, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(16), true, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count((20i64))?;
-        w.member_ptr(p.at(20), true, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(20), true, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
-    w.xstring(p.at(64))?;
-    lp_FxEffectDef(w, p.at(108))?;
-    lp_FxEffectDef(w, p.at(112))?;
-    lp_FxEffectDef(w, p.at(116))?;
-    w.xstring(p.at(148))?;
-    w.xstring(p.at(152))?;
-    w.xstring(p.at(156))?;
-    w.xstring(p.at(160))?;
-    w.xstring(p.at(164))?;
-    w.xstring(p.at(168))?;
-    w.xstring(p.at(172))?;
-    w.xstring(p.at(176))?;
-    w.xstring(p.at(180))?;
-    w.xstring(p.at(184))?;
-    w.xstring(p.at(188))?;
-    w.xstring(p.at(192))?;
-    w.xstring(p.at(196))?;
-    w.xstring(p.at(200))?;
-    w.xstring(p.at(204))?;
-    w.xstring(p.at(208))?;
-    w.xstring(p.at(212))?;
-    w.xstring(p.at(216))?;
-    w.xstring(p.at(220))?;
-    w.xstring(p.at(224))?;
-    w.xstring(p.at(228))?;
-    w.xstring(p.at(232))?;
-    w.xstring(p.at(236))?;
-    w.xstring(p.at(240))?;
-    w.xstring(p.at(244))?;
-    w.xstring(p.at(248))?;
-    w.xstring(p.at(252))?;
-    w.xstring(p.at(256))?;
-    w.xstring(p.at(260))?;
-    w.xstring(p.at(264))?;
-    w.xstring(p.at(268))?;
-    w.xstring(p.at(272))?;
-    w.xstring(p.at(276))?;
-    w.xstring(p.at(280))?;
-    w.xstring(p.at(284))?;
-    w.xstring(p.at(288))?;
-    w.xstring(p.at(292))?;
-    w.xstring(p.at(296))?;
-    w.xstring(p.at(300))?;
-    w.xstring(p.at(304))?;
-    w.xstring(p.at(308))?;
-    w.xstring(p.at(312))?;
-    w.xstring(p.at(316))?;
-    w.xstring(p.at(320))?;
-    w.xstring(p.at(324))?;
-    w.xstring(p.at(328))?;
-    w.xstring(p.at(332))?;
-    w.xstring(p.at(336))?;
-    w.xstring(p.at(340))?;
-    w.xstring(p.at(344))?;
-    w.xstring(p.at(348))?;
-    w.xstring(p.at(352))?;
-    w.xstring(p.at(356))?;
-    w.xstring(p.at(360))?;
-    w.xstring(p.at(364))?;
-    w.xstring(p.at(368))?;
-    w.xstring(p.at(372))?;
-    w.xstring(p.at(376))?;
-    w.xstring(p.at(380))?;
-    w.xstring(p.at(384))?;
-    w.xstring(p.at(388))?;
-    w.xstring(p.at(392))?;
-    w.xstring(p.at(396))?;
-    w.xstring(p.at(400))?;
-    w.xstring(p.at(404))?;
-    w.xstring(p.at(408))?;
-    w.xstring(p.at(412))?;
-    w.xstring(p.at(416))?;
-    w.xstring(p.at(420))?;
-    w.xstring(p.at(424))?;
-    w.xstring(p.at(428))?;
-    w.xstring(p.at(432))?;
+    w.xstring(base.shifted_by(64))?;
+    lp_FxEffectDef(w, base.shifted_by(108))?;
+    lp_FxEffectDef(w, base.shifted_by(112))?;
+    lp_FxEffectDef(w, base.shifted_by(116))?;
+    w.xstring(base.shifted_by(148))?;
+    w.xstring(base.shifted_by(152))?;
+    w.xstring(base.shifted_by(156))?;
+    w.xstring(base.shifted_by(160))?;
+    w.xstring(base.shifted_by(164))?;
+    w.xstring(base.shifted_by(168))?;
+    w.xstring(base.shifted_by(172))?;
+    w.xstring(base.shifted_by(176))?;
+    w.xstring(base.shifted_by(180))?;
+    w.xstring(base.shifted_by(184))?;
+    w.xstring(base.shifted_by(188))?;
+    w.xstring(base.shifted_by(192))?;
+    w.xstring(base.shifted_by(196))?;
+    w.xstring(base.shifted_by(200))?;
+    w.xstring(base.shifted_by(204))?;
+    w.xstring(base.shifted_by(208))?;
+    w.xstring(base.shifted_by(212))?;
+    w.xstring(base.shifted_by(216))?;
+    w.xstring(base.shifted_by(220))?;
+    w.xstring(base.shifted_by(224))?;
+    w.xstring(base.shifted_by(228))?;
+    w.xstring(base.shifted_by(232))?;
+    w.xstring(base.shifted_by(236))?;
+    w.xstring(base.shifted_by(240))?;
+    w.xstring(base.shifted_by(244))?;
+    w.xstring(base.shifted_by(248))?;
+    w.xstring(base.shifted_by(252))?;
+    w.xstring(base.shifted_by(256))?;
+    w.xstring(base.shifted_by(260))?;
+    w.xstring(base.shifted_by(264))?;
+    w.xstring(base.shifted_by(268))?;
+    w.xstring(base.shifted_by(272))?;
+    w.xstring(base.shifted_by(276))?;
+    w.xstring(base.shifted_by(280))?;
+    w.xstring(base.shifted_by(284))?;
+    w.xstring(base.shifted_by(288))?;
+    w.xstring(base.shifted_by(292))?;
+    w.xstring(base.shifted_by(296))?;
+    w.xstring(base.shifted_by(300))?;
+    w.xstring(base.shifted_by(304))?;
+    w.xstring(base.shifted_by(308))?;
+    w.xstring(base.shifted_by(312))?;
+    w.xstring(base.shifted_by(316))?;
+    w.xstring(base.shifted_by(320))?;
+    w.xstring(base.shifted_by(324))?;
+    w.xstring(base.shifted_by(328))?;
+    w.xstring(base.shifted_by(332))?;
+    w.xstring(base.shifted_by(336))?;
+    w.xstring(base.shifted_by(340))?;
+    w.xstring(base.shifted_by(344))?;
+    w.xstring(base.shifted_by(348))?;
+    w.xstring(base.shifted_by(352))?;
+    w.xstring(base.shifted_by(356))?;
+    w.xstring(base.shifted_by(360))?;
+    w.xstring(base.shifted_by(364))?;
+    w.xstring(base.shifted_by(368))?;
+    w.xstring(base.shifted_by(372))?;
+    w.xstring(base.shifted_by(376))?;
+    w.xstring(base.shifted_by(380))?;
+    w.xstring(base.shifted_by(384))?;
+    w.xstring(base.shifted_by(388))?;
+    w.xstring(base.shifted_by(392))?;
+    w.xstring(base.shifted_by(396))?;
+    w.xstring(base.shifted_by(400))?;
+    w.xstring(base.shifted_by(404))?;
+    w.xstring(base.shifted_by(408))?;
+    w.xstring(base.shifted_by(412))?;
+    w.xstring(base.shifted_by(416))?;
+    w.xstring(base.shifted_by(420))?;
+    w.xstring(base.shifted_by(424))?;
+    w.xstring(base.shifted_by(428))?;
+    w.xstring(base.shifted_by(432))?;
     {
         let n = w.count((32i64))?;
-        w.member_ptr(p.at(436), true, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
+        w.member_ptr(base.shifted_by(436), true, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
     }
-    w.xstring(p.at(440))?;
-    w.xstring(p.at(444))?;
-    w.xstring(p.at(448))?;
-    lp_FxEffectDef(w, p.at(464))?;
-    lp_FxEffectDef(w, p.at(468))?;
-    lp_FxEffectDef(w, p.at(472))?;
-    lp_FxEffectDef(w, p.at(476))?;
-    lp_Material(w, p.at(528))?;
-    lp_Material(w, p.at(532))?;
+    w.xstring(base.shifted_by(440))?;
+    w.xstring(base.shifted_by(444))?;
+    w.xstring(base.shifted_by(448))?;
+    lp_FxEffectDef(w, base.shifted_by(464))?;
+    lp_FxEffectDef(w, base.shifted_by(468))?;
+    lp_FxEffectDef(w, base.shifted_by(472))?;
+    lp_FxEffectDef(w, base.shifted_by(476))?;
+    lp_Material(w, base.shifted_by(528))?;
+    lp_Material(w, base.shifted_by(532))?;
     {
         let n = w.count((16i64))?;
-        w.member_ptr(p.at(916), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(916), true, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { lp_XModel(w, b.at(i * 4))?; }
+            for ix in 0..n { lp_XModel(w, b.shifted_by(ix * 4))?; }
             Ok(())
         })?;
     }
-    lp_XModel(w, p.at(920))?;
-    lp_XModel(w, p.at(924))?;
-    lp_XModel(w, p.at(928))?;
-    lp_XModel(w, p.at(932))?;
-    lp_Material(w, p.at(936))?;
-    lp_Material(w, p.at(940))?;
-    lp_Material(w, p.at(956))?;
-    w.xstring(p.at(980))?;
-    w.xstring(p.at(1100))?;
-    w.xstring(p.at(1104))?;
-    w.xstring(p.at(1108))?;
-    w.xstring(p.at(1112))?;
-    w.xstring(p.at(1116))?;
-    w.xstring(p.at(1120))?;
-    w.xstring(p.at(1388))?;
-    lp_Material(w, p.at(1632))?;
-    lp_Material(w, p.at(948))?;
-    w.xstring(p.at(1652))?;
-    w.xstring(p.at(1656))?;
-    lp_XModel(w, p.at(1768))?;
-    lp_FxEffectDef(w, p.at(1776))?;
-    lp_FxEffectDef(w, p.at(1784))?;
-    lp_FxEffectDef(w, p.at(1792))?;
-    lp_FxEffectDef(w, p.at(1800))?;
-    lp_FxEffectDef(w, p.at(1808))?;
-    lp_FxEffectDef(w, p.at(1816))?;
-    w.xstring(p.at(1820))?;
-    w.xstring(p.at(1824))?;
-    w.xstring(p.at(1828))?;
-    w.xstring(p.at(1832))?;
+    lp_XModel(w, base.shifted_by(920))?;
+    lp_XModel(w, base.shifted_by(924))?;
+    lp_XModel(w, base.shifted_by(928))?;
+    lp_XModel(w, base.shifted_by(932))?;
+    lp_Material(w, base.shifted_by(936))?;
+    lp_Material(w, base.shifted_by(940))?;
+    lp_Material(w, base.shifted_by(956))?;
+    w.xstring(base.shifted_by(980))?;
+    w.xstring(base.shifted_by(1100))?;
+    w.xstring(base.shifted_by(1104))?;
+    w.xstring(base.shifted_by(1108))?;
+    w.xstring(base.shifted_by(1112))?;
+    w.xstring(base.shifted_by(1116))?;
+    w.xstring(base.shifted_by(1120))?;
+    w.xstring(base.shifted_by(1388))?;
+    lp_Material(w, base.shifted_by(1632))?;
+    lp_Material(w, base.shifted_by(948))?;
+    w.xstring(base.shifted_by(1652))?;
+    w.xstring(base.shifted_by(1656))?;
+    lp_XModel(w, base.shifted_by(1768))?;
+    lp_FxEffectDef(w, base.shifted_by(1776))?;
+    lp_FxEffectDef(w, base.shifted_by(1784))?;
+    lp_FxEffectDef(w, base.shifted_by(1792))?;
+    lp_FxEffectDef(w, base.shifted_by(1800))?;
+    lp_FxEffectDef(w, base.shifted_by(1808))?;
+    lp_FxEffectDef(w, base.shifted_by(1816))?;
+    w.xstring(base.shifted_by(1820))?;
+    w.xstring(base.shifted_by(1824))?;
+    w.xstring(base.shifted_by(1828))?;
+    w.xstring(base.shifted_by(1832))?;
     {
         let n = w.count((32i64))?;
-        w.member_ptr(p.at(1880), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(1880), true, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
     {
         let n = w.count((32i64))?;
-        w.member_ptr(p.at(1884), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(1884), true, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
-    lp_FxEffectDef(w, p.at(1888))?;
-    lp_FxEffectDef(w, p.at(1916))?;
-    w.xstring(p.at(1920))?;
-    w.xstring(p.at(2124))?;
+    lp_FxEffectDef(w, base.shifted_by(1888))?;
+    lp_FxEffectDef(w, base.shifted_by(1916))?;
+    w.xstring(base.shifted_by(1920))?;
+    w.xstring(base.shifted_by(2124))?;
     {
         let n = w.count(w.rd(246, 2148, Kind::I32)?)?;
-        w.member_ptr(p.at(2132), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(2132), true, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
     {
         let n = w.count(w.rd(246, 2148, Kind::I32)?)?;
-        w.member_ptr(p.at(2140), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(2140), true, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
-    w.xstring(p.at(2128))?;
+    w.xstring(base.shifted_by(2128))?;
     {
         let n = w.count(w.rd(246, 2152, Kind::I32)?)?;
-        w.member_ptr(p.at(2136), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(2136), true, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
     {
         let n = w.count(w.rd(246, 2152, Kind::I32)?)?;
-        w.member_ptr(p.at(2144), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(2144), true, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
-    w.xstring(p.at(2236))?;
-    w.xstring(p.at(2240))?;
-    w.xstring(p.at(2284))?;
+    w.xstring(base.shifted_by(2236))?;
+    w.xstring(base.shifted_by(2240))?;
+    w.xstring(base.shifted_by(2284))?;
     {
         let n = w.count((21i64))?;
-        w.member_ptr(p.at(2300), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(2300), true, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
-    w.xstring(p.at(2304))?;
-    w.xstring(p.at(2308))?;
-    w.xstring(p.at(2312))?;
-    w.xstring(p.at(2316))?;
-    lp_TracerDef(w, p.at(2320))?;
-    lp_TracerDef(w, p.at(2324))?;
-    w.xstring(p.at(2356))?;
-    w.xstring(p.at(2360))?;
+    w.xstring(base.shifted_by(2304))?;
+    w.xstring(base.shifted_by(2308))?;
+    w.xstring(base.shifted_by(2312))?;
+    w.xstring(base.shifted_by(2316))?;
+    lp_TracerDef(w, base.shifted_by(2320))?;
+    lp_TracerDef(w, base.shifted_by(2324))?;
+    w.xstring(base.shifted_by(2356))?;
+    w.xstring(base.shifted_by(2360))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(2364), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(2364), true, false, 4, |w, b| {
             ld_FlameTable(w, b, true)
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(2368), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(2368), true, false, 4, |w, b| {
             ld_FlameTable(w, b, true)
         })?;
     }
-    lp_FxEffectDef(w, p.at(2372))?;
-    lp_FxEffectDef(w, p.at(2376))?;
-    lp_FxEffectDef(w, p.at(2404))?;
-    lp_FxEffectDef(w, p.at(2408))?;
-    lp_FxEffectDef(w, p.at(2412))?;
-    w.xstring(p.at(2416))?;
-    lp_WeaponCamo(w, p.at(2420))?;
+    lp_FxEffectDef(w, base.shifted_by(2372))?;
+    lp_FxEffectDef(w, base.shifted_by(2376))?;
+    lp_FxEffectDef(w, base.shifted_by(2404))?;
+    lp_FxEffectDef(w, base.shifted_by(2408))?;
+    lp_FxEffectDef(w, base.shifted_by(2412))?;
+    w.xstring(base.shifted_by(2416))?;
+    lp_WeaponCamo(w, base.shifted_by(2420))?;
     w.leave();
     Ok(())
 }
 
-fn lp_WeaponVariantDef(w: &mut Walker<'_, '_>, slot: Ptr) -> Result<()> {
-    w.asset_ptr(slot, 247, true, 4, ld_WeaponVariantDef)
+fn lp_WeaponVariantDef(w: &mut Walker<'_, '_>, ref_at: RawRef) -> LoadResult<()> {
+    w.asset_ptr(ref_at, 247, true, 4, ld_WeaponVariantDef)
 }
 
-fn ld_WeaponVariantDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(247, p)?;
-    if at_start { w.load_at(p, 716)?; }
-    w.push(5)?;
-    w.xstring(p.at(0))?;
+fn ld_WeaponVariantDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(247, base)?;
+    if at_start { w.load_at(base, 716)?; }
+    w.put(5)?;
+    w.xstring(base.shifted_by(0))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(8), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), true, false, 4, |w, b| {
             ld_WeaponDef(w, b, true)
         })?;
     }
-    w.xstring(p.at(12))?;
-    w.xstring(p.at(16))?;
-    w.xstring(p.at(20))?;
+    w.xstring(base.shifted_by(12))?;
+    w.xstring(base.shifted_by(16))?;
+    w.xstring(base.shifted_by(20))?;
     {
         let n = w.count((63i64))?;
-        w.member_ptr(p.at(24), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(24), true, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { lp_WeaponAttachment(w, b.at(i * 4))?; }
+            for ix in 0..n { lp_WeaponAttachment(w, b.shifted_by(ix * 4))?; }
             Ok(())
         })?;
     }
     {
         let n = w.count((95i64))?;
-        w.member_ptr(p.at(28), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(28), true, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { lp_WeaponAttachmentUnique(w, b.at(i * 4))?; }
+            for ix in 0..n { lp_WeaponAttachmentUnique(w, b.shifted_by(ix * 4))?; }
             Ok(())
         })?;
     }
     {
         let n = w.count((88i64))?;
-        w.member_ptr(p.at(32), true, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
+        w.member_ptr(base.shifted_by(32), true, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
     }
     {
         let n = w.count((32i64))?;
-        w.member_ptr(p.at(36), true, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(36), true, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
     {
         let n = w.count((8i64))?;
-        w.member_ptr(p.at(40), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(40), true, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { lp_XModel(w, b.at(i * 4))?; }
+            for ix in 0..n { lp_XModel(w, b.shifted_by(ix * 4))?; }
             Ok(())
         })?;
     }
     {
         let n = w.count((8i64))?;
-        w.member_ptr(p.at(44), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(44), true, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { lp_XModel(w, b.at(i * 4))?; }
+            for ix in 0..n { lp_XModel(w, b.shifted_by(ix * 4))?; }
             Ok(())
         })?;
     }
     {
         let n = w.count((8i64))?;
-        w.member_ptr(p.at(48), true, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
+        w.member_ptr(base.shifted_by(48), true, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
     }
     {
         let n = w.count((8i64))?;
-        w.member_ptr(p.at(52), true, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
+        w.member_ptr(base.shifted_by(52), true, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
     }
-    w.xstring(p.at(508))?;
-    w.xstring(p.at(512))?;
-    w.xstring(p.at(520))?;
-    lp_Material(w, p.at(596))?;
-    lp_Material(w, p.at(600))?;
-    lp_Material(w, p.at(604))?;
+    w.xstring(base.shifted_by(508))?;
+    w.xstring(base.shifted_by(512))?;
+    w.xstring(base.shifted_by(520))?;
+    lp_Material(w, base.shifted_by(596))?;
+    lp_Material(w, base.shifted_by(600))?;
+    lp_Material(w, base.shifted_by(604))?;
     w.pop()?;
     w.leave();
     Ok(())
 }
 
-fn ld_WeaponCamoSet(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(249, p)?;
-    if at_start { w.load_at(p, 20)?; }
-    lp_GfxImage(w, p.at(0))?;
-    lp_GfxImage(w, p.at(4))?;
+fn ld_WeaponCamoSet(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(249, base)?;
+    if at_start { w.load_at(base, 20)?; }
+    lp_GfxImage(w, base.shifted_by(0))?;
+    lp_GfxImage(w, base.shifted_by(4))?;
     w.leave();
     Ok(())
 }
 
-fn ld_WeaponCamoMaterialSet(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(250, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_WeaponCamoMaterialSet(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(250, base)?;
+    if at_start { w.load_at(base, 8)?; }
     {
         let n = w.count(w.rd(250, 0, Kind::U32)?)?;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             w.load_at(b, n * 44)?;
-            for i in 0..n { ld_WeaponCamoMaterial(w, b.at(i * 44), false)?; }
+            for ix in 0..n { ld_WeaponCamoMaterial(w, b.shifted_by(ix * 44), false)?; }
             Ok(())
         })?;
     }
@@ -4534,47 +4534,47 @@ fn ld_WeaponCamoMaterialSet(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> R
     Ok(())
 }
 
-fn ld_FxEffectDefRef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(264, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_FxEffectDefRef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(264, base)?;
+    if at_start { w.load_at(base, 4)?; }
     {
-        w.xstring(p.at(0))?;
+        w.xstring(base.shifted_by(0))?;
     }
     w.leave();
     Ok(())
 }
 
-fn ld_FxElemVisuals(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(265, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_FxElemVisuals(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(265, base)?;
+    if at_start { w.load_at(base, 4)?; }
     if ((((((((((((((((((((w.rd(271, 184, Kind::U8)? == (0i64)) as i64) != 0) || (((w.rd(271, 184, Kind::U8)? == (1i64)) as i64) != 0)) as i64) != 0) || (((w.rd(271, 184, Kind::U8)? == (2i64)) as i64) != 0)) as i64) != 0) || (((w.rd(271, 184, Kind::U8)? == (3i64)) as i64) != 0)) as i64) != 0) || (((w.rd(271, 184, Kind::U8)? == (4i64)) as i64) != 0)) as i64) != 0) || (((w.rd(271, 184, Kind::U8)? == (5i64)) as i64) != 0)) as i64) != 0) || (((w.rd(271, 184, Kind::U8)? == (6i64)) as i64) != 0)) as i64) != 0 {
-        lp_Material(w, p.at(0))?;
+        lp_Material(w, base.shifted_by(0))?;
     }
     else if ((w.rd(271, 184, Kind::U8)? == (7i64)) as i64) != 0 {
-        lp_XModel(w, p.at(0))?;
+        lp_XModel(w, base.shifted_by(0))?;
     }
     else if ((w.rd(271, 184, Kind::U8)? == (12i64)) as i64) != 0 {
-        ld_FxEffectDefRef(w, p.at(0), false)?;
+        ld_FxEffectDefRef(w, base.shifted_by(0), false)?;
     }
     else if ((w.rd(271, 184, Kind::U8)? == (10i64)) as i64) != 0 {
-        w.xstring(p.at(0))?;
+        w.xstring(base.shifted_by(0))?;
     }
     else if ((w.rd(271, 184, Kind::U8)? == (9i64)) as i64) != 0 {
-        lp_GfxLightDef(w, p.at(0))?;
+        lp_GfxLightDef(w, base.shifted_by(0))?;
     }
     w.leave();
     Ok(())
 }
 
-fn ld_FxElemDefVisuals(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(266, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_FxElemDefVisuals(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(266, base)?;
+    if at_start { w.load_at(base, 4)?; }
     if ((w.rd(271, 184, Kind::U8)? == (11i64)) as i64) != 0 {
         {
             let n = w.count(w.rd(271, 185, Kind::I8)?)?;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 w.load_at(b, n * 8)?;
-                for i in 0..n { ld_FxElemMarkVisuals(w, b.at(i * 8), false)?; }
+                for ix in 0..n { ld_FxElemMarkVisuals(w, b.shifted_by(ix * 8), false)?; }
                 Ok(())
             })?;
         }
@@ -4582,27 +4582,27 @@ fn ld_FxElemDefVisuals(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result
     else if ((w.rd(271, 185, Kind::I8)? > (1i64)) as i64) != 0 {
         {
             let n = w.count(w.rd(271, 185, Kind::I8)?)?;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 w.load_at(b, n * 4)?;
-                for i in 0..n { ld_FxElemVisuals(w, b.at(i * 4), false)?; }
+                for ix in 0..n { ld_FxElemVisuals(w, b.shifted_by(ix * 4), false)?; }
                 Ok(())
             })?;
         }
     }
     else {
-        ld_FxElemVisuals(w, p.at(0), false)?;
+        ld_FxElemVisuals(w, base.shifted_by(0), false)?;
     }
     w.leave();
     Ok(())
 }
 
-fn ld_FxElemExtendedDefPtr(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(267, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_FxElemExtendedDefPtr(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(267, base)?;
+    if at_start { w.load_at(base, 4)?; }
     if ((w.rd(271, 184, Kind::U8)? == (5i64)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 ld_FxTrailDef(w, b, true)
             })?;
         }
@@ -4610,7 +4610,7 @@ fn ld_FxElemExtendedDefPtr(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Re
     else if ((w.rd(271, 184, Kind::U8)? == (9i64)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 w.load_at(b, n * 12)
             })?;
         }
@@ -4618,7 +4618,7 @@ fn ld_FxElemExtendedDefPtr(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Re
     else {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 1, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 1, |w, b| {
                 w.load_at(b, n * 1)
             })?;
         }
@@ -4627,97 +4627,97 @@ fn ld_FxElemExtendedDefPtr(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Re
     Ok(())
 }
 
-fn ld_FxElemSpawnSound(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(270, p)?;
-    if at_start { w.load_at(p, 4)?; }
-    w.xstring(p.at(0))?;
+fn ld_FxElemSpawnSound(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(270, base)?;
+    if at_start { w.load_at(base, 4)?; }
+    w.xstring(base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn ld_FxElemDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(271, p)?;
-    if at_start { w.load_at(p, 292)?; }
+fn ld_FxElemDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(271, base)?;
+    if at_start { w.load_at(base, 292)?; }
     {
         let n = w.count((w.rd(271, 186, Kind::I8)? + (1i64)))?;
-        w.member_ptr(p.at(188), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(188), false, false, 4, |w, b| {
             w.load_at(b, n * 96)
         })?;
     }
     {
         let n = w.count((w.rd(271, 187, Kind::I8)? + (1i64)))?;
-        w.member_ptr(p.at(192), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(192), false, false, 4, |w, b| {
             w.load_at(b, n * 48)
         })?;
     }
-    ld_FxElemDefVisuals(w, p.at(196), false)?;
-    ld_FxEffectDefRef(w, p.at(224), false)?;
-    ld_FxEffectDefRef(w, p.at(228), false)?;
-    ld_FxEffectDefRef(w, p.at(232), false)?;
-    ld_FxEffectDefRef(w, p.at(252), false)?;
-    ld_FxElemExtendedDefPtr(w, p.at(256), false)?;
-    ld_FxElemSpawnSound(w, p.at(280), false)?;
+    ld_FxElemDefVisuals(w, base.shifted_by(196), false)?;
+    ld_FxEffectDefRef(w, base.shifted_by(224), false)?;
+    ld_FxEffectDefRef(w, base.shifted_by(228), false)?;
+    ld_FxEffectDefRef(w, base.shifted_by(232), false)?;
+    ld_FxEffectDefRef(w, base.shifted_by(252), false)?;
+    ld_FxElemExtendedDefPtr(w, base.shifted_by(256), false)?;
+    ld_FxElemSpawnSound(w, base.shifted_by(280), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_FxImpactEntry(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(272, p)?;
-    if at_start { w.load_at(p, 144)?; }
+fn ld_FxImpactEntry(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(272, base)?;
+    if at_start { w.load_at(base, 144)?; }
     {
         let n = 32;
-        let b = p.at(0);
-        for i in 0..n { lp_FxEffectDef(w, b.at(i * 4))?; }
+        let b = base.shifted_by(0);
+        for ix in 0..n { lp_FxEffectDef(w, b.shifted_by(ix * 4))?; }
     }
     {
         let n = 4;
-        let b = p.at(128);
-        for i in 0..n { lp_FxEffectDef(w, b.at(i * 4))?; }
+        let b = base.shifted_by(128);
+        for ix in 0..n { lp_FxEffectDef(w, b.shifted_by(ix * 4))?; }
     }
     w.leave();
     Ok(())
 }
 
-fn ld_StringTableCell(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(273, p)?;
-    if at_start { w.load_at(p, 8)?; }
-    w.xstring(p.at(0))?;
+fn ld_StringTableCell(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(273, base)?;
+    if at_start { w.load_at(base, 8)?; }
+    w.xstring(base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn ld_LbColumnDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(274, p)?;
-    if at_start { w.load_at(p, 44)?; }
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(16))?;
-    w.xstring(p.at(32))?;
+fn ld_LbColumnDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(274, base)?;
+    if at_start { w.load_at(base, 44)?; }
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(16))?;
+    w.xstring(base.shifted_by(32))?;
     w.leave();
     Ok(())
 }
 
-fn ld_ddlDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(275, p)?;
-    if at_start { w.load_at(p, 28)?; }
+fn ld_ddlDef_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(275, base)?;
+    if at_start { w.load_at(base, 28)?; }
     {
         let n = w.count(w.rd(275, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 20)?;
-            for i in 0..n { ld_ddlStructDef_t(w, b.at(i * 20), false)?; }
+            for ix in 0..n { ld_ddlStructDef_t(w, b.shifted_by(ix * 20), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(275, 20, Kind::I32)?)?;
-        w.member_ptr(p.at(16), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), false, false, 4, |w, b| {
             w.load_at(b, n * 16)?;
-            for i in 0..n { ld_ddlEnumDef_t(w, b.at(i * 16), false)?; }
+            for ix in 0..n { ld_ddlEnumDef_t(w, b.shifted_by(ix * 16), false)?; }
             Ok(())
         })?;
     }
     {
         let n = 1usize;
-        w.member_ptr(p.at(24), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(24), false, false, 4, |w, b| {
             ld_ddlDef_t(w, b, true)
         })?;
     }
@@ -4725,18 +4725,18 @@ fn ld_ddlDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_Glass(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(276, p)?;
-    if at_start { w.load_at(p, 140)?; }
+fn ld_Glass(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(276, base)?;
+    if at_start { w.load_at(base, 140)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(16), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), true, false, 4, |w, b| {
             ld_GlassDef(w, b, true)
         })?;
     }
     {
         let n = w.count(w.rd(276, 77, Kind::I8)?)?;
-        w.member_ptr(p.at(80), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(80), false, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
@@ -4744,21 +4744,21 @@ fn ld_Glass(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_KeyValuePair(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(277, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    w.xstring(p.at(8))?;
+fn ld_KeyValuePair(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(277, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    w.xstring(base.shifted_by(8))?;
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimDynamicFrames(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(280, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_XAnimDynamicFrames(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(280, base)?;
+    if at_start { w.load_at(base, 4)?; }
     if w.rd(284, 2, Kind::U8)? != 0 {
         {
             let n = w.count((w.rd(284, 0, Kind::U16)? + (1i64)))?;
-            w.member_ptr(p.at(0), false, false, 1, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 1, |w, b| {
                 w.load_at(b, n * 3)
             })?;
         }
@@ -4766,7 +4766,7 @@ fn ld_XAnimDynamicFrames(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Resu
     else {
         {
             let n = w.count((w.rd(284, 0, Kind::U16)? + (1i64)))?;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 w.load_at(b, n * 6)
             })?;
         }
@@ -4775,81 +4775,81 @@ fn ld_XAnimDynamicFrames(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Resu
     Ok(())
 }
 
-fn ld_XAnimDynamicIndicesTrans(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(281, p)?;
+fn ld_XAnimDynamicIndicesTrans(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(281, base)?;
     let _ = at_start;
     if ((w.rd(15, 14, Kind::U16)? < (256i64)) as i64) != 0 {
         {
             let n = w.count((w.rd(284, 0, Kind::U16)? + (1i64)))?;
-            w.load_at(p.at(0), n * 1)?;
+            w.load_at(base.shifted_by(0), n * 1)?;
         }
     }
     else {
         {
             let n = w.count((w.rd(284, 0, Kind::U16)? + (1i64)))?;
-            w.load_at(p.at(0), n * 2)?;
+            w.load_at(base.shifted_by(0), n * 2)?;
         }
     }
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimPartTransFrames(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(282, p)?;
-    if at_start { w.load_at(p, 28)?; }
-    ld_XAnimDynamicIndicesTrans(w, p.at(28), true)?;
-    ld_XAnimDynamicFrames(w, p.at(24), false)?;
+fn ld_XAnimPartTransFrames(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(282, base)?;
+    if at_start { w.load_at(base, 28)?; }
+    ld_XAnimDynamicIndicesTrans(w, base.shifted_by(28), true)?;
+    ld_XAnimDynamicFrames(w, base.shifted_by(24), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimPartTransData(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(283, p)?;
+fn ld_XAnimPartTransData(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(283, base)?;
     let _ = at_start;
     if ((w.rd(284, 0, Kind::U16)? > (0i64)) as i64) != 0 {
-        ld_XAnimPartTransFrames(w, p.at(0), true)?;
+        ld_XAnimPartTransFrames(w, base.shifted_by(0), true)?;
     }
     else {
-        w.load_at(p.at(0), 12)?;
+        w.load_at(base.shifted_by(0), 12)?;
     }
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimPartTrans(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(284, p)?;
-    if at_start { w.load_at(p, 4)?; }
-    ld_XAnimPartTransData(w, p.at(4), true)?;
+fn ld_XAnimPartTrans(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(284, base)?;
+    if at_start { w.load_at(base, 4)?; }
+    ld_XAnimPartTransData(w, base.shifted_by(4), true)?;
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimDynamicIndicesQuat2(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(286, p)?;
+fn ld_XAnimDynamicIndicesQuat2(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(286, base)?;
     let _ = at_start;
     if ((w.rd(15, 14, Kind::U16)? < (256i64)) as i64) != 0 {
         {
             let n = w.count((w.rd(289, 0, Kind::U16)? + (1i64)))?;
-            w.load_at(p.at(0), n * 1)?;
+            w.load_at(base.shifted_by(0), n * 1)?;
         }
     }
     else {
         {
             let n = w.count((w.rd(289, 0, Kind::U16)? + (1i64)))?;
-            w.load_at(p.at(0), n * 2)?;
+            w.load_at(base.shifted_by(0), n * 2)?;
         }
     }
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimDeltaPartQuatDataFrames2(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(287, p)?;
-    if at_start { w.load_at(p, 4)?; }
-    ld_XAnimDynamicIndicesQuat2(w, p.at(4), true)?;
+fn ld_XAnimDeltaPartQuatDataFrames2(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(287, base)?;
+    if at_start { w.load_at(base, 4)?; }
+    ld_XAnimDynamicIndicesQuat2(w, base.shifted_by(4), true)?;
     {
         let n = w.count((w.rd(289, 0, Kind::U16)? + (1i64)))?;
-        w.member_ptr(p.at(0), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
@@ -4857,53 +4857,53 @@ fn ld_XAnimDeltaPartQuatDataFrames2(w: &mut Walker<'_, '_>, p: Ptr, at_start: bo
     Ok(())
 }
 
-fn ld_XAnimDeltaPartQuatData2(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(288, p)?;
+fn ld_XAnimDeltaPartQuatData2(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(288, base)?;
     let _ = at_start;
     if ((w.rd(289, 0, Kind::U16)? > (0i64)) as i64) != 0 {
-        ld_XAnimDeltaPartQuatDataFrames2(w, p.at(0), true)?;
+        ld_XAnimDeltaPartQuatDataFrames2(w, base.shifted_by(0), true)?;
     }
     else {
-        w.load_at(p.at(0), 4)?;
+        w.load_at(base.shifted_by(0), 4)?;
     }
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimDeltaPartQuat2(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(289, p)?;
-    if at_start { w.load_at(p, 4)?; }
-    ld_XAnimDeltaPartQuatData2(w, p.at(4), true)?;
+fn ld_XAnimDeltaPartQuat2(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(289, base)?;
+    if at_start { w.load_at(base, 4)?; }
+    ld_XAnimDeltaPartQuatData2(w, base.shifted_by(4), true)?;
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimDynamicIndicesQuat(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(291, p)?;
+fn ld_XAnimDynamicIndicesQuat(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(291, base)?;
     let _ = at_start;
     if ((w.rd(15, 14, Kind::U16)? < (256i64)) as i64) != 0 {
         {
             let n = w.count((w.rd(294, 0, Kind::U16)? + (1i64)))?;
-            w.load_at(p.at(0), n * 1)?;
+            w.load_at(base.shifted_by(0), n * 1)?;
         }
     }
     else {
         {
             let n = w.count((w.rd(294, 0, Kind::U16)? + (1i64)))?;
-            w.load_at(p.at(0), n * 2)?;
+            w.load_at(base.shifted_by(0), n * 2)?;
         }
     }
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimDeltaPartQuatDataFrames(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(292, p)?;
-    if at_start { w.load_at(p, 4)?; }
-    ld_XAnimDynamicIndicesQuat(w, p.at(4), true)?;
+fn ld_XAnimDeltaPartQuatDataFrames(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(292, base)?;
+    if at_start { w.load_at(base, 4)?; }
+    ld_XAnimDynamicIndicesQuat(w, base.shifted_by(4), true)?;
     {
         let n = w.count((w.rd(294, 0, Kind::U16)? + (1i64)))?;
-        w.member_ptr(p.at(0), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
@@ -4911,33 +4911,33 @@ fn ld_XAnimDeltaPartQuatDataFrames(w: &mut Walker<'_, '_>, p: Ptr, at_start: boo
     Ok(())
 }
 
-fn ld_XAnimDeltaPartQuatData(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(293, p)?;
+fn ld_XAnimDeltaPartQuatData(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(293, base)?;
     let _ = at_start;
     if ((w.rd(294, 0, Kind::U16)? > (0i64)) as i64) != 0 {
-        ld_XAnimDeltaPartQuatDataFrames(w, p.at(0), true)?;
+        ld_XAnimDeltaPartQuatDataFrames(w, base.shifted_by(0), true)?;
     }
     else {
-        w.load_at(p.at(0), 8)?;
+        w.load_at(base.shifted_by(0), 8)?;
     }
     w.leave();
     Ok(())
 }
 
-fn ld_XAnimDeltaPartQuat(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(294, p)?;
-    if at_start { w.load_at(p, 4)?; }
-    ld_XAnimDeltaPartQuatData(w, p.at(4), true)?;
+fn ld_XAnimDeltaPartQuat(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(294, base)?;
+    if at_start { w.load_at(base, 4)?; }
+    ld_XAnimDeltaPartQuatData(w, base.shifted_by(4), true)?;
     w.leave();
     Ok(())
 }
 
-fn ld_XRigidVertList(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(299, p)?;
-    if at_start { w.load_at(p, 12)?; }
+fn ld_XRigidVertList(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(299, base)?;
+    if at_start { w.load_at(base, 12)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(8), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), true, false, 4, |w, b| {
             ld_XSurfaceCollisionTree(w, b, true)
         })?;
     }
@@ -4945,14 +4945,14 @@ fn ld_XRigidVertList(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     Ok(())
 }
 
-fn ld_PhysGeomList(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(301, p)?;
-    if at_start { w.load_at(p, 12)?; }
+fn ld_PhysGeomList(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(301, base)?;
+    if at_start { w.load_at(base, 12)?; }
     {
         let n = w.count(w.rd(301, 0, Kind::U32)?)?;
-        w.member_ptr(p.at(4), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 16, |w, b| {
             w.load_at(b, n * 68)?;
-            for i in 0..n { ld_PhysGeomInfo(w, b.at(i * 68), false)?; }
+            for ix in 0..n { ld_PhysGeomInfo(w, b.shifted_by(ix * 68), false)?; }
             Ok(())
         })?;
     }
@@ -4960,13 +4960,13 @@ fn ld_PhysGeomList(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn ld_MaterialArgumentDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(309, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_MaterialArgumentDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(309, base)?;
+    if at_start { w.load_at(base, 4)?; }
     if (((((w.rd(310, 0, Kind::U16)? == (1i64)) as i64) != 0) || (((w.rd(310, 0, Kind::U16)? == (7i64)) as i64) != 0)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), true, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), true, false, 4, |w, b| {
                 w.load_at(b, n * 16)
             })?;
         }
@@ -4975,31 +4975,31 @@ fn ld_MaterialArgumentDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Res
     Ok(())
 }
 
-fn ld_MaterialShaderArgument(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(310, p)?;
-    if at_start { w.load_at(p, 12)?; }
-    ld_MaterialArgumentDef(w, p.at(8), false)?;
+fn ld_MaterialShaderArgument(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(310, base)?;
+    if at_start { w.load_at(base, 12)?; }
+    ld_MaterialArgumentDef(w, base.shifted_by(8), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_SndAlias(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(312, p)?;
-    if at_start { w.load_at(p, 96)?; }
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(8))?;
-    w.xstring(p.at(12))?;
-    w.xstring(p.at(20))?;
+fn ld_SndAlias(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(312, base)?;
+    if at_start { w.load_at(base, 96)?; }
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(8))?;
+    w.xstring(base.shifted_by(12))?;
+    w.xstring(base.shifted_by(20))?;
     w.leave();
     Ok(())
 }
 
-fn ld_GfxAabbTree(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(314, p)?;
-    if at_start { w.load_at(p, 40)?; }
+fn ld_GfxAabbTree(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(314, base)?;
+    if at_start { w.load_at(base, 40)?; }
     {
         let n = w.count(w.rd(314, 30, Kind::U16)?)?;
-        w.member_ptr(p.at(32), true, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(32), true, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
@@ -5007,18 +5007,18 @@ fn ld_GfxAabbTree(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> 
     Ok(())
 }
 
-fn ld_GfxPortal(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(317, p)?;
-    if at_start { w.load_at(p, 92)?; }
+fn ld_GfxPortal(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(317, base)?;
+    if at_start { w.load_at(base, 92)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(32), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(32), true, false, 4, |w, b| {
             ld_GfxCell(w, b, true)
         })?;
     }
     {
         let n = w.count(w.rd(317, 40, Kind::I8)?)?;
-        w.member_ptr(p.at(36), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(36), false, false, 4, |w, b| {
             w.load_at(b, n * 12)
         })?;
     }
@@ -5026,24 +5026,24 @@ fn ld_GfxPortal(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_SSkinShaders(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(319, p)?;
-    if at_start { w.load_at(p, 20)?; }
+fn ld_SSkinShaders(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(319, base)?;
+    if at_start { w.load_at(base, 20)?; }
     {
         let n = w.count(w.rd(319, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(0), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 128, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count(w.rd(319, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count(w.rd(319, 16, Kind::I32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -5051,18 +5051,18 @@ fn ld_SSkinShaders(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn ld_SSkinModel(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(320, p)?;
-    if at_start { w.load_at(p, 16)?; }
+fn ld_SSkinModel(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(320, base)?;
+    if at_start { w.load_at(base, 16)?; }
     {
         let n = w.count(w.rd(320, 0, Kind::I32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
     {
         let n = w.count(w.rd(320, 4, Kind::I32)?)?;
-        w.member_ptr(p.at(12), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
@@ -5070,12 +5070,12 @@ fn ld_SSkinModel(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_SSkinAnim(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(321, p)?;
-    if at_start { w.load_at(p, 16)?; }
+fn ld_SSkinAnim(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(321, base)?;
+    if at_start { w.load_at(base, 16)?; }
     {
         let n = w.count((((4i64) * w.rd(321, 4, Kind::I32)?) * w.rd(321, 8, Kind::I32)?))?;
-        w.member_ptr(p.at(12), false, false, 128, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 128, |w, b| {
             w.load_at(b, n * 4)
         })?;
     }
@@ -5083,12 +5083,12 @@ fn ld_SSkinAnim(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_GfxLightRegionHull(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(328, p)?;
-    if at_start { w.load_at(p, 80)?; }
+fn ld_GfxLightRegionHull(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(328, base)?;
+    if at_start { w.load_at(base, 80)?; }
     {
         let n = w.count(w.rd(328, 72, Kind::U32)?)?;
-        w.member_ptr(p.at(76), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(76), false, false, 4, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
@@ -5096,20 +5096,20 @@ fn ld_GfxLightRegionHull(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Resu
     Ok(())
 }
 
-fn ld_GenericEventScript(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(329, p)?;
-    if at_start { w.load_at(p, 44)?; }
+fn ld_GenericEventScript(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(329, base)?;
+    if at_start { w.load_at(base, 44)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(0), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
             ld_ScriptCondition(w, b, true)
         })?;
     }
-    ld_ExpressionStatement(w, p.at(4), false)?;
-    w.xstring(p.at(28))?;
+    ld_ExpressionStatement(w, base.shifted_by(4), false)?;
+    w.xstring(base.shifted_by(28))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(40), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(40), false, false, 4, |w, b| {
             ld_GenericEventScript(w, b, true)
         })?;
     }
@@ -5117,13 +5117,13 @@ fn ld_GenericEventScript(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Resu
     Ok(())
 }
 
-fn ld_textDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(338, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_textDefData_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(338, base)?;
+    if at_start { w.load_at(base, 4)?; }
     if (((((((((((((((((((((((((((((((((((((((((((((((w.rd(245, 164, Kind::I32)? == (3i64)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (4i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (5i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (7i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (8i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (9i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (10i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (11i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (12i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (13i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (14i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (16i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (20i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (21i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (22i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (30i64)) as i64) != 0)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 ld_focusItemDef_s(w, b, true)
             })?;
         }
@@ -5131,7 +5131,7 @@ fn ld_textDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()
     else if ((w.rd(245, 164, Kind::I32)? == (15i64)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 w.load_at(b, n * 8)
             })?;
         }
@@ -5140,36 +5140,36 @@ fn ld_textDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()
     Ok(())
 }
 
-fn ld_textDef_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(339, p)?;
-    if at_start { w.load_at(p, 140)?; }
-    w.xstring(p.at(128))?;
+fn ld_textDef_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(339, base)?;
+    if at_start { w.load_at(base, 140)?; }
+    w.xstring(base.shifted_by(128))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(132), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(132), false, false, 4, |w, b| {
             ld_textExp_s(w, b, true)
         })?;
     }
-    ld_textDefData_t(w, p.at(136), false)?;
+    ld_textDefData_t(w, base.shifted_by(136), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_imageDef_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(340, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    ld_ExpressionStatement(w, p.at(0), false)?;
+fn ld_imageDef_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(340, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    ld_ExpressionStatement(w, base.shifted_by(0), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_focusDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(341, p)?;
-    if at_start { w.load_at(p, 4)?; }
+fn ld_focusDefData_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(341, base)?;
+    if at_start { w.load_at(base, 4)?; }
     if ((w.rd(245, 164, Kind::I32)? == (4i64)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 ld_listBoxDef_s(w, b, true)
             })?;
         }
@@ -5177,7 +5177,7 @@ fn ld_focusDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     else if ((w.rd(245, 164, Kind::I32)? == (10i64)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 ld_multiDef_s(w, b, true)
             })?;
         }
@@ -5185,7 +5185,7 @@ fn ld_focusDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     else if ((w.rd(245, 164, Kind::I32)? == (22i64)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 ld_profileMultiDef_s(w, b, true)
             })?;
         }
@@ -5193,7 +5193,7 @@ fn ld_focusDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     else if ((((((((((((((((((((((((((w.rd(245, 164, Kind::I32)? == (5i64)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (7i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (8i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (9i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (12i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (13i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (14i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (16i64)) as i64) != 0)) as i64) != 0) || (((w.rd(245, 164, Kind::I32)? == (30i64)) as i64) != 0)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 w.load_at(b, n * 36)
             })?;
         }
@@ -5201,7 +5201,7 @@ fn ld_focusDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     else if ((w.rd(245, 164, Kind::I32)? == (11i64)) as i64) != 0 {
         {
             let n = 1usize;
-            w.member_ptr(p.at(0), false, false, 4, |w, b| {
+            w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
                 ld_enumDvarDef_s(w, b, true)
             })?;
         }
@@ -5210,50 +5210,50 @@ fn ld_focusDefData_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     Ok(())
 }
 
-fn ld_focusItemDef_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(342, p)?;
-    if at_start { w.load_at(p, 24)?; }
-    w.xstring(p.at(0))?;
-    w.xstring(p.at(4))?;
-    w.xstring(p.at(8))?;
-    w.xstring(p.at(12))?;
+fn ld_focusItemDef_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(342, base)?;
+    if at_start { w.load_at(base, 24)?; }
+    w.xstring(base.shifted_by(0))?;
+    w.xstring(base.shifted_by(4))?;
+    w.xstring(base.shifted_by(8))?;
+    w.xstring(base.shifted_by(12))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(16), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), false, false, 4, |w, b| {
             ld_ItemKeyHandler(w, b, true)
         })?;
     }
-    ld_focusDefData_t(w, p.at(20), false)?;
+    ld_focusDefData_t(w, base.shifted_by(20), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_ownerDrawDef_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(343, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    ld_ExpressionStatement(w, p.at(0), false)?;
+fn ld_ownerDrawDef_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(343, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    ld_ExpressionStatement(w, base.shifted_by(0), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_rectData_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(344, p)?;
-    if at_start { w.load_at(p, 64)?; }
-    ld_ExpressionStatement(w, p.at(0), false)?;
-    ld_ExpressionStatement(w, p.at(16), false)?;
-    ld_ExpressionStatement(w, p.at(32), false)?;
-    ld_ExpressionStatement(w, p.at(48), false)?;
+fn ld_rectData_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(344, base)?;
+    if at_start { w.load_at(base, 64)?; }
+    ld_ExpressionStatement(w, base.shifted_by(0), false)?;
+    ld_ExpressionStatement(w, base.shifted_by(16), false)?;
+    ld_ExpressionStatement(w, base.shifted_by(32), false)?;
+    ld_ExpressionStatement(w, base.shifted_by(48), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_animParamsDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(345, p)?;
-    if at_start { w.load_at(p, 108)?; }
-    w.xstring(p.at(0))?;
+fn ld_animParamsDef_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(345, base)?;
+    if at_start { w.load_at(base, 108)?; }
+    w.xstring(base.shifted_by(0))?;
     {
         let n = 1usize;
-        w.member_ptr(p.at(104), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(104), false, false, 4, |w, b| {
             ld_GenericEventHandler(w, b, true)
         })?;
     }
@@ -5261,14 +5261,14 @@ fn ld_animParamsDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<
     Ok(())
 }
 
-fn ld_UIAnimInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(346, p)?;
-    if at_start { w.load_at(p, 236)?; }
+fn ld_UIAnimInfo(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(346, base)?;
+    if at_start { w.load_at(base, 236)?; }
     {
         let n = w.count(w.rd(346, 0, Kind::I32)?)?;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { w.elem_ptr(b.at(i * 4), false, 4, |w, e| ld_animParamsDef_t(w, e, true))?; }
+            for ix in 0..n { w.elem_ptr(b.shifted_by(ix * 4), false, 4, |w, e| ld_animParamsDef_t(w, e, true))?; }
             Ok(())
         })?;
     }
@@ -5276,42 +5276,42 @@ fn ld_UIAnimInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_FlameTable(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(347, p)?;
-    if at_start { w.load_at(p, 484)?; }
-    w.xstring(p.at(432))?;
-    lp_Material(w, p.at(436))?;
-    lp_Material(w, p.at(440))?;
-    lp_Material(w, p.at(444))?;
-    lp_Material(w, p.at(448))?;
-    lp_Material(w, p.at(452))?;
-    lp_Material(w, p.at(456))?;
-    lp_Material(w, p.at(460))?;
-    lp_Material(w, p.at(464))?;
-    w.xstring(p.at(468))?;
-    w.xstring(p.at(472))?;
-    w.xstring(p.at(476))?;
-    w.xstring(p.at(480))?;
+fn ld_FlameTable(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(347, base)?;
+    if at_start { w.load_at(base, 484)?; }
+    w.xstring(base.shifted_by(432))?;
+    lp_Material(w, base.shifted_by(436))?;
+    lp_Material(w, base.shifted_by(440))?;
+    lp_Material(w, base.shifted_by(444))?;
+    lp_Material(w, base.shifted_by(448))?;
+    lp_Material(w, base.shifted_by(452))?;
+    lp_Material(w, base.shifted_by(456))?;
+    lp_Material(w, base.shifted_by(460))?;
+    lp_Material(w, base.shifted_by(464))?;
+    w.xstring(base.shifted_by(468))?;
+    w.xstring(base.shifted_by(472))?;
+    w.xstring(base.shifted_by(476))?;
+    w.xstring(base.shifted_by(480))?;
     w.leave();
     Ok(())
 }
 
-fn ld_WeaponCamoMaterial(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(348, p)?;
-    if at_start { w.load_at(p, 44)?; }
+fn ld_WeaponCamoMaterial(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(348, base)?;
+    if at_start { w.load_at(base, 44)?; }
     {
         let n = w.count(w.rd(348, 2, Kind::U16)?)?;
-        w.member_ptr(p.at(4), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { lp_Material(w, b.at(i * 4))?; }
+            for ix in 0..n { lp_Material(w, b.shifted_by(ix * 4))?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(348, 2, Kind::U16)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| {
             w.load_at(b, n * 4)?;
-            for i in 0..n { lp_Material(w, b.at(i * 4))?; }
+            for ix in 0..n { lp_Material(w, b.shifted_by(ix * 4))?; }
             Ok(())
         })?;
     }
@@ -5319,30 +5319,30 @@ fn ld_WeaponCamoMaterial(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Resu
     Ok(())
 }
 
-fn ld_FxElemMarkVisuals(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(354, p)?;
-    if at_start { w.load_at(p, 8)?; }
+fn ld_FxElemMarkVisuals(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(354, base)?;
+    if at_start { w.load_at(base, 8)?; }
     {
         let n = 2;
-        let b = p.at(0);
-        for i in 0..n { lp_Material(w, b.at(i * 4))?; }
+        let b = base.shifted_by(0);
+        for ix in 0..n { lp_Material(w, b.shifted_by(ix * 4))?; }
     }
     w.leave();
     Ok(())
 }
 
-fn ld_FxTrailDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(355, p)?;
-    if at_start { w.load_at(p, 28)?; }
+fn ld_FxTrailDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(355, base)?;
+    if at_start { w.load_at(base, 28)?; }
     {
         let n = w.count(w.rd(355, 12, Kind::I32)?)?;
-        w.member_ptr(p.at(16), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), false, false, 4, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
     {
         let n = w.count(w.rd(355, 20, Kind::I32)?)?;
-        w.member_ptr(p.at(24), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(24), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
@@ -5350,21 +5350,21 @@ fn ld_FxTrailDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_ddlStructDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(357, p)?;
-    if at_start { w.load_at(p, 20)?; }
-    w.xstring(p.at(0))?;
+fn ld_ddlStructDef_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(357, base)?;
+    if at_start { w.load_at(base, 20)?; }
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(357, 8, Kind::I32)?)?;
-        w.member_ptr(p.at(12), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 4, |w, b| {
             w.load_at(b, n * 44)?;
-            for i in 0..n { ld_ddlMemberDef_t(w, b.at(i * 44), false)?; }
+            for ix in 0..n { ld_ddlMemberDef_t(w, b.shifted_by(ix * 44), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(357, 8, Kind::I32)?)?;
-        w.member_ptr(p.at(16), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(16), false, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
@@ -5372,17 +5372,17 @@ fn ld_ddlStructDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<(
     Ok(())
 }
 
-fn ld_ddlEnumDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(358, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    w.xstring(p.at(0))?;
+fn ld_ddlEnumDef_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(358, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    w.xstring(base.shifted_by(0))?;
     {
         let n = w.count(w.rd(358, 4, Kind::I32)?)?;
-        w.member_ptr(p.at(8), false, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
+        w.member_ptr(base.shifted_by(8), false, false, 4, |w, b| { w.load_at(b, n * 4)?; w.xstrings(b, n) })?;
     }
     {
         let n = w.count(w.rd(358, 4, Kind::I32)?)?;
-        w.member_ptr(p.at(12), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 4, |w, b| {
             w.load_at(b, n * 8)
         })?;
     }
@@ -5390,34 +5390,34 @@ fn ld_ddlEnumDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn ld_GlassDef(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(359, p)?;
-    if at_start { w.load_at(p, 60)?; }
-    w.xstring(p.at(0))?;
-    lp_Material(w, p.at(28))?;
-    lp_Material(w, p.at(32))?;
-    lp_Material(w, p.at(36))?;
-    w.xstring(p.at(40))?;
-    w.xstring(p.at(44))?;
-    w.xstring(p.at(48))?;
-    lp_FxEffectDef(w, p.at(52))?;
-    lp_FxEffectDef(w, p.at(56))?;
+fn ld_GlassDef(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(359, base)?;
+    if at_start { w.load_at(base, 60)?; }
+    w.xstring(base.shifted_by(0))?;
+    lp_Material(w, base.shifted_by(28))?;
+    lp_Material(w, base.shifted_by(32))?;
+    lp_Material(w, base.shifted_by(36))?;
+    w.xstring(base.shifted_by(40))?;
+    w.xstring(base.shifted_by(44))?;
+    w.xstring(base.shifted_by(48))?;
+    lp_FxEffectDef(w, base.shifted_by(52))?;
+    lp_FxEffectDef(w, base.shifted_by(56))?;
     w.leave();
     Ok(())
 }
 
-fn ld_XSurfaceCollisionTree(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(360, p)?;
-    if at_start { w.load_at(p, 40)?; }
+fn ld_XSurfaceCollisionTree(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(360, base)?;
+    if at_start { w.load_at(base, 40)?; }
     {
         let n = w.count(w.rd(360, 24, Kind::U32)?)?;
-        w.member_ptr(p.at(28), false, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(28), false, false, 16, |w, b| {
             w.load_at(b, n * 16)
         })?;
     }
     {
         let n = w.count(w.rd(360, 32, Kind::U32)?)?;
-        w.member_ptr(p.at(36), false, false, 2, |w, b| {
+        w.member_ptr(base.shifted_by(36), false, false, 2, |w, b| {
             w.load_at(b, n * 2)
         })?;
     }
@@ -5425,12 +5425,12 @@ fn ld_XSurfaceCollisionTree(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> R
     Ok(())
 }
 
-fn ld_PhysGeomInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(361, p)?;
-    if at_start { w.load_at(p, 68)?; }
+fn ld_PhysGeomInfo(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(361, base)?;
+    if at_start { w.load_at(base, 68)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(0), true, false, 16, |w, b| {
+        w.member_ptr(base.shifted_by(0), true, false, 16, |w, b| {
             ld_BrushWrapper(w, b, true)
         })?;
     }
@@ -5438,12 +5438,12 @@ fn ld_PhysGeomInfo(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn ld_ScriptCondition(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(363, p)?;
-    if at_start { w.load_at(p, 16)?; }
+fn ld_ScriptCondition(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(363, base)?;
+    if at_start { w.load_at(base, 16)?; }
     {
         let n = 1usize;
-        w.member_ptr(p.at(12), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(12), false, false, 4, |w, b| {
             ld_ScriptCondition(w, b, true)
         })?;
     }
@@ -5451,25 +5451,25 @@ fn ld_ScriptCondition(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<
     Ok(())
 }
 
-fn ld_textExp_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(364, p)?;
-    if at_start { w.load_at(p, 16)?; }
-    ld_ExpressionStatement(w, p.at(0), false)?;
+fn ld_textExp_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(364, base)?;
+    if at_start { w.load_at(base, 16)?; }
+    ld_ExpressionStatement(w, base.shifted_by(0), false)?;
     w.leave();
     Ok(())
 }
 
-fn ld_listBoxDef_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(367, p)?;
-    if at_start { w.load_at(p, 668)?; }
-    lp_Material(w, p.at(640))?;
-    lp_Material(w, p.at(644))?;
-    lp_Material(w, p.at(648))?;
+fn ld_listBoxDef_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(367, base)?;
+    if at_start { w.load_at(base, 668)?; }
+    lp_Material(w, base.shifted_by(640))?;
+    lp_Material(w, base.shifted_by(644))?;
+    lp_Material(w, base.shifted_by(648))?;
     {
         let n = w.count(w.rd(367, 660, Kind::I32)?)?;
-        w.member_ptr(p.at(656), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(656), false, false, 4, |w, b| {
             w.load_at(b, n * 24)?;
-            for i in 0..n { ld_MenuRow(w, b.at(i * 24), false)?; }
+            for ix in 0..n { ld_MenuRow(w, b.shifted_by(ix * 24), false)?; }
             Ok(())
         })?;
     }
@@ -5477,60 +5477,60 @@ fn ld_listBoxDef_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn ld_multiDef_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(368, p)?;
-    if at_start { w.load_at(p, 396)?; }
-    w.xstrings(p.at(0), 32)?;
-    w.xstrings(p.at(128), 32)?;
+fn ld_multiDef_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(368, base)?;
+    if at_start { w.load_at(base, 396)?; }
+    w.xstrings(base.shifted_by(0), 32)?;
+    w.xstrings(base.shifted_by(128), 32)?;
     w.leave();
     Ok(())
 }
 
-fn ld_profileMultiDef_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(369, p)?;
-    if at_start { w.load_at(p, 396)?; }
-    w.xstrings(p.at(0), 32)?;
-    w.xstrings(p.at(128), 32)?;
+fn ld_profileMultiDef_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(369, base)?;
+    if at_start { w.load_at(base, 396)?; }
+    w.xstrings(base.shifted_by(0), 32)?;
+    w.xstrings(base.shifted_by(128), 32)?;
     w.leave();
     Ok(())
 }
 
-fn ld_enumDvarDef_s(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(371, p)?;
-    if at_start { w.load_at(p, 4)?; }
-    w.xstring(p.at(0))?;
+fn ld_enumDvarDef_s(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(371, base)?;
+    if at_start { w.load_at(base, 4)?; }
+    w.xstring(base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn ld_ddlMemberDef_t(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(373, p)?;
-    if at_start { w.load_at(p, 44)?; }
-    w.xstring(p.at(0))?;
+fn ld_ddlMemberDef_t(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(373, base)?;
+    if at_start { w.load_at(base, 44)?; }
+    w.xstring(base.shifted_by(0))?;
     w.leave();
     Ok(())
 }
 
-fn ld_BrushWrapper(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(378, p)?;
-    if at_start { w.load_at(p, 96)?; }
+fn ld_BrushWrapper(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(378, base)?;
+    if at_start { w.load_at(base, 96)?; }
     {
         let n = w.count(w.rd(378, 28, Kind::U32)?)?;
-        w.member_ptr(p.at(32), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(32), false, false, 4, |w, b| {
             w.load_at(b, n * 12)?;
-            for i in 0..n { ld_cbrushside_t(w, b.at(i * 12), false)?; }
+            for ix in 0..n { ld_cbrushside_t(w, b.shifted_by(ix * 12), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count(w.rd(378, 84, Kind::U32)?)?;
-        w.member_ptr(p.at(88), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(88), true, false, 4, |w, b| {
             w.load_at(b, n * 12)
         })?;
     }
     {
         let n = w.count(w.rd(378, 28, Kind::U32)?)?;
-        w.member_ptr(p.at(92), true, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(92), true, false, 4, |w, b| {
             w.load_at(b, n * 20)
         })?;
     }
@@ -5538,26 +5538,26 @@ fn ld_BrushWrapper(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()>
     Ok(())
 }
 
-fn ld_MenuRow(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(379, p)?;
-    if at_start { w.load_at(p, 24)?; }
+fn ld_MenuRow(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(379, base)?;
+    if at_start { w.load_at(base, 24)?; }
     {
         let n = w.count(w.rd(367, 28, Kind::I32)?)?;
-        w.member_ptr(p.at(0), false, false, 4, |w, b| {
+        w.member_ptr(base.shifted_by(0), false, false, 4, |w, b| {
             w.load_at(b, n * 12)?;
-            for i in 0..n { ld_MenuCell(w, b.at(i * 12), false)?; }
+            for ix in 0..n { ld_MenuCell(w, b.shifted_by(ix * 12), false)?; }
             Ok(())
         })?;
     }
     {
         let n = w.count((32i64))?;
-        w.member_ptr(p.at(4), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(4), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
     {
         let n = w.count((32i64))?;
-        w.member_ptr(p.at(8), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }
@@ -5565,12 +5565,12 @@ fn ld_MenuRow(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
     Ok(())
 }
 
-fn ld_MenuCell(w: &mut Walker<'_, '_>, p: Ptr, at_start: bool) -> Result<()> {
-    w.enter(380, p)?;
-    if at_start { w.load_at(p, 12)?; }
+fn ld_MenuCell(w: &mut Walker<'_, '_>, base: RawRef, at_start: bool) -> LoadResult<()> {
+    w.enter(380, base)?;
+    if at_start { w.load_at(base, 12)?; }
     {
         let n = w.count(w.rd(380, 4, Kind::I32)?)?;
-        w.member_ptr(p.at(8), false, false, 1, |w, b| {
+        w.member_ptr(base.shifted_by(8), false, false, 1, |w, b| {
             w.load_at(b, n * 1)
         })?;
     }

@@ -1,29 +1,29 @@
-use playerstate_t6::{UserCmd, button};
+use playerstate_t6::{InputCommand, button};
 
-use crate::client::{CROUCH, PRONE, jam_chance};
+use crate::client::{DUCK_BUTTON_BIT, LYING_FLAT, jam_chance};
 use crate::*;
 
 const FRAME: u32 = 16;
 
 /// A client with each `(key, command)` bound.
-fn bound(binds: &[(usize, &str)]) -> ClientInput {
-    let mut client = ClientInput::default();
+fn bound(binds: &[(usize, &str)]) -> PlayerIntentFeed {
+    let mut client = PlayerIntentFeed::default();
     for &(key, command) in binds {
-        client.keys[key].binding = command_id_lookup(command).expect(command);
+        client.keys[key].binding = action_number_for(command).expect(command);
     }
     client
 }
 
-fn down(client: &mut ClientInput, key: usize, now: i32) {
+fn down(client: &mut PlayerIntentFeed, key: usize, now: i32) {
     key_event(client, key, true, now, FRAME);
 }
 
-fn up(client: &mut ClientInput, key: usize, now: i32) {
+fn up(client: &mut PlayerIntentFeed, key: usize, now: i32) {
     key_event(client, key, false, now, FRAME);
 }
 
-fn sampled_has(client: &mut ClientInput, now: i32, bit: u32) -> bool {
-    sample_move(client, now, FRAME).0.test(bit)
+fn sampled_has(client: &mut PlayerIntentFeed, now: i32, bit: u32) -> bool {
+    read_move_buttons(client, now, FRAME).0.test(bit)
 }
 
 fn close(a: f32, b: f32) -> bool {
@@ -35,46 +35,46 @@ mod table {
 
     #[test]
     fn ids_line_up_with_the_game() {
-        assert_eq!(HOLD_PAIR_LIMIT, 0x41);
-        assert_eq!(command_name(1), Some("+attack"));
-        assert_eq!(command_name(2), Some("-attack"));
-        assert_eq!(command_name(64), Some("-talk"));
+        assert_eq!(HOLD_ID_END, 0x41);
+        assert_eq!(action_label(1), Some("+attack"));
+        assert_eq!(action_label(2), Some("-attack"));
+        assert_eq!(action_label(64), Some("-talk"));
         assert_eq!(
-            command_name(WEAPNEXT_INVENTORY_DOWN),
+            action_label(WEAPNEXT_INVENTORY_DOWN),
             Some("+weapnext_inventory")
         );
-        assert_eq!(command_name(79), Some("-weapnext_inventory"));
-        assert_eq!(command_name(INVENTORY_COMMAND), Some("inventory"));
-        assert_eq!(command_name(0), None);
-        assert_eq!(command_name(81), None);
-        assert_eq!(command_names().count(), 80);
+        assert_eq!(action_label(79), Some("-weapnext_inventory"));
+        assert_eq!(action_label(INVENTORY_COMMAND), Some("inventory"));
+        assert_eq!(action_label(0), None);
+        assert_eq!(action_label(81), None);
+        assert_eq!(action_labels().count(), 80);
     }
 
     #[test]
     fn lookup_takes_any_case_and_a_bare_hold_name() {
-        assert_eq!(command_id_lookup("+attack"), Some(1));
-        assert_eq!(command_id_lookup("  +ATTACK "), Some(1));
-        assert_eq!(command_id_lookup("attack"), Some(1));
-        assert_eq!(command_id_lookup("-attack"), Some(2));
-        assert_eq!(command_id_lookup("TOGGLECROUCH"), Some(72));
+        assert_eq!(action_number_for("+attack"), Some(1));
+        assert_eq!(action_number_for("  +ATTACK "), Some(1));
+        assert_eq!(action_number_for("attack"), Some(1));
+        assert_eq!(action_number_for("-attack"), Some(2));
+        assert_eq!(action_number_for("TOGGLECROUCH"), Some(72));
         assert_eq!(
-            command_id_lookup("actionslot 3"),
-            command_id_lookup("+actionslot 3")
+            action_number_for("actionslot 3"),
+            action_number_for("+actionslot 3")
         );
-        assert_eq!(command_id_lookup(""), None);
-        assert_eq!(command_id_lookup("+weapnext"), None);
-        assert_eq!(command_id_lookup("-nothing"), None);
+        assert_eq!(action_number_for(""), None);
+        assert_eq!(action_number_for("+weapnext"), None);
+        assert_eq!(action_number_for("-nothing"), None);
     }
 
     #[test]
     fn only_the_down_half_of_a_pair_has_an_up_command() {
-        assert_eq!(key_up_command_id(1), Some(2));
-        assert_eq!(key_up_command_id(63), Some(64));
-        assert_eq!(key_up_command_id(2), None);
-        assert_eq!(key_up_command_id(0), None);
-        assert_eq!(key_up_command_id(72), None);
-        assert_eq!(key_up_command_id(WEAPNEXT_INVENTORY_DOWN), Some(79));
-        assert_eq!(key_up_command_id(INVENTORY_COMMAND), None);
+        assert_eq!(release_action_number(1), Some(2));
+        assert_eq!(release_action_number(63), Some(64));
+        assert_eq!(release_action_number(2), None);
+        assert_eq!(release_action_number(0), None);
+        assert_eq!(release_action_number(72), None);
+        assert_eq!(release_action_number(WEAPNEXT_INVENTORY_DOWN), Some(79));
+        assert_eq!(release_action_number(INVENTORY_COMMAND), None);
     }
 }
 
@@ -87,12 +87,12 @@ mod buttons {
         down(&mut c, 1, 100);
         down(&mut c, 2, 105);
         up(&mut c, 1, 110);
-        assert!(c.kb.forward.active);
+        assert!(c.pressed_key_latch.forward.active);
         up(&mut c, 2, 120);
-        assert!(!c.kb.forward.active);
-        assert!(c.kb.forward.was_pressed);
-        c.kb.clear_was_pressed();
-        assert!(!c.kb.forward.was_pressed);
+        assert!(!c.pressed_key_latch.forward.active);
+        assert!(c.pressed_key_latch.forward.tapped_since_clear);
+        c.pressed_key_latch.forget_tap();
+        assert!(!c.pressed_key_latch.forward.tapped_since_clear);
     }
 
     #[test]
@@ -100,9 +100,9 @@ mod buttons {
         let mut c = bound(&[(1, "+forward")]);
         down(&mut c, 1, 100);
         up(&mut c, 1, 108);
-        let (_, axes) = sample_move(&mut c, 116, FRAME);
+        let (_, axes) = read_move_buttons(&mut c, 116, FRAME);
         assert!(close(axes.forward, 0.5));
-        let (_, axes) = sample_move(&mut c, 132, FRAME);
+        let (_, axes) = read_move_buttons(&mut c, 132, FRAME);
         assert!(close(axes.forward, 0.0));
     }
 
@@ -111,10 +111,10 @@ mod buttons {
         let mut c = bound(&[(1, "+forward"), (2, "+back"), (3, "+moveright")]);
         down(&mut c, 1, 100);
         down(&mut c, 3, 100);
-        let (_, axes) = sample_move(&mut c, 104, FRAME);
+        let (_, axes) = read_move_buttons(&mut c, 104, FRAME);
         assert!(close(axes.forward, 1.0) && close(axes.right, 1.0));
         down(&mut c, 2, 104);
-        let (_, axes) = sample_move(&mut c, 120, FRAME);
+        let (_, axes) = read_move_buttons(&mut c, 120, FRAME);
         assert!(close(axes.forward, 0.0));
     }
 
@@ -124,40 +124,40 @@ mod buttons {
         down(&mut c, 1, 100);
         down(&mut c, 2, 100);
         let mut names = alloc::vec::Vec::new();
-        c.kb.visit_active_names(|n| names.push(n));
+        c.pressed_key_latch.each_held_command(|n| names.push(n));
         assert_eq!(names, ["+forward"]);
     }
 
     #[test]
     fn keys_off_the_board_are_ignored() {
-        let mut c = ClientInput::default();
-        down(&mut c, KEY_COUNT, 100);
-        input_cmd(&mut c, 1, SCRIPT_KEYNUM, 100, FRAME);
-        assert!(c.kb.attack.active);
-        input_cmd(&mut c, 2, SCRIPT_KEYNUM, 110, FRAME);
-        assert!(!c.kb.attack.active);
+        let mut c = PlayerIntentFeed::default();
+        down(&mut c, KEYBOARD_SLOTS, 100);
+        input_cmd(&mut c, 1, SCRIPTED_KEY_SLOT, 100, FRAME);
+        assert!(c.pressed_key_latch.attack.active);
+        input_cmd(&mut c, 2, SCRIPTED_KEY_SLOT, 110, FRAME);
+        assert!(!c.pressed_key_latch.attack.active);
     }
 
     #[test]
     fn the_speed_key_flips_aiming() {
         let mut c = bound(&[(1, "+speed_throw"), (2, "toggleads")]);
         down(&mut c, 1, 100);
-        assert!(sampled_has(&mut c, 110, button::ADS));
+        assert!(sampled_has(&mut c, 110, button::AIM_BIT));
         up(&mut c, 1, 120);
         down(&mut c, 2, 130);
-        assert!(c.using_ads);
-        assert!(sampled_has(&mut c, 140, button::ADS));
+        assert!(c.scoped_in);
+        assert!(sampled_has(&mut c, 140, button::AIM_BIT));
         down(&mut c, 1, 150);
-        assert!(!c.using_ads, "the speed key leaves the toggle");
+        assert!(!c.scoped_in, "the speed key leaves the toggle");
         set_ads(&mut c, true);
-        assert!(!sampled_has(&mut c, 160, button::ADS));
+        assert!(!sampled_has(&mut c, 160, button::AIM_BIT));
     }
 }
 
 mod double_tap {
     use super::*;
 
-    fn tap(c: &mut ClientInput, key: usize, at: i32, held: i32) {
+    fn tap(c: &mut PlayerIntentFeed, key: usize, at: i32, held: i32) {
         down(c, key, at);
         up(c, key, at + held);
     }
@@ -194,7 +194,7 @@ mod double_tap {
 mod stance {
     use super::*;
 
-    fn pressed(c: &mut ClientInput, at: i32, held: Option<i32>) {
+    fn pressed(c: &mut PlayerIntentFeed, at: i32, held: Option<i32>) {
         down(c, 1, at);
         if let Some(held) = held {
             up(c, 1, at + held);
@@ -207,18 +207,18 @@ mod stance {
             let mut c = bound(&[(1, command), (2, "toggleprone"), (3, "+stance")]);
             down(&mut c, 1, 1000);
             for now in [1016, 1300, 2000] {
-                let (bits, _) = sample_move(&mut c, now, FRAME);
+                let (bits, _) = read_move_buttons(&mut c, now, FRAME);
                 assert!(bits.test(button::SPRINT), "{command} sprints at {now}");
-                assert!(!bits.test(button::PRONE), "{command} is not prone at {now}");
-                assert!(!bits.test(button::CROUCH), "{command} is not crouched at {now}");
+                assert!(!bits.test(button::LYING_FLAT), "{command} is not prone at {now}");
+                assert!(!bits.test(button::DUCK_BUTTON_BIT), "{command} is not crouched at {now}");
             }
-            assert_eq!(c.stance_latch, 0);
+            assert_eq!(c.posture_hold, 0);
             up(&mut c, 1, 2100);
-            c.kb.clear_was_pressed();
+            c.pressed_key_latch.forget_tap();
             assert!(!sampled_has(&mut c, 2200, button::SPRINT));
             // Ctrl (toggleprone) still toggles prone by itself.
             down(&mut c, 2, 2300);
-            assert!(sampled_has(&mut c, 2316, button::PRONE));
+            assert!(sampled_has(&mut c, 2316, button::LYING_FLAT));
         }
     }
 
@@ -226,26 +226,26 @@ mod stance {
     fn a_tap_crouches_and_another_stands() {
         let mut c = bound(&[(1, "+stance")]);
         pressed(&mut c, 1000, Some(100));
-        assert_eq!(c.stance_latch, CROUCH);
-        assert!(sampled_has(&mut c, 1110, button::CROUCH));
+        assert_eq!(c.posture_hold, DUCK_BUTTON_BIT);
+        assert!(sampled_has(&mut c, 1110, button::DUCK_BUTTON_BIT));
         pressed(&mut c, 1200, Some(100));
-        assert_eq!(c.stance_latch, 0);
+        assert_eq!(c.posture_hold, 0);
     }
 
     #[test]
     fn a_long_press_goes_prone_and_another_stands() {
         let mut c = bound(&[(1, "+stance")]);
         pressed(&mut c, 1000, None);
-        assert_eq!(c.stance_latch, CROUCH);
-        sample_move(&mut c, 1299, FRAME);
-        assert_eq!(c.stance_latch, CROUCH);
-        assert!(sampled_has(&mut c, 1300, button::PRONE));
+        assert_eq!(c.posture_hold, DUCK_BUTTON_BIT);
+        read_move_buttons(&mut c, 1299, FRAME);
+        assert_eq!(c.posture_hold, DUCK_BUTTON_BIT);
+        assert!(sampled_has(&mut c, 1300, button::LYING_FLAT));
         up(&mut c, 1, 1400);
-        assert_eq!(c.stance_latch, PRONE);
+        assert_eq!(c.posture_hold, LYING_FLAT);
         pressed(&mut c, 2000, None);
-        sample_move(&mut c, 2300, FRAME);
+        read_move_buttons(&mut c, 2300, FRAME);
         up(&mut c, 1, 2350);
-        assert_eq!(c.stance_latch, 0);
+        assert_eq!(c.posture_hold, 0);
     }
 
     #[test]
@@ -253,24 +253,24 @@ mod stance {
         let mut c = bound(&[(1, "+stance")]);
         c.sprinting = true;
         pressed(&mut c, 1000, None);
-        assert_eq!(c.stance_latch, 0, "a sprinting press waits");
-        sample_move(&mut c, 1200, FRAME);
-        assert_eq!(c.stance_latch, PRONE);
+        assert_eq!(c.posture_hold, 0, "a sprinting press waits");
+        read_move_buttons(&mut c, 1200, FRAME);
+        assert_eq!(c.posture_hold, LYING_FLAT);
         up(&mut c, 1, 1250);
 
         let mut c = bound(&[(1, "+stance")]);
         c.sprinting = true;
         pressed(&mut c, 1000, Some(100));
-        assert_eq!(c.stance_latch, CROUCH);
+        assert_eq!(c.posture_hold, DUCK_BUTTON_BIT);
     }
 
     #[test]
     fn a_gun_that_forbids_prone_keeps_the_stance() {
         let mut c = bound(&[(1, "+stance")]);
         c.sprinting = true;
-        c.weapon_blocks_prone = true;
+        c.gun_forbids_lying = true;
         pressed(&mut c, 1000, Some(100));
-        assert_eq!(c.stance_latch, 0);
+        assert_eq!(c.posture_hold, 0);
     }
 
     #[test]
@@ -279,21 +279,21 @@ mod stance {
         down(&mut c, 2, 1000);
         pressed(&mut c, 1010, Some(50));
         assert_eq!(
-            c.stance_latch, 0,
+            c.posture_hold, 0,
             "the stance button does nothing while crouch is held"
         );
-        let (bits, _) = sample_move(&mut c, 1100, FRAME);
-        assert!(bits.test(button::CROUCH) && bits.test(button::STANCE_HELD));
+        let (bits, _) = read_move_buttons(&mut c, 1100, FRAME);
+        assert!(bits.test(button::DUCK_BUTTON_BIT) && bits.test(button::STANCE_LOCK_BIT));
     }
 
     #[test]
     fn jump_stands() {
         let mut c = bound(&[(1, "+gostand"), (2, "gocrouch")]);
         down(&mut c, 2, 1000);
-        assert_eq!(c.stance_latch, CROUCH);
+        assert_eq!(c.posture_hold, DUCK_BUTTON_BIT);
         down(&mut c, 1, 1010);
-        assert!(sampled_has(&mut c, 1020, button::JUMP));
-        assert_eq!(c.stance_latch, 0);
+        assert!(sampled_has(&mut c, 1020, button::LEAP));
+        assert_eq!(c.posture_hold, 0);
     }
 
     #[test]
@@ -304,7 +304,7 @@ mod stance {
         assert!(!lower_key_held(&c));
         down(&mut c, 1, 1000);
         assert!(lower_key_held(&c));
-        assert_eq!(c.stance_latch, PRONE);
+        assert_eq!(c.posture_hold, LYING_FLAT);
         up(&mut c, 1, 1100);
         assert!(!lower_key_held(&c));
     }
@@ -318,10 +318,10 @@ mod weapnext {
         let mut c = bound(&[(1, "+weapnext_inventory")]);
         down(&mut c, 1, 1000);
         assert!(c.change_seat_press);
-        assert!(c.weapon_cycles.is_empty());
-        sample_move(&mut c, 1200, FRAME);
+        assert!(c.gun_swap_steps.is_empty());
+        read_move_buttons(&mut c, 1200, FRAME);
         up(&mut c, 1, 1240);
-        assert_eq!(c.weapon_cycles, [true]);
+        assert_eq!(c.gun_swap_steps, [true]);
         assert!(!c.inventory_request);
     }
 
@@ -330,15 +330,15 @@ mod weapnext {
         let mut c = bound(&[(1, "+weapnext_inventory")]);
         down(&mut c, 1, 1000);
         down(&mut c, 1, 1200);
-        sample_move(&mut c, 1249, FRAME);
+        read_move_buttons(&mut c, 1249, FRAME);
         assert!(
             !c.inventory_request,
             "a repeat press keeps the first press time"
         );
-        sample_move(&mut c, 1250, FRAME);
+        read_move_buttons(&mut c, 1250, FRAME);
         assert!(c.inventory_request);
         up(&mut c, 1, 1300);
-        assert!(c.weapon_cycles.is_empty());
+        assert!(c.gun_swap_steps.is_empty());
     }
 
     #[test]
@@ -355,7 +355,7 @@ mod weapnext {
         assert!(!c.change_seat_press);
         down(&mut c, 3, 1000);
         assert!(c.change_seat_press);
-        assert_eq!(c.weapon_cycles, [false, true]);
+        assert_eq!(c.gun_swap_steps, [false, true]);
         down(&mut c, 4, 1000);
         up(&mut c, 4, 1010);
         assert_eq!(c.action_slots, [2]);
@@ -379,13 +379,13 @@ mod jam {
         let mut c = bound(&[(1, "+attack")]);
         c.jam_fire_time = Some(50);
         down(&mut c, 1, 1000);
-        assert!(!c.kb.jam.active);
+        assert!(!c.pressed_key_latch.jam.active);
         up(&mut c, 1, 1010);
         down(&mut c, 1, 1045);
-        assert!(c.kb.jam.active);
+        assert!(c.pressed_key_latch.jam.active);
         assert!(sampled_has(&mut c, 1050, button::JAM));
         up(&mut c, 1, 1060);
-        assert!(!c.kb.jam.active);
+        assert!(!c.pressed_key_latch.jam.active);
     }
 
     #[test]
@@ -394,7 +394,7 @@ mod jam {
         c.jam_fire_time = Some(50);
         down(&mut c, 1, 1000);
         down(&mut c, 2, 1020);
-        assert!(!c.kb.jam.active);
+        assert!(!c.pressed_key_latch.jam.active);
         assert_eq!(c.holds.last_fire, 1000);
     }
 
@@ -409,7 +409,7 @@ mod jam {
         down(&mut c, 1, 1020);
         up(&mut c, 1, 1030);
         down(&mut c, 1, 1040);
-        assert!(!c.kb.jam.active);
+        assert!(!c.pressed_key_latch.jam.active);
         assert_eq!(c.holds.last_fire, 1040);
     }
 }
@@ -417,16 +417,16 @@ mod jam {
 mod look_and_cmd {
     use super::*;
 
-    fn look_input(now_msec: i32) -> AdjustAnglesInput {
-        AdjustAnglesInput {
+    fn look_input(present_tick_ms: i32) -> LookTurnRequest {
+        LookTurnRequest {
             dt: 0.1,
-            now_msec,
-            frame_msec: 100,
-            cl_yawspeed: CL_YAWSPEED_DEFAULT,
-            cl_pitchspeed: CL_PITCHSPEED_DEFAULT,
-            cl_anglespeedkey: CL_ANGLESPEEDKEY_DEFAULT,
-            cgame_max_yaw_speed: 0.0,
-            cgame_max_pitch_speed: 0.0,
+            present_tick_ms,
+            tick_span_ms: 100,
+            key_turn_rate: KEY_TURN_RATE,
+            key_tilt_rate: KEY_TILT_RATE,
+            fast_turn_key_ratio: FAST_TURN_KEY_RATIO,
+            look_turn_rate_cap: 0.0,
+            look_tilt_rate_cap: 0.0,
             frozen: false,
         }
     }
@@ -435,17 +435,17 @@ mod look_and_cmd {
     fn turn_keys_turn_by_rate_and_speed_key() {
         let mut c = bound(&[(1, "+left"), (2, "+speed_throw"), (3, "+lookdown")]);
         down(&mut c, 1, 1000);
-        let (pitch, yaw) = adjust_angles(&mut c.kb, look_input(1100));
+        let (pitch, yaw) = adjust_angles(&mut c.pressed_key_latch, look_input(1100));
         assert!(close(pitch, 0.0) && close(yaw, 14.0));
         down(&mut c, 2, 1100);
         down(&mut c, 3, 1100);
-        let (pitch, yaw) = adjust_angles(&mut c.kb, look_input(1200));
+        let (pitch, yaw) = adjust_angles(&mut c.pressed_key_latch, look_input(1200));
         assert!(close(pitch, 21.0) && close(yaw, 21.0));
-        let capped = AdjustAnglesInput {
-            cgame_max_yaw_speed: 70.0,
+        let capped = LookTurnRequest {
+            look_turn_rate_cap: 70.0,
             ..look_input(1300)
         };
-        let (_, yaw) = adjust_angles(&mut c.kb, capped);
+        let (_, yaw) = adjust_angles(&mut c.pressed_key_latch, capped);
         assert!(close(yaw, 10.5));
     }
 
@@ -454,25 +454,25 @@ mod look_and_cmd {
         let mut c = bound(&[(1, "+right"), (2, "+strafe")]);
         down(&mut c, 1, 1000);
         down(&mut c, 2, 1000);
-        assert_eq!(adjust_angles(&mut c.kb, look_input(1100)), (0.0, 0.0));
-        let frozen = AdjustAnglesInput {
+        assert_eq!(adjust_angles(&mut c.pressed_key_latch, look_input(1100)), (0.0, 0.0));
+        let frozen = LookTurnRequest {
             frozen: true,
             ..look_input(1200)
         };
-        assert_eq!(adjust_angles(&mut c.kb, frozen), (0.0, 0.0));
+        assert_eq!(adjust_angles(&mut c.pressed_key_latch, frozen), (0.0, 0.0));
     }
 
     #[test]
     fn mouse_gain_and_turn() {
         assert_eq!(
-            apply_mouse_sensitivity(2.0, 3.0, 10.0, 0.0, 5.0, 0.5, 1.0),
+            scale_pointer_motion(2.0, 3.0, 10.0, 0.0, 5.0, 0.5, 1.0),
             (20.0, 30.0)
         );
         assert_eq!(
-            apply_mouse_sensitivity(2.0, 3.0, 10.0, 10.0, 5.0, 0.5, 0.5),
+            scale_pointer_motion(2.0, 3.0, 10.0, 10.0, 5.0, 0.5, 0.5),
             (5.5, 8.25)
         );
-        assert_eq!(mouse_move_angles(10.0, -10.0, 1.0, 1.0), (-1820, -1820));
+        assert_eq!(pointer_turn_units(10.0, -10.0, 1.0, 1.0), (-1820, -1820));
     }
 
     #[test]
@@ -488,24 +488,24 @@ mod look_and_cmd {
 
     #[test]
     fn move_bytes_round_and_clamp() {
-        assert_eq!(axis_to_move(1.0), 127);
-        assert_eq!(axis_to_move(-1.0), -127);
-        assert_eq!(axis_to_move(0.5), 64);
-        assert_eq!(axis_to_move(-0.5), -64);
-        assert_eq!(axis_to_move(2.0), 127);
+        assert_eq!(stick_to_thrust(1.0), 127);
+        assert_eq!(stick_to_thrust(-1.0), -127);
+        assert_eq!(stick_to_thrust(0.5), 64);
+        assert_eq!(stick_to_thrust(-0.5), -64);
+        assert_eq!(stick_to_thrust(2.0), 127);
         assert_eq!(clamp_char(254), 127);
         assert_eq!(clamp_char(-254), -128);
         assert_eq!(clamp_char(-5), -5);
     }
 
-    fn turned(pitch: i32, yaw: i32) -> UserCmd {
-        create_cmd(&CreateCmdInput {
-            server_time: 500,
+    fn turned(pitch: i32, yaw: i32) -> InputCommand {
+        build_input_command(&IntentBuildRequest {
+            authority_clock_ms: 500,
             angles: [1000, 0, 0],
-            mouse_pitch_delta: pitch,
-            mouse_yaw_delta: yaw,
-            forwardmove: 127,
-            ..CreateCmdInput::default()
+            pointer_tilt_change: pitch,
+            pointer_turn_change: yaw,
+            thrust_ahead: 127,
+            ..IntentBuildRequest::default()
         })
     }
 
@@ -515,70 +515,70 @@ mod look_and_cmd {
         assert_eq!(turned(-20000, 0).angles[0], 1000 - PITCH_STEP_MAX);
         assert_eq!(turned(65636, 0).angles[0], 1000 + 65636);
         assert_eq!(turned(0, 30000).angles[1], 30000);
-        assert_eq!(turned(0, 0).forwardmove, 127);
+        assert_eq!(turned(0, 0).thrust_ahead, 127);
     }
 
     #[test]
     fn a_frozen_command_carries_only_time_and_view() {
         let mut buttons = playerstate_t6::ButtonBits::default();
-        buttons.set(button::ATTACK);
-        let cmd = create_cmd(&CreateCmdInput {
-            server_time: 500,
+        buttons.set(button::FIRE_BIT);
+        let cmd = build_input_command(&IntentBuildRequest {
+            authority_clock_ms: 500,
             angles: [1, 2, 3],
             buttons,
-            forwardmove: 127,
-            mouse_pitch_delta: 100,
+            thrust_ahead: 127,
+            pointer_tilt_change: 100,
             frozen: true,
-            ..CreateCmdInput::default()
+            ..IntentBuildRequest::default()
         });
-        assert_eq!(cmd.server_time, 500);
+        assert_eq!(cmd.authority_clock_ms, 500);
         assert_eq!(cmd.angles, [1, 2, 3]);
-        assert!(!cmd.held(button::ATTACK));
-        assert_eq!(cmd.forwardmove, 0);
+        assert!(!cmd.held(button::FIRE_BIT));
+        assert_eq!(cmd.thrust_ahead, 0);
     }
 }
 
 mod weapon_select {
-    use crate::weapon_select::{SelectFlags, cycle_weapon, weapon_cycle_allowed};
+    use crate::gun_cycle::{SelectFlags, rotate_gun, may_switch_weapon};
 
     const PLAYING: SelectFlags = SelectFlags {
-        pm_flags: 0,
-        weap_flags: 0,
-        other_flags: 0x4,
-        e_flags: 0,
-        pm_type: 0,
+        movement_state_bits: 0,
+        weapon_state_bits: 0,
+        secondary_state_bits: 0x4,
+        entity_state_bits: 0,
+        movement_mode: 0,
     };
 
     #[test]
     fn a_change_waits_for_play_the_delay_and_the_override() {
-        assert!(weapon_cycle_allowed(PLAYING, 1000, 900, 0, 100));
-        assert!(!weapon_cycle_allowed(PLAYING, 1000, 950, 0, 100));
-        assert!(!weapon_cycle_allowed(PLAYING, 1000, 0, 1001, 0));
-        assert!(!weapon_cycle_allowed(SelectFlags::default(), 1000, 0, 0, 0));
+        assert!(may_switch_weapon(PLAYING, 1000, 900, 0, 100));
+        assert!(!may_switch_weapon(PLAYING, 1000, 950, 0, 100));
+        assert!(!may_switch_weapon(PLAYING, 1000, 0, 1001, 0));
+        assert!(!may_switch_weapon(SelectFlags::default(), 1000, 0, 0, 0));
         let blocked = [
             SelectFlags {
-                pm_flags: 0x800,
+                movement_state_bits: 0x800,
                 ..PLAYING
             },
             SelectFlags {
-                weap_flags: 0x80,
+                weapon_state_bits: 0x80,
                 ..PLAYING
             },
             SelectFlags {
-                other_flags: 0x6,
+                secondary_state_bits: 0x6,
                 ..PLAYING
             },
             SelectFlags {
-                e_flags: 0x10_0000,
+                entity_state_bits: 0x10_0000,
                 ..PLAYING
             },
             SelectFlags {
-                pm_type: 8,
+                movement_mode: 8,
                 ..PLAYING
             },
         ];
         for ps in blocked {
-            assert!(!weapon_cycle_allowed(ps, 1000, 0, 0, 0), "{ps:?}");
+            assert!(!may_switch_weapon(ps, 1000, 0, 0, 0), "{ps:?}");
         }
     }
 
@@ -602,29 +602,29 @@ mod weapon_select {
     #[test]
     fn the_walk_wraps_both_ways_and_skips_other_kinds() {
         let w = inventory(&[1, 41, 2, 51, 3]);
-        assert_eq!(cycle_weapon(&w, 1, 0, 0, true, kind), Some(2));
-        assert_eq!(cycle_weapon(&w, 3, 0, 0, true, kind), Some(1));
-        assert_eq!(cycle_weapon(&w, 1, 0, 0, false, kind), Some(3));
-        assert_eq!(cycle_weapon(&w, 0, 0, 0, true, kind), Some(1));
-        assert_eq!(cycle_weapon(&inventory(&[1]), 1, 0, 0, true, kind), None);
+        assert_eq!(rotate_gun(&w, 1, 0, 0, true, kind), Some(2));
+        assert_eq!(rotate_gun(&w, 3, 0, 0, true, kind), Some(1));
+        assert_eq!(rotate_gun(&w, 1, 0, 0, false, kind), Some(3));
+        assert_eq!(rotate_gun(&w, 0, 0, 0, true, kind), Some(1));
+        assert_eq!(rotate_gun(&inventory(&[1]), 1, 0, 0, true, kind), None);
     }
 
     #[test]
     fn alternate_modes_and_separate_kinds() {
         let w = inventory(&[1, 41, 2, 42, 51]);
         assert_eq!(
-            cycle_weapon(&w, 31, 2, 0, true, kind),
+            rotate_gun(&w, 31, 2, 0, true, kind),
             Some(1),
             "the launcher is its gun"
         );
-        assert_eq!(cycle_weapon(&w, 41, 0, 1, true, kind), Some(42));
+        assert_eq!(rotate_gun(&w, 41, 0, 1, true, kind), Some(42));
         assert_eq!(
-            cycle_weapon(&w, 51, 0, 2, true, kind),
+            rotate_gun(&w, 51, 0, 2, true, kind),
             Some(2),
             "back to the last primary"
         );
         assert_eq!(
-            cycle_weapon(&w, 51, 0, 9, true, kind),
+            rotate_gun(&w, 51, 0, 9, true, kind),
             Some(1),
             "a primary no longer held"
         );

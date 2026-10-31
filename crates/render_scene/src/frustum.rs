@@ -1,5 +1,5 @@
 //! View frustum planes, either built from a camera description or read out of
-//! a clip matrix. A plane is `[nx, ny, nz, d]`; a point is inside when
+//! a clip matrix. A plane is `[facing_x, facing_y, facing_z, d]`; a point is inside when
 //! `n·p + d` is not negative.
 
 use bevy::prelude::*;
@@ -7,25 +7,27 @@ use bevy::prelude::*;
 /// A perspective camera: where it is, which way it faces, its field of view
 /// and its depth range.
 #[derive(Clone, Copy, Debug)]
-pub struct FrustumSpec {
+pub struct FrustumShape {
     pub eye: Vec3,
     pub forward: Vec3,
-    pub right: Vec3,
-    pub up: Vec3,
-    pub fov_y_rad: f32,
-    pub aspect: f32,
-    pub near: f32,
-    pub far: f32,
+    pub side_dir: Vec3,
+    pub up_dir: Vec3,
+    pub vertical_fov_radians: f32,
+    pub wide_by_tall: f32,
+    pub near_cut: f32,
+    pub far_cut: f32,
 }
+
+/// Older spelling perspective_frustum_planes still calls; the rename sweep moves it over.
+pub use self::view_cone_planes as perspective_frustum_planes;
 
 /// The six planes bounding the camera's view, in the order near, far, left,
 /// right, bottom, top, all facing inwards.
-pub fn perspective_frustum_planes(spec: FrustumSpec) -> [[f32; 4]; 6] {
-    let forward = spec.forward.normalize_or_zero();
-    let right = spec.right.normalize_or_zero();
-    let up = spec.up.normalize_or_zero();
-    let tan_y = (spec.fov_y_rad * 0.5).tan();
-    let tan_x = tan_y * spec.aspect.max(1e-6);
+pub fn view_cone_planes(spec: FrustumShape) -> [[f32; 4]; 6] {
+    let FrustumShape { eye, vertical_fov_radians, wide_by_tall: aspect, near_cut: near, far_cut: far, .. } = spec;
+    let [forward, right, up] = [spec.forward, spec.side_dir, spec.up_dir].map(Vec3::normalize_or_zero);
+    let tan_y = (vertical_fov_radians * 0.5).tan();
+    let tan_x = tan_y * aspect.max(1e-6);
 
     // Each side plane holds the eye and the edge ray of its side, so its normal is
     // that ray crossed with the in-plane axis; the sign is fixed afterwards.
@@ -38,7 +40,7 @@ pub fn perspective_frustum_planes(spec: FrustumSpec) -> [[f32; 4]; 6] {
     ]
     .map(Vec3::normalize_or_zero);
 
-    let mid_depth = (spec.near + spec.far) * 0.5;
+    let mid_depth = (near + far) * 0.5;
     for normal in &mut sides {
         if normal.dot(forward * mid_depth) < 0.0 {
             *normal = -*normal;
@@ -47,25 +49,25 @@ pub fn perspective_frustum_planes(spec: FrustumSpec) -> [[f32; 4]; 6] {
 
     let [left, right_side, bottom, top] = sides;
     [
-        plane_through(spec.eye + forward * spec.near, forward),
-        plane_through(spec.eye + forward * spec.far, -forward),
-        plane_through(spec.eye, left),
-        plane_through(spec.eye, right_side),
-        plane_through(spec.eye, bottom),
-        plane_through(spec.eye, top),
+        plane_through(eye + forward * near, forward),
+        plane_through(eye + forward * far, -forward),
+        plane_through(eye, left),
+        plane_through(eye, right_side),
+        plane_through(eye, bottom),
+        plane_through(eye, top),
     ]
 }
 
-fn plane_through(point: Vec3, normal: Vec3) -> [f32; 4] {
-    let n = normal.normalize_or_zero();
-    [n.x, n.y, n.z, -n.dot(point)]
+fn plane_through(spot: Vec3, facing: Vec3) -> [f32; 4] {
+    let unit = facing.normalize_or_zero();
+    [unit.x, unit.y, unit.z, -unit.dot(spot)]
 }
 
 /// The planes of a clip matrix, normalised, in the order left, right, bottom,
 /// top, then the matrix's two depth rows. A degenerate plane comes out all zero:
 /// with an infinite projection one depth row is, and accepts everything.
 #[must_use]
-pub fn clip_from_world_frustum_planes(clip: Mat4) -> [[f32; 4]; 6] {
+pub fn frustum_planes_from_clip_matrix(clip: Mat4) -> [[f32; 4]; 6] {
     let [x, y, z, w] = [clip.row(0), clip.row(1), clip.row(2), clip.row(3)];
     [w + x, w - x, w + y, w - y, z, w - z].map(|plane| {
         let length = plane.truncate().length();
@@ -85,16 +87,16 @@ mod tests {
         plane[0] * p.x + plane[1] * p.y + plane[2] * p.z + plane[3]
     }
 
-    fn spec() -> FrustumSpec {
-        FrustumSpec {
+    fn spec() -> FrustumShape {
+        FrustumShape {
             eye: Vec3::new(10.0, 20.0, 30.0),
             forward: Vec3::X,
-            right: Vec3::NEG_Y,
-            up: Vec3::Z,
-            fov_y_rad: 90f32.to_radians(),
-            aspect: 1.0,
-            near: 1.0,
-            far: 100.0,
+            side_dir: Vec3::NEG_Y,
+            up_dir: Vec3::Z,
+            vertical_fov_radians: 90f32.to_radians(),
+            wide_by_tall: 1.0,
+            near_cut: 1.0,
+            far_cut: 100.0,
         }
     }
 
@@ -105,7 +107,7 @@ mod tests {
     #[test]
     fn a_point_ahead_is_inside_and_the_rest_are_not() {
         let s = spec();
-        let planes = perspective_frustum_planes(s);
+        let planes = view_cone_planes(s);
         assert!(inside(&planes, s.eye + Vec3::X * 50.0));
         assert!(!inside(&planes, s.eye - Vec3::X * 5.0), "behind");
         assert!(!inside(&planes, s.eye + Vec3::X * 150.0), "past far");
@@ -119,14 +121,14 @@ mod tests {
     #[test]
     fn a_ninety_degree_view_accepts_up_to_its_edge() {
         let s = spec();
-        let planes = perspective_frustum_planes(s);
+        let planes = view_cone_planes(s);
         assert!(inside(&planes, s.eye + Vec3::new(10.0, 9.9, 0.0)));
         assert!(inside(&planes, s.eye + Vec3::new(10.0, -9.9, 9.9)));
     }
 
     #[test]
     fn planes_are_unit_length() {
-        for plane in perspective_frustum_planes(spec()) {
+        for plane in view_cone_planes(spec()) {
             let length = Vec3::new(plane[0], plane[1], plane[2]).length();
             assert!((length - 1.0).abs() < 1e-5, "{plane:?}");
         }
@@ -135,17 +137,18 @@ mod tests {
     #[test]
     fn clip_planes_match_the_clip_matrix() {
         let clip = Mat4::perspective_infinite_reverse_rh(90f32.to_radians(), 1.0, 1.0);
-        let planes = clip_from_world_frustum_planes(clip);
-        assert!(inside(&planes, Vec3::new(0.0, 0.0, -10.0)));
+        let planes = frustum_planes_from_clip_matrix(clip);
+        let toward = Vec3::new(0.0, 0.0, -10.0);
+        assert!(inside(&planes, toward));
         assert!(inside(&planes, Vec3::new(9.0, -9.0, -10.0)));
         assert!(!inside(&planes, Vec3::new(11.0, 0.0, -10.0)));
-        assert!(!inside(&planes, Vec3::new(0.0, 0.0, 10.0)), "behind");
-        assert!(!inside(&planes, Vec3::new(0.0, 0.0, -0.5)), "closer than the near distance");
+        assert!(!inside(&planes, -toward), "behind");
+        assert!(!inside(&planes, toward * 0.05), "closer than the near distance");
         assert_eq!(planes[4], [0.0; 4], "an infinite projection has no far plane");
     }
 
     #[test]
     fn a_zero_matrix_gives_zero_planes() {
-        assert_eq!(clip_from_world_frustum_planes(Mat4::ZERO), [[0.0; 4]; 6]);
+        assert_eq!(frustum_planes_from_clip_matrix(Mat4::ZERO), [[0.0; 4]; 6]);
     }
 }

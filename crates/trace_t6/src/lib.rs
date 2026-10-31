@@ -11,16 +11,14 @@
 #![forbid(unsafe_code)]
 
 mod brush;
-mod bullet;
 mod hit;
-mod trace;
-mod work;
+mod capsule;
+mod result;
 
 pub use brush::{AXIAL_SIDES, Brush, BrushSide, Plane, test_box_in_brush, trace_through_brush};
-pub use bullet::BulletFireParams;
 pub use hit::{
-    DynEntDrawType, ENTITYNUM_NONE, ENTITYNUM_WORLD, MAX_GENTITIES, TraceHitType,
-    trace_get_dyn_ent_hit_id, trace_get_entity_hit_id, trace_get_glass_hit_id, trace_set_hit_id,
+    NO_ENTITY_SLOT, ENTITYNUM_WORLD, MAX_GENTITIES, TraceHitType, WORLD_ENTITY_SLOT, entity_hit_slot, glass_hit_slot,
+    trace_get_entity_hit_id, trace_set_hit_id,
 };
-pub use trace::{SURF_TYPE_MASK, SURF_TYPE_SHIFT, Trace, surface_type_from_flags};
-pub use work::{SURFACE_CLIP_EPSILON, TraceExtents, TraceWork, trace_brushes};
+pub use result::{SURF_TYPE_MASK, SURF_TYPE_SHIFT, Trace, TraceResult, surface_kind_of_flags};
+pub use capsule::{SURFACE_CLIP_SLACK, SweepBoxSize, TraceWork, trace_brushes};

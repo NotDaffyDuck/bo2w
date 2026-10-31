@@ -1,0 +1,17 @@
+# A: knife on a gun (AN-94). knife_mp: swing 800 ms, hit at 125 ms; the AN-94 quick-raises in 400 ms.
+# 50 ms ticks: press tick = MELEE_INIT, hit (MELEE_FIRE) 3 ticks later, MELEE_END at 800 ms, READY 400 ms after that.
+msec 50
+spawn an94_mp
+hold melee
+run 1
+expect state MELEE_INIT
+expect anim MELEE_ATTACK
+release melee
+run 3
+expect state MELEE_FIRE
+run 13
+expect state MELEE_END
+expect anim QUICK_RAISE
+expect weapon an94_mp
+run 8
+expect state READY

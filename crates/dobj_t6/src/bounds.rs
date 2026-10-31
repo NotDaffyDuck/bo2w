@@ -5,7 +5,7 @@ pub const DOBJ_NO_ATTACH: u8 = 0xff;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RadiusModel {
     /// The model's stored radius (`XModel::radius`).
-    pub radius: f32,
+    pub stored_radius: f32,
     /// The bone of model 0 it attaches to, or [`DOBJ_NO_ATTACH`].
     pub attach: u8,
 }
@@ -13,7 +13,7 @@ pub struct RadiusModel {
 impl RadiusModel {
     /// A model on no bone: its radius alone.
     pub const fn unattached(radius: f32) -> Self {
-        Self { radius, attach: DOBJ_NO_ATTACH }
+        Self { stored_radius: radius, attach: DOBJ_NO_ATTACH }
     }
 }
 
@@ -28,16 +28,16 @@ pub fn compute_radius(models: &[RadiusModel], model0_base_trans: &[[f32; 3]]) ->
         } else {
             model0_base_trans
                 .get(usize::from(model.attach))
-                .map_or(0.0, |t| (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt())
+                .map_or_else(|| 0.0, |t| (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt())
         };
-        max.max(model.radius + offset)
+        max.max(model.stored_radius + offset)
     })
 }
 
 /// `DObjGetBounds`: a cube of the radius around the DObj origin, as
 /// (mins, maxs).
-pub fn bounds(radius: f32) -> ([f32; 3], [f32; 3]) {
-    ([-radius; 3], [radius; 3])
+pub fn bounds(reach: f32) -> ([f32; 3], [f32; 3]) {
+    ([-reach; 3], [reach; 3])
 }
 
 #[cfg(test)]
@@ -46,23 +46,23 @@ mod tests {
 
     #[test]
     fn attached_models_add_their_bone_offset() {
-        let trans = [[0.0; 3], [3.0, 4.0, 0.0]];
+        let shift_offset = [[0.0; 3], [3.0, 4.0, 0.0]];
         let body = RadiusModel {
-            radius: 10.0,
+            stored_radius: 10.0,
             attach: DOBJ_NO_ATTACH,
         };
         let gun = RadiusModel {
-            radius: 8.0,
+            stored_radius: 8.0,
             attach: 1,
         };
-        assert_eq!(compute_radius(&[body, gun], &trans), 13.0);
+        assert_eq!(compute_radius(&[body, gun], &shift_offset), 13.0);
         // A bone model 0 does not have adds nothing.
         let far = RadiusModel {
-            radius: 8.0,
+            stored_radius: 8.0,
             attach: 7,
         };
-        assert_eq!(compute_radius(&[body, far], &trans), 10.0);
-        assert_eq!(compute_radius(&[], &trans), 0.0);
+        assert_eq!(compute_radius(&[body, far], &shift_offset), 10.0);
+        assert_eq!(compute_radius(&[], &shift_offset), 0.0);
     }
 
     #[test]

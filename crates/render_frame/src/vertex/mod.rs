@@ -4,8 +4,8 @@
 mod gpu_vertices;
 mod surface_ids;
 
-pub use self::gpu_vertices::{PackedVertexRefusal, SmodelVertex, WorldVertex, WorldVertexRefusal};
+pub use self::gpu_vertices::{PackedVertexRefusal, PropVertex, LevelVertex, WorldVertexRefusal};
 pub use self::surface_ids::{
-    DYNAMIC_INDEX_BUFFER_CAPACITY, SurfaceLightmapId, SurfaceReflectionProbeId,
-    SurfaceSamplerInputs, xmodel_tess_info_packed_arm, xmodel_tess_info_vert_decl_type,
+    LIVE_INDEX_BUFFER_CAP, SurfaceBakedLightId, SurfaceCubeProbeId,
+    FacetSamplerInputs, model_tess_packed_arm, model_tess_vert_decl,
 };

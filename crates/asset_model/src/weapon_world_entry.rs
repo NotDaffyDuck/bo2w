@@ -3,52 +3,41 @@
 
 use std::sync::Arc;
 
-use crate::asset_graph::{AssetEdge, capture_xmodel_material_slots, stamp_xmodel_material_edges};
-use crate::skel_model::ModelSkel;
-use crate::MaterialSpace;
-use asset_core::{AssetNamespace, MaterialKey};
-use asset_material::{MaterialCatalog, MaterialDefinitions};
+use crate::link::{bind_slot_keys, read_slot_keys};
+use crate::material_slots::bound_material_name;
+use crate::skel_model::MeshRig;
+use asset_core::AssetCategoryScope;
+use asset_core::MaterialKey;
+use asset_material::MaterialDefinitions;
+use asset_material::SurfaceShaderRoster;
 
 #[derive(Clone, Debug)]
-pub struct WorldWeaponEntry {
-    pub namespace: AssetNamespace,
-    pub skel: Arc<ModelSkel>,
+pub struct LevelWeaponRecord {
+    pub namespace: AssetCategoryScope,
+    pub bone_rig: Arc<MeshRig>,
     /// What each surface's material is called, by surface.
     pub material_keys: Vec<Option<MaterialKey>>,
     /// Which material row each surface is bound to, by surface.
-    pub material_edges: Vec<AssetEdge<MaterialSpace>>,
+    pub surface_links: Vec<asset_core::AssetDependencyLink<asset_core::SurfaceShaderSpace>>,
 }
 
-impl WorldWeaponEntry {
-    pub(crate) fn new(
-        namespace: AssetNamespace,
-        skel: ModelSkel,
-        materials: Option<&MaterialCatalog>,
-    ) -> Self {
-        let (material_keys, material_edges) =
-            capture_xmodel_material_slots(&skel.surface_materials, materials.map(|c| &**c));
-        Self {
-            namespace,
-            skel: Arc::new(skel),
-            material_keys,
-            material_edges,
-        }
+impl LevelWeaponRecord {
+    pub(crate) fn new(space: AssetCategoryScope, bone_rig: MeshRig, roster: Option<&SurfaceShaderRoster>) -> Self {
+        let defs = roster.map(|held| &**held);
+        let (material_keys, surface_links) = read_slot_keys(&bone_rig.facet_materials, defs);
+        let bone_rig = Arc::new(bone_rig);
+        Self { namespace: space, bone_rig, material_keys, surface_links }
     }
 
     /// Binds the surfaces to the material rows that have since been loaded.
-    pub(crate) fn resolve_materials(&mut self, materials: &MaterialDefinitions) {
-        self.material_edges = stamp_xmodel_material_edges(
-            &self.material_keys,
-            &self.skel.surface_materials,
-            materials,
-        );
+    pub(crate) fn bind_materials(&mut self, defs: &MaterialDefinitions) {
+        let pointers = &self.bone_rig.facet_materials;
+        self.surface_links = bind_slot_keys(&self.material_keys, pointers, defs);
     }
 
     /// The material a surface drew from, when that material is loaded.
-    pub fn material_present_name(&self, surface: usize) -> Option<&str> {
-        if !self.material_edges.get(surface)?.is_bound() {
-            return None;
-        }
-        Some(self.material_keys.get(surface)?.as_ref()?.name.as_str())
+    pub fn material_name_of(&self, at: usize) -> Option<&str> {
+        bound_material_name(&self.material_keys, &self.surface_links, at)
     }
 }
+

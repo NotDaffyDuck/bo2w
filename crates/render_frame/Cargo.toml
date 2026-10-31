@@ -1,3 +1,3 @@
-package = { name = 'render_frame', version = '0.1.0', edition = { workspace = true }, license = { workspace = true }, description = 'Per-frame render output: packed source lists, destination-ring records, product status and the GPU layout contract.' }
+package = { name = 'render_frame', version = '0.1.0', edition = { workspace = true }, publish = { workspace = true }, description = 'Per-frame render output: packed source lists, destination-ring records, product status and the GPU layout contract.' }
 lints = { workspace = true }
 dependencies = { asset_t6 = { workspace = true }, bytemuck = { version = '1', features = ['derive'] }, d3d9_sm3 = { workspace = true }, dpvs_t6 = { workspace = true }, fx_t6 = { workspace = true }, glam = { workspace = true }, lighting_t6 = { workspace = true }, render_material = { workspace = true } }

@@ -3,33 +3,41 @@
 
 use core::f32::consts::{FRAC_PI_2, PI, TAU};
 
-use game_math::{angle_vectors, get_lean_fraction};
+use game_math::{euler_basis, lean_amount};
 
-use crate::kick::{GunKickSpring, GunRecoilPlacementState, calculate_weapon_position_gun_recoil};
-use crate::ps_flags::{eflags, pm_flags};
+use super::kick::{ViewmodelKickReturn, ViewmodelKickPoseState, gun_kick_offset};
+use crate::ps_flags::{ent_bit, movement_state_bits};
 use crate::state;
-use crate::sway::{SwaySpringState, sway_contribution};
+use super::sway::{DriftReturnState, drift_offset};
 
-/// `view_height_target` of a prone player and of a crouched one.
-pub(crate) const VIEWHEIGHT_TARGET_PRONE: i32 = 0x0b;
-pub(crate) const VIEWHEIGHT_TARGET_CROUCH: i32 = 0x28;
+/// `eye_height_goal` of a prone player and of a crouched one.
+pub(crate) const EYE_LEVEL_LYING: i32 = 0x0b;
+pub(crate) const EYE_LEVEL_CROUCHED: i32 = 0x28;
 
 /// TODO(fact): BO2's bg_weaponBobAmplitudeBase default was not found; MW2's value kept.
-pub(crate) const WEAPON_BOB_AMPLITUDE_BASE: f32 = 0.16;
+pub(crate) const SWING_AMP_BASE: f32 = 0.16;
 /// The roll bob swings this many times as wide as the side bob.
-pub(crate) const WEAPON_BOB_AMPLITUDE_ROLL: f32 = 1.5;
+pub(crate) const SWING_AMP_ROLL: f32 = 1.5;
 /// The bob cycle runs this share of a half turn ahead of the step counter.
-pub(crate) const WEAPON_BOB_LAG: f32 = 0.25;
+pub(crate) const SWING_DELAY: f32 = 0.25;
 /// The roll runs this far (radians) behind the side bob.
-pub(crate) const WEAPON_BOB_UP_PHASE: f32 = 0.471_238_94;
+pub(crate) const SWING_RISE_PHASE: f32 = 0.471_238_94;
 /// The widest a bob swings.
-const WEAPON_BOB_MAX: f32 = 8.0;
-
+const SWING_CAP: f32 = 8.0;
 /// Gun bob swing (side, up) for each way of moving, per unit of bob speed.
-const BOB_AMP_STANDING: [f32; 2] = [0.055, 0.025];
-const BOB_AMP_DUCKED: [f32; 2] = [0.045, 0.025];
-const BOB_AMP_PRONE: [f32; 2] = [0.02, 0.005];
-const BOB_AMP_SPRINTING: [f32; 2] = [0.02, 0.014];
+struct GunSwings {
+    standing: [f32; 2],
+    ducked: [f32; 2],
+    prone: [f32; 2],
+    sprinting: [f32; 2],
+}
+
+const GUN_SWINGS: GunSwings = GunSwings {
+    standing: [0.055, 0.025],
+    ducked: [0.045, 0.025],
+    prone: [0.02, 0.005],
+    sprinting: [0.02, 0.014],
+};
 /// bo2zm: bg_weaponBobAmplitudeDtp, gun bob during a dive to prone
 /// (0.002 until read from real BO2).
 const BOB_AMP_DTP: [f32; 2] = [0.002, 0.002];
@@ -41,9 +49,9 @@ const BOB_AMP_SWIMMING: [f32; 2] = [4.0, 4.0];
 /// gun, and a gun with no idle setting sways by [`IDLE_AMOUNT_DEFAULT`] at speed 1.
 pub(crate) const WEAPON_IDLE_TIME_MS_SCALE: f32 = 1000.0;
 pub(crate) const WEAPON_IDLE_FACTOR_LERP: f32 = 0.5;
-pub(crate) const WEAPON_IDLE_YAW_FREQ: f32 = 0.0007;
-pub(crate) const WEAPON_IDLE_PITCH_FREQ: f32 = 0.001;
-pub(crate) const WEAPON_IDLE_SIN_SCALE: f32 = 0.01;
+pub(crate) const REST_YAW_HZ: f32 = 0.0007;
+pub(crate) const REST_PITCH_HZ: f32 = 0.001;
+pub(crate) const GUN_REST_WAVE_FACTOR: f32 = 0.01;
 const IDLE_ROLL_FREQ: f32 = 0.0005;
 const IDLE_AMOUNT_DEFAULT: f32 = 80.0;
 
@@ -70,9 +78,9 @@ pub(crate) const PMF_DIVE_ANY: u32 = 0x0020_0000;
 
 /// bo2zm: Black Ops II's idle sway does not count a dive as prone (the dive
 /// drops the view to prone from the frame after take-off).
-pub(crate) fn idle_e_flags(e_flags: u32, pm_flags: u32) -> u32 {
-    if pm_flags & PMF_DIVE_ANY != 0 {
-        e_flags & !eflags::PRONE
+pub(crate) fn idle_e_flags(e_flags: u32, movement_state_bits: u32) -> u32 {
+    if movement_state_bits & PMF_DIVE_ANY != 0 {
+        e_flags & !ent_bit::LYING_FLAT
     } else {
         e_flags
     }
@@ -80,7 +88,7 @@ pub(crate) fn idle_e_flags(e_flags: u32, pm_flags: u32) -> u32 {
 
 /// The turn the walk gives the gun, in degrees.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct WeaponBobState {
+pub struct GunStrideSwayState {
     pub pitch: f32,
     pub yaw: f32,
     pub roll: f32,
@@ -88,18 +96,18 @@ pub struct WeaponBobState {
 
 /// Where the gun rests when crouched or prone.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct WeaponStanceStaticOfsInputs {
+pub struct GunPostureRestShiftFeed {
     pub ducked_ofs: [f32; 3],
     pub prone_ofs: [f32; 3],
     /// How far the gun tips (pitch) at the sights.
-    pub ads_aim_pitch: f32,
+    pub aimed_pitch: f32,
     /// How long raising or lowering the night vision takes, ms.
-    pub night_vision_wear_time: i32,
+    pub goggles_equip_duration: i32,
 }
 
 /// A weapon's offsets (move, turn) for walking, strafing, crouching and going prone.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct WeaponMovementOfsInputs {
+pub struct GunMotionShiftFeed {
     pub stand_move: [f32; 3],
     pub stand_rot: [f32; 3],
     pub strafe_move: [f32; 3],
@@ -125,28 +133,28 @@ pub struct WeaponMovementOfsInputs {
 
 /// How the player is moving, for the movement offsets.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct WeaponMovementKinematics {
-    pub xyspeed: f32,
+pub struct GunMotionPhysics {
+    pub ground_velocity: f32,
     pub speed: f32,
     pub velocity: [f32; 3],
-    pub viewangles: [f32; 3],
-    pub weaponstate: i32,
-    pub weaponstate_secondary: i32,
-    pub pm_flags: u32,
-    pub frametime: f32,
+    pub look_angles: [f32; 3],
+    pub gun_phase: i32,
+    pub gun_phase_alt: i32,
+    pub movement_state_bits: u32,
+    pub step_millis_elapsed: f32,
     /// bo2zm: a Black Ops II climb is keeping the gun in hand.
     pub bo2_mantle: bool,
 }
 
 /// How much of the bob the sights keep.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct WeaponBobInputs {
+pub struct GunStrideSwayFeed {
     pub ads_bob_factor: f32,
 }
 
 /// A weapon's idle drift settings, at the hip and at the sights.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct WeaponIdleInputs {
+pub struct GunRestDriftFeed {
     pub ads_idle_amount: f32,
     pub hip_idle_amount: f32,
     pub ads_idle_speed: f32,
@@ -158,13 +166,13 @@ pub struct WeaponIdleInputs {
 
 /// What the bob waveform needs to know.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct WeaponBobWaveformInputs {
+pub struct GunStrideWaveFeed {
     /// The step counter: 0..=255 for half a turn of the bob.
-    pub bob_cycle: u8,
-    pub xyspeed: f32,
-    pub view_height_target: i32,
-    pub pm_flags: u32,
-    pub weapon_pos_frac: f32,
+    pub sway_phase: u8,
+    pub ground_velocity: f32,
+    pub eye_height_goal: i32,
+    pub movement_state_bits: u32,
+    pub gun_raise_share: f32,
     /// bo2zm: the Black Ops II gun's own bob. None = the MW2 gun bob.
     pub bo2_gun: Option<Bo2GunBob>,
     /// bo2mp: the player's water level (BO2 swims from SWIM_WATER_LEVEL up).
@@ -181,474 +189,480 @@ pub struct Bo2GunBob {
 
 /// How far into a stance change the offsets fade out, as shares of the change.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct StanceTransitionFadeGlobals {
-    pub fade_start_frac: f32,
-    pub fade_end_frac: f32,
+pub struct PostureShiftBlendTuning {
+    pub blend_begin_share: f32,
+    pub blend_finish_share: f32,
 }
 
-impl Default for StanceTransitionFadeGlobals {
+impl Default for PostureShiftBlendTuning {
     fn default() -> Self {
         Self {
-            fade_start_frac: 0.0,
-            fade_end_frac: 1.0,
+            blend_begin_share: 0.0,
+            blend_finish_share: 1.0,
         }
     }
 }
 
 /// Everything the placement remembers from frame to frame.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct WeaponPlacementState {
-    pub movement_angles: [f32; 3],
-    pub movement_origin: [f32; 3],
+pub struct GunPoseState {
+    pub motion_tilt: [f32; 3],
+    pub motion_shift: [f32; 3],
     pub unfaded_angles: [f32; 3],
-    pub sway_springs: SwaySpringState,
-    pub gun_recoil: GunRecoilPlacementState,
-    pub bob: WeaponBobState,
+    pub sway_springs: DriftReturnState,
+    pub gun_recoil: ViewmodelKickPoseState,
+    pub bob: GunStrideSwayState,
     /// The idle clock, ms, and the share of the drift left by the stance.
-    pub weap_idle_time: i32,
-    pub last_idle_factor: f32,
-    pub idle_sway_angles: [f32; 3],
+    pub gun_idle_clock: i32,
+    pub previous_idle_ratio: f32,
+    pub rest_drift_tilt: [f32; 3],
     /// The last hit's flinch: when it was taken, its two kicks, and the turn it gives.
-    pub damage_kick_time: i32,
-    pub damage_time: i32,
-    pub v_dmg_pitch: f32,
-    pub v_dmg_roll: f32,
-    pub damage_kick_angles: [f32; 3],
+    pub hit_flinch_stamp: i32,
+    pub hurt_stamp_ms: i32,
+    pub hurt_kick_pitch: f32,
+    pub hurt_kick_roll: f32,
+    pub hit_flinch_tilt: [f32; 3],
 }
 
 /// The player-state fields the placement reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct WeaponPlacementPsInputs {
-    pub e_flags: u32,
-    pub weapon_pos_frac: f32,
-    pub weapon_time: i32,
-    pub aim_down_sight: bool,
-    pub overlay_reticle: i32,
-    pub weapon_transition_active: bool,
-    pub lean_fraction: f32,
+pub struct GunPosePlayerFeed {
+    pub ent_bits: u32,
+    pub gun_raise_share: f32,
+    pub gun_timer_ms: i32,
+    pub scoped_aiming: bool,
+    pub hud_crosshair_layer: i32,
+    pub swap_in_progress: bool,
+    pub peek_amount: f32,
 }
 
 /// What the placement moves the gun by.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct WeaponPlacementContribution {
+pub struct GunPoseShare {
     pub origin: [f32; 3],
     pub angles: [f32; 3],
 }
 
-pub const PLACEMENT_ASSEMBLE_STEP_COUNT: usize = 6;
+pub const POSE_BUILD_STAGE_TOTAL: usize = 6;
 
 /// The parts of [`weapon_placement_assemble`], in the order it does them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WeaponPlacementAssembleStep {
-    BaseStanceMovementAngles,
+pub enum GunPoseBuildStage {
+    PostureMotionTiltBase,
     Sway,
     GunRecoil,
     Bob,
-    ApplyAngles,
-    ApplyOrigin,
+    CommitTilt,
+    CommitPosition,
 }
 
-fn add_scaled(out: &mut [f32; 3], v: [f32; 3], scale: f32) {
+fn add_scaled(out: &mut [f32; 3], v: [f32; 3], factor_k: f32) {
     for (o, x) in out.iter_mut().zip(v) {
-        *o += x * scale;
+        *o += x * factor_k;
     }
 }
 
-fn lerp3(from: [f32; 3], to: [f32; 3], t: f32) -> [f32; 3] {
-    [0, 1, 2].map(|i| from[i] + (to[i] - from[i]) * t)
+fn blend_triple(start: [f32; 3], goal: [f32; 3], amount: f32) -> [f32; 3] {
+    [0, 1, 2].map(|i| start[i] + (goal[i] - start[i]) * amount)
 }
 
 /// How much of the stance offsets is left: all of it outside a stance change, none once
-/// the change is `fade_end_frac` through.
+/// the change is `blend_finish_share` through.
 fn stance_fade(
-    active: bool,
-    time: i32,
-    wear_time: i32,
-    globals: StanceTransitionFadeGlobals,
+    in_change: bool,
+    elapsed: i32,
+    span: i32,
+    fade_cfg: PostureShiftBlendTuning,
 ) -> f32 {
-    if !active || wear_time <= 0 {
+    if !in_change || span <= 0 {
         return 1.0;
     }
-    let t = time as f32 / wear_time as f32;
-    let (start, end) = (globals.fade_start_frac, globals.fade_end_frac);
-    if t <= start {
+    let progress = elapsed as f32 / span as f32;
+    let (from_frac, to_frac) = (fade_cfg.blend_begin_share, fade_cfg.blend_finish_share);
+    if progress <= from_frac {
         1.0
-    } else if t >= end {
+    } else if progress >= to_frac {
         0.0
-    } else if end - start <= 0.0 {
+    } else if to_frac - from_frac <= 0.0 {
         0.0
     } else {
-        1.0 - (t - start) / (end - start)
+        1.0 - (progress - from_frac) / (to_frac - from_frac)
     }
 }
 
 /// Adds the crouched or prone resting offset to `origin`, and the sights' tip to `pitch`.
 fn add_stance_offset(
-    ps: WeaponPlacementPsInputs,
-    stance: WeaponStanceStaticOfsInputs,
-    fade_globals: StanceTransitionFadeGlobals,
-    pitch: &mut f32,
-    origin: &mut [f32; 3],
+    view_ps: GunPosePlayerFeed,
+    rest_ofs: GunPostureRestShiftFeed,
+    fade_cfg: PostureShiftBlendTuning,
+    tip: &mut f32,
+    rest_pos: &mut [f32; 3],
 ) {
-    let fade = stance_fade(
-        ps.weapon_transition_active,
-        ps.weapon_time,
-        stance.night_vision_wear_time,
-        fade_globals,
+    let keep = stance_fade(
+        view_ps.swap_in_progress,
+        view_ps.gun_timer_ms,
+        rest_ofs.goggles_equip_duration,
+        fade_cfg,
     );
-    if ps.e_flags & eflags::DUCK != 0 {
-        add_scaled(origin, stance.ducked_ofs, fade);
-    } else if ps.e_flags & eflags::PRONE != 0 {
-        add_scaled(origin, stance.prone_ofs, fade);
+    if view_ps.ent_bits & ent_bit::CROUCH_BIT != 0 {
+        add_scaled(rest_pos, rest_ofs.ducked_ofs, keep);
+    } else if view_ps.ent_bits & ent_bit::LYING_FLAT != 0 {
+        add_scaled(rest_pos, rest_ofs.prone_ofs, keep);
     }
-    if ps.aim_down_sight {
-        *pitch += stance.ads_aim_pitch * ps.weapon_pos_frac;
+    if view_ps.scoped_aiming {
+        *tip += rest_ofs.aimed_pitch * view_ps.gun_raise_share;
     }
 }
 
 /// How much of the bob the sights leave: all of it at the hip.
-pub(crate) fn weapon_bob_ads_attenuation(weapon_pos_frac: f32, ads_bob_factor: f32) -> f32 {
-    if weapon_pos_frac <= 0.0 {
+pub(crate) fn swing_damp_aimed(ads_frac: f32, keep_share: f32) -> f32 {
+    if ads_frac <= 0.0 {
         return 1.0;
     }
-    1.0 - weapon_pos_frac * (1.0 - ads_bob_factor)
+    1.0 - ads_frac * (1.0 - keep_share)
 }
 
 /// Takes the walk's bob as the gun's, less what the sights take.
 fn take_bob(
-    state: &mut WeaponPlacementState,
-    ps: WeaponPlacementPsInputs,
-    bob_inputs: WeaponBobInputs,
-    waveform: WeaponBobState,
+    place: &mut GunPoseState,
+    view_ps: GunPosePlayerFeed,
+    bob_cfg: GunStrideSwayFeed,
+    walk_wave: GunStrideSwayState,
 ) {
-    state.bob = waveform;
-    if ps.weapon_pos_frac > 0.0 {
-        let scale = weapon_bob_ads_attenuation(ps.weapon_pos_frac, bob_inputs.ads_bob_factor);
-        state.bob.pitch *= scale;
-        state.bob.yaw *= scale;
-        state.bob.roll *= scale;
+    place.bob = walk_wave;
+    if view_ps.gun_raise_share > 0.0 {
+        let factor_k = swing_damp_aimed(view_ps.gun_raise_share, bob_cfg.ads_bob_factor);
+        place.bob.pitch *= factor_k;
+        place.bob.yaw *= factor_k;
+        place.bob.roll *= factor_k;
     }
 }
 
 /// How wide the bob swings along `axis` (0 side, 1 up) at bob `speed`.
 fn bob_amplitude(
-    view_height_target: i32,
-    pm_flags: u32,
-    weapon_pos_frac: f32,
-    speed: f32,
-    axis: usize,
-    bo2_gun: Option<Bo2GunBob>,
+    height_target: i32,
+    move_flags: u32,
+    ads_frac: f32,
+    bob_speed: f32,
+    dim: usize,
+    gun_bob: Option<Bo2GunBob>,
 ) -> f32 {
-    let hip = 1.0 - weapon_pos_frac;
-    let dive_gun = bo2_gun.filter(|_| pm_flags & PMF_DIVE_ANY != 0);
-    let scale = if let Some(gun) = dive_gun {
-        BOB_AMP_DTP[axis] * gun.dtp[axis]
-    } else if view_height_target == VIEWHEIGHT_TARGET_PRONE {
-        BOB_AMP_PRONE[axis]
-    } else if view_height_target == VIEWHEIGHT_TARGET_CROUCH {
-        hip * BOB_AMP_DUCKED[axis]
-    } else if pm_flags & self::pm_flags::SPRINTING == 0 {
-        hip * BOB_AMP_STANDING[axis]
+    let hip_share = 1.0 - ads_frac;
+    let dive_bob = gun_bob.filter(|_| move_flags & PMF_DIVE_ANY != 0);
+    let factor_k = if let Some(per_gun) = dive_bob {
+        BOB_AMP_DTP[dim] * per_gun.dtp[dim]
+    } else if height_target == EYE_LEVEL_LYING {
+        GUN_SWINGS.prone[dim]
+    } else if height_target == EYE_LEVEL_CROUCHED {
+        hip_share * GUN_SWINGS.ducked[dim]
+    } else if move_flags & self::movement_state_bits::SPRINTING == 0 {
+        hip_share * GUN_SWINGS.standing[dim]
     } else {
-        BOB_AMP_SPRINTING[axis] * bo2_gun.map_or(1.0, |gun| gun.sprint[axis])
+        GUN_SWINGS.sprinting[dim] * gun_bob.map_or(1.0, |per_gun| per_gun.sprint[dim])
     };
-    let amp = speed * scale;
-    if amp > WEAPON_BOB_MAX {
-        WEAPON_BOB_MAX
+    let swing = bob_speed * factor_k;
+    if swing > SWING_CAP {
+        SWING_CAP
     } else {
-        amp
+        swing
     }
 }
 
 /// The up bob's shape at `cycle`, before its amplitude.
-fn bob_up_shape(cycle: f32) -> f32 {
-    (libm::sinf(cycle * 4.0 + FRAC_PI_2) * 0.2 + libm::sinf(cycle + cycle)) * 0.75
+fn bob_up_shape(phase: f32) -> f32 {
+    (libm::sinf(phase * 4.0 + FRAC_PI_2) * 0.2 + libm::sinf(phase + phase)) * 0.75
 }
 
 /// The gun's bob turn for a step counter and speed.
-pub fn calculate_weapon_movement_bob_waveform(inputs: WeaponBobWaveformInputs) -> WeaponBobState {
-    let half_turns = (f32::from(inputs.bob_cycle) / 255.0) * PI;
-    let cycle = TAU + half_turns + half_turns + TAU + WEAPON_BOB_LAG * PI;
-    let speed = WEAPON_BOB_AMPLITUDE_BASE * inputs.xyspeed;
-    let amplitude = |speed: f32, axis: usize| {
+pub fn calculate_weapon_movement_bob_waveform(wf: GunStrideWaveFeed) -> GunStrideSwayState {
+    let half_cycle = (f32::from(wf.sway_phase) / 255.0) * PI;
+    let phase = TAU + half_cycle + half_cycle + TAU + SWING_DELAY * PI;
+    let walk_speed = SWING_AMP_BASE * wf.ground_velocity;
+    let swing_for = |walk_speed: f32, axis: usize| {
         bob_amplitude(
-            inputs.view_height_target,
-            inputs.pm_flags,
-            inputs.weapon_pos_frac,
-            speed,
+            wf.eye_height_goal,
+            wf.movement_state_bits,
+            wf.gun_raise_share,
+            walk_speed,
             axis,
-            inputs.bo2_gun,
+            wf.bo2_gun,
         )
     };
 
-    let (pitch, yaw, mut roll);
+    let (bob_pitch, bob_yaw, mut bob_roll);
     // bo2mp: a BO2 swimmer's gun bobs by the raw swimming amount, whatever the speed.
-    if inputs.bo2_gun.is_some() && inputs.waterlevel >= crate::view_bob::SWIM_WATER_LEVEL {
-        let [side, up] = BOB_AMP_SWIMMING.map(|a| a.min(WEAPON_BOB_MAX));
-        pitch = -bob_up_shape(cycle) * up;
-        yaw = -libm::sinf(cycle) * side;
-        roll = libm::sinf(cycle - WEAPON_BOB_UP_PHASE) * side;
+    if wf.bo2_gun.is_some() && wf.waterlevel >= crate::view_bob::SWIM_WATER_LEVEL {
+        let [side_amp, up_amp] = BOB_AMP_SWIMMING.map(|a| a.min(SWING_CAP));
+        bob_pitch = -bob_up_shape(phase) * up_amp;
+        bob_yaw = -libm::sinf(phase) * side_amp;
+        bob_roll = libm::sinf(phase - SWING_RISE_PHASE) * side_amp;
     } else {
-        pitch = -(bob_up_shape(cycle) * amplitude(speed, 1));
-        yaw = -(libm::sinf(cycle) * amplitude(speed, 0));
-        roll = libm::sinf(cycle - WEAPON_BOB_UP_PHASE)
-            * amplitude(WEAPON_BOB_AMPLITUDE_ROLL * speed, 0);
+        bob_pitch = -(bob_up_shape(phase) * swing_for(walk_speed, 1));
+        bob_yaw = -(libm::sinf(phase) * swing_for(walk_speed, 0));
+        bob_roll = libm::sinf(phase - SWING_RISE_PHASE)
+            * swing_for(SWING_AMP_ROLL * walk_speed, 0);
     }
     // The gun only ever rolls one way: a roll the other way is none.
-    if !(roll <= 0.0) {
-        roll = 0.0;
+    if !(bob_roll <= 0.0) {
+        bob_roll = 0.0;
     }
-    WeaponBobState { pitch, yaw, roll }
+    GunStrideSwayState {
+        pitch: bob_pitch,
+        yaw: bob_yaw,
+        roll: bob_roll,
+    }
 }
 
 /// Adds the bob to `angles`; a full-screen scope takes away what the sights have taken.
-fn add_bob_to_angles(
-    angles: &mut [f32; 3],
-    bob: WeaponBobState,
-    weapon_pos_frac: f32,
-    overlay_reticle: i32,
-) {
-    let scale = if overlay_reticle != 0 {
-        1.0 - weapon_pos_frac
-    } else {
-        1.0
-    };
-    angles[0] += bob.pitch * scale;
-    angles[1] += bob.yaw * scale;
-    angles[2] += bob.roll * scale;
+fn add_bob_to_angles(turn: &mut [f32; 3], walk: GunStrideSwayState, ads_frac: f32, scope_flag: i32) {
+    let factor_k = if scope_flag != 0 { 1.0 - ads_frac } else { 1.0 };
+    turn[0] += walk.pitch * factor_k;
+    turn[1] += walk.yaw * factor_k;
+    turn[2] += walk.roll * factor_k;
 }
 
 /// Turns `origin` by the bob: onto the bob's forward, left and up.
-pub fn weapon_bob_rotate_origin(origin: &mut [f32; 3], bob: WeaponBobState) {
-    let (forward, right, up) = angle_vectors([bob.pitch, bob.yaw, bob.roll]);
-    let axes = [forward, right.map(|x| -x), up];
-    let src = *origin;
-    for (j, out) in origin.iter_mut().enumerate() {
-        *out = src[0] * axes[0][j] + src[1] * axes[1][j] + src[2] * axes[2][j];
+pub fn weapon_bob_rotate_origin(pos: &mut [f32; 3], walk: GunStrideSwayState) {
+    let (fwd, rgt, upv) = euler_basis([walk.pitch, walk.yaw, walk.roll]);
+    let basis = [fwd, rgt.map(|x| -x), upv];
+    let before = *pos;
+    for (row, slot) in pos.iter_mut().enumerate() {
+        *slot = before[0] * basis[0][row] + before[1] * basis[1][row] + before[2] * basis[2][row];
     }
 }
 
 /// How much of the movement offsets the sights leave: none from half way up.
-fn movement_scale(weapon_pos_frac: f32) -> f32 {
-    let left = 1.0 - weapon_pos_frac - weapon_pos_frac;
-    if left > 0.0 { left } else { 0.0 }
+fn movement_scale(ads_frac: f32) -> f32 {
+    let remaining = 1.0 - ads_frac - ads_frac;
+    if remaining > 0.0 { remaining } else { 0.0 }
 }
 
 /// bo2mp: BO2's gun lean, the lean fraction curve, or None when the player is not leaning or is
 /// fully down the sights. TODO(fact): the roll may take the raw lean fraction, not the curve.
-fn viewmodel_lean(ps: WeaponPlacementPsInputs) -> Option<f32> {
-    if ps.lean_fraction == 0.0 || ps.weapon_pos_frac == 1.0 {
+fn viewmodel_lean(view_ps: GunPosePlayerFeed) -> Option<f32> {
+    if view_ps.peek_amount == 0.0 || view_ps.gun_raise_share == 1.0 {
         return None;
     }
-    Some(get_lean_fraction(ps.lean_fraction))
+    Some(lean_amount(view_ps.peek_amount))
 }
 
 /// The gun's angles up to BO2's lean step (movement, sway, lean roll): the lean origin follows
 /// their right vector. TODO(fact): which step's angles BO2 takes the right vector of.
-fn angles_to_lean(state: &WeaponPlacementState, ps: WeaponPlacementPsInputs) -> [f32; 3] {
-    let scale = movement_scale(ps.weapon_pos_frac);
-    let sway = sway_contribution(state.sway_springs);
-    let mut angles = [0.0; 3];
-    if scale > 0.0 {
-        add_scaled(&mut angles, state.movement_angles, scale);
+fn angles_to_lean(place: &GunPoseState, view_ps: GunPosePlayerFeed) -> [f32; 3] {
+    let factor_k = movement_scale(view_ps.gun_raise_share);
+    let sway_now = drift_offset(place.sway_springs);
+    let mut turn = [0.0; 3];
+    if factor_k > 0.0 {
+        add_scaled(&mut turn, place.motion_tilt, factor_k);
     }
-    angles[0] += sway.angles[0];
-    angles[1] += sway.angles[1];
-    if let Some(lean) = viewmodel_lean(ps) {
-        angles[2] -= VIEWMODEL_LEAN_ROLL * lean;
+    turn[0] += sway_now.angles[0];
+    turn[1] += sway_now.angles[1];
+    if let Some(lean_k) = viewmodel_lean(view_ps) {
+        turn[2] -= VIEWMODEL_LEAN_ROLL * lean_k;
     }
-    angles
+    turn
 }
 
 /// Where the gun is moved to: the movement offset, the sway's slide, the lean's push, all
 /// turned by the bob.
 fn weapon_placement_apply_origin(
-    state: &WeaponPlacementState,
-    ps: WeaponPlacementPsInputs,
+    place: &GunPoseState,
+    view_ps: GunPosePlayerFeed,
 ) -> [f32; 3] {
-    let mut out = [0.0_f32; 3];
-    let scale = movement_scale(ps.weapon_pos_frac);
-    if scale > 0.0 {
-        add_scaled(&mut out, state.movement_origin, scale);
+    let mut pos = [0.0_f32; 3];
+    let factor_k = movement_scale(view_ps.gun_raise_share);
+    if factor_k > 0.0 {
+        add_scaled(&mut pos, place.motion_shift, factor_k);
     }
-    let sway = sway_contribution(state.sway_springs);
-    out[1] -= sway.origin[1];
-    out[2] += sway.origin[2];
-    if let Some(lean) = viewmodel_lean(ps) {
-        let (_, right, _) = angle_vectors(angles_to_lean(state, ps));
+    let sway_now = drift_offset(place.sway_springs);
+    pos[1] -= sway_now.at_pos[1];
+    pos[2] += sway_now.at_pos[2];
+    if let Some(lean_k) = viewmodel_lean(view_ps) {
+        let (_, rgt, _) = euler_basis(angles_to_lean(place, view_ps));
         add_scaled(
-            &mut out,
-            right,
-            (1.0 - ps.weapon_pos_frac) * lean * VIEWMODEL_LEAN_DIST,
+            &mut pos,
+            rgt,
+            (1.0 - view_ps.gun_raise_share) * lean_k * VIEWMODEL_LEAN_DIST,
         );
     }
-    weapon_bob_rotate_origin(&mut out, state.bob);
-    out
+    weapon_bob_rotate_origin(&mut pos, place.bob);
+    pos
 }
 
 /// The gun's idle drift (amount, speed) for the sights' progress.
 pub(crate) fn weapon_idle_amount_speed(
-    ps: WeaponPlacementPsInputs,
-    idle: WeaponIdleInputs,
+    view_ps: GunPosePlayerFeed,
+    idle_cfg: GunRestDriftFeed,
 ) -> (f32, f32) {
-    if ps.aim_down_sight {
-        let amount = (idle.ads_idle_amount - idle.hip_idle_amount) * ps.weapon_pos_frac
-            + idle.hip_idle_amount;
-        let speed =
-            (idle.ads_idle_speed - idle.hip_idle_speed) * ps.weapon_pos_frac + idle.hip_idle_speed;
-        return (amount, speed);
+    if view_ps.scoped_aiming {
+        let drift_amount = (idle_cfg.ads_idle_amount - idle_cfg.hip_idle_amount)
+            * view_ps.gun_raise_share
+            + idle_cfg.hip_idle_amount;
+        let drift_speed = (idle_cfg.ads_idle_speed - idle_cfg.hip_idle_speed)
+            * view_ps.gun_raise_share
+            + idle_cfg.hip_idle_speed;
+        return (drift_amount, drift_speed);
     }
-    if idle.hip_idle_amount != 0.0 {
-        return (idle.hip_idle_amount, idle.hip_idle_speed);
+    if idle_cfg.hip_idle_amount != 0.0 {
+        return (idle_cfg.hip_idle_amount, idle_cfg.hip_idle_speed);
     }
     (IDLE_AMOUNT_DEFAULT, 1.0)
 }
 
 /// How far the idle clock moves in a frame, ms.
-pub(crate) fn idle_clock_step(speed: f32, frametime: f32) -> i32 {
-    libm::roundf(speed * WEAPON_IDLE_TIME_MS_SCALE * frametime) as i32
+pub(crate) fn idle_clock_step(idle_speed: f32, frame_secs: f32) -> i32 {
+    libm::roundf(idle_speed * WEAPON_IDLE_TIME_MS_SCALE * frame_secs) as i32
 }
 
 /// `last` moved toward the share of the drift this stance keeps, by half a frame's time
 /// at most.
 pub(crate) fn step_idle_factor(
-    last: f32,
-    e_flags: u32,
-    idle: WeaponIdleInputs,
-    frametime: f32,
+    prev: f32,
+    ent_flags: u32,
+    idle_cfg: GunRestDriftFeed,
+    frame_secs: f32,
 ) -> f32 {
-    let target = if e_flags & eflags::PRONE != 0 {
-        idle.idle_prone_factor
-    } else if e_flags & eflags::DUCK != 0 {
-        idle.idle_crouch_factor
+    let goal = if ent_flags & ent_bit::LYING_FLAT != 0 {
+        idle_cfg.idle_prone_factor
+    } else if ent_flags & ent_bit::CROUCH_BIT != 0 {
+        idle_cfg.idle_crouch_factor
     } else {
         1.0
     };
-    if last == target {
-        return last;
+    if prev == goal {
+        return prev;
     }
-    let step = frametime * WEAPON_IDLE_FACTOR_LERP;
-    if target <= last {
-        let next = last - step;
-        if next < target { target } else { next }
+    let max_move = frame_secs * WEAPON_IDLE_FACTOR_LERP;
+    if goal <= prev {
+        let moved = prev - max_move;
+        if moved < goal { goal } else { moved }
     } else {
-        let next = last + step;
-        if next > target { target } else { next }
+        let moved = prev + max_move;
+        if moved > goal { goal } else { moved }
     }
 }
 
 /// Runs the idle clock on and adds the drift to `angles`.
 fn add_idle_sway(
-    state: &mut WeaponPlacementState,
-    ps: WeaponPlacementPsInputs,
-    idle: WeaponIdleInputs,
-    frametime: f32,
-    angles: &mut [f32; 3],
+    place: &mut GunPoseState,
+    view_ps: GunPosePlayerFeed,
+    idle_cfg: GunRestDriftFeed,
+    frame_secs: f32,
+    turn: &mut [f32; 3],
 ) {
-    let (amount, speed) = weapon_idle_amount_speed(ps, idle);
-    state.weap_idle_time = state
-        .weap_idle_time
-        .wrapping_add(idle_clock_step(speed, frametime));
-    state.last_idle_factor = step_idle_factor(state.last_idle_factor, ps.e_flags, idle, frametime);
+    let (drift_amount, drift_speed) = weapon_idle_amount_speed(view_ps, idle_cfg);
+    place.gun_idle_clock = place
+        .gun_idle_clock
+        .wrapping_add(idle_clock_step(drift_speed, frame_secs));
+    place.previous_idle_ratio = step_idle_factor(
+        place.previous_idle_ratio,
+        view_ps.ent_bits,
+        idle_cfg,
+        frame_secs,
+    );
 
-    let mut scaled = state.last_idle_factor * amount;
-    if ps.overlay_reticle != 0 {
-        scaled *= 1.0 - ps.weapon_pos_frac;
+    let mut strength = place.previous_idle_ratio * drift_amount;
+    if view_ps.hud_crosshair_layer != 0 {
+        strength *= 1.0 - view_ps.gun_raise_share;
     }
-    let t = state.weap_idle_time as f32;
-    let s = scaled * WEAPON_IDLE_SIN_SCALE;
-    let drift = [
-        libm::sinf(t * WEAPON_IDLE_PITCH_FREQ) * s,
-        libm::sinf(t * WEAPON_IDLE_YAW_FREQ) * s,
-        libm::sinf(t * IDLE_ROLL_FREQ) * s,
+    let clock = place.gun_idle_clock as f32;
+    let sin_gain = strength * GUN_REST_WAVE_FACTOR;
+    let idle_turn = [
+        libm::sinf(clock * REST_PITCH_HZ) * sin_gain,
+        libm::sinf(clock * REST_YAW_HZ) * sin_gain,
+        libm::sinf(clock * IDLE_ROLL_FREQ) * sin_gain,
     ];
-    state.idle_sway_angles = drift;
-    for (a, d) in angles.iter_mut().zip(drift) {
-        *a += d;
+    place.rest_drift_tilt = idle_turn;
+    for (slot, add) in turn.iter_mut().zip(idle_turn) {
+        *slot += add;
     }
 }
 
-/// The turn a hit's flinch gives the gun `time - damage_time` ms after the hit.
+/// The turn a hit's flinch gives the gun `time - hurt_stamp_ms` ms after the hit.
 pub fn weapon_damage_kick_angles(
-    time: i32,
-    damage_time: i32,
-    v_dmg_pitch: f32,
-    v_dmg_roll: f32,
-    weapon_pos_frac: f32,
-    overlay_reticle: i32,
+    now: i32,
+    hit_time: i32,
+    dmg_pitch: f32,
+    dmg_roll: f32,
+    ads_frac: f32,
+    scope_flag: i32,
 ) -> [f32; 3] {
-    if damage_time == 0 {
+    if hit_time == 0 {
         return [0.0; 3];
     }
-    let mut factor = GUN_DAMAGE_ADS_HALF + weapon_pos_frac * GUN_DAMAGE_ADS_HALF;
-    let deflect = GUN_DAMAGE_DEFLECT_MS * factor;
-    let ret = GUN_DAMAGE_RETURN_MS * factor;
-    if weapon_pos_frac != 0.0 && overlay_reticle != 0 {
-        factor *= 1.0 - weapon_pos_frac * GUN_DAMAGE_OVERLAY_MIX;
+    let mut stretch = GUN_DAMAGE_ADS_HALF + ads_frac * GUN_DAMAGE_ADS_HALF;
+    let out_ms = GUN_DAMAGE_DEFLECT_MS * stretch;
+    let back_ms = GUN_DAMAGE_RETURN_MS * stretch;
+    if ads_frac != 0.0 && scope_flag != 0 {
+        stretch *= 1.0 - ads_frac * GUN_DAMAGE_OVERLAY_MIX;
     }
-    let delta = time.wrapping_sub(damage_time) as f32;
-    let scale = if deflect <= delta {
-        let left = 1.0 - (delta - deflect) / ret;
-        if left <= 0.0 {
+    let since = now.wrapping_sub(hit_time) as f32;
+    let factor_k = if out_ms <= since {
+        let back_left = 1.0 - (since - out_ms) / back_ms;
+        if back_left <= 0.0 {
             return [0.0; 3];
         }
-        (1.0 - get_lean_fraction(1.0 - left)) * factor
+        (1.0 - lean_amount(1.0 - back_left)) * stretch
     } else {
-        get_lean_fraction(delta / deflect) * factor
+        lean_amount(since / out_ms) * stretch
     };
     [
-        scale * v_dmg_pitch * GUN_DAMAGE_ADS_HALF,
-        -(v_dmg_roll * scale),
-        scale * v_dmg_roll * GUN_DAMAGE_ADS_HALF,
+        factor_k * dmg_pitch * GUN_DAMAGE_ADS_HALF,
+        -(dmg_roll * factor_k),
+        factor_k * dmg_roll * GUN_DAMAGE_ADS_HALF,
     ]
 }
 
 /// The gun's turn: movement, sway, lean, the unfaded angles, bob and kick.
 fn weapon_placement_apply_angles(
-    state: &WeaponPlacementState,
-    ps: WeaponPlacementPsInputs,
+    place: &GunPoseState,
+    view_ps: GunPosePlayerFeed,
 ) -> [f32; 3] {
-    let mut out = angles_to_lean(state, ps);
-    for (o, u) in out.iter_mut().zip(state.unfaded_angles) {
-        *o += u;
+    let mut turn = angles_to_lean(place, view_ps);
+    for (slot, extra) in turn.iter_mut().zip(place.unfaded_angles) {
+        *slot += extra;
     }
-    add_bob_to_angles(&mut out, state.bob, ps.weapon_pos_frac, ps.overlay_reticle);
-    out[0] += state.gun_recoil.pitch_offset;
-    out[1] += state.gun_recoil.yaw_offset;
-    out
+    add_bob_to_angles(
+        &mut turn,
+        place.bob,
+        view_ps.gun_raise_share,
+        view_ps.hud_crosshair_layer,
+    );
+    turn[0] += place.gun_recoil.nod_offset;
+    turn[1] += place.gun_recoil.yaw_shift;
+    turn
 }
 
 /// Adds what moving does to the gun: the stance's move and turn, scaled by how far over the
 /// slowest counted speed the player is, and the strafe's by how much of the speed is sideways.
 fn add_movement_targets(
-    ps: WeaponPlacementPsInputs,
-    kinematics: WeaponMovementKinematics,
-    movement: WeaponMovementOfsInputs,
-    min_speed: f32,
-    origin: &mut [f32; 3],
-    angles: &mut [f32; 3],
+    view_ps: GunPosePlayerFeed,
+    motion: GunMotionPhysics,
+    move_ofs: GunMotionShiftFeed,
+    floor_speed: f32,
+    pos: &mut [f32; 3],
+    turn_out: &mut [f32; 3],
 ) {
-    let (shift, turn) = if ps.e_flags & eflags::PRONE != 0 {
-        (movement.prone_move, movement.prone_rot)
-    } else if ps.e_flags & eflags::DUCK != 0 {
-        (movement.ducked_move, movement.ducked_rot)
+    let (shift_v, turn_v) = if view_ps.ent_bits & ent_bit::LYING_FLAT != 0 {
+        (move_ofs.prone_move, move_ofs.prone_rot)
+    } else if view_ps.ent_bits & ent_bit::CROUCH_BIT != 0 {
+        (move_ofs.ducked_move, move_ofs.ducked_rot)
     } else {
-        (movement.stand_move, movement.stand_rot)
+        (move_ofs.stand_move, move_ofs.stand_rot)
     };
-    let mut speed_frac = (kinematics.xyspeed - min_speed) / (kinematics.speed - min_speed);
-    if speed_frac >= 1.0 {
-        speed_frac = 1.0;
+    let mut over_frac = (motion.ground_velocity - floor_speed) / (motion.speed - floor_speed);
+    if over_frac >= 1.0 {
+        over_frac = 1.0;
     }
-    let hip = 1.0 - ps.weapon_pos_frac;
-    add_scaled(origin, shift, speed_frac);
-    add_scaled(angles, turn, speed_frac * hip);
+    let hip_share = 1.0 - view_ps.gun_raise_share;
+    add_scaled(pos, shift_v, over_frac);
+    add_scaled(turn_out, turn_v, over_frac * hip_share);
 
-    let (forward, _, _) = angle_vectors(kinematics.viewangles);
-    let along = (forward[0] * kinematics.velocity[0] + kinematics.velocity[1] * forward[1])
-        * speed_frac
-        / kinematics.xyspeed;
-    add_scaled(origin, movement.strafe_move, along);
-    add_scaled(angles, movement.strafe_rot, along * hip);
+    let (fwd, _, _) = euler_basis(motion.look_angles);
+    let side_part =
+        (fwd[0] * motion.velocity[0] + motion.velocity[1] * fwd[1]) * over_frac / motion.ground_velocity;
+    add_scaled(pos, move_ofs.strafe_move, side_part);
+    add_scaled(turn_out, move_ofs.strafe_rot, side_part * hip_share);
 }
 
 /// A weapon state that is a reload.
@@ -665,175 +679,177 @@ fn is_reload_state(ws: i32) -> bool {
 
 /// Works out where the stance and the movement want the gun, and eases toward it.
 fn base_stance_movement_angles(
-    state: &mut WeaponPlacementState,
-    ps: WeaponPlacementPsInputs,
-    stance: WeaponStanceStaticOfsInputs,
-    fade_globals: StanceTransitionFadeGlobals,
-    movement: WeaponMovementOfsInputs,
-    kinematics: WeaponMovementKinematics,
+    place: &mut GunPoseState,
+    view_ps: GunPosePlayerFeed,
+    rest_ofs: GunPostureRestShiftFeed,
+    fade_cfg: PostureShiftBlendTuning,
+    move_ofs: GunMotionShiftFeed,
+    motion: GunMotionPhysics,
 ) {
-    let duck = ps.e_flags & eflags::DUCK != 0;
-    let prone = ps.e_flags & eflags::PRONE != 0;
-    let min_speed = if prone {
-        movement.prone_move_min_speed
-    } else if duck {
-        movement.ducked_move_min_speed
+    let crouched = view_ps.ent_bits & ent_bit::CROUCH_BIT != 0;
+    let lying = view_ps.ent_bits & ent_bit::LYING_FLAT != 0;
+    let floor_speed = if lying {
+        move_ofs.prone_move_min_speed
+    } else if crouched {
+        move_ofs.ducked_move_min_speed
     } else {
-        movement.stand_move_min_speed
+        move_ofs.stand_move_min_speed
     };
-    let moving = kinematics.xyspeed > min_speed && kinematics.speed > min_speed;
-    let reloading = is_reload_state(kinematics.weaponstate)
-        || is_reload_state(kinematics.weaponstate_secondary);
-    let night_vision = matches!(
-        kinematics.weaponstate,
+    let in_motion = motion.ground_velocity > floor_speed && motion.speed > floor_speed;
+    let mid_reload =
+        is_reload_state(motion.gun_phase) || is_reload_state(motion.gun_phase_alt);
+    let nv_busy = matches!(
+        motion.gun_phase,
         crate::state::NIGHTVISION_WEAR | crate::state::NIGHTVISION_REMOVE
     );
-    let on_ladder = kinematics.pm_flags & pm_flags::LADDER != 0;
+    let laddering = motion.movement_state_bits & movement_state_bits::LADDER != 0;
 
-    let mut origin_target = [0.0_f32; 3];
-    let mut angles_target = [0.0_f32; 3];
+    let mut pos_goal = [0.0_f32; 3];
+    let mut turn_goal = [0.0_f32; 3];
 
-    if (duck || prone) && (!moving || !night_vision || !prone) {
-        let mut pitch = 0.0_f32;
-        add_stance_offset(ps, stance, fade_globals, &mut pitch, &mut origin_target);
-        angles_target[0] += pitch;
+    if (crouched || lying) && (!in_motion || !nv_busy || !lying) {
+        let mut tip = 0.0_f32;
+        add_stance_offset(view_ps, rest_ofs, fade_cfg, &mut tip, &mut pos_goal);
+        turn_goal[0] += tip;
     }
-    if moving && !on_ladder && !reloading && !night_vision {
+    if in_motion && !laddering && !mid_reload && !nv_busy {
         add_movement_targets(
-            ps,
-            kinematics,
-            movement,
-            min_speed,
-            &mut origin_target,
-            &mut angles_target,
+            view_ps,
+            motion,
+            move_ofs,
+            floor_speed,
+            &mut pos_goal,
+            &mut turn_goal,
         );
     }
-    if kinematics.bo2_mantle {
+    if motion.bo2_mantle {
         for i in 0..3 {
-            origin_target[i] += movement.mantle_ofs[i];
-            angles_target[i] += movement.mantle_rot[i];
+            pos_goal[i] += move_ofs.mantle_ofs[i];
+            turn_goal[i] += move_ofs.mantle_rot[i];
         }
     }
 
-    let (move_rate, turn_rate) = if prone {
-        (movement.pos_prone_move_rate, movement.pos_prone_rot_rate)
+    let (slide_rate, spin_rate) = if lying {
+        (move_ofs.pos_prone_move_rate, move_ofs.pos_prone_rot_rate)
     } else {
-        (movement.pos_move_rate, movement.pos_rot_rate)
+        (move_ofs.pos_move_rate, move_ofs.pos_rot_rate)
     };
-    let share = |rate: f32| {
-        let t = rate * kinematics.frametime;
-        if t > 1.0 { 1.0 } else { t }
+    let ease_share = |rate: f32| {
+        let step_k = rate * motion.step_millis_elapsed;
+        if step_k > 1.0 { 1.0 } else { step_k }
     };
-    state.movement_origin = lerp3(state.movement_origin, origin_target, share(move_rate));
-    state.movement_angles = lerp3(state.movement_angles, angles_target, share(turn_rate));
+    place.motion_shift = blend_triple(place.motion_shift, pos_goal, ease_share(slide_rate));
+    place.motion_tilt = blend_triple(place.motion_tilt, turn_goal, ease_share(spin_rate));
 }
 
 /// One frame of the gun's placement: eases the stance and movement offsets, steps the kick,
 /// takes the bob, then sums the turn and the move.
 #[allow(clippy::too_many_arguments)]
-pub fn weapon_placement_assemble(
-    state: &mut WeaponPlacementState,
-    ps: WeaponPlacementPsInputs,
-    stance: WeaponStanceStaticOfsInputs,
-    fade_globals: StanceTransitionFadeGlobals,
-    movement: WeaponMovementOfsInputs,
-    kinematics: WeaponMovementKinematics,
-    bob_inputs: WeaponBobInputs,
-    idle: WeaponIdleInputs,
-    bob_waveform: Option<WeaponBobState>,
-    gun_spring_hip: GunKickSpring,
-    gun_spring_ads: GunKickSpring,
-    gun_max_pitch: f32,
-    gun_max_yaw: f32,
-    dt_secs: f32,
-    steps_out: &mut [WeaponPlacementAssembleStep; PLACEMENT_ASSEMBLE_STEP_COUNT],
-) -> WeaponPlacementContribution {
-    use WeaponPlacementAssembleStep as Step;
-    *steps_out = [
-        Step::BaseStanceMovementAngles,
-        Step::Sway,
-        Step::GunRecoil,
-        Step::Bob,
-        Step::ApplyAngles,
-        Step::ApplyOrigin,
+pub fn compose_gun_pose(
+    place: &mut GunPoseState,
+    view_ps: GunPosePlayerFeed,
+    rest_ofs: GunPostureRestShiftFeed,
+    fade_cfg: PostureShiftBlendTuning,
+    move_ofs: GunMotionShiftFeed,
+    motion: GunMotionPhysics,
+    bob_cfg: GunStrideSwayFeed,
+    idle_cfg: GunRestDriftFeed,
+    walk_bob: Option<GunStrideSwayState>,
+    hip_spring: ViewmodelKickReturn,
+    ads_spring: ViewmodelKickReturn,
+    pitch_cap: f32,
+    yaw_cap: f32,
+    step_secs: f32,
+    order_out: &mut [GunPoseBuildStage; POSE_BUILD_STAGE_TOTAL],
+) -> GunPoseShare {
+    *order_out = [
+        GunPoseBuildStage::PostureMotionTiltBase,
+        GunPoseBuildStage::Sway,
+        GunPoseBuildStage::GunRecoil,
+        GunPoseBuildStage::Bob,
+        GunPoseBuildStage::CommitTilt,
+        GunPoseBuildStage::CommitPosition,
     ];
 
-    base_stance_movement_angles(state, ps, stance, fade_globals, movement, kinematics);
-    calculate_weapon_position_gun_recoil(
-        &mut state.gun_recoil,
-        dt_secs,
-        ps.weapon_pos_frac,
-        ps.aim_down_sight,
-        gun_spring_hip,
-        gun_spring_ads,
-        gun_max_pitch,
-        gun_max_yaw,
+    base_stance_movement_angles(place, view_ps, rest_ofs, fade_cfg, move_ofs, motion);
+    gun_kick_offset(
+        &mut place.gun_recoil,
+        step_secs,
+        view_ps.gun_raise_share,
+        view_ps.scoped_aiming,
+        hip_spring,
+        ads_spring,
+        pitch_cap,
+        yaw_cap,
     );
-    if let Some(waveform) = bob_waveform {
-        take_bob(state, ps, bob_inputs, waveform);
+    if let Some(walk_wave) = walk_bob {
+        take_bob(place, view_ps, bob_cfg, walk_wave);
     }
 
-    let mut angles = weapon_placement_apply_angles(state, ps);
-    let idle_ps = WeaponPlacementPsInputs {
-        e_flags: idle_e_flags(ps.e_flags, kinematics.pm_flags),
-        ..ps
+    let mut turn = weapon_placement_apply_angles(place, view_ps);
+    let idle_view = GunPosePlayerFeed {
+        ent_bits: idle_e_flags(view_ps.ent_bits, motion.movement_state_bits),
+        ..view_ps
     };
-    add_idle_sway(state, idle_ps, idle, kinematics.frametime, &mut angles);
-    let flinch = weapon_damage_kick_angles(
-        state.damage_kick_time,
-        state.damage_time,
-        state.v_dmg_pitch,
-        state.v_dmg_roll,
-        ps.weapon_pos_frac,
-        ps.overlay_reticle,
+    add_idle_sway(place, idle_view, idle_cfg, motion.step_millis_elapsed, &mut turn);
+    let hit_turn = weapon_damage_kick_angles(
+        place.hit_flinch_stamp,
+        place.hurt_stamp_ms,
+        place.hurt_kick_pitch,
+        place.hurt_kick_roll,
+        view_ps.gun_raise_share,
+        view_ps.hud_crosshair_layer,
     );
-    state.damage_kick_angles = flinch;
-    for (a, f) in angles.iter_mut().zip(flinch) {
+    place.hit_flinch_tilt = hit_turn;
+    for (a, f) in turn.iter_mut().zip(hit_turn) {
         *a += f;
     }
 
-    let origin = weapon_placement_apply_origin(state, ps);
-    WeaponPlacementContribution { origin, angles }
+    let pos = weapon_placement_apply_origin(place, view_ps);
+    GunPoseShare {
+        origin: pos,
+        angles: turn,
+    }
 }
 
 /// How far out along the right vector a dual wielded gun sits: the left hand's is further.
 #[must_use]
-pub fn dual_wield_view_model_origin_add(hand: i32, right: [f32; 3], offset: f32) -> [f32; 3] {
-    let reach = offset
-        * if hand == 0 {
+pub fn dual_wield_gun_offset(hand_idx: i32, rgt: [f32; 3], gap: f32) -> [f32; 3] {
+    let hand_reach = gap
+        * if hand_idx == 0 {
             1.0
         } else {
             DUAL_WIELD_LEFT_SCALE
         };
-    right.map(|x| x * reach)
+    rgt.map(|x| x * hand_reach)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn lean_ps(lean_fraction: f32, weapon_pos_frac: f32) -> WeaponPlacementPsInputs {
-        WeaponPlacementPsInputs {
-            lean_fraction,
-            weapon_pos_frac,
+    fn lean_ps(peek_amount: f32, gun_raise_share: f32) -> GunPosePlayerFeed {
+        GunPosePlayerFeed {
+            peek_amount,
+            gun_raise_share,
             ..Default::default()
         }
     }
 
     #[test]
     fn a_stance_change_fades_the_resting_offset_out() {
-        let globals = StanceTransitionFadeGlobals {
-            fade_start_frac: 0.25,
-            fade_end_frac: 0.75,
+        let globals = PostureShiftBlendTuning {
+            blend_begin_share: 0.25,
+            blend_finish_share: 0.75,
         };
         assert_eq!(stance_fade(false, 50, 100, globals), 1.0);
         assert_eq!(stance_fade(true, 50, 0, globals), 1.0);
         assert_eq!(stance_fade(true, 20, 100, globals), 1.0);
         assert_eq!(stance_fade(true, 50, 100, globals), 0.5);
         assert_eq!(stance_fade(true, 80, 100, globals), 0.0);
-        let flat = StanceTransitionFadeGlobals {
-            fade_start_frac: 0.5,
-            fade_end_frac: 0.5,
+        let flat = PostureShiftBlendTuning {
+            blend_begin_share: 0.5,
+            blend_finish_share: 0.5,
         };
         // On the edge the start wins; past it the offset is gone.
         assert_eq!(stance_fade(true, 50, 100, flat), 1.0);
@@ -842,35 +858,35 @@ mod tests {
 
     #[test]
     fn crouching_rests_the_gun_and_the_sights_tip_it() {
-        let stance = WeaponStanceStaticOfsInputs {
+        let rest_ofs = GunPostureRestShiftFeed {
             ducked_ofs: [1.0, 2.0, 3.0],
             prone_ofs: [4.0, 5.0, 6.0],
-            ads_aim_pitch: 8.0,
-            night_vision_wear_time: 0,
+            aimed_pitch: 8.0,
+            goggles_equip_duration: 0,
         };
-        let globals = StanceTransitionFadeGlobals::default();
+        let globals = PostureShiftBlendTuning::default();
         let (mut pitch, mut origin) = (0.0, [0.0; 3]);
-        let ps = WeaponPlacementPsInputs {
-            e_flags: eflags::DUCK | eflags::PRONE,
-            weapon_pos_frac: 0.5,
-            aim_down_sight: true,
+        let view_ps = GunPosePlayerFeed {
+            ent_bits: ent_bit::CROUCH_BIT | ent_bit::LYING_FLAT,
+            gun_raise_share: 0.5,
+            scoped_aiming: true,
             ..Default::default()
         };
-        add_stance_offset(ps, stance, globals, &mut pitch, &mut origin);
+        add_stance_offset(view_ps, rest_ofs, globals, &mut pitch, &mut origin);
         assert_eq!((origin, pitch), ([1.0, 2.0, 3.0], 4.0));
-        let prone = WeaponPlacementPsInputs {
-            e_flags: eflags::PRONE,
-            ..ps
+        let prone = GunPosePlayerFeed {
+            ent_bits: ent_bit::LYING_FLAT,
+            ..view_ps
         };
         let mut origin = [0.0; 3];
-        add_stance_offset(prone, stance, globals, &mut 0.0, &mut origin);
+        add_stance_offset(prone, rest_ofs, globals, &mut 0.0, &mut origin);
         assert_eq!(origin, [4.0, 5.0, 6.0]);
     }
 
     #[test]
     fn a_bob_with_no_turn_leaves_the_origin_alone() {
         let mut origin = [3.0, -2.0, 5.0];
-        weapon_bob_rotate_origin(&mut origin, WeaponBobState::default());
+        weapon_bob_rotate_origin(&mut origin, GunStrideSwayState::default());
         assert_eq!(origin, [3.0, -2.0, 5.0]);
     }
 
@@ -898,83 +914,83 @@ mod tests {
 
     #[test]
     fn the_idle_share_moves_toward_the_stance_without_passing_it() {
-        let idle = WeaponIdleInputs {
+        let idle_cfg = GunRestDriftFeed {
             idle_crouch_factor: 0.5,
             idle_prone_factor: 0.1,
             ..Default::default()
         };
-        assert_eq!(step_idle_factor(1.0, 0, idle, 0.5), 1.0);
-        assert_eq!(step_idle_factor(1.0, eflags::DUCK, idle, 0.5), 0.75);
-        assert_eq!(step_idle_factor(1.0, eflags::DUCK, idle, 4.0), 0.5);
-        assert_eq!(step_idle_factor(0.0, 0, idle, 0.5), 0.25);
-        assert_eq!(step_idle_factor(0.9, eflags::PRONE, idle, 8.0), 0.1);
+        assert_eq!(step_idle_factor(1.0, 0, idle_cfg, 0.5), 1.0);
+        assert_eq!(step_idle_factor(1.0, ent_bit::CROUCH_BIT, idle_cfg, 0.5), 0.75);
+        assert_eq!(step_idle_factor(1.0, ent_bit::CROUCH_BIT, idle_cfg, 4.0), 0.5);
+        assert_eq!(step_idle_factor(0.0, 0, idle_cfg, 0.5), 0.25);
+        assert_eq!(step_idle_factor(0.9, ent_bit::LYING_FLAT, idle_cfg, 8.0), 0.1);
         assert_eq!(idle_clock_step(1.0, 0.05), 50);
     }
 
     #[test]
     fn a_gun_with_no_idle_setting_drifts_by_the_default() {
-        let ps = WeaponPlacementPsInputs::default();
+        let view_ps = GunPosePlayerFeed::default();
         assert_eq!(
-            weapon_idle_amount_speed(ps, WeaponIdleInputs::default()),
+            weapon_idle_amount_speed(view_ps, GunRestDriftFeed::default()),
             (80.0, 1.0)
         );
-        let hip = WeaponIdleInputs {
+        let hip = GunRestDriftFeed {
             hip_idle_amount: 30.0,
             hip_idle_speed: 2.0,
             ..Default::default()
         };
-        assert_eq!(weapon_idle_amount_speed(ps, hip), (30.0, 2.0));
-        let ads = WeaponIdleInputs {
+        assert_eq!(weapon_idle_amount_speed(view_ps, hip), (30.0, 2.0));
+        let ads = GunRestDriftFeed {
             ads_idle_amount: 10.0,
             ads_idle_speed: 4.0,
             ..hip
         };
-        let half = WeaponPlacementPsInputs {
-            aim_down_sight: true,
-            weapon_pos_frac: 0.5,
-            ..ps
+        let half = GunPosePlayerFeed {
+            scoped_aiming: true,
+            gun_raise_share: 0.5,
+            ..view_ps
         };
         assert_eq!(weapon_idle_amount_speed(half, ads), (20.0, 3.0));
     }
 
     #[test]
     fn a_still_player_gets_no_placement() {
-        let mut state = WeaponPlacementState::default();
-        let mut steps = [WeaponPlacementAssembleStep::Bob; PLACEMENT_ASSEMBLE_STEP_COUNT];
-        let out = weapon_placement_assemble(
-            &mut state,
-            WeaponPlacementPsInputs::default(),
-            WeaponStanceStaticOfsInputs::default(),
-            StanceTransitionFadeGlobals::default(),
-            WeaponMovementOfsInputs::default(),
-            WeaponMovementKinematics::default(),
-            WeaponBobInputs::default(),
-            WeaponIdleInputs::default(),
+        let mut place = GunPoseState::default();
+        let mut steps = [GunPoseBuildStage::Bob; POSE_BUILD_STAGE_TOTAL];
+        let out = compose_gun_pose(
+            &mut place,
+            GunPosePlayerFeed::default(),
+            GunPostureRestShiftFeed::default(),
+            PostureShiftBlendTuning::default(),
+            GunMotionShiftFeed::default(),
+            GunMotionPhysics::default(),
+            GunStrideSwayFeed::default(),
+            GunRestDriftFeed::default(),
             None,
-            GunKickSpring::default(),
-            GunKickSpring::default(),
+            ViewmodelKickReturn::default(),
+            ViewmodelKickReturn::default(),
             0.0,
             0.0,
             0.0,
             &mut steps,
         );
-        assert_eq!(out, WeaponPlacementContribution::default());
+        assert_eq!(out, GunPoseShare::default());
         assert_eq!(
             steps[0],
-            WeaponPlacementAssembleStep::BaseStanceMovementAngles
+            GunPoseBuildStage::PostureMotionTiltBase
         );
-        assert_eq!(steps[5], WeaponPlacementAssembleStep::ApplyOrigin);
+        assert_eq!(steps[5], GunPoseBuildStage::CommitPosition);
     }
 
     #[test]
     fn a_dual_wielded_left_gun_sits_twice_as_far_out() {
         let right = [0.0, 1.0, 0.0];
         assert_eq!(
-            dual_wield_view_model_origin_add(0, right, 3.0),
+            dual_wield_gun_offset(0, right, 3.0),
             [0.0, 3.0, 0.0]
         );
         assert_eq!(
-            dual_wield_view_model_origin_add(1, right, 3.0),
+            dual_wield_gun_offset(1, right, 3.0),
             [0.0, 6.0, 0.0]
         );
     }
@@ -982,8 +998,8 @@ mod tests {
     mod bo2_gun_bob {
         use super::*;
 
-        fn side(pm_flags: u32, bo2_gun: Option<Bo2GunBob>) -> f32 {
-            bob_amplitude(60, pm_flags, 0.0, 20.0, 0, bo2_gun)
+        fn side(movement_state_bits: u32, bo2_gun: Option<Bo2GunBob>) -> f32 {
+            bob_amplitude(60, movement_state_bits, 0.0, 20.0, 0, bo2_gun)
         }
 
         #[test]
@@ -993,7 +1009,7 @@ mod tests {
                 sprint: [1.0, 1.0],
                 dtp: [1.0, 1.0],
             });
-            let sprint = pm_flags::SPRINTING;
+            let sprint = movement_state_bits::SPRINTING;
             assert_eq!(side(sprint, rifle), 0.0);
             assert!((side(sprint, pistol) - 0.02 * 20.0).abs() < 1e-6);
             assert!((side(sprint, None) - 0.02 * 20.0).abs() < 1e-6);
@@ -1013,7 +1029,7 @@ mod tests {
 
         #[test]
         fn a_prone_gun_bobs_the_prone_amount_and_a_fast_one_stops_at_the_cap() {
-            let prone = bob_amplitude(VIEWHEIGHT_TARGET_PRONE, 0, 0.0, 10.0, 1, None);
+            let prone = bob_amplitude(EYE_LEVEL_LYING, 0, 0.0, 10.0, 1, None);
             assert!((prone - 0.005 * 10.0).abs() < 1e-6);
             assert_eq!(bob_amplitude(0, 0, 0.0, 1000.0, 0, None), 8.0);
         }
@@ -1024,40 +1040,40 @@ mod tests {
 
         #[test]
         fn a_lean_moves_and_rolls_the_gun_and_fades_with_ads() {
-            let state = WeaponPlacementState::default();
+            let place = GunPoseState::default();
             // Full right lean at hip: curve 1.0, 1.6 to the right (minus y), roll down 2.
             let hip = lean_ps(1.0, 0.0);
-            let origin = weapon_placement_apply_origin(&state, hip);
-            let angles = weapon_placement_apply_angles(&state, hip);
+            let origin = weapon_placement_apply_origin(&place, hip);
+            let angles = weapon_placement_apply_angles(&place, hip);
             assert!((angles[2] + 2.0).abs() < 1e-5);
-            let reach =
+            let hand_reach =
                 (origin[0] * origin[0] + origin[1] * origin[1] + origin[2] * origin[2]).sqrt();
-            assert!((reach - 1.6).abs() < 1e-4);
+            assert!((hand_reach - 1.6).abs() < 1e-4);
             assert!(origin[1] < -1.5);
             // Half way down the sights the push halves; the roll does not.
-            let half = weapon_placement_apply_origin(&state, lean_ps(1.0, 0.5));
+            let half = weapon_placement_apply_origin(&place, lean_ps(1.0, 0.5));
             assert!((half[1] - origin[1] * 0.5).abs() < 1e-5);
             assert!(
-                (weapon_placement_apply_angles(&state, lean_ps(1.0, 0.5))[2] + 2.0).abs() < 1e-5
+                (weapon_placement_apply_angles(&place, lean_ps(1.0, 0.5))[2] + 2.0).abs() < 1e-5
             );
             // Fully down the sights, or not leaning: nothing.
             assert_eq!(
-                weapon_placement_apply_angles(&state, lean_ps(1.0, 1.0))[2],
+                weapon_placement_apply_angles(&place, lean_ps(1.0, 1.0))[2],
                 0.0
             );
             assert_eq!(
-                weapon_placement_apply_origin(&state, lean_ps(0.0, 0.0)),
+                weapon_placement_apply_origin(&place, lean_ps(0.0, 0.0)),
                 [0.0; 3]
             );
         }
 
         #[test]
         fn a_swimmer_s_gun_bobs_by_the_raw_amount_at_any_speed_and_ads() {
-            let swim = |xyspeed, weapon_pos_frac| {
-                calculate_weapon_movement_bob_waveform(WeaponBobWaveformInputs {
-                    bob_cycle: 40,
-                    xyspeed,
-                    weapon_pos_frac,
+            let swim = |ground_velocity, gun_raise_share| {
+                calculate_weapon_movement_bob_waveform(GunStrideWaveFeed {
+                    sway_phase: 40,
+                    ground_velocity,
+                    gun_raise_share,
                     bo2_gun: Some(Bo2GunBob::default()),
                     waterlevel: 4,
                     ..Default::default()
@@ -1068,15 +1084,15 @@ mod tests {
             assert_eq!(slow, swim(0.0, 0.8));
             assert!(slow.yaw.abs() > 0.5);
             // Waist deep, or the MW2 gun bob: no swimming bob.
-            let wade = WeaponBobWaveformInputs {
-                bob_cycle: 40,
+            let wade = GunStrideWaveFeed {
+                sway_phase: 40,
                 waterlevel: 3,
                 bo2_gun: Some(Bo2GunBob::default()),
                 ..Default::default()
             };
             assert_eq!(calculate_weapon_movement_bob_waveform(wade).yaw, 0.0);
-            let mw2 = WeaponBobWaveformInputs {
-                bob_cycle: 40,
+            let mw2 = GunStrideWaveFeed {
+                sway_phase: 40,
                 waterlevel: 4,
                 ..Default::default()
             };

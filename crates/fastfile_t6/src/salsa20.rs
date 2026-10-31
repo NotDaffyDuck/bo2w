@@ -27,15 +27,15 @@ fn block(input: &[u32; 16]) -> [u8; 64] {
         quarter(&mut x, 10, 11, 8, 9);
         quarter(&mut x, 15, 12, 13, 14);
     }
-    let mut out = [0u8; 64];
+    let mut block_out = [0u8; 64];
     for (i, word) in x.iter().enumerate() {
         let sum = word.wrapping_add(input[i]);
-        out[i * 4..i * 4 + 4].copy_from_slice(&sum.to_le_bytes());
+        block_out[i * 4..i * 4 + 4].copy_from_slice(&sum.to_le_bytes());
     }
-    out
+    block_out
 }
 
-fn word(bytes: &[u8], at: usize) -> u32 {
+fn le_word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
@@ -44,20 +44,20 @@ fn word(bytes: &[u8], at: usize) -> u32 {
 pub fn xor_keystream(key: &[u8; 32], nonce: &[u8; 8], data: &mut [u8]) {
     let mut state = [0u32; 16];
     state[0] = SIGMA[0];
-    state[1] = word(key, 0);
-    state[2] = word(key, 4);
-    state[3] = word(key, 8);
-    state[4] = word(key, 12);
+    state[1] = le_word(key, 0);
+    state[2] = le_word(key, 4);
+    state[3] = le_word(key, 8);
+    state[4] = le_word(key, 12);
     state[5] = SIGMA[1];
-    state[6] = word(nonce, 0);
-    state[7] = word(nonce, 4);
+    state[6] = le_word(nonce, 0);
+    state[7] = le_word(nonce, 4);
     state[8] = 0;
     state[9] = 0;
     state[10] = SIGMA[2];
-    state[11] = word(key, 16);
-    state[12] = word(key, 20);
-    state[13] = word(key, 24);
-    state[14] = word(key, 28);
+    state[11] = le_word(key, 16);
+    state[12] = le_word(key, 20);
+    state[13] = le_word(key, 24);
+    state[14] = le_word(key, 28);
     state[15] = SIGMA[3];
 
     for chunk in data.chunks_mut(64) {

@@ -25,40 +25,43 @@ pub fn axis_to_quat(axis: [[f32; 3]; 3]) -> [f32; 4] {
         .into_iter()
         .find(|candidate| length_sq(*candidate) >= 1.0)
         .unwrap_or(by_y);
-    let chosen_sq = length_sq(chosen);
-    if chosen_sq <= 0.0 {
-        return [0.0, 0.0, 0.0, 1.0];
-    }
-    let scale = 1.0 / libm::sqrtf(chosen_sq);
-    [
-        chosen[0] * scale,
-        chosen[1] * scale,
-        chosen[2] * scale,
-        chosen[3] * scale,
-    ]
+    // No length at all: the identity rotation.
+    let mut identity = [0.0; 4];
+    identity[3] = 1.0;
+    scaled_to_unit(chosen).unwrap_or(identity)
+}
+
+/// `q` over its length, or `None` when it has none.
+fn scaled_to_unit(q: [f32; 4]) -> Option<[f32; 4]> {
+    let sq = length_sq(q);
+    let stow_kind = (sq > 0.0 || sq.is_nan()).then(|| 1.0 / libm::sqrtf(sq))?;
+    Some(q.map(|c| c * stow_kind))
 }
 
 /// `q` scaled to length one; a quaternion with no length is handed back as is.
 pub fn quat_normalize(q: [f32; 4]) -> [f32; 4] {
-    let sq = length_sq(q);
-    if sq <= 0.0 {
-        return q;
-    }
-    let scale = 1.0 / libm::sqrtf(sq);
-    [q[0] * scale, q[1] * scale, q[2] * scale, q[3] * scale]
+    scaled_to_unit(q).unwrap_or(q)
 }
 
 /// The rotation frame for a unit quaternion.
 pub fn unit_quat_to_axis(q: [f32; 4]) -> [[f32; 3]; 3] {
-    let [x, y, z, w] = q;
-    let (x2, y2, z2) = (x + x, y + y, z + z);
-    let (xx, yy, zz) = (x2 * x, y2 * y, z2 * z);
-    let (xy, xz, xw) = (x2 * y, x2 * z, x2 * w);
-    let (yz, yw, zw) = (y2 * z, y2 * w, z2 * w);
+    // p[i][j] = 2 * q[i] * q[j] (doubled first, as the game does).
+    let p = core::array::from_fn::<[f32; 4], 3, _>(|i| {
+        let doubled = q[i] + q[i];
+        q.map(|other| doubled * other)
+    });
+    let sq = [p[0][0], p[1][1], p[2][2]];
+    // Row r: the diagonal is 1 less the other two squares; off-diagonals pair
+    // the xy/xz/yz product with the w product of the third axis.
+    let off = |a: usize, b: usize, sign: f32| {
+        let c = 3 - a - b;
+        let (lo, hi) = (a.min(b), a.max(b));
+        p[lo][hi] + sign * p[c][3]
+    };
     [
-        [1.0 - (yy + zz), xy + zw, xz - yw],
-        [xy - zw, 1.0 - (xx + zz), xw + yz],
-        [xz + yw, yz - xw, 1.0 - (yy + xx)],
+        [1.0 - (sq[1] + sq[2]), off(0, 1, 1.0), off(0, 2, -1.0)],
+        [off(0, 1, -1.0), 1.0 - (sq[0] + sq[2]), off(1, 2, 1.0)],
+        [off(0, 2, 1.0), off(1, 2, -1.0), 1.0 - (sq[1] + sq[0])],
     ]
 }
 

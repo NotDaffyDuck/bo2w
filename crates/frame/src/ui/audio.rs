@@ -1,22 +1,22 @@
 //! Sound requests the menu UI makes.
 
-use bevy::prelude::Message;
+use bevy::ecs::message::Message;
 
 /// Play the sound alias once.
 #[derive(Message, Clone, Debug)]
-pub struct UiPlaySound {
+pub struct MenuCueStart {
     pub alias: String,
 }
 
 /// Start the music alias.
 #[derive(Message, Clone, Debug)]
-pub struct UiPlayMusic {
+pub struct MenuSongStart {
     pub alias: String,
 }
 
 /// Stop whatever music is playing.
 #[derive(Message, Clone, Debug, Default)]
-pub struct UiStopMusic;
+pub struct MenuSongHalt;
 
 #[cfg(test)]
 mod tests {
@@ -27,13 +27,13 @@ mod tests {
     #[test]
     fn sound_requests_queue_in_order() {
         let mut app = App::new();
-        app.add_message::<UiPlaySound>();
+        app.add_message::<MenuCueStart>();
         for alias in ["click", "back"] {
-            app.world_mut().write_message(UiPlaySound {
+            app.world_mut().write_message(MenuCueStart {
                 alias: alias.into(),
             });
         }
-        let queued = app.world().resource::<Messages<UiPlaySound>>();
+        let queued = app.world().resource::<Messages<MenuCueStart>>();
         let aliases: Vec<&str> = queued
             .iter_current_update_messages()
             .map(|m| m.alias.as_str())
@@ -44,8 +44,8 @@ mod tests {
     #[test]
     fn stopping_music_needs_no_argument() {
         let mut app = App::new();
-        app.add_message::<UiStopMusic>();
-        app.world_mut().write_message(UiStopMusic);
-        assert_eq!(app.world().resource::<Messages<UiStopMusic>>().len(), 1);
+        app.add_message::<MenuSongHalt>();
+        app.world_mut().write_message(MenuSongHalt);
+        assert_eq!(app.world().resource::<Messages<MenuSongHalt>>().len(), 1);
     }
 }

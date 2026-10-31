@@ -18,11 +18,11 @@ pub const SECTOR_SPLIT_MIN: f32 = 512.0;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WorldSector {
     pub contents_static_models: u32,
-    pub contents_entities: u32,
+    pub solid_ents: u32,
     /// One more than the first entity filed here (0 for none).
     pub entities: u16,
     /// One more than the first static model filed here (0 for none).
-    pub static_models: u16,
+    pub prop_set: u16,
     pub dist: f32,
     pub axis: u16,
     pub parent: u16,
@@ -31,16 +31,24 @@ pub struct WorldSector {
 }
 
 impl WorldSector {
-    const EMPTY: Self = Self {
-        contents_static_models: 0,
-        contents_entities: 0,
-        entities: 0,
-        static_models: 0,
-        dist: 0.0,
-        axis: 0,
-        parent: 0,
-        children: [0; 2],
-    };
+    /// A sector with nothing filed, no split and no links.
+    const fn blank() -> Self {
+        Self {
+            contents_static_models: 0,
+            solid_ents: 0,
+            entities: 0,
+            prop_set: 0,
+            dist: 0.0,
+            axis: 0,
+            parent: 0,
+            children: [0; 2],
+        }
+    }
+
+    /// Nothing filed here and nothing below.
+    fn is_vacant(&self) -> bool {
+        self.entities == 0 && self.prop_set == 0 && self.children == [0; 2]
+    }
 }
 
 /// `svEntity_s`: the sector an entity is filed in (0 for none), the next
@@ -49,38 +57,44 @@ impl WorldSector {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SvEntity {
     pub world_sector: u16,
-    pub next_entity_in_world_sector: u16,
+    pub following_sector_entity: u16,
     pub link_contents: u32,
     pub link_min: [f32; 3],
     pub link_max: [f32; 3],
 }
 
 impl SvEntity {
-    const EMPTY: Self = Self {
-        world_sector: 0,
-        next_entity_in_world_sector: 0,
-        link_contents: 0,
-        link_min: [0.0; 3],
-        link_max: [0.0; 3],
-    };
+    const fn blank() -> Self {
+        Self {
+            world_sector: 0,
+            following_sector_entity: 0,
+            link_contents: 0,
+            link_min: [0.0; 3],
+            link_max: [0.0; 3],
+        }
+    }
 
-    fn set_link(&mut self, contents: u32, mins: [f32; 3], maxs: [f32; 3]) {
-        self.link_contents = contents;
-        self.link_min = mins;
-        self.link_max = maxs;
+    fn set_link(&mut self, solid_bits: u32, mins: [f32; 3], hi_box: [f32; 3]) {
+        (self.link_contents, self.link_min, self.link_max) = (solid_bits, mins, hi_box);
+    }
+
+    /// Filed in `node` with contents no wider than `contents`, so a relink
+    /// there can keep its place.
+    fn sits_in(&self, sector_ix: usize, contents: u32) -> bool {
+        usize::from(self.world_sector) == sector_ix && self.link_contents & !contents == 0
     }
 }
 
 /// `cStaticModel_s`: the next static model in its sector (one more than
 /// its number, `cStaticModelWritable`), its collision model, contents,
-/// place, inverse scaled axis (`inv_scaled_axis`) and box.
+/// place, inverse scaled axis (`reverse_scaled_basis`) and box.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StaticModel<'a> {
     pub next_model_in_world_sector: u16,
     pub xmodel: Option<&'a XModelColl<'a>>,
     pub contents: u32,
     pub origin: [f32; 3],
-    pub inv_scaled_axis: [[f32; 3]; 3],
+    pub reverse_scaled_basis: [[f32; 3]; 3],
     pub absmin: [f32; 3],
     pub absmax: [f32; 3],
 }
@@ -97,7 +111,7 @@ pub trait LinkedEntities {
 pub struct World {
     pub mins: [f32; 3],
     pub maxs: [f32; 3],
-    pub free_head: u16,
+    pub vacant_list_front: u16,
     pub sectors: [WorldSector; WORLD_SECTORS],
     /// `sv.svEntities`, which `clear` leaves as they are.
     pub entities: [SvEntity; LINKED_ENTITIES],
@@ -109,6 +123,91 @@ impl Default for World {
     }
 }
 
+/// The lists here hold one more than an item's number, with 0 ending them.
+fn link_index(link: u16) -> Option<usize> {
+    usize::from(link).checked_sub(1)
+}
+
+/// The link that names item `num`.
+fn link_to(num: usize) -> u16 {
+    num as u16 + 1
+}
+
+/// Which child a box goes down: the side past the split (0), the side short
+/// of it (1), or neither when it straddles.
+fn side(past: bool, short: bool) -> Option<usize> {
+    if past {
+        Some(0)
+    } else if short {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Where a list that runs in item order takes `num`: the item it goes after
+/// (none for the head) and the link that will follow it.
+fn ordered_slot(head: u16, num: usize, next_of: impl Fn(usize) -> u16) -> (Option<usize>, u16) {
+    let mut after = None;
+    let mut following = head;
+    while let Some(item) = link_index(following).filter(|&item| item <= num) {
+        after = Some(item);
+        following = next_of(item);
+    }
+    (after, following)
+}
+
+/// How a walk down from the root ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// The box crosses the sector's split.
+    Straddles,
+    /// The box fits one side, but the sector has no child there.
+    NoChild,
+}
+
+/// The part of the world's ground plan a sector covers.
+#[derive(Clone, Copy)]
+struct Area {
+    low: [f32; 2],
+    high: [f32; 2],
+}
+
+/// The sector a walk from the root stopped in, and the area it covers.
+struct Descent {
+    stop: Stop,
+    sector: usize,
+    area: Area,
+}
+
+/// One `CM_AreaEntities` request in progress.
+struct AreaQuery<'q, G> {
+    game: &'q G,
+    mins: [f32; 3],
+    maxs: [f32; 3],
+    mask: u32,
+    found: &'q mut [usize],
+    count: usize,
+}
+
+impl<G: LinkedEntities> AreaQuery<'_, G> {
+    /// Offers entity `num`; false once the list is full.
+    fn offer(&mut self, num: usize) -> bool {
+        if self.mask & self.game.contents(num) == 0 {
+            return true;
+        }
+        let (lo, hi) = self.game.abs_bounds(num);
+        let touches = (0..3).all(|k| lo[k] <= self.maxs[k] && self.mins[k] <= hi[k]);
+        if !touches {
+            return true;
+        }
+        let Some(slot) = self.found.get_mut(self.count) else { return false };
+        *slot = num;
+        self.count += 1;
+        true
+    }
+}
+
 impl World {
     /// All zero, as BO2's globals start.
     #[must_use]
@@ -116,24 +215,28 @@ impl World {
         Self {
             mins: [0.0; 3],
             maxs: [0.0; 3],
-            free_head: 0,
-            sectors: [WorldSector::EMPTY; WORLD_SECTORS],
-            entities: [SvEntity::EMPTY; LINKED_ENTITIES],
+            vacant_list_front: 0,
+            sectors: [WorldSector::blank(); WORLD_SECTORS],
+            entities: [SvEntity::blank(); LINKED_ENTITIES],
         }
     }
 
     /// `CM_ClearWorld`: empty the tree, take the world model's bounds and
     /// split the root across their longer side; sectors 2 on are free.
     pub fn clear(&mut self, cm: &ClipMap<'_>) {
-        (self.mins, self.maxs) = cm.brush_model(0).map_or(([0.0; 3], [0.0; 3]), |m| (m.mins, m.maxs));
-        self.sectors = [WorldSector::EMPTY; WORLD_SECTORS];
-        self.free_head = 2;
-        for (i, sector) in self.sectors.iter_mut().enumerate().take(WORLD_SECTORS - 1).skip(2) {
-            sector.parent = i as u16 + 1;
+        let bounds = cm.solid_model(0).map(|third_person_mesh| (third_person_mesh.mins, third_person_mesh.maxs));
+        (self.mins, self.maxs) = bounds.unwrap_or_default();
+        self.sectors = [WorldSector::blank(); WORLD_SECTORS];
+        // The free list runs 2, 3, ... and ends at the last sector.
+        for slot in 2..WORLD_SECTORS - 1 {
+            self.sectors[slot].parent = (slot + 1) as u16;
         }
-        let axis = usize::from(self.maxs[0] - self.mins[0] <= self.maxs[1] - self.mins[1]);
-        self.sectors[1].axis = axis as u16;
-        self.sectors[1].dist = (self.maxs[axis] + self.mins[axis]) * 0.5;
+        self.vacant_list_front = 2;
+        let (lo, hi) = (self.mins, self.maxs);
+        let axis = usize::from(hi[0] - lo[0] <= hi[1] - lo[1]);
+        let root = &mut self.sectors[1];
+        root.axis = axis as u16;
+        root.dist = (hi[axis] + lo[axis]) * 0.5;
     }
 
     /// `CM_LinkWorld`: clear the tree and file every static model in it.
@@ -142,42 +245,47 @@ impl World {
         self.link_static_models(game, models);
     }
 
+    /// Walks down from the root, letting `mark` stamp every sector passed,
+    /// and taking the child `pick(axis, dist)` names until the box
+    /// straddles a split or the child is missing.
+    fn descend(
+        &mut self,
+        mark: impl Fn(&mut WorldSector),
+        pick: impl Fn(usize, f32) -> Option<usize>,
+    ) -> Descent {
+        let whole = Area { low: [self.mins[0], self.mins[1]], high: [self.maxs[0], self.maxs[1]] };
+        let mut walk = Descent { stop: Stop::NoChild, sector: 1, area: whole };
+        loop {
+            let sector = &mut self.sectors[walk.sector];
+            mark(sector);
+            let axis = usize::from(sector.axis);
+            let Some(toward) = pick(axis, sector.dist) else {
+                walk.stop = Stop::Straddles;
+                return walk;
+            };
+            // Going past the split raises the low edge; short of it, the high.
+            let edge = if toward == 0 { &mut walk.area.low } else { &mut walk.area.high };
+            edge[axis] = sector.dist;
+            match sector.children[toward] {
+                0 => return walk,
+                child => walk.sector = usize::from(child),
+            }
+        }
+    }
+
     /// `CM_LinkAllStaticModels`: file each static model that has contents
     /// in the deepest sector it fits on one side of.
     pub fn link_static_models(&mut self, game: &impl LinkedEntities, models: &mut [StaticModel<'_>]) {
-        for i in 0..models.len() {
-            let StaticModel {
-                contents,
-                absmin,
-                absmax,
-                ..
-            } = models[i];
-            if contents == 0 {
+        for num in 0..models.len() {
+            let model = models[num];
+            let stamp = model.contents;
+            if stamp == 0 {
                 continue;
             }
-            let mut mins2 = [self.mins[0], self.mins[1]];
-            let mut maxs2 = [self.maxs[0], self.maxs[1]];
-            let mut node = 1;
-            loop {
-                let s = &mut self.sectors[node];
-                s.contents_static_models |= contents;
-                let axis = s.axis as usize;
-                let child = if !(absmin[axis] <= s.dist) {
-                    mins2[axis] = s.dist;
-                    s.children[0]
-                } else if s.dist <= absmax[axis] {
-                    break;
-                } else {
-                    maxs2[axis] = s.dist;
-                    s.children[1]
-                };
-                if child == 0 {
-                    break;
-                }
-                node = child as usize;
-            }
-            self.add_static_model_to_node(models, node, i);
-            self.sort_node(game, models, node, mins2, maxs2);
+            let pick = |axis: usize, dist: f32| side(!(model.absmin[axis] <= dist), !(dist <= model.absmax[axis]));
+            let reached = self.descend(|sector| sector.contents_static_models |= stamp, pick);
+            self.add_static_model_to_node(models, reached.sector, num);
+            self.order_sector(game, models, reached.sector, reached.area);
         }
     }
 
@@ -195,116 +303,101 @@ impl World {
         absmax: [f32; 3],
         model: u32,
     ) {
-        let link_contents = cm
-            .brush_model(model)
-            .map_or(0, |m| m.leaf.terrain_contents | m.leaf.brush_contents);
+        let clip = cm.solid_model(model).map(|m| m.leaf.terrain_contents | m.leaf.solid_content_flags);
+        let link_contents = clip.unwrap_or(0);
         if link_contents == 0 {
-            self.unlink_entity(game, num);
-            return;
+            return self.unlink_entity(game, num);
         }
-        let contents = game.contents(num);
+        let stamp = link_contents | game.contents(num);
+        let pick = |axis: usize, dist: f32| side(dist < absmin[axis], !(dist <= absmax[axis]));
         loop {
-            let mut mins2 = [self.mins[0], self.mins[1]];
-            let mut maxs2 = [self.maxs[0], self.maxs[1]];
-            let mut node = 1;
-            loop {
-                let s = &mut self.sectors[node];
-                s.contents_entities |= link_contents | contents;
-                let axis = s.axis as usize;
-                let child = if s.dist < absmin[axis] {
-                    mins2[axis] = s.dist;
-                    s.children[0]
-                } else if s.dist <= absmax[axis] {
-                    let ent = &mut self.entities[num];
-                    if ent.world_sector as usize == node && ent.link_contents & !link_contents == 0 {
-                        ent.set_link(link_contents, absmin, absmax);
-                        return;
-                    }
-                    break;
-                } else {
-                    maxs2[axis] = s.dist;
-                    s.children[1]
-                };
-                if child == 0 {
-                    break;
-                }
-                node = child as usize;
+            let reached = self.descend(|sector| sector.solid_ents |= stamp, &pick);
+            let filed = self.entities[num];
+            let stays = filed.sits_in(reached.sector, link_contents);
+            if reached.stop == Stop::Straddles && stays {
+                // Already filed in the sector it straddles: only the box moves.
+                self.entities[num].set_link(link_contents, absmin, absmax);
+                return;
             }
-            let ent = self.entities[num];
-            if ent.world_sector == 0 {
-                self.add_entity_to_node(node, num);
-            } else if ent.world_sector as usize != node || ent.link_contents & !link_contents != 0 {
+            if filed.world_sector != 0 && !stays {
                 self.unlink_entity(game, num);
                 continue;
             }
+            if filed.world_sector == 0 {
+                self.link_ent_at(reached.sector, num);
+            }
             self.entities[num].set_link(link_contents, absmin, absmax);
-            self.sort_node(game, models, node, mins2, maxs2);
+            self.order_sector(game, models, reached.sector, reached.area);
             return;
         }
+    }
+
+    /// The entities filed from link `first` on, in list order.
+    fn entity_chain(&self, first: u16) -> impl Iterator<Item = usize> + '_ {
+        core::iter::successors(link_index(first), |&num| link_index(self.entities[num].following_sector_entity))
+    }
+
+    /// The link that leads to whatever comes after `after` in `node`'s
+    /// entity list (the list head when `after` is none).
+    fn entity_link_mut(&mut self, sector_ix: usize, after: Option<usize>) -> &mut u16 {
+        match after {
+            Some(prev) => &mut self.entities[prev].following_sector_entity,
+            None => &mut self.sectors[sector_ix].entities,
+        }
+    }
+
+    /// Frees `node` if nothing is left in or under it, unhooking it from its
+    /// parent; the parent, when it did. Its entity contents go to zero
+    /// either way once it is vacant.
+    fn prune(&mut self, node: usize) -> Option<usize> {
+        let sector = self.sectors[node];
+        if !sector.is_vacant() {
+            return None;
+        }
+        self.sectors[node].solid_ents = 0;
+        // The root is never freed.
+        let parent = link_index(sector.parent).map(|_| usize::from(sector.parent))?;
+        self.sectors[node].parent = core::mem::replace(&mut self.vacant_list_front, node as u16);
+        let slots = &mut self.sectors[parent].children;
+        let which = usize::from(usize::from(slots[0]) != node);
+        slots[which] = 0;
+        Some(parent)
     }
 
     /// `CM_UnlinkEntity`: take entity `num` out of its sector, free the
     /// sectors left empty, and work the entity contents out again up to
     /// the root.
     pub fn unlink_entity(&mut self, game: &impl LinkedEntities, num: usize) {
-        let mut node = self.entities[num].world_sector as usize;
-        if node == 0 {
+        let home = usize::from(self.entities[num].world_sector);
+        if home == 0 {
             return;
         }
-        self.entities[num].world_sector = 0;
-        let next = self.entities[num].next_entity_in_world_sector;
-        let head = self.sectors[node].entities;
-        if head as usize == num + 1 {
-            self.sectors[node].entities = next;
+        let leaving = &mut self.entities[num];
+        leaving.world_sector = 0;
+        let following = leaving.following_sector_entity;
+        let me = link_to(num);
+        if self.sectors[home].entities == me {
+            self.sectors[home].entities = following;
         } else {
-            let mut scan = head as usize - 1;
-            loop {
-                let scan_next = self.entities[scan].next_entity_in_world_sector;
-                if scan_next == 0 {
-                    break;
-                }
-                if scan_next as usize == num + 1 {
-                    self.entities[scan].next_entity_in_world_sector = next;
-                    break;
-                }
-                scan = scan_next as usize - 1;
+            let head = self.sectors[home].entities;
+            let before = self.entity_chain(head).find(|&prev| self.entities[prev].following_sector_entity == me);
+            if let Some(prev) = before {
+                self.entities[prev].following_sector_entity = following;
             }
         }
-        loop {
-            let s = self.sectors[node];
-            if s.entities != 0 || s.static_models != 0 || s.children != [0; 2] {
-                break;
-            }
-            self.sectors[node].contents_entities = 0;
-            let parent = s.parent as usize;
-            if parent == 0 {
-                break;
-            }
-            self.sectors[node].parent = self.free_head;
-            self.free_head = node as u16;
-            let p = &mut self.sectors[parent];
-            if p.children[0] as usize == node {
-                p.children[0] = 0;
-            } else {
-                p.children[1] = 0;
-            }
-            node = parent;
+
+        let mut node = home;
+        while let Some(up) = self.prune(node) {
+            node = up;
         }
-        loop {
-            let s = self.sectors[node];
-            let mut contents = self.sectors[s.children[1] as usize].contents_entities
-                | self.sectors[s.children[0] as usize].contents_entities;
-            let mut e = s.entities;
-            while e != 0 {
-                let i = e as usize - 1;
-                contents |= game.contents(i) | self.entities[i].link_contents;
-                e = self.entities[i].next_entity_in_world_sector;
-            }
-            self.sectors[node].contents_entities = contents;
-            if s.parent == 0 {
-                break;
-            }
-            node = s.parent as usize;
+        let mut climb = Some(node);
+        while let Some(at) = climb {
+            let sector = self.sectors[at];
+            let below = sector.children.iter().fold(0, |acc, &child| acc | self.sectors[usize::from(child)].solid_ents);
+            let filed_here = self.entity_chain(sector.entities);
+            let all = filed_here.fold(below, |acc, filed| acc | game.contents(filed) | self.entities[filed].link_contents);
+            self.sectors[at].solid_ents = all;
+            climb = (sector.parent != 0).then(|| usize::from(sector.parent));
         }
     }
 
@@ -316,187 +409,141 @@ impl World {
         game: &impl LinkedEntities,
         mins: [f32; 3],
         maxs: [f32; 3],
-        contentmask: u32,
+        want_bits: u32,
         list: &mut [usize],
     ) -> usize {
-        let mut count = 0;
-        self.area_entities_r(game, 1, mins, maxs, contentmask, list, &mut count);
-        count
+        let mut query = AreaQuery { game, mins, maxs, mask: want_bits, found: list, count: 0 };
+        self.gather(1, &mut query);
+        query.count
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn area_entities_r(
-        &self,
-        game: &impl LinkedEntities,
-        mut node: usize,
-        mins: [f32; 3],
-        maxs: [f32; 3],
-        contentmask: u32,
-        list: &mut [usize],
-        count: &mut usize,
-    ) {
-        while contentmask & self.sectors[node].contents_entities != 0 {
-            let s = &self.sectors[node];
-            let mut e = s.entities;
-            while e != 0 {
-                let i = e as usize - 1;
-                if contentmask & game.contents(i) != 0 {
-                    let (amin, amax) = game.abs_bounds(i);
-                    if (0..3).all(|k| amin[k] <= maxs[k] && mins[k] <= amax[k]) {
-                        if *count == list.len() {
-                            return;
-                        }
-                        list[*count] = i;
-                        *count += 1;
-                    }
-                }
-                e = self.entities[i].next_entity_in_world_sector;
+    /// Collects from `node` down; false once the list is full.
+    fn gather<G: LinkedEntities>(&self, from_pt: usize, query: &mut AreaQuery<'_, G>) -> bool {
+        let mut node = from_pt;
+        while query.mask & self.sectors[node].solid_ents != 0 {
+            let sector = &self.sectors[node];
+            if !self.entity_chain(sector.entities).all(|num| query.offer(num)) {
+                return false;
             }
-            let axis = s.axis as usize;
-            node = if maxs[axis] <= s.dist {
-                if s.dist <= mins[axis] {
-                    return;
+            let (axis, dist) = (usize::from(sector.axis), sector.dist);
+            let [past, short] = sector.children.map(usize::from);
+            let wholly_short = query.maxs[axis] <= dist;
+            node = match (wholly_short, dist <= query.mins[axis], query.mins[axis] < dist) {
+                (true, true, _) => return true,
+                (true, false, _) => short,
+                (false, _, true) => {
+                    if !self.gather(past, query) {
+                        return false;
+                    }
+                    short
                 }
-                s.children[1] as usize
-            } else if mins[axis] < s.dist {
-                self.area_entities_r(game, s.children[0] as usize, mins, maxs, contentmask, list, count);
-                s.children[1] as usize
-            } else {
-                s.children[0] as usize
+                (false, _, false) => past,
             };
         }
+        true
     }
 
     /// `CM_AllocWorldSector`: a free sector splitting `mins`..`maxs`
-    /// across its longer side, or 0 when none is free or the area is too
+    /// across its longer side; none when none is free or the area is too
     /// small to split.
-    fn alloc_sector(&mut self, mins: [f32; 2], maxs: [f32; 2]) -> usize {
-        let node = self.free_head as usize;
-        if node == 0 {
-            return 0;
+    fn claim_sector(&mut self, area: Area) -> Option<usize> {
+        let Area { low, high } = area;
+        let fresh = usize::from(self.vacant_list_front);
+        let span = [high[0] - low[0], high[1] - low[1]];
+        let axis = usize::from(span[0] <= span[1]);
+        if fresh == 0 || span[axis] <= SECTOR_SPLIT_MIN {
+            return None;
         }
-        let size = [maxs[0] - mins[0], maxs[1] - mins[1]];
-        let axis = usize::from(size[0] <= size[1]);
-        if size[axis] <= SECTOR_SPLIT_MIN {
-            return 0;
-        }
-        let s = &mut self.sectors[node];
-        self.free_head = s.parent;
-        s.axis = axis as u16;
-        s.dist = (mins[axis] + maxs[axis]) * 0.5;
-        node
+        let sector = &mut self.sectors[fresh];
+        self.vacant_list_front = sector.parent;
+        sector.axis = axis as u16;
+        sector.dist = (low[axis] + high[axis]) * 0.5;
+        Some(fresh)
     }
 
-    /// Child `side` of `node`, made from a free sector over `mins`..`maxs`
-    /// if it has none (0 if none can be).
-    fn child_or_alloc(&mut self, node: usize, side: usize, mins: [f32; 2], maxs: [f32; 2]) -> usize {
-        let child = self.sectors[node].children[side] as usize;
-        if child != 0 {
-            return child;
+    /// Child `side` of `node`, made from a free sector over `area` if it
+    /// has none yet.
+    fn child_or_alloc(&mut self, sector_ix: usize, side: usize, area: Area) -> Option<usize> {
+        let existing = usize::from(self.sectors[sector_ix].children[side]);
+        if existing > 0 {
+            return Some(existing);
         }
-        let child = self.alloc_sector(mins, maxs);
-        if child != 0 {
-            self.sectors[node].children[side] = child as u16;
-            self.sectors[child].parent = node as u16;
-        }
-        child
+        let made = self.claim_sector(area)?;
+        self.sectors[sector_ix].children[side] = made as u16;
+        self.sectors[made].parent = sector_ix as u16;
+        Some(made)
     }
 
     /// `CM_AddEntityToNode`: file entity `num` in `node`'s list, which
     /// runs in entity order.
-    fn add_entity_to_node(&mut self, node: usize, num: usize) {
-        let mut prev = None;
-        let mut cur = self.sectors[node].entities;
-        while u32::from(cur).wrapping_sub(1) <= num as u32 {
-            prev = Some(cur as usize - 1);
-            cur = self.entities[cur as usize - 1].next_entity_in_world_sector;
-        }
-        self.entities[num].world_sector = node as u16;
-        self.entities[num].next_entity_in_world_sector = cur;
-        match prev {
-            None => self.sectors[node].entities = num as u16 + 1,
-            Some(p) => self.entities[p].next_entity_in_world_sector = num as u16 + 1,
-        }
+    fn link_ent_at(&mut self, sector_ix: usize, num: usize) {
+        let entities = &self.entities;
+        let (after, following) =
+            ordered_slot(self.sectors[sector_ix].entities, num, |item| entities[item].following_sector_entity);
+        let filed = &mut self.entities[num];
+        filed.world_sector = sector_ix as u16;
+        filed.following_sector_entity = following;
+        *self.entity_link_mut(sector_ix, after) = link_to(num);
     }
 
     /// `CM_AddStaticModelToNode`: file static model `num` in `node`'s
     /// list, which runs in model order.
-    fn add_static_model_to_node(&mut self, models: &mut [StaticModel<'_>], node: usize, num: usize) {
-        let mut prev = None;
-        let mut cur = self.sectors[node].static_models;
-        while u32::from(cur).wrapping_sub(1) <= num as u32 {
-            prev = Some(cur as usize - 1);
-            cur = models[cur as usize - 1].next_model_in_world_sector;
-        }
-        models[num].next_model_in_world_sector = cur;
-        match prev {
-            None => self.sectors[node].static_models = num as u16 + 1,
-            Some(p) => models[p].next_model_in_world_sector = num as u16 + 1,
-        }
+    fn add_static_model_to_node(&mut self, models: &mut [StaticModel<'_>], sector_ix: usize, num: usize) {
+        let head = self.sectors[sector_ix].prop_set;
+        let (after, following) = ordered_slot(head, num, |item| models[item].next_model_in_world_sector);
+        models[num].next_model_in_world_sector = following;
+        *model_link_mut(&mut self.sectors[sector_ix], models, after) = link_to(num);
     }
 
     /// `CM_SortNode`: move each entity and static model in `node` that
     /// lies wholly on one side of its split down into that child, making
-    /// the child from `mins`..`maxs` if there is none.
-    fn sort_node(
-        &mut self,
-        game: &impl LinkedEntities,
-        models: &mut [StaticModel<'_>],
-        node: usize,
-        mins: [f32; 2],
-        maxs: [f32; 2],
-    ) {
-        let axis = self.sectors[node].axis as usize;
-        let dist = self.sectors[node].dist;
-        let mut prev: Option<usize> = None;
-        let mut cur = self.sectors[node].entities;
-        while cur != 0 {
-            let e = cur as usize - 1;
-            let ent = self.entities[e];
-            cur = ent.next_entity_in_world_sector;
-            let side = if !(ent.link_min[axis] <= dist) {
-                Some(0)
-            } else if ent.link_max[axis] < dist {
-                Some(1)
-            } else {
-                None
-            };
-            let child = side.map_or(0, |side| self.child_or_alloc(node, side, mins, maxs));
-            if child == 0 {
-                prev = Some(e);
-                continue;
-            }
-            self.add_entity_to_node(child, e);
-            self.sectors[child].contents_entities |= game.contents(e) | ent.link_contents;
-            match prev {
-                None => self.sectors[node].entities = cur,
-                Some(p) => self.entities[p].next_entity_in_world_sector = cur,
+    /// the child from `area` if there is none.
+    fn order_sector(&mut self, game: &impl LinkedEntities, models: &mut [StaticModel<'_>], sector_ix: usize, area: Area) {
+        let (axis, dist) = (usize::from(self.sectors[sector_ix].axis), self.sectors[sector_ix].dist);
+
+        // The last entity left behind in `node`, whose link skips the movers.
+        let mut kept = None;
+        let mut cursor = self.sectors[sector_ix].entities;
+        while let Some(num) = link_index(cursor) {
+            let ent = self.entities[num];
+            cursor = ent.following_sector_entity;
+            let toward = side(!(ent.link_min[axis] <= dist), ent.link_max[axis] < dist);
+            match toward.and_then(|s| self.child_or_alloc(sector_ix, s, area)) {
+                None => kept = Some(num),
+                Some(child) => {
+                    self.link_ent_at(child, num);
+                    self.sectors[child].solid_ents |= game.contents(num) | ent.link_contents;
+                    *self.entity_link_mut(sector_ix, kept) = cursor;
+                }
             }
         }
-        let mut prev: Option<usize> = None;
-        let mut cur = self.sectors[node].static_models;
-        while cur != 0 {
-            let m = cur as usize - 1;
-            let model = models[m];
-            cur = model.next_model_in_world_sector;
-            let side = if dist < model.absmin[axis] {
-                Some(0)
-            } else if model.absmax[axis] < dist {
-                Some(1)
-            } else {
-                None
-            };
-            let child = side.map_or(0, |side| self.child_or_alloc(node, side, mins, maxs));
-            if child == 0 {
-                prev = Some(m);
-                continue;
-            }
-            self.add_static_model_to_node(models, child, m);
-            self.sectors[child].contents_static_models |= model.contents;
-            match prev {
-                None => self.sectors[node].static_models = cur,
-                Some(p) => models[p].next_model_in_world_sector = cur,
+
+        let mut kept = None;
+        let mut cursor = self.sectors[sector_ix].prop_set;
+        while let Some(num) = link_index(cursor) {
+            let model = models[num];
+            cursor = model.next_model_in_world_sector;
+            let toward = side(dist < model.absmin[axis], model.absmax[axis] < dist);
+            match toward.and_then(|s| self.child_or_alloc(sector_ix, s, area)) {
+                None => kept = Some(num),
+                Some(child) => {
+                    self.add_static_model_to_node(models, child, num);
+                    self.sectors[child].contents_static_models |= model.contents;
+                    *model_link_mut(&mut self.sectors[sector_ix], models, kept) = cursor;
+                }
             }
         }
+    }
+}
+
+/// The static-model counterpart of `World::entity_link_mut`.
+fn model_link_mut<'m>(
+    sector: &'m mut WorldSector,
+    models: &'m mut [StaticModel<'_>],
+    after: Option<usize>,
+) -> &'m mut u16 {
+    match after {
+        Some(prev) => &mut models[prev].next_model_in_world_sector,
+        None => &mut sector.prop_set,
     }
 }

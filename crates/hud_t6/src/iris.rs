@@ -3,7 +3,7 @@
 //! global EMP scope material) and the four-quad or one-quad overlay layout.
 
 /// Reticle zoom counts as active only above this.
-pub const ADS_IRIS_ZOOM_ACTIVE_MIN: f32 = 0.01;
+pub const SCOPE_APERTURE_ENGAGE_FLOOR: f32 = 0.01;
 /// Real viewport heights at or below this use the low-res overlay material (not for a shoutcaster).
 pub const LOW_RES_VIEWPORT_MAX_HEIGHT: u32 = 480;
 /// Overlays no bigger than this are drawn as four mirrored quarter quads.
@@ -25,18 +25,18 @@ pub const WEAP_OVERLAY_INTERFACE_TURRETSCOPE: u32 = 2;
 /// CG_GetWeapReticleZoom: Some(zoom, capped at 1) when above 0.01. `window` is the ADS zoom-in
 /// fraction (zoom-out while leaving ADS); BO2 does not guard a zero window.
 #[must_use]
-pub fn get_weap_reticle_zoom(weapon_pos_frac: f32, window: f32) -> Option<f32> {
-    let zoom = (weapon_pos_frac - (1.0 - window)) / window;
-    (zoom > ADS_IRIS_ZOOM_ACTIVE_MIN).then(|| zoom.min(1.0))
+pub fn get_weap_reticle_zoom(gun_raise_share: f32, window: f32) -> Option<f32> {
+    let zoom = (gun_raise_share - (1.0 - window)) / window;
+    (zoom > SCOPE_APERTURE_ENGAGE_FLOOR).then(|| zoom.min(1.0))
 }
 
 /// The weapon fields the overlay path reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WeaponOverlayDef {
     /// Material handles; 0 is none.
-    pub overlay_material: u32,
-    pub overlay_material_low_res: u32,
-    pub overlay_reticle: u32,
+    pub hud_layer_surface: u32,
+    pub vignette_surface_coarse: u32,
+    pub hud_crosshair_layer: u32,
     pub overlay_interface: u32,
     pub overlay_width: f32,
     pub overlay_height: f32,
@@ -49,8 +49,8 @@ pub struct WeaponOverlayDef {
 /// TV guided.
 #[must_use]
 pub fn iris_overlay_configured(w: &WeaponOverlayDef) -> bool {
-    let material = w.overlay_material != 0 || w.overlay_material_low_res != 0;
-    (material && w.overlay_reticle != WEAP_OVERLAY_RETICLE_NONE) || w.infrared || w.tv_guided
+    let material = w.hud_layer_surface != 0 || w.vignette_surface_coarse != 0;
+    (material && w.hud_crosshair_layer != WEAP_OVERLAY_RETICLE_NONE) || w.infrared || w.tv_guided
 }
 
 /// CG_DrawWeapReticle: overlay colour alpha.
@@ -68,15 +68,15 @@ pub fn reticle_sides_alpha(zoom: f32, overlay_alpha_scale: f32) -> f32 {
 /// CG_AddViewWeapon: the gun is hidden while the reticle zoom is active, with cg_drawGun off, or in a
 /// cubemap shot.
 #[must_use]
-pub fn view_weapon_draw_gun(reticle_zoom_active: bool, cg_draw_gun: bool, cubemap_shot: bool) -> bool {
-    !reticle_zoom_active && cg_draw_gun && !cubemap_shot
+pub fn view_weapon_draw_gun(reticle_zoom_active: bool, show_held_gun: bool, cubemap_shot: bool) -> bool {
+    !reticle_zoom_active && show_held_gun && !cubemap_shot
 }
 
 /// The overlay counts as infrared with the otherFlags bit, cg_forceInfrared, or at full zoom on an
 /// infrared weapon.
 #[must_use]
-pub fn overlay_is_infrared(other_flags: u32, cg_force_infrared: bool, full_zoom: bool, weapon_infrared: bool) -> bool {
-    other_flags & OTHER_FLAGS_INFRARED_OVERLAY != 0 || cg_force_infrared || (full_zoom && weapon_infrared)
+pub fn overlay_is_infrared(secondary_state_bits: u32, cg_force_infrared: bool, full_zoom: bool, weapon_infrared: bool) -> bool {
+    secondary_state_bits & OTHER_FLAGS_INFRARED_OVERLAY != 0 || cg_force_infrared || (full_zoom && weapon_infrared)
 }
 
 /// eFlags bits that turn the infrared view off.
@@ -101,9 +101,9 @@ pub struct InfraredState {
     pub demo_free_camera: bool,
     pub emp_jammed: bool,
     pub killcam_entity: bool,
-    pub other_flags: u32,
+    pub secondary_state_bits: u32,
     pub cg_force_infrared: bool,
-    pub e_flags: u32,
+    pub ent_bits: u32,
     pub third_person: bool,
     /// get_weap_reticle_zoom.
     pub reticle_zoom: Option<f32>,
@@ -118,10 +118,10 @@ pub fn is_infrared(s: &InfraredState) -> bool {
     if s.demo_free_camera || s.emp_jammed || s.killcam_entity {
         return false;
     }
-    if s.other_flags & OTHER_FLAGS_INFRARED_OVERLAY != 0 || s.cg_force_infrared {
+    if s.secondary_state_bits & OTHER_FLAGS_INFRARED_OVERLAY != 0 || s.cg_force_infrared {
         return true;
     }
-    s.e_flags & E_FLAGS_INFRARED_BLOCK == 0
+    s.ent_bits & E_FLAGS_INFRARED_BLOCK == 0
         && !s.third_person
         && s.reticle_zoom.is_some_and(|z| z >= INFRARED_FULL_ZOOM_MIN)
         && s.weapon_infrared
@@ -179,16 +179,16 @@ pub fn ads_overlay_material(
 ) -> u32 {
     if emp_jammed && infrared {
         emp_scope_material
-    } else if viewport_height <= LOW_RES_VIEWPORT_MAX_HEIGHT && !shoutcaster && w.overlay_material_low_res != 0 {
-        w.overlay_material_low_res
+    } else if viewport_height <= LOW_RES_VIEWPORT_MAX_HEIGHT && !shoutcaster && w.vignette_surface_coarse != 0 {
+        w.vignette_surface_coarse
     } else {
-        w.overlay_material
+        w.hud_layer_surface
     }
 }
 
 /// One overlay quad in virtual-screen units; s/t flip by swapping 0 and 1.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AdsOverlayQuad {
+pub struct ScopeVignetteRect {
     pub x: f32,
     pub y: f32,
     pub w: f32,
@@ -203,10 +203,10 @@ pub struct AdsOverlayQuad {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AdsOverlayLayout {
     /// Each quarter mirrored on x and/or y around the centre.
-    Four([AdsOverlayQuad; 4]),
+    Four([ScopeVignetteRect; 4]),
     /// One centred quad; also feeds the generic-overlay post-process rect and, at alpha > 0.99, the
     /// scissor viewport.
-    One { quad: AdsOverlayQuad, scissor: bool },
+    One { quad: ScopeVignetteRect, scissor: bool },
 }
 
 impl AdsOverlayLayout {
@@ -227,11 +227,11 @@ pub fn ads_overlay_uses_four_quads(w: f32, h: f32) -> bool {
 
 /// Layout from the weapon's overlay size (r_dualPlayActive doubles the width).
 #[must_use]
-pub fn draw_ads_overlay_layout(cx: f32, cy: f32, width: f32, height: f32, dual_play: bool, alpha: f32) -> AdsOverlayLayout {
-    let w = if dual_play { width * 2.0 } else { width };
-    let h = height;
+pub fn draw_ads_overlay_layout(cx: f32, cy: f32, across: f32, tall: f32, dual_play: bool, alpha: f32) -> AdsOverlayLayout {
+    let w = if dual_play { across * 2.0 } else { across };
+    let h = tall;
     if ads_overlay_uses_four_quads(w, h) {
-        let q = |x: f32, y: f32, s0: f32, s1: f32, t0: f32, t1: f32| AdsOverlayQuad { x, y, w, h, s0, t0, s1, t1 };
+        let q = |x: f32, y: f32, s0: f32, s1: f32, t0: f32, t1: f32| ScopeVignetteRect { x, y, w, h, s0, t0, s1, t1 };
         AdsOverlayLayout::Four([
             q(cx - w, cy - h, 0.0, 1.0, 0.0, 1.0),
             q(cx, cy - h, 1.0, 0.0, 0.0, 1.0),
@@ -239,7 +239,7 @@ pub fn draw_ads_overlay_layout(cx: f32, cy: f32, width: f32, height: f32, dual_p
             q(cx, cy, 1.0, 0.0, 1.0, 0.0),
         ])
     } else {
-        let quad = AdsOverlayQuad { x: cx - w * 0.5, y: cy - h * 0.5, w, h, s0: 0.0, t0: 0.0, s1: 1.0, t1: 1.0 };
+        let quad = ScopeVignetteRect { x: cx - w * 0.5, y: cy - h * 0.5, w, h, s0: 0.0, t0: 0.0, s1: 1.0, t1: 1.0 };
         AdsOverlayLayout::One { quad, scissor: alpha > ADS_OVERLAY_SCISSOR_ALPHA_MIN }
     }
 }
@@ -262,9 +262,9 @@ mod tests {
 
     #[test]
     fn material_choice() {
-        let w = WeaponOverlayDef { overlay_material: 5, overlay_material_low_res: 6, overlay_reticle: 1, ..Default::default() };
+        let w = WeaponOverlayDef { hud_layer_surface: 5, vignette_surface_coarse: 6, hud_crosshair_layer: 1, ..WeaponOverlayDef::default() };
         assert!(iris_overlay_configured(&w));
-        assert!(!iris_overlay_configured(&WeaponOverlayDef { overlay_material: 5, ..Default::default() }));
+        assert!(!iris_overlay_configured(&WeaponOverlayDef { hud_layer_surface: 5, ..WeaponOverlayDef::default() }));
         assert_eq!(ads_overlay_material(&w, 480, false, false, false, 9), 6);
         assert_eq!(ads_overlay_material(&w, 480, true, false, false, 9), 5);
         assert_eq!(ads_overlay_material(&w, 1080, false, false, false, 9), 5);
@@ -275,17 +275,17 @@ mod tests {
 
     #[test]
     fn infrared_gate() {
-        let ads = InfraredState { reticle_zoom: Some(1.0), weapon_infrared: true, ..Default::default() };
+        let ads = InfraredState { reticle_zoom: Some(1.0), weapon_infrared: true, ..InfraredState::default() };
         assert!(is_infrared(&ads));
         assert!(!is_infrared(&InfraredState { reticle_zoom: Some(0.9), ..ads }));
         assert!(!is_infrared(&InfraredState { reticle_zoom: None, ..ads }));
         assert!(!is_infrared(&InfraredState { weapon_infrared: false, ..ads }));
         assert!(!is_infrared(&InfraredState { third_person: true, ..ads }));
-        assert!(!is_infrared(&InfraredState { e_flags: 0x100, ..ads }));
+        assert!(!is_infrared(&InfraredState { ent_bits: 0x100, ..ads }));
         assert!(!is_infrared(&InfraredState { emp_jammed: true, ..ads }));
         assert!(!is_infrared(&InfraredState { killcam_entity: true, cg_force_infrared: true, ..ads }));
-        assert!(is_infrared(&InfraredState { other_flags: OTHER_FLAGS_INFRARED_OVERLAY, ..Default::default() }));
-        assert!(is_infrared(&InfraredState { cg_force_infrared: true, third_person: true, ..Default::default() }));
+        assert!(is_infrared(&InfraredState { secondary_state_bits: OTHER_FLAGS_INFRARED_OVERLAY, ..InfraredState::default() }));
+        assert!(is_infrared(&InfraredState { cg_force_infrared: true, third_person: true, ..InfraredState::default() }));
 
         assert_eq!(infrared_refdef(false, 5.0), InfraredRefdef::default());
         let r = infrared_refdef(true, 0.0);

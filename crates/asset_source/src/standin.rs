@@ -1,13 +1,13 @@
 //! The Gravity Gun when no Half-Life 2 files are found (his 10-13 "if
 //! that's not possible ... then let's use the Minecraft one"): a blocky,
 //! pixel-textured gun made here, laid out as Half-Life 2's view model is
-//! (the same bones, attachments, sequences and "active" claws), so it
+//! (its bones, attachment points, sequences and "active" claws match), so it
 //! animates, glows and takes the character's hands the same way. Nothing
 //! in it is Valve's.
 
 use glam::{Mat3, Mat4, Quat, Vec2, Vec3};
 
-use crate::mdl::{Animation, Attachment, Bone, Mesh, Model, Pose, PoseParam, Sequence, Texture, Vertex};
+use crate::mdl::{Animation, Joint, Mesh, Model, Mount, NO_TURN, ONE_BONE, Pose, PoseParam, Sequence, Texture, Vertex};
 use crate::vtf::Rgba;
 
 /// The gun's axis (Source model space: X forward, Y left, Z up, inches),
@@ -65,8 +65,8 @@ const NAMES: [&str; 6] = ["Base", "Handle", "Muzzle", "Prong_A", "Prong_B", "Pro
 fn pose(shift: Vec3, turn: Quat, open: f32) -> Pose {
     let mut p: Pose = vec![
         (turn, BASE + shift),
-        (Quat::IDENTITY, HANDLE - BASE),
-        (Quat::IDENTITY, MUZZLE - BASE),
+        (NO_TURN, HANDLE - BASE),
+        (NO_TURN, MUZZLE - BASE),
     ];
     p.extend((0..3).map(|k| claw_pose(k, open)));
     p
@@ -74,7 +74,7 @@ fn pose(shift: Vec3, turn: Quat, open: f32) -> Pose {
 
 /// Each bone's model-space place at rest.
 fn rest() -> Vec<Mat4> {
-    let p = pose(Vec3::ZERO, Quat::IDENTITY, SHUT);
+    let p = pose(Vec3::ZERO, NO_TURN, SHUT);
     let base = Mat4::from_rotation_translation(p[0].0, p[0].1);
     let mut out = vec![base];
     out.extend(p[1..].iter().map(|(q, t)| base * Mat4::from_rotation_translation(*q, *t)));
@@ -87,9 +87,9 @@ struct Builder {
 }
 
 impl Builder {
-    /// A box from `lo` to `hi` in bone `bone`'s own space (placed by
+    /// A box from `lo` to `hi` in bone `joint`'s own space (placed by
     /// `place`), its faces textured 1 pixel an inch.
-    fn cuboid(&mut self, place: Mat4, bone: u8, m: usize, lo: Vec3, hi: Vec3) {
+    fn cuboid(&mut self, place: Mat4, joint: u8, m: usize, lo: Vec3, hi: Vec3) {
         let mesh = &mut self.meshes[m];
         // Each face: its normal, and its two in-face axes (u, v).
         let faces = [
@@ -112,16 +112,16 @@ impl Builder {
                     pos: place.transform_point3(local),
                     normal: place.transform_vector3(n).normalize(),
                     uv,
-                    bones: [bone, 0, 0],
-                    weights: [1.0, 0.0, 0.0],
+                    bones: [joint, 0, 0],
+                    blend: ONE_BONE,
                 });
             }
             // Wound so the face's front is its normal's side (the guest
             // pass draws both sides; this keeps it right if that changes).
             if u.cross(v).dot(n) > 0.0 {
-                mesh.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+                mesh.tri_list.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
             } else {
-                mesh.indices.extend([base, base + 2, base + 1, base, base + 3, base + 2]);
+                mesh.tri_list.extend([base, base + 2, base + 1, base, base + 3, base + 2]);
             }
         }
     }
@@ -135,7 +135,7 @@ fn body(b: &mut Builder, m: usize, lo: [f32; 3], hi: [f32; 3]) {
 fn meshes() -> Vec<Mesh> {
     let rest = rest();
     let mut b = Builder {
-        meshes: (0..MATERIALS.len()).map(|m| Mesh { texture: m, vertices: Vec::new(), indices: Vec::new() }).collect(),
+        meshes: (0..MATERIALS.len()).map(Mesh::empty).collect(),
     };
     let (y, z) = (AXIS_Y, AXIS_Z);
     // The body: a block round the axis, a dark back cap, a metal collar
@@ -154,11 +154,11 @@ fn meshes() -> Vec<Mesh> {
     body(&mut b, DARK, [27.0, -3.5, -17.0], [39.0, 1.0, -13.0]);
     // The three claws, each two blocks bending in at the tip.
     for k in 0..3 {
-        let bone = 3 + k as u8;
+        let joint = 3 + k as u8;
         let place = rest[3 + k];
-        b.cuboid(place, bone, DARK, Vec3::new(-1.0, -1.5, -1.0), Vec3::new(3.0, 1.5, 1.5));
-        b.cuboid(place, bone, METAL, Vec3::new(2.0, -0.75, -0.25), Vec3::new(11.0, 0.75, 1.25));
-        b.cuboid(place, bone, ACCENT, Vec3::new(10.0, -1.0, -2.5), Vec3::new(13.5, 1.0, 0.5));
+        b.cuboid(place, joint, DARK, -Vec3::new(1.0, 1.5, 1.0), Vec3::new(3.0, 1.5, 1.5));
+        b.cuboid(place, joint, METAL, Vec3::new(2.0, -0.75, -0.25), Vec3::new(11.0, 0.75, 1.25));
+        b.cuboid(place, joint, ACCENT, Vec3::new(10.0, -1.0, -2.5), Vec3::new(13.5, 1.0, 0.5));
     }
     b.meshes
 }
@@ -167,9 +167,9 @@ fn meshes() -> Vec<Mesh> {
 /// each `seconds` long, its base at `shift(t)` turned `turn(t)`.
 fn sequence(
     model: &mut Model,
-    name: &str,
+    called: &str,
     seconds: f32,
-    looping: bool,
+    repeats: bool,
     motion: impl Fn(f32) -> (Vec3, Quat),
 ) {
     let frames = ((seconds * FPS).round() as usize).max(1) + 1;
@@ -182,19 +182,19 @@ fn sequence(
             })
             .collect();
         anims.push(model.animations.len());
-        model.animations.push(Animation { name: format!("{name}_{label}"), fps: FPS, looping, delta: false, frames });
+        model.animations.push(Animation { name: format!("{called}_{label}"), fps: FPS, repeats, delta: false, frames });
     }
     model.sequences.push(Sequence {
-        name: name.to_owned(),
+        name: called.to_owned(),
         activity: String::new(),
-        looping,
-        fade_in: 0.2,
-        fade_out: 0.2,
+        repeats,
+        ease_on: 0.2,
+        ease_off: 0.2,
         anims,
         groups: [2, 1],
         params: [Some((0, 0.0, 1.0)), None],
-        events: Vec::new(),
-        flags: 0,
+        events: vec![],
+        studio_bits: 0,
         layers: Vec::new(),
         weights: vec![1.0; NAMES.len()],
     });
@@ -217,25 +217,28 @@ pub fn model(upgraded: bool) -> Model {
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            let p = pose(Vec3::ZERO, Quat::IDENTITY, SHUT)[i];
-            Bone {
+            let p = pose(Vec3::ZERO, NO_TURN, SHUT)[i];
+            Joint {
                 name: (*name).to_owned(),
-                parent: (i > 0).then_some(0),
+                parent_slot: (i > 0).then_some(0),
                 pos: p.1,
                 quat: p.0,
-                rot: Vec3::ZERO,
+                turn_matrix: Vec3::ZERO,
                 pos_scale: Vec3::ZERO,
                 rot_scale: Vec3::ZERO,
                 pose_to_bone: rest[i].inverse(),
             }
         })
         .collect();
-    let at = |bone: usize, local: Vec3| Attachment {
+    let at = |joint: usize, local: Vec3| Mount {
         name: String::new(),
-        bone,
+        joint,
         local: Mat4::from_translation(local),
     };
-    let named = |name: &str, a: Attachment| Attachment { name: name.to_owned(), ..a };
+    let named = |label: &str, mut a: Mount| {
+        a.name = label.to_owned();
+        a
+    };
     let mut model = Model {
         name: if upgraded { "standin_superphyscannon" } else { "standin_physcannon" }.to_owned(),
         bones,
@@ -355,12 +358,12 @@ pub fn sprite(path: &str) -> Rgba {
     let mut pixels = Vec::with_capacity((side * side * 4) as usize);
     for y in 0..side {
         for x in 0..side {
-            let (dx, dy) = (x as f32 - 7.5, y as f32 - 7.5);
-            let d = (dx * dx + dy * dy).sqrt();
+            let (step_along_x, dy) = (x as f32 - 7.5, y as f32 - 7.5);
+            let d = (step_along_x * step_along_x + dy * dy).sqrt();
             // Stepped rings, Minecraft's particles' look.
             let mut a = (1.0 - (d / 8.0 * rings).floor() / rings).clamp(0.0, 1.0);
             a *= a;
-            if star && (dx.abs() < 1.0 || dy.abs() < 1.0) {
+            if star && (step_along_x.abs() < 1.0 || dy.abs() < 1.0) {
                 a = a.max((1.0 - d / 8.0).clamp(0.0, 1.0));
             }
             let hot = (1.0 - d / 3.0).clamp(0.0, 1.0);

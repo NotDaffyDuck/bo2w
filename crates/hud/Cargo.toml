@@ -1,28 +1,26 @@
-[package]
-name = "hud"
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-description = "On-screen HUD: renders the values hud_t6 works out from the presented snapshot."
+# The on-screen HUD.
+package.name = "hud"
+package.version = "0.1.0"
+package.edition.workspace = true
+package.publish.workspace = true
+package.description = "On-screen HUD: renders the values hud_t6 works out from the presented snapshot."
 
-[lints]
-workspace = true
+lints.workspace = true
 
-[dependencies]
-asset_core.workspace = true
-asset_game.workspace = true
-asset_material.workspace = true
-asset_transport.workspace = true
-assets.workspace = true
-bevy.workspace = true
-diag.workspace = true
-entity_t6.workspace = true
-frame.workspace = true
-game_math.workspace = true
-gamemode_t6.workspace = true
-playerstate_t6.workspace = true
-ui.workspace = true
-weapon_t6.workspace = true
-hud_t6 = { path = "../hud_t6" }
-net = { path = "../net" }
-sim = { path = "../sim" }
+dependencies.asset_core.workspace = true
+dependencies.asset_game.workspace = true
+dependencies.asset_material.workspace = true
+dependencies.asset_transport.workspace = true
+dependencies.assets.workspace = true
+dependencies.bevy.workspace = true
+dependencies.diag.workspace = true
+dependencies.entity_t6.workspace = true
+dependencies.frame.workspace = true
+dependencies.game_math.workspace = true
+dependencies.gamemode_t6.workspace = true
+dependencies.playerstate_t6.workspace = true
+dependencies.ui.workspace = true
+dependencies.weapon_t6.workspace = true
+dependencies.hud_t6.path = "../hud_t6"
+dependencies.net.path = "../net"
+dependencies.sim.path = "../sim"

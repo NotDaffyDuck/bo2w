@@ -5,12 +5,19 @@ mod args;
 mod banks;
 mod table;
 
-pub use args::{ExecutableArgumentBinding, PackedCodeArg, PreparedArgBelts, PreparedArgSlice};
+pub use args::RunnableParamSource;
+pub use args::PackedCodeParam;
+pub use args::PreparedParamStrips;
+pub use args::PreparedParamSpan;
 pub use banks::{
-    PackedLocalBanks, PackedLocalSamplerLane, PackedLocalSamplers, pack_local_banks,
-    pack_local_samplers,
+    LocalSamplerBanks, CompactSamplerSlot, LocalSamplerBundle, encode_local_register_banks,
 };
+pub use banks::pack_local_samplers;
 pub use table::{
-    AdmittedPortFacts, GfxPassStateBits, PreparedMaterial, PreparedMaterialTable, PreparedPass,
-    PreparedTableCensus, PreparedTechnique,
+    ResolvedTableTally, ResolvedShadingRecipe, VertexVariant,
 };
+pub use table::AcceptedPortSummary;
+pub use table::VisualPassStateBits;
+pub use table::StagedMaterial;
+pub use table::StagedMaterialTable;
+pub use table::ResolvedDrawPass;

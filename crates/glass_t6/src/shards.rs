@@ -11,9 +11,6 @@
 
 use crate::GlassWorldTrace;
 
-type V2 = [f32; 2];
-type V3 = [f32; 3];
-
 /// `maxShardSplit`: the piece budget when the def gives none.
 const MAX_SHARD_SPLIT: usize = 125;
 /// `StaticFixedSizeAllocator<TempPackedOutline, 350>`.
@@ -71,10 +68,10 @@ pub const T6_GLASS_LOW_LOD_DIST: f32 = 450.0;
 /// One window's shard source: its outline in its own plane and its def.
 #[derive(Clone, Debug, Default)]
 pub struct T6PaneShape {
-    pub outline: Vec<V2>,
+    pub outline: Vec<[f32; 2]>,
     /// In-plane x, in-plane y, normal.
-    pub axis: [V3; 3],
-    pub outline_origin: V3,
+    pub axis: [[f32; 3]; 3],
+    pub outline_origin: [f32; 3],
     pub thickness: f32,
     pub uv_scale: f32,
     pub is_planar: bool,
@@ -105,17 +102,17 @@ pub struct T6Shard {
     pub pane: u32,
     /// Outline about `origin` in the plane of `axis[0]`, `axis[1]`; edge `i`
     /// runs from vertex `i` to `i + 1`.
-    pub outline: Vec<V2>,
+    pub outline: Vec<[f32; 2]>,
     /// Edge `i` is part of the pane's frame.
     pub frame: Vec<bool>,
     /// Where this piece sat on the pane (its texture position).
-    pub uv_offset: V2,
-    pub origin: V3,
-    pub axis: [V3; 3],
+    pub uv_offset: [f32; 2],
+    pub origin: [f32; 3],
+    pub along: [[f32; 3]; 3],
     pub area: f32,
     pub motion: T6ShardMotion,
-    pub vel: V3,
-    pub avel: V3,
+    pub motion_vec: [f32; 3],
+    pub avel: [f32; 3],
     /// Seconds left: until a delayed piece falls, or a simple one goes.
     pub timer: f32,
 }
@@ -123,9 +120,9 @@ pub struct T6Shard {
 /// One vertex of a shard's mesh, in the world.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct T6ShardVertex {
-    pub position: V3,
-    pub normal: V3,
-    pub uv: V2,
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub tex_coord: [f32; 2],
 }
 
 /// Counts for the proof logs.
@@ -145,8 +142,8 @@ pub struct T6Glass {
     /// The world's floor (`worldBottom`: bounds minimum z + 5).
     pub floor: f32,
     clock: Option<i32>,
-    rng: Rng,
-    serial: u64,
+    dice: Rng,
+    shatter_seq: u64,
     log: bool,
     /// Bumped whenever the shards change, for the draw pass.
     pub revision: u64,
@@ -158,7 +155,7 @@ impl T6Glass {
         *self = Self {
             panes,
             floor,
-            rng: Rng::new(0x5EED_0B02),
+            dice: Rng::new(0x5EED_0B02),
             log: std::env::var_os("BO2MP_T6_GLASSLOG").is_some(),
             ..Self::default()
         };
@@ -185,15 +182,15 @@ impl T6Glass {
     /// `dir` aim the falling pieces (zero `dir`: random drift). A shatter
     /// that is old news (`animate` false, BO2's game-state shatter) drops
     /// the pieces that would fly with no collision right away.
-    pub fn shatter(&mut self, pane: u32, hit: V3, dir: V3, seed: Option<u64>, animate: bool) -> bool {
+    pub fn shatter(&mut self, pane: u32, hit: [f32; 3], dir: [f32; 3], seed: Option<u64>, animate: bool) -> bool {
         let Some(shape) = self.panes.get(pane as usize) else {
             return false;
         };
         if shape.outline.len() < 3 {
             return false;
         }
-        self.serial = self.serial.wrapping_add(1);
-        let mut rng = Rng::new(seed.unwrap_or(self.serial.wrapping_mul(0x9E37_79B9)) ^ (u64::from(pane) << 40));
+        self.shatter_seq = self.shatter_seq.wrapping_add(1);
+        let mut rng = Rng::new(seed.unwrap_or(self.shatter_seq.wrapping_mul(0x9E37_79B9)) ^ (u64::from(pane) << 40));
         let mut outline = Outline::new(shape.outline.clone(), shape.is_planar);
         outline.dedup();
         if outline.p.len() < 3 {
@@ -266,34 +263,34 @@ impl T6Glass {
     /// `GlassCl_TracePoint` -> `GlassShard::TracePoint`: a bullet from
     /// `start` to `end` cuts the first shard it meets that is still (in the
     /// frame, waiting to drop, or lying on the floor). Returns 1 on a hit.
-    pub fn hit_segment(&mut self, start: V3, end: V3, seed: u64) -> usize {
-        let delta = sub3(end, start);
+    pub fn hit_segment(&mut self, seg_a: [f32; 3], seg_b: [f32; 3], seed: u64) -> usize {
+        let delta = sub3(seg_b, seg_a);
         let len = dot3(delta, delta).sqrt();
-        if !(len > 1e-4) || !start.iter().chain(end.iter()).all(|v| v.is_finite()) {
+        if !(len > 1e-4) || !seg_a.iter().chain(seg_b.iter()).all(|v| v.is_finite()) {
             return 0;
         }
-        let mut best: Option<(f32, usize, V3)> = None;
+        let mut nearest_hit: Option<(f32, usize, [f32; 3])> = None;
         for (i, s) in self.shards.iter().enumerate() {
             if !matches!(s.motion, T6ShardMotion::Still | T6ShardMotion::Delayed) {
                 continue;
             }
-            let n = s.axis[2];
+            let n = s.along[2];
             let den = dot3(delta, n);
             if den.abs() < 1e-6 {
                 continue;
             }
-            let f = dot3(sub3(s.origin, start), n) / den;
-            if !(0.0..=1.0).contains(&f) || best.is_some_and(|b| b.0 <= f) {
+            let f = dot3(sub3(s.origin, seg_a), n) / den;
+            if !(0.0..=1.0).contains(&f) || nearest_hit.is_some_and(|b| b.0 <= f) {
                 continue;
             }
-            let hit = add3(start, scale3(delta, f));
+            let hit = add3(seg_a, scale3(delta, f));
             let local = sub3(hit, s.origin);
-            let p = [dot3(local, s.axis[0]), dot3(local, s.axis[1])];
+            let p = [dot3(local, s.along[0]), dot3(local, s.along[1])];
             if point_in_polygon(&s.outline, p) {
-                best = Some((f, i, hit));
+                nearest_hit = Some((f, i, hit));
             }
         }
-        let Some((_, i, hit)) = best else {
+        let Some((_frac, i, hit)) = nearest_hit else {
             return 0;
         };
         self.hit_shard(i, hit, scale3(delta, 1.0 / len), seed);
@@ -302,12 +299,12 @@ impl T6Glass {
 
     /// `GlassShard::TracePoint` -> `GlassOutline::HitPoint`: shard `i` is cut
     /// near `hit`; pieces still on the frame stay, the rest fall.
-    fn hit_shard(&mut self, i: usize, hit: V3, dir: V3, seed: u64) {
+    fn hit_shard(&mut self, i: usize, hit: [f32; 3], heading: [f32; 3], seed: u64) {
         let parent = self.shards.swap_remove(i);
         let shape = shape_of(&self.panes, parent.pane).clone();
         let mut rng = Rng::new(seed ^ 0xB0_2C11);
         let local = sub3(hit, parent.origin);
-        let h = [dot3(local, parent.axis[0]), dot3(local, parent.axis[1])];
+        let h = [dot3(local, parent.along[0]), dot3(local, parent.along[1])];
         let source = Outline {
             p: parent.outline.clone(),
             f: parent.frame.clone(),
@@ -318,13 +315,13 @@ impl T6Glass {
         let diag = (sq(hi[0] - lo[0]) + sq(hi[1] - lo[1]) + sq(shape.thickness)).sqrt();
         let (mut stay, mut fall) = (0, 0);
         for piece in pieces {
-            let mut shard = make_shard(parent.pane, piece, parent.uv_offset, parent.origin, parent.axis);
+            let mut shard = make_shard(parent.pane, piece, parent.uv_offset, parent.origin, parent.along);
             if shard.frame.iter().any(|&f| f) {
                 shard.motion = T6ShardMotion::Still;
                 self.shards.push(shard);
                 stay += 1;
             } else {
-                self.fall(shard, true, hit, dir, diag.max(1e-3), &mut rng);
+                self.fall(shard, true, hit, heading, diag.max(1e-3), &mut rng);
                 fall += 1;
             }
         }
@@ -341,7 +338,7 @@ impl T6Glass {
     /// Per-piece `GlassShard::InitPhysics`: a piece on the frame (not on its
     /// bottom edge) may stay; one that fails waits, then falls; the rest
     /// fall now.
-    fn place(&mut self, mut shard: T6Shard, collide: bool, hit: V3, dir: V3, size: f32, f: f32, rng: &mut Rng) {
+    fn place(&mut self, mut shard: T6Shard, collide: bool, hit: [f32; 3], heading: [f32; 3], size: f32, f: f32, rng: &mut Rng) {
         let flagged = shard.frame.iter().any(|&e| e);
         if flagged && f > 0.0 && !on_bottom_edge(&shard) {
             let o = Outline {
@@ -360,20 +357,20 @@ impl T6Glass {
                 return;
             }
         }
-        self.fall(shard, collide, hit, dir, size, rng);
+        self.fall(shard, collide, hit, heading, size, rng);
     }
 
     /// The piece gets its body and starting velocity and falls.
-    fn fall(&mut self, mut shard: T6Shard, collide: bool, hit: V3, dir: V3, size: f32, rng: &mut Rng) {
-        let d2 = dot3(dir, dir);
+    fn fall(&mut self, mut shard: T6Shard, collide: bool, hit: [f32; 3], heading: [f32; 3], size: f32, rng: &mut Rng) {
+        let d2 = dot3(heading, heading);
         let away = sub3(shard.origin, hit);
         let dist = dot3(away, away).sqrt();
         let unit = if dist > 0.0 { scale3(away, 1.0 / dist) } else { [0.0; 3] };
-        shard.vel = if d2 == 0.0 {
+        shard.motion_vec = if d2 == 0.0 {
             [0; 3].map(|_| rng.range(-EXTRA_LIN_VEL, EXTRA_LIN_VEL))
         } else if d2 <= 1.01 {
             let k = 1.0 - (dist * FORCE_ATTENUATION / size.max(1e-6)).clamp(0.25, 1.0);
-            scale3(add3(scale3(unit, FORCE_ORIGIN_MULT), dir), k * LIN_VEL_MULT)
+            scale3(add3(scale3(unit, FORCE_ORIGIN_MULT), heading), k * LIN_VEL_MULT)
         } else {
             let s = ((d2.sqrt() - 1.0) * 2.0).clamp(0.2, 1.0);
             scale3(unit, s * LIN_VEL_MULT)
@@ -399,8 +396,8 @@ impl T6Glass {
                 .shards
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.motion == T6ShardMotion::Colliding)
-                .min_by(|a, b| a.1.area.total_cmp(&b.1.area))
+                .filter(|entry| entry.1.motion == T6ShardMotion::Colliding)
+                .min_by(|lhs, rhs| lhs.1.area.total_cmp(&rhs.1.area))
                 .map(|(i, s)| (i, s.area));
             match smallest {
                 Some((i, area)) if area < shard.area => {
@@ -424,14 +421,14 @@ impl T6Glass {
     /// at the edge, times 0.01 and `glassForceMultiplier`, at most 500
     /// (`AddForce`), over its mass. Its frame hold is gone either way.
     /// Returns how many pieces it knocked.
-    pub fn explosion(&mut self, centre: V3, inner: f32, outer: f32, radius: f32) -> usize {
-        let radius = radius.min(MAX_EXPLOSION_RADIUS);
-        if !(radius > 0.0) || !centre.iter().all(|v| v.is_finite()) {
+    pub fn explosion(&mut self, centre: [f32; 3], inner: f32, outer: f32, reach: f32) -> usize {
+        let reach = reach.min(MAX_EXPLOSION_RADIUS);
+        if !(reach > 0.0) || !centre.iter().all(|v| v.is_finite()) {
             return 0;
         }
         let near = |s: &T6Shard| {
             let away = sub3(s.origin, centre);
-            matches!(s.motion, T6ShardMotion::Still | T6ShardMotion::Delayed) && dot3(away, away) < radius * radius
+            matches!(s.motion, T6ShardMotion::Still | T6ShardMotion::Delayed) && dot3(away, away) < reach * reach
         };
         let (hit, keep): (Vec<T6Shard>, Vec<T6Shard>) = std::mem::take(&mut self.shards).into_iter().partition(near);
         self.shards = keep;
@@ -444,7 +441,7 @@ impl T6Glass {
             let away = sub3(shard.origin, centre);
             let d = dot3(away, away).sqrt();
             let unit = if d > 0.0 { scale3(away, 1.0 / d) } else { away };
-            let push = ((1.0 - d / radius) * (inner - outer) + outer) * 0.01 * FORCE_MULTIPLIER;
+            let push = ((1.0 - d / reach) * (inner - outer) + outer) * 0.01 * FORCE_MULTIPLIER;
             let mut force = scale3(unit, push);
             let len = dot3(force, force).sqrt();
             if len > MAX_FORCE {
@@ -453,12 +450,12 @@ impl T6Glass {
             // The push lands on the piece's own origin: no spin. Both body
             // kinds take it as one step's impulse, force / mass.
             let mass = mass_of(shard.area, shape_of(&self.panes, shard.pane).thickness);
-            shard.vel = scale3(force, 1.0 / mass);
+            shard.motion_vec = scale3(force, 1.0 / mass);
             shard.avel = [0.0; 3];
             if let Err(mut left) = self.add_body(shard, true) {
                 // No body: it stays where it is, its frame hold gone.
                 left.motion = T6ShardMotion::Still;
-                left.vel = [0.0; 3];
+                left.motion_vec = [0.0; 3];
                 self.shards.push(left);
                 stuck += 1;
             }
@@ -467,7 +464,7 @@ impl T6Glass {
         if self.log {
             let c = self.counts();
             eprintln!(
-                "bo2mp t6 glass shards: blast at {centre:?} radius {radius} ({inner} to {outer}) knocked {knocked} pieces ({stuck} with no body; now {} still, {} delayed, {} colliding, {} simple)",
+                "bo2mp t6 glass shards: blast at {centre:?} radius {reach} ({inner} to {outer}) knocked {knocked} pieces ({stuck} with no body; now {} still, {} delayed, {} colliding, {} simple)",
                 c.still, c.delayed, c.colliding, c.simple
             );
         }
@@ -522,20 +519,20 @@ impl T6Glass {
         if dt <= 0.0 || self.shards.is_empty() {
             return;
         }
-        let mut rng = std::mem::take(&mut self.rng);
+        let mut kept_dice = std::mem::take(&mut self.dice);
         let mut i = 0;
         while i < self.shards.len() {
             if self.shards[i].motion == T6ShardMotion::Delayed {
                 self.shards[i].timer -= dt;
                 if self.shards[i].timer < 0.0 {
                     let shard = self.shards.swap_remove(i);
-                    self.fall(shard, true, [0.0; 3], [0.0; 3], 0.0, &mut rng);
+                    self.fall(shard, true, [0.0; 3], [0.0; 3], 0.0, &mut kept_dice);
                     continue;
                 }
             }
             i += 1;
         }
-        self.rng = rng;
+        self.dice = kept_dice;
         let floor = self.floor;
         let panes = &self.panes;
         let mut rested = 0;
@@ -570,7 +567,7 @@ impl T6Glass {
     /// Shard `i`'s mesh (`Mesh::Init`, `GlassShard::GenerateVerts`): front
     /// face on the outline, back face `thickness` along the normal, and
     /// (high LOD) one quad per edge. UVs are where it sat on the pane.
-    pub fn shard_mesh(&self, i: usize, walls: bool, verts: &mut Vec<T6ShardVertex>, indices: &mut Vec<u32>) {
+    pub fn shard_mesh(&self, i: usize, walls: bool, vertex_points: &mut Vec<T6ShardVertex>, indices: &mut Vec<u32>) {
         let Some(s) = self.shards.get(i) else {
             return;
         };
@@ -579,24 +576,24 @@ impl T6Glass {
         if n < 3 {
             return;
         }
-        let [ax, ay, az] = s.axis;
+        let [ax, ay, az] = s.along;
         let back = scale3(az, shape.thickness);
-        let world = |p: V2| add3(s.origin, add3(scale3(ax, p[0]), scale3(ay, p[1])));
-        let uv = |p: V2| [(s.uv_offset[0] + p[0]) * shape.uv_scale, (s.uv_offset[1] + p[1]) * shape.uv_scale];
-        let tris = triangulate(&s.outline);
+        let world = |p: [f32; 2]| add3(s.origin, add3(scale3(ax, p[0]), scale3(ay, p[1])));
+        let uv = |p: [f32; 2]| [(s.uv_offset[0] + p[0]) * shape.uv_scale, (s.uv_offset[1] + p[1]) * shape.uv_scale];
+        let triangle_list = triangulate(&s.outline);
         // Front faces +normal, back faces -normal; each wound to face out.
         let handed = dot3(cross3(ax, ay), az) >= 0.0;
         let ccw = signed_area(&s.outline) >= 0.0;
         let front_flip = handed != ccw;
-        let base = verts.len() as u32;
+        let base = vertex_points.len() as u32;
         for &p in &s.outline {
-            verts.push(T6ShardVertex { position: world(p), normal: az, uv: uv(p) });
+            vertex_points.push(T6ShardVertex { position: world(p), normal: az, tex_coord: uv(p) });
         }
         for &p in &s.outline {
-            verts.push(T6ShardVertex { position: add3(world(p), back), normal: scale3(az, -1.0), uv: uv(p) });
+            vertex_points.push(T6ShardVertex { position: add3(world(p), back), normal: scale3(az, -1.0), tex_coord: uv(p) });
         }
         let nb = base + n as u32;
-        for &[a, b, c] in &tris {
+        for &[a, b, c] in &triangle_list {
             let (a, b, c) = (a as u32, b as u32, c as u32);
             if front_flip {
                 indices.extend([base + a, base + c, base + b, nb + a, nb + b, nb + c]);
@@ -613,10 +610,10 @@ impl T6Glass {
             // Outward in the plane: right of the edge for a CCW outline.
             let out2 = if ccw { [d[1], -d[0]] } else { [-d[1], d[0]] };
             let normal = norm3(add3(scale3(ax, out2[0]), scale3(ay, out2[1])));
-            let w = verts.len() as u32;
+            let w = vertex_points.len() as u32;
             let (f0, f1) = (world(p0), world(p1));
             for (pos, p) in [(f0, p0), (f1, p1), (add3(f1, back), p1), (add3(f0, back), p0)] {
-                verts.push(T6ShardVertex { position: pos, normal, uv: uv(p) });
+                vertex_points.push(T6ShardVertex { position: pos, normal, tex_coord: uv(p) });
             }
             indices.extend([w, w + 1, w + 2, w, w + 2, w + 3]);
         }
@@ -632,7 +629,7 @@ fn shape_of(panes: &[T6PaneShape], pane: u32) -> &T6PaneShape {
 
 /// A piece recentred on its box (`Recenter`): its origin moves in its
 /// plane and its texture offset carries the move.
-fn make_shard(pane: u32, o: Outline, uv_offset: V2, origin: V3, axis: [V3; 3]) -> T6Shard {
+fn make_shard(pane: u32, o: Outline, uv_offset: [f32; 2], shard_at: [f32; 3], along: [[f32; 3]; 3]) -> T6Shard {
     let (lo, hi) = bbox(&o.p);
     let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
     let area = o.area();
@@ -641,11 +638,11 @@ fn make_shard(pane: u32, o: Outline, uv_offset: V2, origin: V3, axis: [V3; 3]) -
         outline: o.p.iter().map(|&p| sub2(p, c)).collect(),
         frame: o.f,
         uv_offset: add2(uv_offset, c),
-        origin: add3(origin, add3(scale3(axis[0], c[0]), scale3(axis[1], c[1]))),
-        axis,
+        origin: add3(shard_at, add3(scale3(along[0], c[0]), scale3(along[1], c[1]))),
+        along,
         area,
         motion: T6ShardMotion::Still,
-        vel: [0.0; 3],
+        motion_vec: [0.0; 3],
         avel: [0.0; 3],
         timer: 0.0,
     }
@@ -667,7 +664,7 @@ fn mass_of(area: f32, thickness: f32) -> f32 {
 /// `IsOnBottomEdge`: an upright piece whose one frame edge is level and
 /// lowest falls at once.
 fn on_bottom_edge(s: &T6Shard) -> bool {
-    let [ax, ay, az] = s.axis;
+    let [ax, ay, az] = s.along;
     if az[2].abs() >= 0.01 {
         return false;
     }
@@ -676,7 +673,7 @@ fn on_bottom_edge(s: &T6Shard) -> bool {
         return false;
     };
     let n = s.outline.len();
-    let z = |p: V2| ax[2] * p[0] + ay[2] * p[1];
+    let z = |p: [f32; 2]| ax[2] * p[0] + ay[2] * p[1];
     let (p0, p1) = (s.outline[e], s.outline[(e + 1) % n]);
     let d = sub2(p1, p0);
     let len = (d[0] * d[0] + d[1] * d[1]).sqrt();
@@ -689,12 +686,12 @@ fn on_bottom_edge(s: &T6Shard) -> bool {
 
 /// `GlassPhysics::IntegrateVelocity` + `Step` for one dt.
 fn step_body(s: &mut T6Shard, dt: f32) {
-    s.vel[2] += GRAVITY * dt;
+    s.motion_vec[2] += GRAVITY * dt;
     // Gyroscopic term in body axes, solid box inertia.
     let (lo, hi) = bbox(&s.outline);
     let l = [hi[0] - lo[0], hi[1] - lo[1], 0.0f32];
     let inertia = [sq(l[1]) + sq(l[2]), sq(l[0]) + sq(l[2]), sq(l[0]) + sq(l[1])];
-    let wb = [dot3(s.avel, s.axis[0]), dot3(s.avel, s.axis[1]), dot3(s.avel, s.axis[2])];
+    let wb = [dot3(s.avel, s.along[0]), dot3(s.avel, s.along[1]), dot3(s.avel, s.along[2])];
     let mut nb = wb;
     for k in 0..3 {
         let (k1, k2) = ((k + 1) % 3, (k + 2) % 3);
@@ -702,54 +699,54 @@ fn step_body(s: &mut T6Shard, dt: f32) {
             nb[k] += dt * (inertia[k1] - inertia[k2]) / inertia[k] * wb[k1] * wb[k2];
         }
     }
-    s.avel = add3(add3(scale3(s.axis[0], nb[0]), scale3(s.axis[1], nb[1])), scale3(s.axis[2], nb[2]));
+    s.avel = add3(add3(scale3(s.along[0], nb[0]), scale3(s.along[1], nb[1])), scale3(s.along[2], nb[2]));
     let w2 = dot3(s.avel, s.avel);
     if w2 > MAX_ANG_SPEED * MAX_ANG_SPEED {
         s.avel = scale3(s.avel, MAX_ANG_SPEED / w2.sqrt());
     }
-    s.vel = scale3(s.vel, 1.0 - (DRAG_LINEAR * dt).min(0.9));
+    s.motion_vec = scale3(s.motion_vec, 1.0 - (DRAG_LINEAR * dt).min(0.9));
     s.avel = scale3(s.avel, 1.0 - (DRAG_ANGULAR * dt).min(0.9));
-    s.origin = add3(s.origin, scale3(s.vel, dt));
+    s.origin = add3(s.origin, scale3(s.motion_vec, dt));
     let turn = scale3(s.avel, dt);
-    s.axis = s.axis.map(|a| rotate3(a, turn));
-    orthonormalize(&mut s.axis);
+    s.along = s.along.map(|a| rotate3(a, turn));
+    orthonormalize(&mut s.along);
 }
 
 /// A colliding piece meets the world along its step: it bounces off with
 /// friction, and on a floor at low speed it lies flat and stays (BO2's
 /// engine rest). Glass is passed through. True when it came to rest.
-fn collide(s: &mut T6Shard, from: V3, world: &dyn GlassWorldTrace, thickness: f32) -> bool {
+fn collide(s: &mut T6Shard, from: [f32; 3], world: &dyn GlassWorldTrace, thickness: f32) -> bool {
     let Some(hit) = world.sweep(from, s.origin) else {
         return false;
     };
-    if hit.startsolid || hit.pane.is_some() {
+    if hit.began_inside || hit.pane.is_some() {
         return false;
     }
     let n = norm3(hit.normal);
     s.origin = add3(hit.end, scale3(n, 0.1));
-    let vn = dot3(s.vel, n);
-    if vn < 0.0 {
-        let normal_change = -vn * (1.0 + RESTITUTION);
-        let tangent = sub3(s.vel, scale3(n, vn));
+    let normal_speed = dot3(s.motion_vec, n);
+    if normal_speed < 0.0 {
+        let normal_change = -normal_speed * (1.0 + RESTITUTION);
+        let tangent = sub3(s.motion_vec, scale3(n, normal_speed));
         let tlen = dot3(tangent, tangent).sqrt();
         let cut = (FRICTION * normal_change).min(tlen);
         let tangent = if tlen > 0.0 { scale3(tangent, (tlen - cut) / tlen) } else { tangent };
-        s.vel = add3(tangent, scale3(n, -vn * RESTITUTION));
+        s.motion_vec = add3(tangent, scale3(n, -normal_speed * RESTITUTION));
         s.avel = scale3(s.avel, 0.5);
     }
-    if n[2] > 0.7 && dot3(s.vel, s.vel) < REST_SPEED * REST_SPEED {
+    if n[2] > 0.7 && dot3(s.motion_vec, s.motion_vec) < REST_SPEED * REST_SPEED {
         // Lie flat on the floor, the side nearest it down (the back face
         // sits `thickness` along the normal, so a face-up piece lifts by it).
-        let face_up = dot3(s.axis[2], n) < 0.0;
+        let face_up = dot3(s.along[2], n) < 0.0;
         let up = if face_up { scale3(n, -1.0) } else { n };
-        let handed = dot3(cross3(s.axis[0], s.axis[1]), s.axis[2]) >= 0.0;
-        let x = sub3(s.axis[0], scale3(up, dot3(s.axis[0], up)));
+        let handed = dot3(cross3(s.along[0], s.along[1]), s.along[2]) >= 0.0;
+        let x = sub3(s.along[0], scale3(up, dot3(s.along[0], up)));
         let x = if dot3(x, x) > 1e-6 { norm3(x) } else { perpendicular(up) };
         let y = if handed { cross3(up, x) } else { cross3(x, up) };
-        s.axis = [x, y, up];
+        s.along = [x, y, up];
         let lift = if face_up { thickness.abs() } else { 0.0 };
         s.origin = add3(hit.end, scale3(n, 0.1 + lift));
-        s.vel = [0.0; 3];
+        s.motion_vec = [0.0; 3];
         s.avel = [0.0; 3];
         s.motion = T6ShardMotion::Still;
         return true;
@@ -761,13 +758,13 @@ fn collide(s: &mut T6Shard, from: V3, world: &dyn GlassWorldTrace, thickness: f3
 
 #[derive(Clone, Debug, PartialEq)]
 struct Outline {
-    p: Vec<V2>,
+    p: Vec<[f32; 2]>,
     /// Edge `i` (vertex `i` to `i + 1`) is frame.
     f: Vec<bool>,
 }
 
 impl Outline {
-    fn new(p: Vec<V2>, frame: bool) -> Self {
+    fn new(p: Vec<[f32; 2]>, frame: bool) -> Self {
         let f = vec![frame; p.len()];
         Self { p, f }
     }
@@ -776,7 +773,7 @@ impl Outline {
         self.p.len()
     }
 
-    fn edge(&self, i: usize) -> (V2, V2) {
+    fn edge(&self, i: usize) -> ([f32; 2], [f32; 2]) {
         (self.p[i], self.p[(i + 1) % self.p.len()])
     }
 
@@ -939,16 +936,16 @@ fn split_hit(o: &Outline, e: usize, t: f32, min_piece: f32, rng: &mut Rng) -> Op
 /// One jagged crack from `start` (on edge `e`) heading `dir`: segments of
 /// 2..15% of the perimeter, bending 10..30 degrees each way in turn, to the
 /// far wall. Both halves must pass `InitSplitOutlines`.
-fn crack(o: &Outline, e: usize, start: V2, dir: V2, min_piece: f32, rng: &mut Rng) -> Option<(Outline, Outline)> {
+fn crack(o: &Outline, e: usize, crack_at: [f32; 2], dir: [f32; 2], min_piece: f32, rng: &mut Rng) -> Option<(Outline, Outline)> {
     let per = o.perimeter();
     let min_cut = EDGE_SIZE.0 * per;
-    let (count, mut wall_t, mut wall_e) = ray(o, start, dir, Some(e));
+    let (count, mut wall_t, mut wall_e) = ray(o, crack_at, dir, Some(e));
     if count % 2 == 0 || wall_t <= min_cut {
         return None;
     }
-    let mut pts = vec![start];
-    let (mut cur, mut dir) = (start, dir);
-    let mut sign = rng.sign();
+    let mut pts = vec![crack_at];
+    let (mut cur, mut dir) = (crack_at, dir);
+    let mut turn_way = rng.sign();
     loop {
         let seg = rng.range(EDGE_SIZE.0 * per, EDGE_SIZE.1 * per);
         if wall_t - seg < 0.5 * min_cut {
@@ -962,14 +959,14 @@ fn crack(o: &Outline, e: usize, start: V2, dir: V2, min_piece: f32, rng: &mut Rn
         }
         let mut next = None;
         for _ in 0..5 {
-            let d = rotate2(dir, sign * rng.range(SPLIT_DIR2.0, SPLIT_DIR2.1));
+            let d = rotate2(dir, turn_way * rng.range(SPLIT_DIR2.0, SPLIT_DIR2.1));
             let (count, t, w) = ray(o, cur, d, None);
             if count % 2 == 1 && !crosses_polyline(cur, add2(cur, scale2(d, t)), &pts[..pts.len() - 1]) {
                 next = Some((d, t, w));
                 break;
             }
         }
-        sign = -sign;
+        turn_way = -turn_way;
         let (d, t, w) = next?;
         dir = d;
         wall_t = t;
@@ -980,7 +977,7 @@ fn crack(o: &Outline, e: usize, start: V2, dir: V2, min_piece: f32, rng: &mut Rn
 
 /// `GlassOutline::Chip`: leg one from the nearest edge point to the hit,
 /// leg two bent 30..60 degrees to the first wall.
-fn chip(o: &Outline, e: usize, edge_point: V2, hit: V2, min_piece: f32, rng: &mut Rng) -> Option<(Outline, Outline)> {
+fn chip(o: &Outline, e: usize, edge_point: [f32; 2], hit: [f32; 2], min_piece: f32, rng: &mut Rng) -> Option<(Outline, Outline)> {
     let leg = sub2(hit, edge_point);
     if len2(leg) < MIN_VERT_GAP {
         return None;
@@ -997,14 +994,14 @@ fn chip(o: &Outline, e: usize, edge_point: V2, hit: V2, min_piece: f32, rng: &mu
 /// The two outlines either side of a crack `pts` from edge `e` to edge
 /// `w`, with frame flags copied from the cut edges (crack edges never
 /// frame), checked as `InitSplitOutlines` checks them.
-fn halves(o: &Outline, e: usize, w: usize, pts: &[V2], chip: bool, min_piece: f32) -> Option<(Outline, Outline)> {
+fn halves(o: &Outline, e: usize, w: usize, cut_pts: &[[f32; 2]], chip: bool, min_piece: f32) -> Option<(Outline, Outline)> {
     let n = o.len();
-    if e == w || pts.len() < 2 {
+    if e == w || cut_pts.len() < 2 {
         return None;
     }
-    let last = pts.len() - 1;
+    let last = cut_pts.len() - 1;
     let mut a = Outline { p: Vec::new(), f: Vec::new() };
-    for (i, &p) in pts.iter().enumerate() {
+    for (i, &p) in cut_pts.iter().enumerate() {
         a.p.push(p);
         a.f.push(i == last && o.f[w]);
     }
@@ -1018,7 +1015,7 @@ fn halves(o: &Outline, e: usize, w: usize, pts: &[V2], chip: bool, min_piece: f3
         j = (j + 1) % n;
     }
     let mut b = Outline { p: Vec::new(), f: Vec::new() };
-    for (i, &p) in pts.iter().rev().enumerate() {
+    for (i, &p) in cut_pts.iter().rev().enumerate() {
         b.p.push(p);
         b.f.push(i == last && !chip && o.f[e]);
     }
@@ -1068,7 +1065,7 @@ fn leave_on_edge(o: &Outline, f: f32, rng: &mut Rng) -> bool {
 }
 
 /// `GlassOutline::HitPoint`: the cut a bullet makes in a shard at `hit`.
-fn hit_point(o: &Outline, hit: V2, max_pieces: usize, min_size: f32, max_size: f32, rng: &mut Rng) -> Vec<Outline> {
+fn hit_point(o: &Outline, hit: [f32; 2], max_pieces: usize, min_size: f32, max_size: f32, rng: &mut Rng) -> Vec<Outline> {
     let per = o.perimeter();
     let skip = (2.5 * min_size).min(max_size);
     let (e, t, edge_point, dist) = nearest_edge_point(o, hit);
@@ -1157,7 +1154,7 @@ fn hit_point(o: &Outline, hit: V2, max_pieces: usize, min_size: f32, max_size: f
 }
 
 /// The outline point nearest `p`: edge, parameter, point, distance.
-fn nearest_edge_point(o: &Outline, p: V2) -> (usize, f32, V2, f32) {
+fn nearest_edge_point(o: &Outline, p: [f32; 2]) -> (usize, f32, [f32; 2], f32) {
     let mut best = (0, 0.0, o.p[0], f32::MAX);
     for i in 0..o.len() {
         let (a, b) = o.edge(i);
@@ -1174,7 +1171,7 @@ fn nearest_edge_point(o: &Outline, p: V2) -> (usize, f32, V2, f32) {
 }
 
 /// A ray against the outline: crossings, distance to the first, its edge.
-fn ray(o: &Outline, from: V2, dir: V2, skip: Option<usize>) -> (usize, f32, usize) {
+fn ray(o: &Outline, from: [f32; 2], dir: [f32; 2], skip: Option<usize>) -> (usize, f32, usize) {
     let mut count = 0;
     let mut best = (f32::INFINITY, 0);
     for i in 0..o.len() {
@@ -1201,11 +1198,11 @@ fn ray(o: &Outline, from: V2, dir: V2, skip: Option<usize>) -> (usize, f32, usiz
 }
 
 /// `DoesIntersect`: the segment p..q crosses the polyline.
-fn crosses_polyline(p: V2, q: V2, line: &[V2]) -> bool {
+fn crosses_polyline(p: [f32; 2], q: [f32; 2], line: &[[f32; 2]]) -> bool {
     line.windows(2).any(|w| segments_cross(p, q, w[0], w[1]))
 }
 
-fn segments_cross(p: V2, q: V2, a: V2, b: V2) -> bool {
+fn segments_cross(p: [f32; 2], q: [f32; 2], a: [f32; 2], b: [f32; 2]) -> bool {
     let r = sub2(q, p);
     let s = sub2(b, a);
     let den = cross2(r, s);
@@ -1218,17 +1215,17 @@ fn segments_cross(p: V2, q: V2, a: V2, b: V2) -> bool {
     t > 1e-4 && t < 1.0 - 1e-4 && u > 1e-4 && u < 1.0 - 1e-4
 }
 
-fn inward_normal(o: &Outline, along: V2) -> V2 {
+fn inward_normal(o: &Outline, along: [f32; 2]) -> [f32; 2] {
     if signed_area(&o.p) >= 0.0 { [-along[1], along[0]] } else { [along[1], -along[0]] }
 }
 
-fn point_in_polygon(poly: &[V2], p: V2) -> bool {
+fn point_in_polygon(poly: &[[f32; 2]], pt: [f32; 2]) -> bool {
     let n = poly.len();
     let mut inside = false;
     let mut j = n.wrapping_sub(1);
     for i in 0..n {
         let (a, b) = (poly[i], poly[j]);
-        if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0] {
+        if (a[1] > pt[1]) != (b[1] > pt[1]) && pt[0] < (b[0] - a[0]) * (pt[1] - a[1]) / (b[1] - a[1]) + a[0] {
             inside = !inside;
         }
         j = i;
@@ -1238,7 +1235,7 @@ fn point_in_polygon(poly: &[V2], p: V2) -> bool {
 
 /// Ear clipping: `n - 2` triangles for any simple outline (a fan when the
 /// clip gets stuck).
-fn triangulate(poly: &[V2]) -> Vec<[usize; 3]> {
+fn triangulate(poly: &[[f32; 2]]) -> Vec<[usize; 3]> {
     let n = poly.len();
     let mut out = Vec::with_capacity(n.saturating_sub(2));
     if n < 3 {
@@ -1283,7 +1280,7 @@ fn triangulate(poly: &[V2]) -> Vec<[usize; 3]> {
     out
 }
 
-fn point_in_triangle(p: V2, a: V2, b: V2, c: V2) -> bool {
+fn point_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
     let d1 = cross2(sub2(b, a), sub2(p, a));
     let d2 = cross2(sub2(c, b), sub2(p, b));
     let d3 = cross2(sub2(a, c), sub2(p, c));
@@ -1292,12 +1289,12 @@ fn point_in_triangle(p: V2, a: V2, b: V2, c: V2) -> bool {
     !(neg && pos)
 }
 
-fn signed_area(p: &[V2]) -> f32 {
+fn signed_area(p: &[[f32; 2]]) -> f32 {
     let n = p.len();
     (0..n).map(|i| cross2(p[i], p[(i + 1) % n])).sum::<f32>() * 0.5
 }
 
-fn bbox(p: &[V2]) -> (V2, V2) {
+fn bbox(p: &[[f32; 2]]) -> ([f32; 2], [f32; 2]) {
     let mut lo = [f32::MAX; 2];
     let mut hi = [f32::MIN; 2];
     for v in p {
@@ -1314,60 +1311,60 @@ fn bbox(p: &[V2]) -> (V2, V2) {
 fn sq(x: f32) -> f32 {
     x * x
 }
-fn add2(a: V2, b: V2) -> V2 {
+fn add2(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
     [a[0] + b[0], a[1] + b[1]]
 }
-fn sub2(a: V2, b: V2) -> V2 {
+fn sub2(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
     [a[0] - b[0], a[1] - b[1]]
 }
-fn scale2(a: V2, s: f32) -> V2 {
-    [a[0] * s, a[1] * s]
+fn scale2(v: [f32; 2], k: f32) -> [f32; 2] {
+    [v[0] * k, v[1] * k]
 }
-fn dot2(a: V2, b: V2) -> f32 {
+fn dot2(a: [f32; 2], b: [f32; 2]) -> f32 {
     a[0] * b[0] + a[1] * b[1]
 }
-fn cross2(a: V2, b: V2) -> f32 {
+fn cross2(a: [f32; 2], b: [f32; 2]) -> f32 {
     a[0] * b[1] - a[1] * b[0]
 }
-fn len2(a: V2) -> f32 {
+fn len2(a: [f32; 2]) -> f32 {
     dot2(a, a).sqrt()
 }
-fn norm2(a: V2) -> V2 {
+fn norm2(a: [f32; 2]) -> [f32; 2] {
     let l = len2(a);
     if l > 0.0 { scale2(a, 1.0 / l) } else { a }
 }
-fn lerp2(a: V2, b: V2, t: f32) -> V2 {
-    add2(a, scale2(sub2(b, a), t))
+fn lerp2(from: [f32; 2], to: [f32; 2], mix_t: f32) -> [f32; 2] {
+    add2(from, scale2(sub2(to, from), mix_t))
 }
-fn rotate2(v: V2, degrees: f32) -> V2 {
-    let (s, c) = degrees.to_radians().sin_cos();
+fn rotate2(v: [f32; 2], turn_deg: f32) -> [f32; 2] {
+    let (s, c) = turn_deg.to_radians().sin_cos();
     [v[0] * c - v[1] * s, v[0] * s + v[1] * c]
 }
-fn add3(a: V3, b: V3) -> V3 {
+fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
-fn sub3(a: V3, b: V3) -> V3 {
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
-fn scale3(a: V3, s: f32) -> V3 {
-    [a[0] * s, a[1] * s, a[2] * s]
+fn scale3(v: [f32; 3], k: f32) -> [f32; 3] {
+    [v[0] * k, v[1] * k, v[2] * k]
 }
-fn dot3(a: V3, b: V3) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+fn dot3(u: [f32; 3], v: [f32; 3]) -> f32 {
+    u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
 }
-fn cross3(a: V3, b: V3) -> V3 {
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
-fn norm3(a: V3) -> V3 {
+fn norm3(a: [f32; 3]) -> [f32; 3] {
     let l = dot3(a, a).sqrt();
     if l > 0.0 { scale3(a, 1.0 / l) } else { a }
 }
-fn perpendicular(n: V3) -> V3 {
+fn perpendicular(n: [f32; 3]) -> [f32; 3] {
     let t = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
     norm3(cross3(n, t))
 }
 /// `v` turned by the rotation vector `r` (axis times angle).
-fn rotate3(v: V3, r: V3) -> V3 {
+fn rotate3(v: [f32; 3], r: [f32; 3]) -> [f32; 3] {
     let angle = dot3(r, r).sqrt();
     if angle < 1e-9 {
         return v;
@@ -1379,13 +1376,13 @@ fn rotate3(v: V3, r: V3) -> V3 {
         scale3(k, dot3(k, v) * (1.0 - c)),
     )
 }
-fn orthonormalize(axis: &mut [V3; 3]) {
-    let x = norm3(axis[0]);
-    let z = norm3(cross3(x, axis[1]));
-    let flip = dot3(z, axis[2]) < 0.0;
+fn orthonormalize(along: &mut [[f32; 3]; 3]) {
+    let x = norm3(along[0]);
+    let z = norm3(cross3(x, along[1]));
+    let flip = dot3(z, along[2]) < 0.0;
     let z = if flip { scale3(z, -1.0) } else { z };
     let y = if flip { cross3(x, z) } else { cross3(z, x) };
-    *axis = [x, y, z];
+    *along = [x, y, z];
 }
 
 /// The shard code's random numbers (uniform, `flrand`).
@@ -1404,10 +1401,10 @@ impl Rng {
     }
     fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        let mut mix = self.0;
+        mix = (mix ^ (mix >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        mix = (mix ^ (mix >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        mix ^ (mix >> 31)
     }
     /// 0..1.
     fn unit(&mut self) -> f32 {
@@ -1508,9 +1505,9 @@ mod tests {
     #[test]
     fn concave_outline_triangulates_inside() {
         let l = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 1.0], [1.0, 1.0], [1.0, 4.0], [0.0, 4.0]];
-        let tris = triangulate(&l);
-        assert_eq!(tris.len(), 4);
-        let area: f32 = tris
+        let triangle_list = triangulate(&l);
+        assert_eq!(triangle_list.len(), 4);
+        let area: f32 = triangle_list
             .iter()
             .map(|t| signed_area(&[l[t[0]], l[t[1]], l[t[2]]]).abs())
             .sum();
@@ -1567,7 +1564,7 @@ mod tests {
         g.set_panes(vec![pane(48.0, 64.0)], -1000.0);
         assert!(g.shatter(0, [0.0, 24.0, 32.0], [1.0, 0.0, 0.0], Some(11), true));
         let centre = [-120.0, 0.0, 0.0];
-        let dist = |o: V3| {
+        let dist = |o: [f32; 3]| {
             let a = sub3(o, centre);
             dot3(a, a).sqrt()
         };
@@ -1593,10 +1590,10 @@ mod tests {
             assert!(d < 128.0, "{d}");
             assert!(s.frame.iter().all(|&f| !f));
             let push = (((1.0 - d / 128.0) * 225.0 + 75.0) * 0.005f32).min(500.0);
-            let speed = dot3(s.vel, s.vel).sqrt();
+            let speed = dot3(s.motion_vec, s.motion_vec).sqrt();
             let want = push / mass_of(s.area, 0.5);
             assert!((speed - want).abs() < 1e-3 * want, "{speed} vs {want}");
-            assert!(dot3(s.vel, sub3(s.origin, centre)) > 0.0);
+            assert!(dot3(s.motion_vec, sub3(s.origin, centre)) > 0.0);
             seen += 1;
         }
         assert_eq!(seen, near);

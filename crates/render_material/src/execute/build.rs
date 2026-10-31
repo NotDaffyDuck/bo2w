@@ -3,222 +3,203 @@
 
 use std::sync::Arc;
 
-use super::lanes::{
-    PackedCodeConstantLane, PackedCodeConstants, PackedCodeSamplerLane, PackedCodeSamplers,
-};
-use super::refusal::MaterialRefusal;
-use super::resolve::{MaterialDrawKey, missing_prepared_technique, resolve_material_technique};
-use super::shell::{MaterialExecution, StableMaterialShell, StablePassShell};
-use crate::prepared::{GfxPassStateBits, PackedCodeArg, PreparedArgBelts, PreparedMaterialTable};
-use crate::{
-    CodeSourceLookup, RuntimeMaterialCatalog, RuntimeShaderStage, SetupArm, TechType,
-};
+use super::lanes::{CodeConstantChannel, CodeSamplerChannel};
+use super::refusal::MaterialExecutionDenial;
+use super::resolve::{SurfaceSortKeyPair, missing_prepared_technique, select_material_technique};
+use super::shell::{CodeLanes, MaterialRunPlan, MaterialPlan, PassPlan};
+use crate::prepared::{VisualPassStateBits, PackedCodeParam, PreparedParamStrips, StagedMaterialTable, ResolvedDrawPass};
+use crate::{EngineValueSource, LiveMaterialLedger, LivePassRecord, SetupVariantBranch, MethodType};
 
+/// Refuses a pass whose blend state the host cannot reproduce.
 pub(super) fn check_pass_state(
-    pass_index: u8,
-    state: GfxPassStateBits,
-) -> Result<(), MaterialRefusal> {
-    match state.unsupported_host_fields() {
-        None => Ok(()),
-        Some(fields) => Err(MaterialRefusal::UnsupportedState {
-            pass_index,
-            fields,
-            word0: state.word0,
-            word1: state.word1,
-        }),
-    }
-}
-
-fn constant_lane(
-    sources: &impl CodeSourceLookup,
-    pass_index: u8,
-    stage: RuntimeShaderStage,
-    destination: u16,
-    index: u16,
-    first_row: u8,
-    row_count: u8,
-) -> Result<PackedCodeConstantLane, MaterialRefusal> {
-    let Some(rows) = sources.constant_arc(index) else {
-        return Err(MaterialRefusal::MissingCodeConstant {
-            pass_index,
-            stage,
-            index,
-        });
+    technique_pass_ordinal: u8,
+    state: VisualPassStateBits,
+) -> Result<(), MaterialExecutionDenial> {
+    let Some(fields) = state.unsupported_host_fields() else {
+        return Ok(());
     };
-    let start = usize::from(first_row);
-    if rows.get(start..start.saturating_add(usize::from(row_count))).is_none() {
-        return Err(MaterialRefusal::CodeConstantRowsOutOfRange {
-            pass_index,
-            stage,
-            index,
-            first_row,
-            row_count,
-            available_rows: rows.len(),
-        });
-    }
-    Ok(PackedCodeConstantLane {
-        stage,
-        destination,
-        index,
-        first_row,
-        row_count,
-        rows,
+    Err(MaterialExecutionDenial::UnhandledRenderState {
+        technique_pass_ordinal,
+        fields,
+        dword0: state.dword0,
+        dword1: state.dword1,
     })
 }
 
-fn sampler_lane(
-    sources: &impl CodeSourceLookup,
-    pass_index: u8,
-    destination: u16,
-    index: u32,
-) -> Result<PackedCodeSamplerLane, MaterialRefusal> {
-    let Some(sampler_state) = sources.texture(index) else {
-        return Err(MaterialRefusal::MissingCodeTexture { pass_index, index });
-    };
-    Ok(PackedCodeSamplerLane {
-        register: destination,
-        index,
-        sampler_state,
-        image: sources.texture_image(index),
-    })
+/// Resolves the code arguments of one pass against the live sources.
+struct LaneResolver<'a, S> {
+    sources: &'a S,
+    technique_pass_ordinal: u8,
 }
 
-/// Refills `constants` and `samplers` with one lane per code argument of the
-/// pass, in stable, per-primitive, per-object order.
-pub(super) fn fill_pass_code(
-    belts: &PreparedArgBelts,
-    sources: &impl CodeSourceLookup,
-    pass_index: u8,
-    constants: &mut PackedCodeConstants,
-    samplers: &mut PackedCodeSamplers,
-) -> Result<(), MaterialRefusal> {
-    constants.lanes.clear();
-    samplers.lanes.clear();
-    let arguments = belts
-        .stable
-        .code
-        .iter()
-        .chain(&belts.per_prim.code)
-        .chain(&belts.per_obj.code)
-        .copied();
-    for argument in arguments {
-        match argument {
-            PackedCodeArg::Constant {
+impl<S: EngineValueSource> LaneResolver<'_, S> {
+    fn resolve_lane(
+        &self,
+        param: PackedCodeParam,
+        lanes: &mut CodeLanes,
+    ) -> Result<(), MaterialExecutionDenial> {
+        let technique_pass_ordinal = self.technique_pass_ordinal;
+        match param {
+            PackedCodeParam::Constant {
                 stage,
-                destination,
+                slot_reg: dest,
                 index,
-                first_row,
-                row_count,
-            } => constants.lanes.push(constant_lane(
-                sources,
-                pass_index,
-                stage,
-                destination,
-                index,
-                first_row,
-                row_count,
-            )?),
-            PackedCodeArg::Sampler { destination, index } => samplers
-                .lanes
-                .push(sampler_lane(sources, pass_index, destination, index)?),
-            PackedCodeArg::Unknown { argument_type } => {
-                return Err(MaterialRefusal::UnknownArgumentType {
-                    pass_index,
-                    argument_type,
+                row_base: first_row,
+                line_total,
+            } => {
+                let table_rows = self
+                    .sources
+                    .shared_constants_for(index)
+                    .ok_or(MaterialExecutionDenial::EngineConstantUnavailable {
+                        technique_pass_ordinal,
+                        stage,
+                        index,
+                    })?;
+                let first = usize::from(first_row);
+                let end = first.saturating_add(usize::from(line_total));
+                if end > table_rows.len() {
+                    return Err(MaterialExecutionDenial::EngineConstantRowsBeyondTable {
+                        technique_pass_ordinal,
+                        stage,
+                        index,
+                        row_base: first_row,
+                        line_total,
+                        rows_remaining: table_rows.len(),
+                    });
+                }
+                lanes.constants.lanes.push(CodeConstantChannel {
+                    stage,
+                    slot_reg: dest,
+                    index,
+                    row_base: first_row,
+                    line_total,
+                    row_data: table_rows,
+                });
+            }
+            PackedCodeParam::Sampler { slot_reg: dest, index: tex } => {
+                let texture_sampling_mode = self
+                    .sources
+                    .sampler_mode_of(tex)
+                    .ok_or(MaterialExecutionDenial::EngineTextureUnavailable { technique_pass_ordinal, index: tex })?;
+                lanes.samplers.lanes.push(CodeSamplerChannel {
+                    sampler_reg: dest,
+                    index: tex,
+                    texture_sampling_mode,
+                    image: self.sources.image_for(tex),
+                });
+            }
+            PackedCodeParam::Unknown { kind_code: kind } => {
+                return Err(MaterialExecutionDenial::UnrecognisedArgumentKind {
+                    technique_pass_ordinal,
+                    kind_code: kind,
                 });
             }
         }
+        Ok(())
     }
-    samplers.rehash();
-    constants.rehash();
+}
+
+/// Refills `lanes` with one entry per code argument of the pass: stable
+/// arguments first, then per-primitive, then per-object.
+pub(super) fn fill_pass_code(
+    belts: &PreparedParamStrips,
+    sources: &impl EngineValueSource,
+    technique_pass_ordinal: u8,
+    lanes: &mut CodeLanes,
+) -> Result<(), MaterialExecutionDenial> {
+    lanes.constants.lanes.clear();
+    lanes.samplers.lanes.clear();
+    let resolver = LaneResolver {
+        sources,
+        technique_pass_ordinal,
+    };
+    for &argument in [&belts.stable, &belts.each_triangle_batch_inputs, &belts.each_mesh_inputs]
+        .into_iter()
+        .flat_map(|belt| belt.code.iter())
+    {
+        resolver.resolve_lane(argument, lanes)?;
+    }
+    lanes.samplers.rehash();
+    lanes.constants.rehash();
     Ok(())
 }
 
-pub fn execute_material(
-    catalog: &RuntimeMaterialCatalog,
-    prepared: &PreparedMaterialTable,
-    code_sources: &impl CodeSourceLookup,
-    key: MaterialDrawKey,
-    tech_type: TechType,
-    vertex_type: u8,
-) -> Result<MaterialExecution, MaterialRefusal> {
-    execute_material_with_shell(catalog, prepared, code_sources, key, tech_type, vertex_type)
+/// One pass of the technique, resolved for `vertex_format_code`, with its lanes.
+fn plan_pass(
+    index: usize,
+    pass: &LivePassRecord,
+    prepared: Option<&ResolvedDrawPass>,
+    vertex_format_code: u8,
+    sources: &impl EngineValueSource,
+) -> Result<(PassPlan, CodeLanes), MaterialExecutionDenial> {
+    let technique_pass_ordinal = u8::try_from(index)
+        .map_err(|_| MaterialExecutionDenial::PassNumberTooLarge { technique_pass_ordinal: index })?;
+    let shader_pair = pass
+        .stage_program_duo
+        .ok_or(MaterialExecutionDenial::ShaderProgramAbsent { technique_pass_ordinal })?;
+    let unsupported = MaterialExecutionDenial::UnhandledShaderCombination { technique_pass_ordinal, pair: shader_pair };
+    let prepared = prepared.ok_or_else(|| unsupported.clone())?;
+    let port = prepared.port(vertex_format_code).ok_or(unsupported)?;
+    check_pass_state(technique_pass_ordinal, prepared.state)?;
+    let belts = prepared
+        .belts
+        .as_ref()
+        .ok_or_else(|| MaterialExecutionDenial::PassArgumentTotalWrong {
+            technique_pass_ordinal,
+            each_triangle_batch_inputs: pass.per_prim_arg_tally,
+            each_mesh_inputs: pass.per_obj_arg_tally,
+            stable: pass.stable_arg_tally,
+            arg_total: Vec::len(&pass.arguments),
+        })?;
+
+    let mut lanes = CodeLanes::default();
+    fill_pass_code(belts, sources, technique_pass_ordinal, &mut lanes)?;
+    let plan = PassPlan {
+        technique_pass_ordinal,
+        port,
+        stage_program_duo: shader_pair,
+        state: prepared.state,
+        local_banks: prepared.local_banks(vertex_format_code).cloned(),
+        local_samplers: prepared.local_samplers.clone(),
+        belts: Arc::new(belts.clone()),
+    };
+    Ok((plan, lanes))
 }
 
-pub fn execute_material_with_shell(
-    catalog: &RuntimeMaterialCatalog,
-    prepared: &PreparedMaterialTable,
-    code_sources: &impl CodeSourceLookup,
-    key: MaterialDrawKey,
-    tech_type: TechType,
-    vertex_type: u8,
-) -> Result<MaterialExecution, MaterialRefusal> {
-    let (material, technique) = resolve_material_technique(catalog, key, tech_type)?;
-    let Some(prepared_tech) = prepared.technique(material.asset_id, tech_type) else {
-        return Err(missing_prepared_technique(material, technique, tech_type));
+pub fn run_material_pipeline(
+    catalog: &LiveMaterialLedger,
+    prepared: &StagedMaterialTable,
+    engine_sources: &impl EngineValueSource,
+    key: SurfaceSortKeyPair,
+    shading_technique_kind: MethodType,
+    vertex_format_code: u8,
+) -> Result<MaterialRunPlan, MaterialExecutionDenial> {
+    let (picked, technique) = select_material_technique(catalog, key, shading_technique_kind)?;
+    let Some(prepared_tech) = prepared.recipe_for(picked.asset_id, shading_technique_kind) else {
+        return Err(missing_prepared_technique(picked, technique, shading_technique_kind));
     };
 
-    let pass_total = technique.passes.len();
-    let mut passes = Vec::with_capacity(pass_total);
-    let mut code_constants = Vec::with_capacity(pass_total);
-    let mut code_samplers = Vec::with_capacity(pass_total);
-
-    for (index, pass) in technique.passes.iter().enumerate() {
-        let pass_index = u8::try_from(index)
-            .map_err(|_| MaterialRefusal::PassIndexOverflow { pass_index: index })?;
-        let pair = pass
-            .shader_pair
-            .ok_or(MaterialRefusal::ShaderProgramMissing { pass_index })?;
-        let unsupported_pair = MaterialRefusal::UnsupportedShaderPair { pass_index, pair };
-        let prepared_pass = prepared_tech
-            .passes
-            .get(index)
-            .ok_or_else(|| unsupported_pair.clone())?;
-        let port = prepared_pass
-            .port
-            .get(usize::from(vertex_type))
-            .copied()
-            .flatten()
-            .ok_or(unsupported_pair)?;
-        check_pass_state(pass_index, prepared_pass.state)?;
-        let Some(belts) = prepared_pass.belts.as_ref() else {
-            return Err(MaterialRefusal::PassArgCountMismatch {
-                pass_index,
-                per_prim: pass.per_prim_arg_count,
-                per_obj: pass.per_obj_arg_count,
-                stable: pass.stable_arg_count,
-                arguments: pass.arguments.len(),
-            });
-        };
-
-        let mut constants = PackedCodeConstants::default();
-        let mut samplers = PackedCodeSamplers::default();
-        fill_pass_code(belts, code_sources, pass_index, &mut constants, &mut samplers)?;
-        code_constants.push(constants);
-        code_samplers.push(samplers);
-        passes.push(StablePassShell {
-            pass_index,
-            port,
-            shader_pair: pair,
-            state: prepared_pass.state,
-            local_banks: prepared_pass
-                .local_banks
-                .get(usize::from(vertex_type))
-                .cloned()
-                .flatten(),
-            local_samplers: prepared_pass.local_samplers.clone(),
-            belts: Arc::new(belts.clone()),
-        });
-    }
-
-    Ok(MaterialExecution::from_parts(
-        StableMaterialShell {
-            tech_type,
-            arm: SetupArm::classify(tech_type),
-            vertex_type,
-            passes,
-        },
-        code_constants,
-        code_samplers,
-    ))
+    let (passes, lanes): (Vec<_>, Vec<_>) = technique
+        .passes
+        .iter()
+        .enumerate()
+        .map(|(index, pass)| {
+            plan_pass(
+                index,
+                pass,
+                prepared_tech.passes.get(index),
+                vertex_format_code,
+                engine_sources,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .unzip();
+    let plan = MaterialPlan {
+        shading_technique_kind,
+        arm: SetupVariantBranch::classify(shading_technique_kind),
+        vertex_format_code,
+        passes,
+    };
+    Ok(MaterialRunPlan::from_parts(plan, lanes))
 }

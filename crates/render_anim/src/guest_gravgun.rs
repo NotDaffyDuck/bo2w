@@ -16,17 +16,21 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 
 use asset_source::glam::{Mat4, Quat, Vec3};
+use bytemuck::Pod;
+use bytemuck::Zeroable;
 use asset_source::{mdl, vtf};
+use diag::{info, warn};
 
 /// One vertex of a guest weapon (`render_gpu`'s guest view reads the same
 /// 28 bytes): view-space position, texture point, shade and layer (alpha),
 /// light, and a flag (`pad[0]` 255: the enchanted shine).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Debug, Default)]
+#[derive(Pod, Zeroable)]
 pub struct GuestVertex {
     pub position: [f32; 3],
-    pub uv: [f32; 2],
-    pub color: [u8; 4],
+    pub tex_uv: [f32; 2],
+    pub tint: [u8; 4],
     pub light: [u8; 2],
     pub pad: [u8; 2],
 }
@@ -92,7 +96,7 @@ pub const SOUNDS: &[(&str, &str)] = &[
 
 /// One of the two view models with what it needs to draw.
 struct Gun {
-    model: mdl::Model,
+    mdl: mdl::Model,
     /// The texture layer of each of the model's textures.
     layers: Vec<u32>,
     active: Option<usize>,
@@ -112,11 +116,11 @@ struct Gun {
 }
 
 impl Gun {
-    fn new(model: mdl::Model, layers: Vec<u32>) -> Option<Self> {
-        let seq = |name: &str| model.sequence(name);
-        let att = |name: &str| model.attachments.iter().position(|a| a.name.eq_ignore_ascii_case(name));
+    fn new(mdl_in: mdl::Model, layers: Vec<u32>) -> Option<Self> {
+        let seq = |name: &str| mdl_in.sequence(name);
+        let att = |name: &str| mdl_in.attachments.iter().position(|a| a.name.eq_ignore_ascii_case(name));
         Some(Self {
-            active: model.pose_param("active"),
+            active: mdl_in.pose_param("active"),
             idle: seq("idle")?,
             hold: seq("hold_idle").or(seq("idle"))?,
             draw: seq("draw").or(seq("idle"))?,
@@ -127,7 +131,7 @@ impl Gun {
             tint: None,
             handle: None,
             layers,
-            model,
+            mdl: mdl_in,
         })
     }
 }
@@ -136,19 +140,19 @@ impl Gun {
 /// and each vertex's place, normal and uv), for the Portal Gun to hold.
 struct HandMesh {
     layer: u32,
-    vertices: Vec<(Vec3, Vec3, [f32; 2])>,
-    indices: Vec<u32>,
+    verts: Vec<(Vec3, Vec3, [f32; 2])>,
+    index_list: Vec<u32>,
 }
 
 /// The Gravity Gun's hand meshes (their texture is the hands' sheet) at
 /// the idle's first frame.
 fn rest_hand(gun: &Gun) -> Vec<HandMesh> {
-    let model = &gun.model;
+    let model = &gun.mdl;
     let mut params = vec![0.0; model.pose_params.len()];
     if let Some(a) = gun.active {
         params[a] = model.pose_params[a].start;
     }
-    let bones = model.bone_world(&model.pose(gun.idle, 0.0, &params, 0.0));
+    let bones = model.joint_global_transform(&model.pose(gun.idle, 0.0, &params, 0.0));
     let skin: Vec<Mat4> = bones.iter().zip(&model.bones).map(|(w, b)| *w * b.pose_to_bone).collect();
     model
         .meshes
@@ -156,24 +160,24 @@ fn rest_hand(gun: &Gun) -> Vec<HandMesh> {
         .filter(|m| model.textures.get(m.texture).is_some_and(|t| t.name.to_ascii_lowercase().contains("hand")))
         .map(|mesh| HandMesh {
             layer: gun.layers.get(mesh.texture).copied().unwrap_or(0),
-            vertices: mesh
+            verts: mesh
                 .vertices
                 .iter()
                 .map(|v| {
                     let (mut p, mut n) = (Vec3::ZERO, Vec3::ZERO);
                     for k in 0..3 {
-                        if v.weights[k] > 0.0 {
+                        if v.blend[k] > 0.0 {
                             let m = skin[v.bones[k] as usize];
-                            p += m.transform_point3(v.pos) * v.weights[k];
-                            n += m.transform_vector3(v.normal) * v.weights[k];
+                            p += m.transform_point3(v.pos) * v.blend[k];
+                            n += m.transform_vector3(v.normal) * v.blend[k];
                         }
                     }
                     (p, n, [v.uv.x, v.uv.y])
                 })
-                .collect(),
-            indices: mesh.indices.clone(),
+                .collect::<_>(),
+            index_list: mesh.tri_list.clone(),
         })
-        .collect()
+        .collect::<_>()
 }
 
 /// The 3D Portal Gun and the Super one (`asset_source::portalgun`), their
@@ -193,10 +197,10 @@ fn portal_guns(layers: &mut Vec<Vec<Vec<u8>>>, size: u32) -> Vec<Gun> {
             let orange = of[portalgun::CORE_ORANGE];
             let mut gun = Gun::new(model, of).expect("the Portal Gun has every sequence");
             gun.tint = Some((portalgun::CORE, orange));
-            gun.handle = gun.model.bones.iter().position(|b| b.name.eq_ignore_ascii_case("Handle"));
+            gun.handle = gun.mdl.bones.iter().position(|b| b.name.eq_ignore_ascii_case("Handle"));
             gun
         })
-        .collect()
+        .collect::<_>()
 }
 
 /// Everything read from the Source files.
@@ -226,7 +230,7 @@ impl Default for Load {
 }
 
 /// The folder the game runs from (its `guest/` sits beside the exe).
-fn install_dir() -> PathBuf {
+fn app_home_folder() -> PathBuf {
     std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -245,11 +249,11 @@ fn layer_levels(rgba: Option<&vtf::Rgba>, size: u32) -> Vec<Vec<u8>> {
                     let fx = ((x as f32 + 0.5) * w as f32 / size as f32 - 0.5).clamp(0.0, (w - 1) as f32);
                     let (x0, tx) = (fx.floor() as usize, fx.fract());
                     let x1 = (x0 + 1).min(w - 1);
-                    for c in 0..4 {
-                        let p = |xx: usize, yy: usize| f32::from(t.pixels[(yy * w + xx) * 4 + c]);
+                    for ch in 0..4 {
+                        let p = |xx: usize, yy: usize| f32::from(t.pixels[(yy * w + xx) * 4 + ch]);
                         let top = p(x0, y0) + (p(x1, y0) - p(x0, y0)) * tx;
                         let bottom = p(x0, y1) + (p(x1, y1) - p(x0, y1)) * tx;
-                        out[(y * size as usize + x) * 4 + c] = (top + (bottom - top) * ty).round() as u8;
+                        out[(y * size as usize + x) * 4 + ch] = (top + (bottom - top) * ty).round() as u8;
                     }
                 }
             }
@@ -266,10 +270,10 @@ fn layer_levels(rgba: Option<&vtf::Rgba>, size: u32) -> Vec<Vec<u8>> {
             let mut n = vec![0u8; next_side * next_side * 4];
             for y in 0..next_side {
                 for x in 0..next_side {
-                    for c in 0..4 {
-                        let p = |xx: usize, yy: usize| u32::from(level[(yy * side + xx) * 4 + c]);
+                    for ch in 0..4 {
+                        let p = |xx: usize, yy: usize| u32::from(level[(yy * side + xx) * 4 + ch]);
                         let sum = p(2 * x, 2 * y) + p(2 * x + 1, 2 * y) + p(2 * x, 2 * y + 1) + p(2 * x + 1, 2 * y + 1);
-                        n[(y * next_side + x) * 4 + c] = ((sum + 2) / 4) as u8;
+                        n[(y * next_side + x) * 4 + ch] = ((sum + 2) / 4) as u8;
                     }
                 }
             }
@@ -290,27 +294,27 @@ fn layer_levels(rgba: Option<&vtf::Rgba>, size: u32) -> Vec<Vec<u8>> {
 /// not (`BO2MP_GRAVGUN_STANDIN=1` forces it, for a test).
 fn load() -> Result<Assets, String> {
     if std::env::var_os("BO2MP_GRAVGUN_STANDIN").is_some() {
-        diag::info!(World, "gravity gun: BO2MP_GRAVGUN_STANDIN, the Minecraft stand-in");
+        info!(World, "gravity gun: BO2MP_GRAVGUN_STANDIN, the Minecraft stand-in");
         return Ok(standin());
     }
     load_hl2().or_else(|why| {
-        diag::info!(World, "gravity gun: no Half-Life 2 files ({why}); the Minecraft stand-in");
+        info!(World, "gravity gun: no Half-Life 2 files ({why}); the Minecraft stand-in");
         Ok(standin())
     })
 }
 
-/// A pixel texture blown up to `size` by nearest pixel (kept sharp), then
+/// A pixel texture blown up to `len_bytes` by nearest pixel (kept sharp), then
 /// its levels.
-fn pixel_levels(rgba: &vtf::Rgba, size: u32) -> Vec<Vec<u8>> {
+fn pixel_levels(rgba: &vtf::Rgba, len_bytes: u32) -> Vec<Vec<u8>> {
     let (w, h) = (rgba.width.max(1) as usize, rgba.height.max(1) as usize);
-    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
-    for y in 0..size as usize {
-        for x in 0..size as usize {
-            let at = ((y * h / size as usize) * w + x * w / size as usize) * 4;
+    let mut pixels = Vec::with_capacity((len_bytes * len_bytes * 4) as usize);
+    for y in 0..len_bytes as usize {
+        for x in 0..len_bytes as usize {
+            let at = ((y * h / len_bytes as usize) * w + x * w / len_bytes as usize) * 4;
             pixels.extend_from_slice(&rgba.pixels[at..at + 4]);
         }
     }
-    layer_levels(Some(&vtf::Rgba { width: size, height: size, pixels }), size)
+    layer_levels(Some(&vtf::Rgba { width: len_bytes, height: len_bytes, pixels }), len_bytes)
 }
 
 /// The Minecraft-style stand-in (`asset_source::standin`): no sounds of its
@@ -336,7 +340,7 @@ fn standin() -> Assets {
     };
     let mut guns = vec![gun(false), gun(true)];
     guns.extend(portal_guns(&mut layers, size));
-    diag::info!(World, "gravity gun: the Minecraft stand-in, textures {size}px x{}", layers.len());
+    info!(World, "gravity gun: the Minecraft stand-in, textures {size}px x{}", layers.len());
     Assets {
         guns,
         hand: Vec::new(),
@@ -348,9 +352,9 @@ fn standin() -> Assets {
 
 /// Reads both view models, their textures, the sprites and the sounds.
 fn load_hl2() -> Result<Assets, String> {
-    let source = asset_source::Source::find(&install_dir());
-    for line in &source.report {
-        diag::info!(World, "gravity gun: {line}");
+    let source = asset_source::Source::find(&app_home_folder());
+    for line in &source.notes {
+        info!(World, "gravity gun: {line}");
     }
     let read_model = |name: &str| -> Result<mdl::Model, String> {
         let file = |ext: &str| source.read(&format!("models/weapons/{name}.{ext}")).ok_or(format!("no {name}.{ext}"));
@@ -401,7 +405,7 @@ fn load_hl2() -> Result<Assets, String> {
     }
     let size = named
         .iter()
-        .filter_map(|(_, t)| t.as_ref().map(|t| t.width.max(t.height)))
+        .filter_map(|(_k, t)| t.as_ref().map(|t| t.width.max(t.height)))
         .max()
         .unwrap_or(256)
         .next_power_of_two()
@@ -421,7 +425,7 @@ fn load_hl2() -> Result<Assets, String> {
             .textures
             .iter()
             .map(|t| named.iter().position(|(n, _)| n.eq_ignore_ascii_case(&t.name)).unwrap_or(0) as u32)
-            .collect()
+            .collect::<_>()
     };
     let (normal_layers, mega_layers) = (layer_of(&normal), layer_of(&mega));
     let mut guns = vec![
@@ -432,7 +436,7 @@ fn load_hl2() -> Result<Assets, String> {
     guns.extend(portal_guns(&mut layers, size));
     let sounds = SOUNDS
         .iter()
-        .filter_map(|(name, path)| source.read(path).map(|bytes| (*name, Arc::<[u8]>::from(bytes))))
+        .filter_map(|(clip_name, path)| source.read(path).map(|bytes| (*clip_name, Arc::<[u8]>::from(bytes))))
         .collect::<HashMap<_, _>>();
     diag::info!(
         World,
@@ -499,10 +503,10 @@ pub struct ViewInput {
     /// The look direction in Minecraft's axes, and the pitch in degrees
     /// (down positive).
     pub look: [f32; 3],
-    pub pitch: f32,
+    pub tilt: f32,
     /// His feet in blocks, for the bob's speed.
     pub feet: [f64; 3],
-    pub aspect: f32,
+    pub aspect_ratio: f32,
     /// Sky and block light at the eye, 0..15.
     pub eye_light: [f32; 2],
     /// Something is held in the beam.
@@ -516,10 +520,10 @@ pub struct ViewInput {
 
 /// The view model's mesh for the renderer.
 pub struct ViewMesh {
-    pub vertices: Vec<u8>,
-    pub indices: Vec<u32>,
-    pub solid: u32,
-    pub clip: [f32; 16],
+    pub verts: Vec<u8>,
+    pub idx_list: Vec<u32>,
+    pub solid_count: u32,
+    pub to_clip: [f32; 16],
     pub texture: Arc<GuestTexture>,
 }
 
@@ -581,7 +585,7 @@ impl Gravgun {
                     Some(assets)
                 }
                 Ok(Err(why)) => {
-                    diag::warn!(World, "gravity gun: nothing to show ({why})");
+                    warn!(World, "gravity gun: nothing to show ({why})");
                     self.load = Load::Missing;
                     None
                 }
@@ -608,7 +612,7 @@ impl Gravgun {
         for &cue in cues {
             if cue == Cue::Hum(None) {
                 if log {
-                    diag::info!(World, "gravity gun sound: hum stops");
+                    info!(World, "gravity gun sound: hum stops");
                 }
                 queue.push(audio::GuestSoundRequest::stop(HUM));
                 continue;
@@ -616,12 +620,12 @@ impl Gravgun {
             let hold = matches!(cue, Cue::Hum(_)).then_some(HUM);
             self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             let hl2 = hl2_sound(cue, self.rng >> 16)
-                .and_then(|(name, volume)| Some((name, volume, assets.as_ref()?.sounds.get(name)?.clone())));
-            if let Some((name, volume, bytes)) = hl2 {
+                .and_then(|(hl2_name, vol)| Some((hl2_name, vol, assets.as_ref()?.sounds.get(hl2_name)?.clone())));
+            if let Some((hl2_name, vol, bytes)) = hl2 {
                 if log {
-                    diag::info!(World, "gravity gun sound: {cue:?} HL2 {name}");
+                    info!(World, "gravity gun sound: {cue:?} HL2 {hl2_name}");
                 }
-                queue.push(audio::GuestSoundRequest { key: format!("hl2:{name}"), bytes, volume, pitch: 1.0, hold });
+                queue.push(audio::GuestSoundRequest { key: format!("hl2:{hl2_name}"), bytes, volume: vol, pitch_mul: 1.0, hold });
             }
         }
     }
@@ -642,7 +646,7 @@ impl Gravgun {
         let (upgraded, portal) = (which % 2 == 1, which >= 2);
         let assets = assets?;
         let gun = assets.guns.get(which)?;
-        let model = &gun.model;
+        let model = &gun.mdl;
         let dt = input.dt.clamp(0.0, 0.1);
         self.clock += dt;
         if self.out != Some(which) {
@@ -675,7 +679,7 @@ impl Gravgun {
         // `WeaponIdle`: once a one-shot is done, the shake while holding
         // (ACT_VM_RELOAD) or the idle.
         let idle = if input.holding { gun.hold } else { gun.idle };
-        let one_shot = !model.sequences[self.seq].looping && self.seq != gun.idle && self.seq != gun.hold;
+        let one_shot = !model.sequences[self.seq].repeats && self.seq != gun.idle && self.seq != gun.hold;
         if (one_shot && self.seq_time >= model.duration(self.seq)) || (!one_shot && self.seq != idle) {
             self.seq = idle;
             self.seq_time = 0.0;
@@ -702,7 +706,7 @@ impl Gravgun {
             params[a] = p.start + (p.end - p.start) * self.claws;
         }
         let pose = model.pose(self.seq, self.seq_time, &params, self.clock);
-        let bones = model.bone_world(&pose);
+        let bones = model.joint_global_transform(&pose);
         let skin: Vec<Mat4> = bones.iter().zip(&model.bones).map(|(w, b)| *w * b.pose_to_bone).collect();
 
         // The view model's place: `CalcViewModelLag` and HL2's bob.
@@ -720,11 +724,11 @@ impl Gravgun {
         *last = (*last + difference * (speed * dt)).normalize_or(look);
         let world_offset = difference * -5.0;
         let mut offset = Vec3::new(world_offset.dot(right), world_offset.dot(up), -world_offset.dot(look));
-        let pitch = input.pitch;
+        let pitch = input.tilt;
         offset += Vec3::new(-pitch * 0.03, -pitch * 0.02, pitch * 0.035);
         let moved = self.last_feet.replace(input.feet).map_or(0.0, |l| {
-            let (dx, dz) = (input.feet[0] - l[0], input.feet[2] - l[2]);
-            (dx * dx + dz * dz).sqrt() as f32
+            let (step_along_x, dz) = (input.feet[0] - l[0], input.feet[2] - l[2]);
+            (step_along_x * step_along_x + dz * dz).sqrt() as f32
         });
         // A teleport is not a run.
         let speed = if dt > 0.0 && moved < 2.0 { moved / dt } else { 0.0 };
@@ -761,14 +765,14 @@ impl Gravgun {
                 Some((core, orange)) if input.orange && mesh.texture == core => orange,
                 _ => gun.layers.get(mesh.texture).copied().unwrap_or(0),
             };
-            let base = vertices.len() as u32;
+            let first = vertices.len() as u32;
             for v in &mesh.vertices {
                 let (mut p, mut n) = (Vec3::ZERO, Vec3::ZERO);
                 for k in 0..3 {
-                    if v.weights[k] > 0.0 {
+                    if v.blend[k] > 0.0 {
                         let m = skin[v.bones[k] as usize];
-                        p += m.transform_point3(v.pos) * v.weights[k];
-                        n += m.transform_vector3(v.normal) * v.weights[k];
+                        p += m.transform_point3(v.pos) * v.blend[k];
+                        n += m.transform_vector3(v.normal) * v.blend[k];
                     }
                 }
                 let n = bob_rotation * n;
@@ -777,13 +781,13 @@ impl Gravgun {
                 let c = (shade * 255.0).round() as u8;
                 vertices.push(GuestVertex {
                     position: to_view(p).to_array(),
-                    uv: [v.uv.x, v.uv.y],
-                    color: [c, c, c, layer as u8],
+                    tex_uv: [v.uv.x, v.uv.y],
+                    tint: [c, c, c, layer as u8],
                     light,
                     pad: [0; 2],
                 });
             }
-            indices.extend(mesh.indices.iter().map(|i| base + i));
+            indices.extend(mesh.tri_list.iter().map(|i| first + i));
         }
         // The Portal Gun in Half-Life 2's hand: the hand as it holds the
         // Gravity Gun's handle, on this gun's handle (it sits where the
@@ -791,21 +795,21 @@ impl Gravgun {
         if let Some(handle) = gun.handle.filter(|_| portal) {
             let place = bones[handle] * model.bones[handle].pose_to_bone;
             for mesh in &assets.hand {
-                let base = vertices.len() as u32;
-                for (p, n, uv) in &mesh.vertices {
+                let first = vertices.len() as u32;
+                for (p, n, uv) in &mesh.verts {
                     let n = bob_rotation * place.transform_vector3(*n);
                     let n = Vec3::new(-n.y, n.z, -n.x).normalize_or_zero();
                     let shade = (0.5 + 0.5 * n.dot(light_dir).max(0.0)).clamp(0.0, 1.0);
                     let c = (shade * 255.0).round() as u8;
                     vertices.push(GuestVertex {
                         position: to_view(place.transform_point3(*p)).to_array(),
-                        uv: *uv,
-                        color: [c, c, c, mesh.layer as u8],
+                        tex_uv: *uv,
+                        tint: [c, c, c, mesh.layer as u8],
                         light,
                         pad: [0; 2],
                     });
                 }
-                indices.extend(mesh.indices.iter().map(|i| base + i));
+                indices.extend(mesh.index_list.iter().map(|i| first + i));
             }
         }
         let solid = indices.len() as u32;
@@ -815,10 +819,10 @@ impl Gravgun {
         // pulled halfway to the eye at half size (the same on screen).
         let attachment = |a: Option<usize>| -> Option<Vec3> {
             let a = &model.attachments[a?];
-            Some(to_view((bones[a.bone] * a.local).w_axis.truncate()))
+            Some(to_view((bones[a.joint] * a.local).w_axis.truncate()))
         };
         let sprite = |vertices: &mut Vec<GuestVertex>,
-                          indices: &mut Vec<u32>,
+                          idx_out: &mut Vec<u32>,
                           at: Vec3,
                           which: usize,
                           half: f32,
@@ -827,18 +831,18 @@ impl Gravgun {
                 return;
             }
             let (at, half) = (at * 0.5, half * 0.5);
-            let base = vertices.len() as u32;
+            let first = vertices.len() as u32;
             let rgb = colour.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
-            for (dx, dy, u, v) in [(-1.0, -1.0, 0.0, 1.0), (1.0, -1.0, 1.0, 1.0), (1.0, 1.0, 1.0, 0.0), (-1.0, 1.0, 0.0, 0.0)] {
+            for (step_along_x, dy, u, v) in [(-1.0, -1.0, 0.0, 1.0), (1.0, -1.0, 1.0, 1.0), (1.0, 1.0, 1.0, 0.0), (-1.0, 1.0, 0.0, 0.0)] {
                 vertices.push(GuestVertex {
-                    position: [at.x + dx * half, at.y + dy * half, at.z],
-                    uv: [u, v],
-                    color: [rgb[0], rgb[1], rgb[2], (SPRITE_BASE as usize + which) as u8],
+                    position: [at.x + step_along_x * half, at.y + dy * half, at.z],
+                    tex_uv: [u, v],
+                    tint: [rgb[0], rgb[1], rgb[2], (SPRITE_BASE as usize + which) as u8],
                     light,
                     pad: [0; 2],
                 });
             }
-            indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+            idx_out.extend([first, first + 1, first + 2, first, first + 2, first + 3]);
         };
         let (core, flare, glow) = if portal {
             // The Portal Gun's tip glows the last portal's colour.
@@ -879,16 +883,16 @@ impl Gravgun {
         let f = 1.0 / ((VIEWMODEL_FOV / 2.0).to_radians().tan() * 0.75);
         let near = 0.5;
         let clip = [
-            f / input.aspect.max(0.1), 0.0, 0.0, 0.0, //
+            f / input.aspect_ratio.max(0.1), 0.0, 0.0, 0.0, //
             0.0, f, 0.0, 0.0, //
             0.0, 0.0, 0.0, -1.0, //
             0.0, 0.0, near, 0.0,
         ];
         Some(ViewMesh {
-            vertices: bytemuck::cast_slice(&vertices).to_vec(),
-            indices,
-            solid,
-            clip,
+            verts: bytemuck::cast_slice(&vertices).to_vec(),
+            idx_list: indices,
+            solid_count: solid,
+            to_clip: clip,
             texture: assets.texture.clone(),
         })
     }

@@ -1,49 +1,39 @@
-use bevy::prelude::*;
-use fx::{FxGenerateVertsOut, GfxMarkMeshCensus};
-use fx_t6::FxPostLight;
+//! Result of one effects frame.
 
-use crate::present::FxVertsGaps;
-use crate::tracer::TracerWorld;
+use bevy::prelude::Transform;
+use fx::DecalMeshTally;
+use fx::CornerBuildOutput;
+use fx_t6::AfterglowSprite;
 
-#[derive(Debug)]
-pub enum FxUnavailableCause {
-    CatalogAbsent,
+use crate::{effect_play::EffectVertexHoles, tracer::StreakLevel};
+
+/// Where the eye stood and what it could see when the frame was built.
+pub struct FxFrameView {
+    pub camera: Transform,
+    pub frustum: Vec<[f32; 4]>,
+    pub view_proj: Option<[f32; 16]>,
+    pub fov_half_tan: Option<(f32, f32)>,
+    pub level_present: bool,
 }
 
-pub struct FxGeneratedFrame {
-    pub out: FxGenerateVertsOut,
-    pub verts_gaps: FxVertsGaps,
-    pub mark_mesh: Option<GfxMarkMeshCensus>,
-    pub post_lights: Vec<FxPostLight>,
-    pub tracers: TracerWorld,
-    pub cam_tf: Transform,
-    pub frustum_planes: Vec<[f32; 4]>,
-    pub clip_from_world: Option<[f32; 16]>,
-    pub tan_half_fov: Option<(f32, f32)>,
-    pub world_present: bool,
+/// What a frame produced when effect generation ran to completion.
+pub struct GeneratedFxFrame {
+    pub products: CornerBuildOutput,
+    pub gaps: EffectVertexHoles,
+    pub marks: Option<DecalMeshTally>,
+    pub after_lights: Vec<AfterglowSprite>,
+    pub tracers: StreakLevel,
+    pub view: FxFrameView,
 }
 
-pub enum FxFrameOutcome {
-    Generated(FxGeneratedFrame),
-    Unavailable(FxUnavailableCause),
+/// Why effect generation could not run for a frame.
+#[derive(Clone, Copy, Debug)]
+pub enum FxSkipCause {
+    NoCatalog,
 }
 
-pub fn clear_fx_owned_plans(
-    plan: &mut crate::FxCodeMeshPlan,
-    spark: &mut crate::FxParticleCloudPlan,
-    marks: &mut crate::GfxMarkMeshPlan,
-) {
-    plan.clear();
-    spark.clear_draws();
-    marks.clear();
-}
-
-pub fn publish_empty_fx_owned_plans(
-    plan: &mut crate::FxCodeMeshPlan,
-    spark: &mut crate::FxParticleCloudPlan,
-) {
-    plan.bump();
-    plan.publish_share();
-    spark.bump();
-    spark.publish_share();
+/// Either a generated frame or the reason there is none.
+pub enum FxFrameResult {
+    Ready(GeneratedFxFrame),
+    Skipped(FxSkipCause),
 }

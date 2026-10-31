@@ -2,16 +2,16 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering::Relaxed;
 
 pub struct TestDir(PathBuf);
 
 impl TestDir {
     pub fn new(tag: &str) -> Self {
-        static COUNT: AtomicU32 = AtomicU32::new(0);
-        let number = COUNT.fetch_add(1, Ordering::Relaxed);
+        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let serial = COUNT.fetch_add(1, Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "bo2mp-replay-test-{}-{number}-{tag}",
+            "bo2mp-replay-test-{}-{serial}-{tag}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("the temp folder can be made");

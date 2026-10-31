@@ -1,8 +1,11 @@
 //! Which arms model a first-person weapon wears.
 
-use asset_core::AssetNamespace;
+use asset_core::AssetCategoryScope;
 
-use crate::{FpvMeshCatalog, SoldierKit, arms_for_body, is_arms_model};
+use crate::FirstPersonMeshRoster;
+use crate::TrooperOutfit;
+use crate::arms_matching_body;
+use crate::is_arms_model;
 
 /// The arms Black Ops II gives the first player (the map script's
 /// `setviewmodel`); on Nuketown that is CIA, in a suit.
@@ -10,163 +13,149 @@ const DEFAULT_ARMS: &str = "c_zom_suit_viewhands";
 
 /// The arms chosen for a weapon, and what chose them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FpvHands {
+pub enum FirstPersonArms {
     /// The soldier kit names them, or they match the kit's body.
     FromKit {
-        namespace: AssetNamespace,
+        namespace: AssetCategoryScope,
         name: String,
     },
     /// The weapon's own definition names them.
-    FromWeaponDef {
-        namespace: AssetNamespace,
+    DerivedFromWeaponSpec {
+        namespace: AssetCategoryScope,
         name: String,
     },
     /// Neither said, so these are the map's stand-in.
-    GameDefault {
-        namespace: AssetNamespace,
+    StockDefault {
+        namespace: AssetCategoryScope,
         name: String,
     },
     /// No arms are loaded.
-    Unresolved,
+    NothingLoaded,
 }
 
-impl FpvHands {
-    pub fn key(&self) -> Option<(AssetNamespace, &str)> {
+impl FirstPersonArms {
+    pub fn key(&self) -> Option<(AssetCategoryScope, &str)> {
         match self {
-            Self::FromKit { namespace, name }
-            | Self::FromWeaponDef { namespace, name }
-            | Self::GameDefault { namespace, name } => Some((*namespace, name)),
-            Self::Unresolved => None,
+            FirstPersonArms::FromKit { namespace: space, name: label }
+            | Self::DerivedFromWeaponSpec { namespace: space, name: label }
+            | Self::StockDefault { namespace: space, name: label } => Some((*space, label.as_str())),
+            Self::NothingLoaded => None,
         }
     }
 
-    /// Picks arms from what the catalog holds for the map's namespace: the
-    /// kit's, then the weapon's, then the default.
-    pub fn resolve(
-        catalog: &FpvMeshCatalog,
-        map_ns: AssetNamespace,
-        kit: Option<&SoldierKit>,
-        weapon_hand: Option<&str>,
-        weapon_ns: AssetNamespace,
+    /// Picks arms from what the set holds for the map's namespace: the kit's,
+    /// then the weapon's, then the stand-in.
+    pub fn choose(
+        loaded: &FirstPersonMeshRoster,
+        space: AssetCategoryScope,
+        soldier: Option<&TrooperOutfit>,
+        gun_hands: Option<&str>,
+        gun_space: AssetCategoryScope,
     ) -> Self {
-        if let Some(name) = kit.and_then(|kit| kit_arms(catalog, map_ns, kit)) {
-            return Self::FromKit {
-                namespace: map_ns,
-                name,
-            };
-        }
-        let weapon_arms = weapon_hand
-            .filter(|name| weapon_ns == map_ns && catalog.contains(map_ns, name));
-        if let Some(name) = weapon_arms {
-            return Self::FromWeaponDef {
-                namespace: map_ns,
-                name: name.to_owned(),
-            };
-        }
-        match default_arms(catalog, map_ns) {
-            Some(name) => Self::GameDefault {
-                namespace: map_ns,
-                name,
+        let from_kit = soldier.and_then(|kit| kit_arms(loaded, space, kit));
+        let from_gun = match gun_hands {
+            Some(label) if gun_space == space && loaded.holds(space, label) => Some(label),
+            _ => None,
+        };
+        let stand_in = || default_arms(loaded, space);
+        match (from_kit, from_gun) {
+            (Some(label), _) => FirstPersonArms::FromKit { namespace: space, name: label },
+            (None, Some(own)) => Self::DerivedFromWeaponSpec { namespace: space, name: own.to_owned() },
+            (None, None) => match stand_in() {
+                Some(label) => Self::StockDefault { namespace: space, name: label },
+                None => Self::NothingLoaded,
             },
-            None => Self::Unresolved,
         }
     }
 }
 
 /// The kit's arms if it names some the catalog holds, else the pair that goes
 /// with its body.
-fn kit_arms(catalog: &FpvMeshCatalog, map_ns: AssetNamespace, kit: &SoldierKit) -> Option<String> {
-    let named = kit
-        .arms
-        .as_deref()
-        .filter(|name| catalog.contains(map_ns, name));
-    if let Some(name) = named {
-        return Some(name.to_owned());
+fn kit_arms(loaded: &FirstPersonMeshRoster, space: AssetCategoryScope, kit: &TrooperOutfit) -> Option<String> {
+    if let Some(label) = kit.limbs.as_deref().filter(|label| loaded.holds(space, label)) {
+        return Some(label.to_owned());
     }
-    let candidates: Vec<&str> = catalog
-        .names_in(map_ns)
-        .filter(|name| is_arms_model(name))
-        .collect();
-    arms_for_body(&kit.body, &candidates).filter(|name| catalog.contains(map_ns, name))
+    let offered: Vec<&str> = loaded.labels_in(space).filter(|label| is_arms_model(label)).collect();
+    arms_matching_body(&kit.torso, &offered).filter(|label| loaded.holds(space, label))
 }
 
 /// The stand-in arms: the game's own if loaded; failing that, on a
 /// multiplayer map, whichever faction arms sort first (until a class script
 /// picks a side, none is more right than another).
-fn default_arms(catalog: &FpvMeshCatalog, map_ns: AssetNamespace) -> Option<String> {
-    if map_ns != AssetNamespace::T6 {
+fn default_arms(loaded: &FirstPersonMeshRoster, space: AssetCategoryScope) -> Option<String> {
+    if space != AssetCategoryScope::T6 {
         return None;
     }
-    if catalog.contains(map_ns, DEFAULT_ARMS) {
+    if loaded.holds(space, DEFAULT_ARMS) {
         return Some(DEFAULT_ARMS.to_owned());
     }
-    catalog
-        .names_in(map_ns)
-        .filter(|name| name.ends_with("_viewhands"))
-        .min()
-        .map(str::to_owned)
+    let first_faction = loaded.labels_in(space).filter(|label| label.ends_with("_viewhands")).min();
+    // bo2zm: a zone that carries only a Zombies Declassified-style pair draws its players'
+    // `viewmodel_*_arms`.
+    let first_any = || loaded.labels_in(space).filter(|label| is_arms_model(label)).min();
+    first_faction.or_else(first_any).map(str::to_owned)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::FpvMeshBuild;
-    use crate::fpv_mesh_catalog::test_support::skel;
+    use crate::fpv_mesh_catalog::test_support::bone_rig;
 
-    const T6: AssetNamespace = AssetNamespace::T6;
+    const T6: AssetCategoryScope = AssetCategoryScope::T6;
 
-    fn catalog_of(names: &[&str]) -> FpvMeshCatalog {
+    fn catalog_of(labels: &[&str]) -> FirstPersonMeshRoster {
         let mut build = FpvMeshBuild::default();
-        for name in names {
-            build.insert_in(T6, skel(name, &["tag_origin"], true), None);
+        for label in labels {
+            build.put_into_namespace(T6, bone_rig(label, &["tag_origin"], true), None);
         }
         build.publish()
     }
 
-    fn picked(hands: &FpvHands) -> Option<&str> {
+    fn picked(hands: &FirstPersonArms) -> Option<&str> {
         hands.key().map(|(_, name)| name)
     }
 
     #[test]
     fn the_weapons_hands_win_over_the_default() {
         let catalog = catalog_of(&[DEFAULT_ARMS, "c_usa_mp_seal6_viewhands"]);
-        let hands = FpvHands::resolve(&catalog, T6, None, Some("c_usa_mp_seal6_viewhands"), T6);
-        assert!(matches!(hands, FpvHands::FromWeaponDef { .. }));
+        let hands = FirstPersonArms::choose(&catalog, T6, None, Some("c_usa_mp_seal6_viewhands"), T6);
+        assert!(matches!(hands, FirstPersonArms::DerivedFromWeaponSpec { .. }));
         assert_eq!(picked(&hands), Some("c_usa_mp_seal6_viewhands"));
     }
 
     #[test]
     fn a_weapon_from_another_namespace_is_ignored() {
         let catalog = catalog_of(&[DEFAULT_ARMS, "other_viewhands"]);
-        let hands = FpvHands::resolve(&catalog, T6, None, Some("other_viewhands"), AssetNamespace::T5);
-        assert!(matches!(hands, FpvHands::GameDefault { .. }));
+        let hands = FirstPersonArms::choose(&catalog, T6, None, Some("other_viewhands"), AssetCategoryScope::T5);
+        assert!(matches!(hands, FirstPersonArms::StockDefault { .. }));
         assert_eq!(picked(&hands), Some(DEFAULT_ARMS));
     }
 
     #[test]
     fn without_the_default_the_first_faction_arms_sort_in() {
         let catalog = catalog_of(&["c_usa_mp_seal6_viewhands", "c_rus_mp_spetsnaz_viewhands"]);
-        let hands = FpvHands::resolve(&catalog, T6, None, None, T6);
+        let hands = FirstPersonArms::choose(&catalog, T6, None, None, T6);
         assert_eq!(picked(&hands), Some("c_rus_mp_spetsnaz_viewhands"));
     }
 
     #[test]
     fn no_arms_loaded_is_unresolved() {
-        let hands = FpvHands::resolve(&catalog_of(&["viewmodel_gun"]), T6, None, None, T6);
-        assert_eq!(hands, FpvHands::Unresolved);
+        let hands = FirstPersonArms::choose(&catalog_of(&["viewmodel_gun"]), T6, None, None, T6);
+        assert_eq!(hands, FirstPersonArms::NothingLoaded);
         assert_eq!(hands.key(), None);
     }
 
     #[test]
     fn a_kit_naming_loaded_arms_wins() {
         let catalog = catalog_of(&["viewmodel_marines_arms", DEFAULT_ARMS]);
-        let kit = SoldierKit {
-            body: "body".into(),
-            head: None,
-            arms: Some("viewmodel_marines_arms".into()),
+        let kit = TrooperOutfit {
+            torso: "body".into(),
+            skull: None,
+            limbs: Some("viewmodel_marines_arms".into()),
         };
-        let hands = FpvHands::resolve(&catalog, T6, Some(&kit), None, T6);
-        assert!(matches!(hands, FpvHands::FromKit { .. }));
+        let hands = FirstPersonArms::choose(&catalog, T6, Some(&kit), None, T6);
+        assert!(matches!(hands, FirstPersonArms::FromKit { .. }));
         assert_eq!(picked(&hands), Some("viewmodel_marines_arms"));
     }
 }

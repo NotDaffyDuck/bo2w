@@ -7,12 +7,12 @@
 //! No engine, launcher or game-session types: callers hand in the map's
 //! panes, hits and a world trace, and read back states and shard meshes.
 
-pub mod client;
+pub mod pane_view;
 pub mod net;
 pub mod server;
 pub mod shards;
 
-pub use client::{ClientPane, Cue, FxPoint, GlassesClient, shatter_fx_points};
+pub use pane_view::{ClientPane, Cue, FxPoint, GlassesClient, shatter_fx_points};
 pub use net::{GlassMsg, NetError, PaneUpdate};
 
 pub use server::{
@@ -30,11 +30,11 @@ pub struct GlassWorldContact {
     pub fraction: f32,
     pub end: [f32; 3],
     pub normal: [f32; 3],
-    pub startsolid: bool,
+    pub began_inside: bool,
     pub pane: Option<u32>,
 }
 
 /// The world as falling shards see it: a sweep from `start` to `end`.
 pub trait GlassWorldTrace {
-    fn sweep(&self, start: [f32; 3], end: [f32; 3]) -> Option<GlassWorldContact>;
+    fn sweep(&self, from_pt: [f32; 3], to_pt: [f32; 3]) -> Option<GlassWorldContact>;
 }

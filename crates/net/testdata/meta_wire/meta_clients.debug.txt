@@ -1,19 +1,27 @@
-SnapshotMetaSectionBytes {
-    match_header: 2569,
-    events: 11,
-    aliases: 41,
-    entity_dobjs: 2,
-    corpses: 9,
-    entities: 2,
-    script_movers: 2,
-    entity_kernel: 16,
-    item_tables: 4,
-    area_entities: 1,
-    objectives: 31,
-    world_objects: 11,
+MetaSectionSizes {
+    header_len: 2577,
+    event_len: 11,
+    alias_len: 41,
+    dobj_len: 2,
+    corpse_len: 9,
+    entity_len: 2,
+    mover_len: 2,
+    kernel_len: 16,
+    item_len: 4,
+    area_len: 1,
+    objective_len: 31,
+    world_len: 11,
 }
-SnapshotMeta {
-    objectives: ObjectiveMatch {
+TickLedgerNotes {
+    phase: Playing,
+    kind: Domination,
+    prematch: Starting {
+        spent_ms: 2500,
+    },
+    match_clock_ms: 123456,
+    score_limit: 75,
+    time_limit_ms: 600000,
+    objectives: MatchBoard {
         scores: [
             0,
             0,
@@ -33,29 +41,21 @@ SnapshotMeta {
         missile_vision: None,
         pain_vision: None,
     },
-    phase: Playing,
-    match_elapsed_ms: 123456,
-    prematch: Starting {
-        elapsed_ms: 2500,
-    },
-    score_limit: 75,
-    time_limit_ms: 600000,
-    kind: Domination,
     clients: [
         (
-            ClientId(
+            SeatNo(
                 0,
             ),
-            ClientSnapshotMeta {
+            SeatTickNotes {
                 controls: ScriptControls {
-                    frozen: true,
+                    stuck: true,
                     weapons_disabled: false,
                     fire_disabled: false,
                     offhands_disabled: false,
                     switch_disabled: false,
                     jump_disabled: true,
                     usability_disabled: false,
-                    linked: true,
+                    paired: true,
                     stunned: false,
                     prone_disabled: true,
                     crouch_disabled: false,
@@ -64,11 +64,12 @@ SnapshotMeta {
                     melee_disabled: true,
                     ads_disabled: false,
                     switch_to: 2571,
+                    slick: false,
                 },
                 weapon_lock: WeaponLock {
-                    weapon: 321,
-                    life: 4,
-                    flags: 5,
+                    gun: 321,
+                    life_no: 4,
+                    bits: 5,
                     target: [
                         1.0,
                         2.0,
@@ -76,9 +77,9 @@ SnapshotMeta {
                     ],
                     aim: Some(
                         Entity {
-                            entity: EntityRef {
-                                number: 30,
-                                generation: 2,
+                            entity: EntHandle {
+                                slot: 30,
+                                reuse: 2,
                             },
                             offset: [
                                 0.5,
@@ -90,14 +91,14 @@ SnapshotMeta {
                     acquire_started_at: 8800,
                 },
                 killcam_hud: Some(
-                    KillcamHud {
+                    DeathReelBoard {
                         final_kill: true,
                     },
                 ),
                 lifecycle: Alive,
                 loadout: Some(
-                    LoadoutSpec {
-                        class_id: ClassId(
+                    KitPlan {
+                        class_id: LoadoutClass(
                             3,
                         ),
                         revision: 12,
@@ -124,19 +125,19 @@ SnapshotMeta {
                         ],
                     },
                 ),
-                life_sequence: LifeSequence(
+                life_sequence: LifeCount(
                     5,
                 ),
-                item_use_spawn_ms: 1500,
+                item_ready_ms: 1500,
                 item_use_entity: Some(
-                    EntityRef {
-                        number: 31,
-                        generation: 1,
+                    EntHandle {
+                        slot: 31,
+                        reuse: 1,
                     },
                 ),
-                ammo_clip: 17,
+                mag_rounds: 17,
                 ammo_stock: 120,
-                ammo_by_weapon: [
+                rounds_per_gun: [
                     (
                         101,
                         12,
@@ -162,12 +163,12 @@ SnapshotMeta {
                 kill_streak: 5,
                 radar: Fast,
                 remote_missile: Some(
-                    RemoteMissile {
-                        projectile: ProjectileId(
+                    SteeredMissile {
+                        projectile: ThrownId(
                             77,
                         ),
-                        entnum: 45,
-                        angles: [
+                        ent_no: 45,
+                        turn: [
                             10.0,
                             20.0,
                             30.0,
@@ -180,10 +181,10 @@ SnapshotMeta {
                             1234,
                         ),
                         t6: true,
-                        held: false,
+                        holding: false,
                     },
                 ),
-                dead_since_tick: Some(
+                died_at_step: Some(
                     777,
                 ),
                 look_at_killer_yaw: -90,
@@ -211,154 +212,154 @@ SnapshotMeta {
                 client_state_team: 1,
                 rank: 55,
                 prestige: 3,
-                player_card_icon: 1001,
-                player_card_title: 1002,
-                player_card_nameplate: 1003,
+                card_icon: 1001,
+                card_title: 1002,
+                card_plate: 1003,
                 hud_archival: [
-                    HudElem {
+                    OverlayPiece {
                         x: 320.5,
                         y: -12.25,
                         z: 1.0,
-                        font_scale: 1.5,
-                        from_font_scale: 0.0,
-                        font_scale_start_time: 0,
-                        color_rgba: 4286595327,
-                        from_color_rgba: 0,
-                        fade_start_time: 0,
-                        scale_start_time: 0,
-                        from_x: 0.0,
-                        from_y: 0.0,
-                        move_start_time: 0,
+                        text_size: 1.5,
+                        text_size_was: 0.0,
+                        text_grow_from: 0,
+                        tint_rgba: 4286595327,
+                        tint_was: 0,
+                        fade_from: 0,
+                        grow_from: 0,
+                        was_x: 0.0,
+                        was_y: 0.0,
+                        slide_from: 0,
                         time: 9000,
-                        duration: 2500,
-                        value: 42.0,
+                        lasts: 2500,
+                        val: 42.0,
                         sort: 3.0,
-                        glow_color_rgba: 0,
-                        fx_birth_time: 0,
-                        flags: 0,
-                        target_ent_num: 0,
-                        font_scale_time: 0,
-                        fade_time: 0,
-                        label: 7,
+                        glow_rgba: 0,
+                        fx_born: 0,
+                        bits: 0,
+                        aim_ent: 0,
+                        text_grow_ms: 0,
+                        fade_len: 0,
+                        caption: 7,
                         width: 0,
                         height: 0,
-                        from_width: 0,
-                        from_height: 0,
-                        scale_time: 0,
-                        move_time: 0,
-                        text: 8,
-                        fx_letter_time: 0,
-                        fx_decay_start_time: 0,
-                        fx_decay_duration: 0,
+                        was_wide: 0,
+                        was_tall: 0,
+                        grow_ms: 0,
+                        slide_ms: 0,
+                        words: 8,
+                        fx_char_ms: 0,
+                        fx_fade_from: 0,
+                        fx_fade_len: 0,
                         fx_redact_decay_start_time: 0,
                         fx_redact_decay_duration: 0,
-                        elem_type: 1,
+                        piece_kind: 1,
                         font: 2,
-                        align_org: 5,
-                        align_screen: 0,
-                        material_index: 11,
+                        anchor: 5,
+                        screen_anchor: 0,
+                        skin_no: 11,
                         offscreen_material_index: 0,
-                        from_align_org: 0,
-                        from_align_screen: 0,
-                        sound_id: 4,
+                        anchor_was: 0,
+                        screen_anchor_was: 0,
+                        sound_no: 4,
                         ui3d_window: 0,
                     },
-                    HudElem {
+                    OverlayPiece {
                         x: -64.0,
                         y: 480.0,
                         z: 0.0,
-                        font_scale: 0.0,
-                        from_font_scale: 0.0,
-                        font_scale_start_time: 0,
-                        color_rgba: 270544960,
-                        from_color_rgba: 0,
-                        fade_start_time: 0,
-                        scale_start_time: 0,
-                        from_x: 0.0,
-                        from_y: 0.0,
-                        move_start_time: 0,
+                        text_size: 0.0,
+                        text_size_was: 0.0,
+                        text_grow_from: 0,
+                        tint_rgba: 270544960,
+                        tint_was: 0,
+                        fade_from: 0,
+                        grow_from: 0,
+                        was_x: 0.0,
+                        was_y: 0.0,
+                        slide_from: 0,
                         time: 0,
-                        duration: 0,
-                        value: 0.0,
+                        lasts: 0,
+                        val: 0.0,
                         sort: 0.0,
-                        glow_color_rgba: 0,
-                        fx_birth_time: 0,
-                        flags: 10,
-                        target_ent_num: 31,
-                        font_scale_time: 0,
-                        fade_time: 0,
-                        label: 0,
+                        glow_rgba: 0,
+                        fx_born: 0,
+                        bits: 10,
+                        aim_ent: 31,
+                        text_grow_ms: 0,
+                        fade_len: 0,
+                        caption: 0,
                         width: 200,
                         height: 24,
-                        from_width: 0,
-                        from_height: 0,
-                        scale_time: 0,
-                        move_time: 0,
-                        text: 0,
-                        fx_letter_time: 0,
-                        fx_decay_start_time: 0,
-                        fx_decay_duration: 0,
+                        was_wide: 0,
+                        was_tall: 0,
+                        grow_ms: 0,
+                        slide_ms: 0,
+                        words: 0,
+                        fx_char_ms: 0,
+                        fx_fade_from: 0,
+                        fx_fade_len: 0,
                         fx_redact_decay_start_time: 0,
                         fx_redact_decay_duration: 0,
-                        elem_type: 0,
+                        piece_kind: 0,
                         font: 0,
-                        align_org: 0,
-                        align_screen: 0,
-                        material_index: 0,
+                        anchor: 0,
+                        screen_anchor: 0,
+                        skin_no: 0,
                         offscreen_material_index: 0,
-                        from_align_org: 0,
-                        from_align_screen: 0,
-                        sound_id: 0,
+                        anchor_was: 0,
+                        screen_anchor_was: 0,
+                        sound_no: 0,
                         ui3d_window: 0,
                     },
                 ],
                 hud_current: [
-                    HudElem {
+                    OverlayPiece {
                         x: -64.0,
                         y: 480.0,
                         z: 0.0,
-                        font_scale: 0.0,
-                        from_font_scale: 0.0,
-                        font_scale_start_time: 0,
-                        color_rgba: 270544960,
-                        from_color_rgba: 0,
-                        fade_start_time: 0,
-                        scale_start_time: 0,
-                        from_x: 0.0,
-                        from_y: 0.0,
-                        move_start_time: 0,
+                        text_size: 0.0,
+                        text_size_was: 0.0,
+                        text_grow_from: 0,
+                        tint_rgba: 270544960,
+                        tint_was: 0,
+                        fade_from: 0,
+                        grow_from: 0,
+                        was_x: 0.0,
+                        was_y: 0.0,
+                        slide_from: 0,
                         time: 0,
-                        duration: 0,
-                        value: 0.0,
+                        lasts: 0,
+                        val: 0.0,
                         sort: 0.0,
-                        glow_color_rgba: 0,
-                        fx_birth_time: 0,
-                        flags: 10,
-                        target_ent_num: 31,
-                        font_scale_time: 0,
-                        fade_time: 0,
-                        label: 0,
+                        glow_rgba: 0,
+                        fx_born: 0,
+                        bits: 10,
+                        aim_ent: 31,
+                        text_grow_ms: 0,
+                        fade_len: 0,
+                        caption: 0,
                         width: 200,
                         height: 24,
-                        from_width: 0,
-                        from_height: 0,
-                        scale_time: 0,
-                        move_time: 0,
-                        text: 0,
-                        fx_letter_time: 0,
-                        fx_decay_start_time: 0,
-                        fx_decay_duration: 0,
+                        was_wide: 0,
+                        was_tall: 0,
+                        grow_ms: 0,
+                        slide_ms: 0,
+                        words: 0,
+                        fx_char_ms: 0,
+                        fx_fade_from: 0,
+                        fx_fade_len: 0,
                         fx_redact_decay_start_time: 0,
                         fx_redact_decay_duration: 0,
-                        elem_type: 0,
+                        piece_kind: 0,
                         font: 0,
-                        align_org: 0,
-                        align_screen: 0,
-                        material_index: 0,
+                        anchor: 0,
+                        screen_anchor: 0,
+                        skin_no: 0,
                         offscreen_material_index: 0,
-                        from_align_org: 0,
-                        from_align_screen: 0,
-                        sound_id: 0,
+                        anchor_was: 0,
+                        screen_anchor_was: 0,
+                        sound_no: 0,
                         ui3d_window: 0,
                     },
                 ],
@@ -382,12 +383,12 @@ SnapshotMeta {
                             kind: Flashed,
                         },
                         view: ShellshockView {
-                            fade_ms: 250,
+                            fade_for_ms: 250,
                             kick_rate: 4.5,
                             kick_radius: 8.0,
                         },
                         sound: ShellshockSound {
-                            affect: true,
+                            touches: true,
                             loop_alias: "shock_loop",
                             loop_silent_alias: "shock_loop_quiet",
                             end_alias: "shock_end",
@@ -403,11 +404,11 @@ SnapshotMeta {
                             snapshot: "snd_shock",
                         },
                         look_control: ShellshockLookControl {
-                            affect: true,
-                            fade_ms: 80,
-                            sensitivity: 0.5,
-                            max_pitch_speed: 20.0,
-                            max_yaw_speed: 30.0,
+                            touches: true,
+                            fade_for_ms: 80,
+                            touchiness: 0.5,
+                            pitch_cap: 20.0,
+                            yaw_cap: 30.0,
                         },
                         movement_scale: 0.75,
                         animation: true,
@@ -422,67 +423,67 @@ SnapshotMeta {
                     naked_vision: Some(
                         VisionChange {
                             name: "naked",
-                            duration_ms: 400,
+                            lasts_ms: 400,
                             set_ms: 10,
                         },
                     ),
                     thermal_vision: Some(
                         VisionChange {
                             name: "thermal",
-                            duration_ms: 500,
+                            lasts_ms: 500,
                             set_ms: 20,
                         },
                     ),
                     missile_vision: Some(
                         VisionChange {
                             name: "missile",
-                            duration_ms: 600,
+                            lasts_ms: 600,
                             set_ms: 30,
                         },
                     ),
                     night_vision: Some(
                         VisionChange {
                             name: "night",
-                            duration_ms: 700,
+                            lasts_ms: 700,
                             set_ms: 40,
                         },
                     ),
                     pain_vision: Some(
                         VisionChange {
                             name: "pain",
-                            duration_ms: 800,
+                            lasts_ms: 800,
                             set_ms: 50,
                         },
                     ),
                     depth_of_field: ScriptDepthOfField {
-                        near_start: 1.0,
-                        near_end: 2.0,
-                        far_start: 300.0,
-                        far_end: 900.0,
-                        near_blur: 4.0,
-                        far_blur: 0.5,
+                        near_from: 1.0,
+                        near_to: 2.0,
+                        far_from: 300.0,
+                        far_to: 900.0,
+                        near_smear: 4.0,
+                        far_smear: 0.5,
                     },
                     blur: Some(
                         ScriptBlur {
                             from: 0.0,
                             to: 6.5,
                             set_ms: 5,
-                            duration_ms: 1500,
+                            lasts_ms: 1500,
                         },
                     ),
                 },
                 menu_commands: [
-                    MenuCommand {
+                    MenuOrder {
                         serial: 1,
-                        kind: Open(
+                        kind: Show(
                             "class",
                         ),
                     },
-                    MenuCommand {
+                    MenuOrder {
                         serial: 2,
                         kind: ClosePopup,
                     },
-                    MenuCommand {
+                    MenuOrder {
                         serial: 3,
                         kind: CloseInGame,
                     },
@@ -491,7 +492,7 @@ SnapshotMeta {
                     LocationSelection {
                         material: "compass_map_default",
                         choose_direction: true,
-                        radius: 192.0,
+                        reach: 192.0,
                     },
                 ),
                 t6_view: Some(
@@ -511,19 +512,19 @@ SnapshotMeta {
             },
         ),
         (
-            ClientId(
+            SeatNo(
                 1,
             ),
-            ClientSnapshotMeta {
+            SeatTickNotes {
                 controls: ScriptControls {
-                    frozen: false,
+                    stuck: false,
                     weapons_disabled: false,
                     fire_disabled: false,
                     offhands_disabled: false,
                     switch_disabled: false,
                     jump_disabled: false,
                     usability_disabled: false,
-                    linked: false,
+                    paired: false,
                     stunned: false,
                     prone_disabled: false,
                     crouch_disabled: false,
@@ -532,11 +533,12 @@ SnapshotMeta {
                     melee_disabled: false,
                     ads_disabled: false,
                     switch_to: 0,
+                    slick: false,
                 },
                 weapon_lock: WeaponLock {
-                    weapon: 0,
-                    life: 0,
-                    flags: 0,
+                    gun: 0,
+                    life_no: 0,
+                    bits: 0,
                     target: [
                         0.0,
                         0.0,
@@ -544,10 +546,10 @@ SnapshotMeta {
                     ],
                     aim: Some(
                         Player {
-                            client: ClientId(
+                            client: SeatNo(
                                 1,
                             ),
-                            life: LifeSequence(
+                            life: LifeCount(
                                 3,
                             ),
                             offset: [
@@ -560,20 +562,20 @@ SnapshotMeta {
                     acquire_started_at: 0,
                 },
                 killcam_hud: Some(
-                    KillcamHud {
+                    DeathReelBoard {
                         final_kill: false,
                     },
                 ),
                 lifecycle: Dead,
                 loadout: None,
-                life_sequence: LifeSequence(
+                life_sequence: LifeCount(
                     0,
                 ),
-                item_use_spawn_ms: 0,
+                item_ready_ms: 0,
                 item_use_entity: None,
-                ammo_clip: 0,
+                mag_rounds: 0,
                 ammo_stock: 0,
-                ammo_by_weapon: [],
+                rounds_per_gun: [],
                 taped_mag_spent: [],
                 weapon_shot_count: 0,
                 burst_latch: false,
@@ -586,7 +588,7 @@ SnapshotMeta {
                 kill_streak: 0,
                 radar: Constant,
                 remote_missile: None,
-                dead_since_tick: None,
+                died_at_step: None,
                 look_at_killer_yaw: 0,
                 name: [
                     0,
@@ -610,9 +612,9 @@ SnapshotMeta {
                 client_state_team: 0,
                 rank: 0,
                 prestige: 0,
-                player_card_icon: 0,
-                player_card_title: 0,
-                player_card_nameplate: 0,
+                card_icon: 0,
+                card_title: 0,
+                card_plate: 0,
                 hud_archival: [],
                 hud_current: [],
                 client_dvars: [],
@@ -624,12 +626,12 @@ SnapshotMeta {
                     night_vision: None,
                     pain_vision: None,
                     depth_of_field: ScriptDepthOfField {
-                        near_start: 0.0,
-                        near_end: 0.0,
-                        far_start: 0.0,
-                        far_end: 0.0,
-                        near_blur: 0.0,
-                        far_blur: 0.0,
+                        near_from: 0.0,
+                        near_to: 0.0,
+                        far_from: 0.0,
+                        far_to: 0.0,
+                        near_smear: 0.0,
+                        far_smear: 0.0,
                     },
                     blur: None,
                 },
@@ -640,19 +642,19 @@ SnapshotMeta {
             },
         ),
         (
-            ClientId(
+            SeatNo(
                 7,
             ),
-            ClientSnapshotMeta {
+            SeatTickNotes {
                 controls: ScriptControls {
-                    frozen: false,
+                    stuck: false,
                     weapons_disabled: false,
                     fire_disabled: false,
                     offhands_disabled: false,
                     switch_disabled: false,
                     jump_disabled: false,
                     usability_disabled: false,
-                    linked: false,
+                    paired: false,
                     stunned: false,
                     prone_disabled: false,
                     crouch_disabled: false,
@@ -661,11 +663,12 @@ SnapshotMeta {
                     melee_disabled: false,
                     ads_disabled: false,
                     switch_to: 0,
+                    slick: false,
                 },
                 weapon_lock: WeaponLock {
-                    weapon: 0,
-                    life: 0,
-                    flags: 0,
+                    gun: 0,
+                    life_no: 0,
+                    bits: 0,
                     target: [
                         0.0,
                         0.0,
@@ -685,14 +688,14 @@ SnapshotMeta {
                 killcam_hud: None,
                 lifecycle: Spectating,
                 loadout: None,
-                life_sequence: LifeSequence(
+                life_sequence: LifeCount(
                     0,
                 ),
-                item_use_spawn_ms: 0,
+                item_ready_ms: 0,
                 item_use_entity: None,
-                ammo_clip: 0,
+                mag_rounds: 0,
                 ammo_stock: 0,
-                ammo_by_weapon: [],
+                rounds_per_gun: [],
                 taped_mag_spent: [],
                 weapon_shot_count: 0,
                 burst_latch: false,
@@ -705,7 +708,7 @@ SnapshotMeta {
                 kill_streak: 0,
                 radar: Normal,
                 remote_missile: None,
-                dead_since_tick: None,
+                died_at_step: None,
                 look_at_killer_yaw: 0,
                 name: [
                     0,
@@ -729,9 +732,9 @@ SnapshotMeta {
                 client_state_team: 0,
                 rank: 0,
                 prestige: 0,
-                player_card_icon: 0,
-                player_card_title: 0,
-                player_card_nameplate: 0,
+                card_icon: 0,
+                card_title: 0,
+                card_plate: 0,
                 hud_archival: [],
                 hud_current: [],
                 client_dvars: [],
@@ -743,12 +746,12 @@ SnapshotMeta {
                     night_vision: None,
                     pain_vision: None,
                     depth_of_field: ScriptDepthOfField {
-                        near_start: 0.0,
-                        near_end: 0.0,
-                        far_start: 0.0,
-                        far_end: 0.0,
-                        near_blur: 0.0,
-                        far_blur: 0.0,
+                        near_from: 0.0,
+                        near_to: 0.0,
+                        far_from: 0.0,
+                        far_to: 0.0,
+                        near_smear: 0.0,
+                        far_smear: 0.0,
                     },
                     blur: None,
                 },
@@ -759,19 +762,19 @@ SnapshotMeta {
             },
         ),
         (
-            ClientId(
+            SeatNo(
                 2,
             ),
-            ClientSnapshotMeta {
+            SeatTickNotes {
                 controls: ScriptControls {
-                    frozen: false,
+                    stuck: false,
                     weapons_disabled: false,
                     fire_disabled: false,
                     offhands_disabled: false,
                     switch_disabled: false,
                     jump_disabled: false,
                     usability_disabled: false,
-                    linked: false,
+                    paired: false,
                     stunned: false,
                     prone_disabled: false,
                     crouch_disabled: false,
@@ -780,11 +783,12 @@ SnapshotMeta {
                     melee_disabled: false,
                     ads_disabled: false,
                     switch_to: 0,
+                    slick: false,
                 },
                 weapon_lock: WeaponLock {
-                    weapon: 0,
-                    life: 0,
-                    flags: 0,
+                    gun: 0,
+                    life_no: 0,
+                    bits: 0,
                     target: [
                         0.0,
                         0.0,
@@ -796,14 +800,14 @@ SnapshotMeta {
                 killcam_hud: None,
                 lifecycle: Connecting,
                 loadout: None,
-                life_sequence: LifeSequence(
+                life_sequence: LifeCount(
                     0,
                 ),
-                item_use_spawn_ms: 0,
+                item_ready_ms: 0,
                 item_use_entity: None,
-                ammo_clip: 0,
+                mag_rounds: 0,
                 ammo_stock: 0,
-                ammo_by_weapon: [],
+                rounds_per_gun: [],
                 taped_mag_spent: [],
                 weapon_shot_count: 0,
                 burst_latch: false,
@@ -816,7 +820,7 @@ SnapshotMeta {
                 kill_streak: 0,
                 radar: Off,
                 remote_missile: None,
-                dead_since_tick: None,
+                died_at_step: None,
                 look_at_killer_yaw: 0,
                 name: [
                     0,
@@ -840,9 +844,9 @@ SnapshotMeta {
                 client_state_team: 0,
                 rank: 0,
                 prestige: 0,
-                player_card_icon: 0,
-                player_card_title: 0,
-                player_card_nameplate: 0,
+                card_icon: 0,
+                card_title: 0,
+                card_plate: 0,
                 hud_archival: [],
                 hud_current: [],
                 client_dvars: [],
@@ -854,12 +858,12 @@ SnapshotMeta {
                     night_vision: None,
                     pain_vision: None,
                     depth_of_field: ScriptDepthOfField {
-                        near_start: 0.0,
-                        near_end: 0.0,
-                        far_start: 0.0,
-                        far_end: 0.0,
-                        near_blur: 0.0,
-                        far_blur: 0.0,
+                        near_from: 0.0,
+                        near_to: 0.0,
+                        far_from: 0.0,
+                        far_to: 0.0,
+                        near_smear: 0.0,
+                        far_smear: 0.0,
                     },
                     blur: None,
                 },
@@ -870,19 +874,19 @@ SnapshotMeta {
             },
         ),
         (
-            ClientId(
+            SeatNo(
                 3,
             ),
-            ClientSnapshotMeta {
+            SeatTickNotes {
                 controls: ScriptControls {
-                    frozen: false,
+                    stuck: false,
                     weapons_disabled: false,
                     fire_disabled: false,
                     offhands_disabled: false,
                     switch_disabled: false,
                     jump_disabled: false,
                     usability_disabled: false,
-                    linked: false,
+                    paired: false,
                     stunned: false,
                     prone_disabled: false,
                     crouch_disabled: false,
@@ -891,11 +895,12 @@ SnapshotMeta {
                     melee_disabled: false,
                     ads_disabled: false,
                     switch_to: 0,
+                    slick: false,
                 },
                 weapon_lock: WeaponLock {
-                    weapon: 0,
-                    life: 0,
-                    flags: 0,
+                    gun: 0,
+                    life_no: 0,
+                    bits: 0,
                     target: [
                         0.0,
                         0.0,
@@ -905,16 +910,16 @@ SnapshotMeta {
                     acquire_started_at: 0,
                 },
                 killcam_hud: None,
-                lifecycle: ChoosingClass,
+                lifecycle: PickingLoadout,
                 loadout: None,
-                life_sequence: LifeSequence(
+                life_sequence: LifeCount(
                     0,
                 ),
-                item_use_spawn_ms: 0,
+                item_ready_ms: 0,
                 item_use_entity: None,
-                ammo_clip: 0,
+                mag_rounds: 0,
                 ammo_stock: 0,
-                ammo_by_weapon: [],
+                rounds_per_gun: [],
                 taped_mag_spent: [],
                 weapon_shot_count: 0,
                 burst_latch: false,
@@ -927,7 +932,7 @@ SnapshotMeta {
                 kill_streak: 0,
                 radar: Off,
                 remote_missile: None,
-                dead_since_tick: None,
+                died_at_step: None,
                 look_at_killer_yaw: 0,
                 name: [
                     0,
@@ -951,9 +956,9 @@ SnapshotMeta {
                 client_state_team: 0,
                 rank: 0,
                 prestige: 0,
-                player_card_icon: 0,
-                player_card_title: 0,
-                player_card_nameplate: 0,
+                card_icon: 0,
+                card_title: 0,
+                card_plate: 0,
                 hud_archival: [],
                 hud_current: [],
                 client_dvars: [],
@@ -965,12 +970,12 @@ SnapshotMeta {
                     night_vision: None,
                     pain_vision: None,
                     depth_of_field: ScriptDepthOfField {
-                        near_start: 0.0,
-                        near_end: 0.0,
-                        far_start: 0.0,
-                        far_end: 0.0,
-                        near_blur: 0.0,
-                        far_blur: 0.0,
+                        near_from: 0.0,
+                        near_to: 0.0,
+                        far_from: 0.0,
+                        far_to: 0.0,
+                        near_smear: 0.0,
+                        far_smear: 0.0,
                     },
                     blur: None,
                 },
@@ -981,19 +986,19 @@ SnapshotMeta {
             },
         ),
         (
-            ClientId(
+            SeatNo(
                 4,
             ),
-            ClientSnapshotMeta {
+            SeatTickNotes {
                 controls: ScriptControls {
-                    frozen: false,
+                    stuck: false,
                     weapons_disabled: false,
                     fire_disabled: false,
                     offhands_disabled: false,
                     switch_disabled: false,
                     jump_disabled: false,
                     usability_disabled: false,
-                    linked: false,
+                    paired: false,
                     stunned: false,
                     prone_disabled: false,
                     crouch_disabled: false,
@@ -1002,11 +1007,12 @@ SnapshotMeta {
                     melee_disabled: false,
                     ads_disabled: false,
                     switch_to: 0,
+                    slick: false,
                 },
                 weapon_lock: WeaponLock {
-                    weapon: 0,
-                    life: 0,
-                    flags: 0,
+                    gun: 0,
+                    life_no: 0,
+                    bits: 0,
                     target: [
                         0.0,
                         0.0,
@@ -1016,16 +1022,16 @@ SnapshotMeta {
                     acquire_started_at: 0,
                 },
                 killcam_hud: None,
-                lifecycle: SpawnPending,
+                lifecycle: AwaitingFirstLife,
                 loadout: None,
-                life_sequence: LifeSequence(
+                life_sequence: LifeCount(
                     0,
                 ),
-                item_use_spawn_ms: 0,
+                item_ready_ms: 0,
                 item_use_entity: None,
-                ammo_clip: 0,
+                mag_rounds: 0,
                 ammo_stock: 0,
-                ammo_by_weapon: [],
+                rounds_per_gun: [],
                 taped_mag_spent: [],
                 weapon_shot_count: 0,
                 burst_latch: false,
@@ -1038,7 +1044,7 @@ SnapshotMeta {
                 kill_streak: 0,
                 radar: Off,
                 remote_missile: None,
-                dead_since_tick: None,
+                died_at_step: None,
                 look_at_killer_yaw: 0,
                 name: [
                     0,
@@ -1062,9 +1068,9 @@ SnapshotMeta {
                 client_state_team: 0,
                 rank: 0,
                 prestige: 0,
-                player_card_icon: 0,
-                player_card_title: 0,
-                player_card_nameplate: 0,
+                card_icon: 0,
+                card_title: 0,
+                card_plate: 0,
                 hud_archival: [],
                 hud_current: [],
                 client_dvars: [],
@@ -1076,12 +1082,12 @@ SnapshotMeta {
                     night_vision: None,
                     pain_vision: None,
                     depth_of_field: ScriptDepthOfField {
-                        near_start: 0.0,
-                        near_end: 0.0,
-                        far_start: 0.0,
-                        far_end: 0.0,
-                        near_blur: 0.0,
-                        far_blur: 0.0,
+                        near_from: 0.0,
+                        near_to: 0.0,
+                        far_from: 0.0,
+                        far_to: 0.0,
+                        near_smear: 0.0,
+                        far_smear: 0.0,
                     },
                     blur: None,
                 },
@@ -1092,19 +1098,19 @@ SnapshotMeta {
             },
         ),
         (
-            ClientId(
+            SeatNo(
                 5,
             ),
-            ClientSnapshotMeta {
+            SeatTickNotes {
                 controls: ScriptControls {
-                    frozen: false,
+                    stuck: false,
                     weapons_disabled: false,
                     fire_disabled: false,
                     offhands_disabled: false,
                     switch_disabled: false,
                     jump_disabled: false,
                     usability_disabled: false,
-                    linked: false,
+                    paired: false,
                     stunned: false,
                     prone_disabled: false,
                     crouch_disabled: false,
@@ -1113,11 +1119,12 @@ SnapshotMeta {
                     melee_disabled: false,
                     ads_disabled: false,
                     switch_to: 0,
+                    slick: false,
                 },
                 weapon_lock: WeaponLock {
-                    weapon: 0,
-                    life: 0,
-                    flags: 0,
+                    gun: 0,
+                    life_no: 0,
+                    bits: 0,
                     target: [
                         0.0,
                         0.0,
@@ -1127,16 +1134,16 @@ SnapshotMeta {
                     acquire_started_at: 0,
                 },
                 killcam_hud: None,
-                lifecycle: RespawnPending,
+                lifecycle: AwaitingNextLife,
                 loadout: None,
-                life_sequence: LifeSequence(
+                life_sequence: LifeCount(
                     0,
                 ),
-                item_use_spawn_ms: 0,
+                item_ready_ms: 0,
                 item_use_entity: None,
-                ammo_clip: 0,
+                mag_rounds: 0,
                 ammo_stock: 0,
-                ammo_by_weapon: [],
+                rounds_per_gun: [],
                 taped_mag_spent: [],
                 weapon_shot_count: 0,
                 burst_latch: false,
@@ -1149,7 +1156,7 @@ SnapshotMeta {
                 kill_streak: 0,
                 radar: Off,
                 remote_missile: None,
-                dead_since_tick: None,
+                died_at_step: None,
                 look_at_killer_yaw: 0,
                 name: [
                     0,
@@ -1173,9 +1180,9 @@ SnapshotMeta {
                 client_state_team: 0,
                 rank: 0,
                 prestige: 0,
-                player_card_icon: 0,
-                player_card_title: 0,
-                player_card_nameplate: 0,
+                card_icon: 0,
+                card_title: 0,
+                card_plate: 0,
                 hud_archival: [],
                 hud_current: [],
                 client_dvars: [],
@@ -1187,12 +1194,12 @@ SnapshotMeta {
                     night_vision: None,
                     pain_vision: None,
                     depth_of_field: ScriptDepthOfField {
-                        near_start: 0.0,
-                        near_end: 0.0,
-                        far_start: 0.0,
-                        far_end: 0.0,
-                        near_blur: 0.0,
-                        far_blur: 0.0,
+                        near_from: 0.0,
+                        near_to: 0.0,
+                        far_from: 0.0,
+                        far_to: 0.0,
+                        near_smear: 0.0,
+                        far_smear: 0.0,
                     },
                     blur: None,
                 },
@@ -1203,19 +1210,19 @@ SnapshotMeta {
             },
         ),
         (
-            ClientId(
+            SeatNo(
                 6,
             ),
-            ClientSnapshotMeta {
+            SeatTickNotes {
                 controls: ScriptControls {
-                    frozen: false,
+                    stuck: false,
                     weapons_disabled: false,
                     fire_disabled: false,
                     offhands_disabled: false,
                     switch_disabled: false,
                     jump_disabled: false,
                     usability_disabled: false,
-                    linked: false,
+                    paired: false,
                     stunned: false,
                     prone_disabled: false,
                     crouch_disabled: false,
@@ -1224,11 +1231,12 @@ SnapshotMeta {
                     melee_disabled: false,
                     ads_disabled: false,
                     switch_to: 0,
+                    slick: false,
                 },
                 weapon_lock: WeaponLock {
-                    weapon: 0,
-                    life: 0,
-                    flags: 0,
+                    gun: 0,
+                    life_no: 0,
+                    bits: 0,
                     target: [
                         0.0,
                         0.0,
@@ -1240,14 +1248,14 @@ SnapshotMeta {
                 killcam_hud: None,
                 lifecycle: Intermission,
                 loadout: None,
-                life_sequence: LifeSequence(
+                life_sequence: LifeCount(
                     0,
                 ),
-                item_use_spawn_ms: 0,
+                item_ready_ms: 0,
                 item_use_entity: None,
-                ammo_clip: 0,
+                mag_rounds: 0,
                 ammo_stock: 0,
-                ammo_by_weapon: [],
+                rounds_per_gun: [],
                 taped_mag_spent: [],
                 weapon_shot_count: 0,
                 burst_latch: false,
@@ -1260,7 +1268,7 @@ SnapshotMeta {
                 kill_streak: 0,
                 radar: Off,
                 remote_missile: None,
-                dead_since_tick: None,
+                died_at_step: None,
                 look_at_killer_yaw: 0,
                 name: [
                     0,
@@ -1284,9 +1292,9 @@ SnapshotMeta {
                 client_state_team: 0,
                 rank: 0,
                 prestige: 0,
-                player_card_icon: 0,
-                player_card_title: 0,
-                player_card_nameplate: 0,
+                card_icon: 0,
+                card_title: 0,
+                card_plate: 0,
                 hud_archival: [],
                 hud_current: [],
                 client_dvars: [],
@@ -1298,12 +1306,12 @@ SnapshotMeta {
                     night_vision: None,
                     pain_vision: None,
                     depth_of_field: ScriptDepthOfField {
-                        near_start: 0.0,
-                        near_end: 0.0,
-                        far_start: 0.0,
-                        far_end: 0.0,
-                        near_blur: 0.0,
-                        far_blur: 0.0,
+                        near_from: 0.0,
+                        near_to: 0.0,
+                        far_from: 0.0,
+                        far_to: 0.0,
+                        near_smear: 0.0,
+                        far_smear: 0.0,
                     },
                     blur: None,
                 },
@@ -1322,36 +1330,36 @@ SnapshotMeta {
     effect_names: [],
     hud_materials: [],
     hud_strings: [],
-    rng: RngDebugMeta {
+    rng: DiceTrace {
         root_seed: 0,
         scheme: 0,
         spawn_draws: 0,
         combat_draws: 0,
         bot_draws: 0,
     },
-    world_objects: WorldObjectSnapshot {
+    world_objects: PropsSnapshot {
         as_of_ms: 0,
         map_round_epoch: 0,
         t6_glass: [],
         destructible_loop_sounds: [],
     },
     area_entities: None,
-    entity_dobjs: [],
-    entities: [],
-    script_movers: [],
-    entity_kernel: EntityKernelSnapshot {
+    entity_kernel: FrozenSlotTable {
         slots: [],
         high_water: 26,
         free_fifo: [],
         level_time_ms: 0,
         frame_serial: 0,
     },
-    corpses: PlayerCorpsePool {
+    entities: [],
+    entity_dobjs: [],
+    script_movers: [],
+    corpses: CorpseYard {
         slots: [
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -1364,9 +1372,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -1387,10 +1395,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -1403,9 +1411,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -1426,10 +1434,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -1442,9 +1450,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -1465,10 +1473,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -1481,9 +1489,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -1504,10 +1512,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -1520,9 +1528,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -1543,10 +1551,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -1559,9 +1567,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -1582,10 +1590,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -1598,9 +1606,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -1621,10 +1629,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -1637,9 +1645,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -1666,6 +1674,7 @@ SnapshotMeta {
     item_ammo: [],
     item_pickups: [],
     oriented_blockers: [],
+    follows: [],
     feel: None,
     enemy_models: [],
 }

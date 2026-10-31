@@ -1,12 +1,10 @@
-[package]
-name = "frame"
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-description = "Frame ordering sets, session identity keys and the shared UI/settings contracts. Plain data and set declarations; no systems."
+# The shared vocabulary every engine crate builds on.
+package.name = "frame"
+package.version = "0.1.0"
+package.edition.workspace = true
+package.publish.workspace = true
+package.description = "The shared frame vocabulary: ordering sets, session identity keys, and the data the UI and settings pass around. Declarations only; the systems live elsewhere."
 
-[dependencies]
-bevy.workspace = true
+dependencies.bevy.workspace = true
 
-[lints]
-workspace = true
+lints.workspace = true

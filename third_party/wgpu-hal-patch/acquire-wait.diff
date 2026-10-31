@@ -1,0 +1,68 @@
+diff --git a/src/vulkan/swapchain/native.rs b/src/vulkan/swapchain/native.rs
+--- a/src/vulkan/swapchain/native.rs
++++ b/src/vulkan/swapchain/native.rs
+@@ -451,7 +451,11 @@ impl Swapchain for NativeSwapchain {
+                     vk::Result::ERROR_SURFACE_LOST_KHR => Err(crate::SurfaceError::Lost),
+                     // We don't use VK_EXT_full_screen_exclusive
+                     // VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT
+-                    other => Err(map_host_device_oom_and_lost_err(other).into()),
++                    other => {
++                        // bo2mp patch: name the code, since the error it becomes doesn't.
++                        log::error!("vulkan acquire: vkAcquireNextImageKHR returned {other:?}");
++                        Err(map_host_device_oom_and_lost_err(other).into())
++                    }
+                 };
+             }
+         };
+@@ -468,10 +472,30 @@ impl Swapchain for NativeSwapchain {
+         // acquire.
+         unsafe {
+             // The `wait_all` argument must be `true` to avoid crash on some Android devices. See https://github.com/gfx-rs/wgpu/pull/8769
+-            self.device
+-                .raw
+-                .wait_for_fences(&[self.fence], true, timeout_ns)
+-                .map_err(map_host_device_oom_and_lost_err)?;
++            //
++            // bo2mp patch: the image is already ours, so a wait that runs out (VK_TIMEOUT) only means
++            // the presentation engine is slow to hand it over (a busy card or a starved PC). Upstream
++            // maps that to `DeviceError::Unexpected`, which wgpu-core treats as a lost device. Wait
++            // again instead, and give up only after `MAX_WAITS` timeouts in a row.
++            const MAX_WAITS: u32 = 30;
++            let mut waits = 0;
++            loop {
++                let wait_ns = if waits == 0 { first_wait_ns(timeout_ns) } else { timeout_ns };
++                match self.device.raw.wait_for_fences(&[self.fence], true, wait_ns) {
++                    Ok(()) => break,
++                    Err(vk::Result::TIMEOUT) if waits < MAX_WAITS => {
++                        waits += 1;
++                        log::warn!(
++                            "vulkan acquire: swap-chain image {index} not ready after {} ms (wait {waits}), waiting again",
++                            wait_ns / 1_000_000
++                        );
++                    }
++                    Err(other) => {
++                        log::error!("vulkan acquire: waiting for swap-chain image {index} returned {other:?}");
++                        return Err(map_host_device_oom_and_lost_err(other).into());
++                    }
++                }
++            }
+ 
+             self.device
+                 .raw
+@@ -901,3 +925,16 @@ impl<'a> SwapchainSubmissionSemaphoreGuard for NativeSwapchainSubmissionSemaphor
+             .map(SemaphoreType::Binary)
+     }
+ }
++
++/// bo2mp patch: the first wait for an acquired image. `WGPU_HAL_TEST_ACQUIRE_WAIT_NS` shortens it so a
++/// test can make it run out on purpose and check that the game keeps going; unset, it is `timeout_ns`.
++fn first_wait_ns(timeout_ns: u64) -> u64 {
++    static TEST_WAIT_NS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
++    TEST_WAIT_NS
++        .get_or_init(|| {
++            std::env::var("WGPU_HAL_TEST_ACQUIRE_WAIT_NS")
++                .ok()
++                .and_then(|v| v.trim().parse().ok())
++        })
++        .map_or(timeout_ns, |ns| ns.min(timeout_ns))
++}

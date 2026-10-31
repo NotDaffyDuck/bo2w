@@ -1,0 +1,23 @@
+# A with Fast Hands (perk 22): every drop and raise x0.5. AN-94 -> MP7 = drop 200, ready 450.
+# Spawn as BO2 does: empty hands, class guns given, the primary comes up with its first raise (AN-94 1600 ms),
+# which marks every held gun as raised before. 50 ms ticks: 1 press tick + 32.
+msec 50
+give an94_mp
+give mp7_mp
+select an94_mp
+run 33
+expect state READY
+expect anim IDLE
+perk 22
+select mp7_mp
+run 1
+expect state DROPPING
+run 3
+expect state DROPPING
+run 1                 # 200 ms
+expect state RAISING
+expect weapon mp7_mp
+run 4
+expect state RAISING
+run 1                 # 450 ms
+expect state READY

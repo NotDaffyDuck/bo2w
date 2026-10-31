@@ -11,29 +11,29 @@ use alloc::vec::Vec;
 use trace_t6::Trace;
 
 use crate::{
-    ClipMap, LinkedEntities, StaticModel, StoreError, World, XModelColl, XModelCollSurf, XModelCollTri,
+    ClipMap, LinkedEntities, StaticModel, StoreError, World, XModelColl, XModelCollSurf, ModelHitTriangle,
 };
 
-/// `XModelCollSurf_s`, with its triangles as `tri_count` entries of
-/// `StaticModelStore::tris` from `first_tri`.
+/// `XModelCollSurf_s`, with its triangles as `tri_tally` entries of
+/// `StaticModelStore::triangle_list` from `leading_triangle`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StoredCollSurf {
-    pub first_tri: u32,
-    pub tri_count: u32,
+    pub leading_triangle: u32,
+    pub tri_tally: u32,
     pub mins: [f32; 3],
     pub maxs: [f32; 3],
-    pub bone_idx: i32,
+    pub joint_position: i32,
     pub contents: u32,
-    pub surf_flags: u32,
+    pub face_property_bits: u32,
 }
 
-/// An `XModel`'s collision: its `collLod` and its surfaces as `surf_count`
-/// entries of `StaticModelStore::surfs` from `first_surf`.
+/// An `XModel`'s collision: its `collLod` and its surfaces as `facet_amount`
+/// entries of `StaticModelStore::surfs` from `lead_skin`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StoredXModel {
-    pub coll_lod: i32,
-    pub first_surf: u32,
-    pub surf_count: u32,
+    pub collision_detail_tier: i32,
+    pub lead_skin: u32,
+    pub facet_amount: u32,
 }
 
 /// `cStaticModel_s`, its model an entry of `StaticModelStore::xmodels`
@@ -43,7 +43,7 @@ pub struct StoredStaticModel {
     pub xmodel: Option<u32>,
     pub contents: u32,
     pub origin: [f32; 3],
-    pub inv_scaled_axis: [[f32; 3]; 3],
+    pub reverse_scaled_basis: [[f32; 3]; 3],
     pub absmin: [f32; 3],
     pub absmax: [f32; 3],
 }
@@ -51,7 +51,7 @@ pub struct StoredStaticModel {
 /// A map's static models and their models' collision.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StaticModelStore {
-    pub tris: Vec<XModelCollTri>,
+    pub triangle_list: Vec<ModelHitTriangle>,
     pub surfs: Vec<StoredCollSurf>,
     pub xmodels: Vec<StoredXModel>,
     pub models: Vec<StoredStaticModel>,
@@ -88,12 +88,12 @@ impl StaticModelStore {
     pub fn check(&self) -> Result<(), StoreError> {
         let bad = |table, index| Err(StoreError { table, index });
         for (i, s) in self.surfs.iter().enumerate() {
-            if !in_run(s.first_tri, s.tri_count, self.tris.len()) {
+            if !in_run(s.leading_triangle, s.tri_tally, self.triangle_list.len()) {
                 return bad("static model surfs", i);
             }
         }
         for (i, m) in self.xmodels.iter().enumerate() {
-            if !in_run(m.first_surf, m.surf_count, self.surfs.len()) {
+            if !in_run(m.lead_skin, m.facet_amount, self.surfs.len()) {
                 return bad("static model xmodels", i);
             }
         }
@@ -113,17 +113,17 @@ impl StaticModelStore {
     /// Each call keeps one more copy, so a loader calls it once a map.
     #[must_use]
     pub fn leak(self, cm: &ClipMap<'_>) -> &'static StaticWorld {
-        let tris: &'static [XModelCollTri] = Box::leak(self.tris.into_boxed_slice());
+        let triangle_list: &'static [ModelHitTriangle] = Box::leak(self.triangle_list.into_boxed_slice());
         let surfs: &'static [XModelCollSurf<'static>] = Box::leak(
             self.surfs
                 .iter()
                 .map(|s| XModelCollSurf {
-                    tris: &tris[s.first_tri as usize..][..s.tri_count as usize],
+                    triangle_list: &triangle_list[s.leading_triangle as usize..][..s.tri_tally as usize],
                     mins: s.mins,
                     maxs: s.maxs,
-                    bone_idx: s.bone_idx,
+                    joint_position: s.joint_position,
                     contents: s.contents,
-                    surf_flags: s.surf_flags,
+                    face_property_bits: s.face_property_bits,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -132,8 +132,8 @@ impl StaticModelStore {
             self.xmodels
                 .iter()
                 .map(|m| XModelColl {
-                    coll_lod: m.coll_lod,
-                    surfs: &surfs[m.first_surf as usize..][..m.surf_count as usize],
+                    collision_detail_tier: m.collision_detail_tier,
+                    surfs: &surfs[m.lead_skin as usize..][..m.facet_amount as usize],
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -146,7 +146,7 @@ impl StaticModelStore {
                 xmodel: m.xmodel.map(|x| &xmodels[x as usize]),
                 contents: m.contents,
                 origin: m.origin,
-                inv_scaled_axis: m.inv_scaled_axis,
+                reverse_scaled_basis: m.reverse_scaled_basis,
                 absmin: m.absmin,
                 absmax: m.absmax,
             })
@@ -173,24 +173,24 @@ pub struct StaticHit {
 
 impl StaticWorld {
     /// `CM_PointTraceStaticModels` over these models.
-    pub fn point_trace(&self, trace: &mut Trace, start: [f32; 3], end: [f32; 3], contentmask: u32) {
+    pub fn point_trace(&self, hit: &mut Trace, from_pt: [f32; 3], to_pt: [f32; 3], want_bits: u32) {
         self.world
-            .point_trace_static_models(self.models, trace, start, end, contentmask);
+            .point_trace_static_models(self.models, hit, from_pt, to_pt, want_bits);
     }
 
     /// The nearest static model the line `start`..`end` meets before
     /// `fraction`, if any.
     #[must_use]
-    pub fn nearest_hit(&self, start: [f32; 3], end: [f32; 3], fraction: f32, contentmask: u32) -> Option<StaticHit> {
-        let mut trace = Trace::new();
-        trace.fraction = fraction;
-        self.point_trace(&mut trace, start, end, contentmask);
-        trace.static_model.map(|model| StaticHit {
+    pub fn nearest_hit(&self, from_pt: [f32; 3], to_pt: [f32; 3], frac_at: f32, want_bits: u32) -> Option<StaticHit> {
+        let mut tr_out = Trace::new();
+        tr_out.fraction = frac_at;
+        self.point_trace(&mut tr_out, from_pt, to_pt, want_bits);
+        tr_out.static_model.map(|model| StaticHit {
             model,
-            fraction: trace.fraction,
-            normal: trace.normal,
-            sflags: trace.sflags,
-            cflags: trace.cflags,
+            fraction: tr_out.fraction,
+            normal: tr_out.normal,
+            sflags: tr_out.sflags,
+            cflags: tr_out.cflags,
         })
     }
 }
@@ -198,13 +198,13 @@ impl StaticWorld {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CModel, inv_scaled_axis};
+    use crate::{CModel, reverse_scaled_basis};
 
     // A wall triangle at local x = 0 facing -x over y and z 0 to 10.
-    const WALL: XModelCollTri = XModelCollTri {
+    const WALL: ModelHitTriangle = ModelHitTriangle {
         plane: [-1.0, 0.0, 0.0, 0.0],
-        svec: [0.0, 0.1, 0.0, 0.0],
-        tvec: [0.0, 0.0, 0.1, 0.0],
+        surface_tangent: [0.0, 0.1, 0.0, 0.0],
+        surface_bitangent: [0.0, 0.0, 0.1, 0.0],
     };
 
     fn placed(xmodel: Option<u32>, x: f32) -> StoredStaticModel {
@@ -212,7 +212,7 @@ mod tests {
             xmodel,
             contents: 1,
             origin: [x, 0.0, 0.0],
-            inv_scaled_axis: inv_scaled_axis([0.0; 3], 1.0),
+            reverse_scaled_basis: reverse_scaled_basis([0.0; 3], 1.0),
             absmin: [x - 12.0, -12.0, -12.0],
             absmax: [x + 12.0, 12.0, 12.0],
         }
@@ -220,20 +220,20 @@ mod tests {
 
     fn store() -> StaticModelStore {
         StaticModelStore {
-            tris: alloc::vec![XModelCollTri::default(), WALL],
+            triangle_list: alloc::vec![ModelHitTriangle::default(), WALL],
             surfs: alloc::vec![StoredCollSurf {
-                first_tri: 1,
-                tri_count: 1,
+                leading_triangle: 1,
+                tri_tally: 1,
                 mins: [-1.0; 3],
                 maxs: [10.0; 3],
-                bone_idx: 0,
+                joint_position: 0,
                 contents: 1,
-                surf_flags: 0x50,
+                face_property_bits: 0x50,
             }],
             xmodels: alloc::vec![StoredXModel {
-                coll_lod: 0,
-                first_surf: 0,
-                surf_count: 1,
+                collision_detail_tier: 0,
+                lead_skin: 0,
+                facet_amount: 1,
             }],
             models: alloc::vec![placed(None, -300.0), placed(Some(0), 200.0), placed(Some(0), -100.0)],
         }
@@ -260,22 +260,22 @@ mod tests {
         kept.point_trace(&mut trace, [-400.0, 2.0, 2.0], [400.0, 2.0, 2.0], 1);
         assert_eq!(trace.static_model, Some(2));
         assert_eq!(trace.sflags, 0x50);
-        let mut trace = Trace::new();
-        kept.point_trace(&mut trace, [0.0, 2.0, 2.0], [400.0, 2.0, 2.0], 1);
-        assert_eq!(trace.static_model, Some(1));
+        let mut tr_out = Trace::new();
+        kept.point_trace(&mut tr_out, [0.0, 2.0, 2.0], [400.0, 2.0, 2.0], 1);
+        assert_eq!(tr_out.static_model, Some(1));
         let hit = kept.nearest_hit([0.0, 2.0, 2.0], [400.0, 2.0, 2.0], 1.0, 1).unwrap();
         assert_eq!((hit.model, hit.sflags, hit.cflags), (1, 0x50, 1));
-        assert_eq!(hit.fraction, trace.fraction);
+        assert_eq!(hit.fraction, tr_out.fraction);
         assert_eq!(kept.nearest_hit([0.0, 2.0, 2.0], [400.0, 2.0, 2.0], hit.fraction * 0.5, 1), None);
     }
 
     #[test]
     fn check_names_the_first_row_out_of_its_table() {
         let mut s = store();
-        s.surfs[0].tri_count = 2;
+        s.surfs[0].tri_tally = 2;
         assert_eq!(s.check(), Err(StoreError { table: "static model surfs", index: 0 }));
         let mut s = store();
-        s.xmodels[0].first_surf = 1;
+        s.xmodels[0].lead_skin = 1;
         assert_eq!(s.check(), Err(StoreError { table: "static model xmodels", index: 0 }));
         let mut s = store();
         s.models[2].xmodel = Some(1);

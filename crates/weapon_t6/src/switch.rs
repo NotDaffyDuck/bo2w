@@ -10,10 +10,14 @@
 
 use crate::anim;
 use crate::cmd::T6Cmd;
-use crate::env::{T6Env, perk, pm_type, pmf};
-use crate::events::{self, AnimScript, Event};
+use crate::env::{T6Env, perk, movement_mode, pmf};
+use crate::events::{
+    AnimScript, Event, EV_WEAPON_BREAKING_DOWN, EV_STOP_WEAPON_SOUND, EV_WEAPON_SWITCH_STARTED,
+    EV_WEAPON_ALT, EV_PUTAWAY_WEAPON, EV_RAISE_PICKUP_WEAPON, EV_FIRST_RAISE_WEAPON,
+    EV_RAISE_WEAPON, EV_NOAMMO,
+};
 use crate::facts::{
-    CoreFacts, FactsTable, SwitchFacts, inventory, offhand_slot, weap_class, weap_type,
+    CoreFacts, FactsTable, SwitchFacts, inventory, offhand_slot, gun_kind_ids, gun_family_code,
 };
 use crate::player::{MAX_HELD, T6WeaponPs, wf};
 use crate::state;
@@ -38,9 +42,9 @@ const MANTLE_CAP_DROP: u32 = 0x2000;
 /// `guidedMissileType_t` values that keep a gun in hand at 0 ammo (the player is still steering the shot).
 const GUIDED_WIRE: i32 = 5;
 const GUIDED_TV: i32 = 6;
-/// `pm_flags` that stop the third-person drop anim.
+/// `movement_state_bits` that stop the third-person drop anim.
 const PMF_NO_DROP_SCRIPT: u32 = 0x8004;
-/// `pm_flags` that stop the third-person raise anim.
+/// `movement_state_bits` that stop the third-person raise anim.
 const PMF_NO_RAISE_SCRIPT: u32 = 0xa008;
 /// Aim spread after a normal raise, and the floor after an alt raise.
 const SPREAD_RAISE: f32 = 255.0;
@@ -62,7 +66,7 @@ pub struct SwitchOut {
 }
 
 impl SwitchOut {
-    fn add(&mut self, id: u16) {
+    fn push_id(&mut self, id: u16) {
         self.events.push(Event {
             id,
             parm: 0,
@@ -88,12 +92,12 @@ fn times(facts: &FactsTable, weapon: u32) -> SwitchFacts {
 }
 
 fn alive(env: &T6Env) -> bool {
-    env.pm_type < pm_type::DEAD
+    env.movement_mode < movement_mode::DEAD
 }
 
 fn start_anim(ps: &mut T6WeaponPs, env: &T6Env, a: i32, left_too: bool) {
     if alive(env) {
-        ps.weap_anim = anim::start(ps.weap_anim, a);
+        ps.gun_clip = anim::start(ps.gun_clip, a);
         if left_too {
             ps.weap_anim_left = anim::start(ps.weap_anim_left, a);
         }
@@ -102,14 +106,14 @@ fn start_anim(ps: &mut T6WeaponPs, env: &T6Env, a: i32, left_too: bool) {
 
 /// The gun-down part of BO2's idle: both hands to READY with no time left, anim IDLE.
 fn idle(ps: &mut T6WeaponPs, env: &T6Env) {
-    ps.weap_flags &= !wf::USING_OFFHAND;
-    ps.weapon_time = 0;
-    ps.weapon_delay = 0;
+    ps.weapon_state_bits &= !wf::USING_OFFHAND;
+    ps.gun_timer_ms = Default::default();
+    ps.weapon_ready_wait = 0;
     ps.weapon_time_left = 0;
     ps.weapon_delay_left = 0;
-    ps.weaponstate = state::READY;
+    ps.gun_phase = state::READY;
     ps.weaponstate_left = state::READY;
-    start_anim(ps, env, anim::IDLE, true);
+    start_anim(ps, env, anim::REST, true);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -124,13 +128,13 @@ pub fn is_quick_switch(facts: &FactsTable, old: u32, new: u32, state_now: i32) -
     if new != 0
         && matches!(
             n.weap_class,
-            weap_class::PISTOL | weap_class::PISTOL_SPREAD | weap_class::MELEE
+            gun_kind_ids::PISTOL | gun_kind_ids::PISTOL_SPREAD | gun_kind_ids::CLOSE_COMBAT
         )
     {
         return true;
     }
     state_now == state::DROPPING_QUICK
-        || (old == 0 && n.weap_type == weap_type::PROJECTILE)
+        || (old == 0 && n.gun_family_code == gun_family_code::PROJECTILE)
         || o.can_use_in_vehicle
         || n.can_use_in_vehicle
         || o.offhand_slot != offhand_slot::NONE
@@ -138,9 +142,9 @@ pub fn is_quick_switch(facts: &FactsTable, old: u32, new: u32, state_now: i32) -
 }
 
 /// Fast hands may speed this state up: drop or raise, and not a specific-use offhand.
-pub fn can_fast_switch(facts: &FactsTable, weapon: u32, weaponstate: i32) -> bool {
+pub fn quick_swap_ok(facts: &FactsTable, gun: u32, weaponstate: i32) -> bool {
     (state::RAISING..=state::DROPPING_ALTSWITCH).contains(&weaponstate)
-        && core(facts, weapon).offhand_slot != offhand_slot::SPECIFIC_USE
+        && core(facts, gun).offhand_slot != offhand_slot::SPECIFIC_USE
 }
 
 /// Attachment switch: both real guns and the new one is the old one's other mode.
@@ -150,7 +154,7 @@ pub fn is_alt_switch(ps: &T6WeaponPs, facts: &FactsTable, old: u32, new: u32) ->
     }
     let o = core(facts, old);
     new == o.alt_weapon
-        || (o.inventory_type == inventory::ALTMODE && ps.last_weapon_alt_mode_switch == new)
+        || (o.carry_slot_kind == inventory::ALTMODE && ps.last_weapon_alt_mode_switch == new)
 }
 
 /// Both guns are ADS-only modes of each other (dual optic): no drop/raise anims, the change is instant.
@@ -162,17 +166,17 @@ pub fn is_ads_only_change(facts: &FactsTable, old: u32, new: u32) -> bool {
 }
 
 /// Clip of the hand being run is empty (unlimited ammo is never empty).
-fn clip_empty(ps: &T6WeaponPs, facts: &FactsTable) -> bool {
-    let c = core(facts, ps.weapon);
+fn clip_empty(player: &T6WeaponPs, facts: &FactsTable) -> bool {
+    let c = core(facts, player.weapon);
     if c.unlimited_ammo {
         return false;
     }
-    let w = if ps.b_run_left_gun {
+    let w = if player.b_run_left_gun {
         c.dual_wield_weapon
     } else {
-        ps.weapon
+        player.weapon
     };
-    ps.ammo_in_clip(facts, w) == 0
+    player.ammo_in_clip(facts, w) == 0
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -186,7 +190,7 @@ pub fn timer_step(ps: &T6WeaponPs, env: &T6Env, facts: &FactsTable, msec: i32) -
     let mult = env.dvars.perk_weap_switch_multiplier;
     if env.has_perk(perk::FASTSWITCH)
         && mult > 0.0
-        && can_fast_switch(facts, ps.weapon, ps.weaponstate)
+        && quick_swap_ok(facts, ps.weapon, ps.gun_phase)
     {
         (msec as f32 / mult).round() as i32
     } else {
@@ -199,7 +203,7 @@ pub fn timer_step(ps: &T6WeaponPs, env: &T6Env, facts: &FactsTable, msec: i32) -
 // ---------------------------------------------------------------------------------------------------------------
 
 fn switch_blocked(ps: &T6WeaponPs, env: &T6Env) -> bool {
-    let s = ps.weaponstate;
+    let s = ps.gun_phase;
     (env.waterlevel > 3 && env.dvars.player_disable_weapons_in_water)
         || (state::MELEE_INIT..=state::MELEE_END).contains(&s)
         || (state::DTP_IN..=state::DTP_OUT).contains(&s)
@@ -207,16 +211,16 @@ fn switch_blocked(ps: &T6WeaponPs, env: &T6Env) -> bool {
         || s == state::NIGHTVISION_REMOVE
         || (state::RIOTSHIELD_PREPARE..=state::RIOTSHIELD_END).contains(&s)
         || env.e_flags2 & EF2_WEAPON_LOCKED != 0
-        || ps.weap_flags & wf::CHANGE_LOCKED != 0
-        || env.link_flags & LF_WEAPON_LOCKED != 0
+        || ps.weapon_state_bits & wf::CHANGE_LOCKED != 0
+        || env.attach_bits & LF_WEAPON_LOCKED != 0
         || env.mantle_weapon_equipped
 }
 
 /// A running timer holds the switch only while firing, in the continuous-fire loop, swinging a knife, or with a
 /// delay pending. Reloads (11-18) and rechambers (7-8) never hold it.
 fn timer_holds_switch(ps: &T6WeaponPs) -> bool {
-    let s = ps.weaponstate;
-    if ps.weapon_time == 0
+    let s = ps.gun_phase;
+    if ps.gun_timer_ms == 0
         || state::is_reload_family(s)
         || s == state::RECHAMBER_START
         || s == state::RECHAMBERING
@@ -226,7 +230,7 @@ fn timer_holds_switch(ps: &T6WeaponPs) -> bool {
     s == state::FIRING
         || s == state::CONT_FIRE_LOOP
         || (state::MELEE_INIT..=state::MELEE_END).contains(&s)
-        || ps.weapon_delay != 0
+        || ps.weapon_ready_wait != 0
 }
 
 /// BO2's change-weapon check: compares the command's gun with the gun in hand and starts a drop when they differ.
@@ -242,24 +246,24 @@ pub fn check_for_change(
     }
 
     // Forced drops to no weapon.
-    if env.mantle_weapon_inactive
-        || env.pm_flags & pmf::LADDER != 0
-        || ps.weap_flags & wf::WEAPONS_DISABLED != 0
+    if env.gun_stowed_while_climbing
+        || env.movement_state_bits & pmf::LADDER != 0
+        || ps.weapon_state_bits & wf::WEAPONS_DISABLED != 0
     {
-        if ps.weapon != 0 {
+        if 0 != ps.weapon {
             begin_change(ps, cmd, env, facts, 0, true, out);
         }
         return;
     }
-    if ps.weap_flags & wf::DISABLE_SWITCH_TO_NONE != 0 {
-        if ps.weapon != 0 {
+    if ps.weapon_state_bits & wf::DISABLE_SWITCH_TO_NONE != 0 {
+        if 0 != ps.weapon {
             begin_change(ps, cmd, env, facts, 0, false, out);
         }
         return;
     }
 
     let wanted = cmd.weapon;
-    let frozen = env.pm_flags & (pmf::FROZEN | pmf::NO_FIRE) != 0 && ps.weapon != 0;
+    let frozen = env.movement_state_bits & (pmf::FROZEN | pmf::NO_FIRE) != 0 && ps.weapon != 0;
     // Asking for a gun you do not hold counts as no change (and drops the gun in hand if that one is gone too).
     let invalid = wanted != 0 && !ps.has_weapon(wanted);
 
@@ -268,15 +272,15 @@ pub fn check_for_change(
             return;
         }
         if !core(facts, wanted).can_use_in_vehicle {
-            if ps.weapon != 0 {
+            if 0 != ps.weapon {
                 begin_change(ps, cmd, env, facts, 0, false, out);
             }
             return;
         }
         if ps.weapon == wanted
-            || ps.weaponstate == state::DEPLOYING
+            || ps.gun_phase == state::DEPLOYING
             || frozen
-            || env.other_flags & OF_VEHICLE_NO_SWITCH != 0
+            || env.secondary_state_bits & OF_VEHICLE_NO_SWITCH != 0
             || invalid
         {
             return;
@@ -287,23 +291,23 @@ pub fn check_for_change(
             env,
             facts,
             wanted,
-            env.mantle_flags & MANTLE_QUICK != 0,
+            env.ledge_climb_bits & MANTLE_QUICK != 0,
             out,
         );
         return;
     }
 
-    let in_offhand = state::is_offhand(ps.weaponstate);
+    let in_offhand = state::is_secondary_gear(ps.gun_phase);
     let offhand_hands_over = ps.off_hand_weapon != 0
         && core(facts, ps.off_hand_weapon).offhand_slot == offhand_slot::EQUIPMENT
         && cmd.held(OFFHAND_SWITCH_BUTTON);
     if ps.weapon == wanted
-        || ps.weaponstate == state::DEPLOYING
+        || ps.gun_phase == state::DEPLOYING
         || frozen
         || invalid
         || (in_offhand && !offhand_hands_over)
     {
-        if ps.weapon == wanted && state::is_dropping(ps.weaponstate) {
+        if ps.weapon == wanted && state::is_dropping(ps.gun_phase) {
             // Asked for the gun already in hand while it goes down: cancel the drop on the spot.
             idle(ps, env);
             start_anim(ps, env, anim::FORCE_IDLE, false);
@@ -313,20 +317,20 @@ pub fn check_for_change(
         return;
     }
 
-    match ps.weaponstate {
+    match ps.gun_phase {
         state::DEPLOYING | state::BREAKING_DOWN => {}
         state::DEPLOYED => {
-            if ps.weap_flags & wf::DEPLOY_SWITCH_PENDING == 0 {
+            if ps.weapon_state_bits & wf::DEPLOY_SWITCH_PENDING == 0 {
                 out.clear_deployed = true;
             }
         }
-        _ if env.e_flags & EF_DEPLOYED != 0 => {
-            ps.weap_flags |= wf::DEPLOY_SWITCH_PENDING;
-            out.add(events::EV_WEAPON_BREAKING_DOWN);
+        _ if env.ent_bits & EF_DEPLOYED != 0 => {
+            ps.weapon_state_bits |= wf::DEPLOY_SWITCH_PENDING;
+            out.push_id(EV_WEAPON_BREAKING_DOWN);
         }
         s => {
-            let quick = env.mantle_flags & MANTLE_QUICK != 0
-                || ps.weap_flags & wf::FORCE_QUICK_SWITCH != 0
+            let quick = env.ledge_climb_bits & MANTLE_QUICK != 0
+                || ps.weapon_state_bits & wf::FORCE_QUICK_SWITCH != 0
                 || is_quick_switch(facts, ps.weapon, wanted, s);
             begin_change(ps, cmd, env, facts, wanted, quick, out);
         }
@@ -340,7 +344,7 @@ pub fn check_for_change(
 /// Starts putting the gun in hand away. Does nothing while already dropping: a new pick during a drop only changes
 /// which gun comes up at the end (it is read from the command when the drop ends).
 pub fn begin_change(
-    ps: &mut T6WeaponPs,
+    player: &mut T6WeaponPs,
     _cmd: &T6Cmd,
     env: &T6Env,
     facts: &FactsTable,
@@ -348,31 +352,31 @@ pub fn begin_change(
     quick: bool,
     out: &mut SwitchOut,
 ) {
-    if (new != 0 && !ps.has_weapon(new)) || state::is_dropping(ps.weaponstate) {
+    if (new != 0 && !player.has_weapon(new)) || state::is_dropping(player.gun_phase) {
         return;
     }
-    let was = ps.weaponstate;
+    let was = player.gun_phase;
     if state::is_reload_family(was) {
-        out.add_predictable(events::EV_STOP_WEAPON_SOUND, was as u32);
+        out.add_predictable(EV_STOP_WEAPON_SOUND, was as u32);
     }
-    ps.weap_flags &= !wf::FORCE_QUICK_SWITCH;
-    ps.weapon_delay = 0;
-    let old = if state::is_offhand(was) {
-        ps.off_hand_weapon
+    player.weapon_state_bits &= !wf::FORCE_QUICK_SWITCH;
+    player.weapon_ready_wait = 0;
+    let old = if state::is_secondary_gear(was) {
+        player.off_hand_weapon
     } else {
-        ps.weapon
+        player.weapon
     };
     let o = core(facts, old);
 
-    if new != 0 && core(facts, new).weap_type == weap_type::RIOTSHIELD {
-        ps.weap_flags |= wf::RIOTSHIELD_SWITCH;
+    if new != 0 && core(facts, new).gun_family_code == gun_family_code::RIOTSHIELD {
+        player.weapon_state_bits |= wf::RIOTSHIELD_SWITCH;
     } else {
-        ps.weap_flags &= !wf::RIOTSHIELD_SWITCH;
+        player.weapon_state_bits &= !wf::RIOTSHIELD_SWITCH;
     }
     if o.fire_type == crate::facts::fire_type::CHARGESHOT {
-        ps.weap_flags &= !wf::CHARGE_SHOT;
-        ps.charge_shot_timer = 0;
-        ps.charge_shot_level = 0;
+        player.weapon_state_bits &= !wf::CHARGE_SHOT;
+        player.charge_shot_timer = 0;
+        player.charge_shot_level = 0;
     }
     if o.can_use_in_vehicle && core(facts, new).can_use_in_vehicle {
         return;
@@ -384,62 +388,62 @@ pub fn begin_change(
         state::DROPPING
     };
     if o.offhand_slot != offhand_slot::EQUIPMENT
-        && (old == 0 || !ps.has_weapon(old) || ps.grenade_time_left > 0)
+        && (old == 0 || !player.has_weapon(old) || player.cook_remaining > 0)
     {
         // Nothing (or nothing real) in hand: no drop anim, the raise starts next tick.
-        ps.weap_flags &= !wf::USING_OFFHAND;
-        ps.weapon_time = 0;
-        ps.grenade_time_left = 0;
-        ps.weaponstate = drop_state;
+        player.weapon_state_bits &= !wf::USING_OFFHAND;
+        player.gun_timer_ms = Default::default();
+        player.cook_remaining = 0;
+        player.gun_phase = drop_state;
         out.prone_override = true;
         return;
     }
-    ps.weap_flags &= !wf::USING_OFFHAND;
+    player.weapon_state_bits &= !wf::USING_OFFHAND;
 
-    ps.ads_zoom_select = 0;
-    ps.ads_zoom_latch_time = 0;
-    let empty = clip_empty(ps, facts);
-    let alt = is_alt_switch(ps, facts, old, new);
-    ps.grenade_time_left = 0;
-    if ps.weap_flags & wf::WEAPONS_DISABLED == 0 {
-        out.add_predictable(events::EV_WEAPON_SWITCH_STARTED, ps.weapon);
+    player.ads_zoom_select = 0;
+    player.ads_zoom_latch_time = 0;
+    let empty = clip_empty(player, facts);
+    let alt = is_alt_switch(player, facts, old, new);
+    player.cook_remaining = 0;
+    if player.weapon_state_bits & wf::WEAPONS_DISABLED == 0 {
+        out.add_predictable(EV_WEAPON_SWITCH_STARTED, player.weapon);
     }
 
     let t = times(facts, old);
     let thrown_grenade = was == state::FIRING
-        && o.weap_type == weap_type::GRENADE
+        && o.gun_family_code == gun_family_code::GRENADE
         && o.offhand_slot == offhand_slot::SPECIFIC_USE;
     if alt {
-        out.add(events::EV_WEAPON_ALT);
-        start_anim(ps, env, anim::ALTSWITCHFROM, false);
+        out.push_id(EV_WEAPON_ALT);
+        start_anim(player, env, anim::ALTSWITCHFROM, false);
     } else if !thrown_grenade {
-        out.add(events::EV_PUTAWAY_WEAPON);
+        out.push_id(EV_PUTAWAY_WEAPON);
         if !o.no_drops_or_raises {
             let a = if !empty || (quick && !t.no_quick_drop_when_empty) {
-                if quick { anim::QUICK_DROP } else { anim::DROP }
+                if quick { anim::FAST_PUT_AWAY } else { anim::PUT_AWAY }
             } else {
-                anim::EMPTY_DROP
+                anim::EMPTY_PUT_AWAY
             };
-            start_anim(ps, env, a, o.dual_wield);
+            start_anim(player, env, a, o.dual_wield);
         }
     }
 
     if env.dvars.tu_enforce_rechamber_on_switch
-        && o.bolt_action
+        && o.manual_cycle
         && was == state::RELOAD_START_RECHAMBER
-        && let Some(h) = ps.held_mut(old)
+        && let Some(h) = player.held_mut(old)
     {
         h.needs_rechamber = true;
     }
 
-    ps.weaponstate = if alt {
+    player.gun_phase = if alt {
         state::DROPPING_ALTSWITCH
     } else {
         drop_state
     };
-    ps.weaponstate_left = ps.weaponstate;
+    player.weaponstate_left = player.gun_phase;
     out.prone_override = true;
-    ps.weapon_time = if o.no_drops_or_raises {
+    player.gun_timer_ms = if o.no_drops_or_raises {
         0
     } else if alt {
         t.alt_drop
@@ -450,18 +454,18 @@ pub fn begin_change(
     } else {
         t.drop
     };
-    if env.mantle_weapon_inactive && env.mantle_flags & MANTLE_CAP_DROP != 0 {
-        ps.weapon_time = ps.weapon_time.min(env.mantle_time_left);
+    if env.gun_stowed_while_climbing && env.ledge_climb_bits & MANTLE_CAP_DROP != 0 {
+        player.gun_timer_ms = player.gun_timer_ms.min(env.mantle_time_left);
     }
 
     if !alt
         && !matches!(
-            env.pm_type,
-            pm_type::LASTSTAND | pm_type::REVIVEE | pm_type::LASTSTAND_TRANSITION
+            env.movement_mode,
+            movement_mode::LASTSTAND | movement_mode::REVIVEE | movement_mode::LASTSTAND_TRANSITION
         )
         && env.view_height_settled
-        && env.pm_flags & PMF_NO_DROP_SCRIPT == 0
-        && core(facts, new).inventory_type != inventory::OFFHAND
+        && env.movement_state_bits & PMF_NO_DROP_SCRIPT == 0
+        && core(facts, new).carry_slot_kind != inventory::OFFHAND
         && o.offhand_slot != offhand_slot::EQUIPMENT
     {
         out.scripts.push(AnimScript::DropWeapon);
@@ -473,10 +477,10 @@ pub fn begin_change(
 // ---------------------------------------------------------------------------------------------------------------
 
 /// Puts the raise on the clock: state RAISING (or RAISING_ALTSWITCH), the anim on both hands.
-pub fn begin_raise(ps: &mut T6WeaponPs, env: &T6Env, time: i32, spread: f32, alt: bool, a: i32) {
-    ps.weapon_time = time;
-    ps.aim_spread_scale = spread;
-    ps.weaponstate = if alt {
+pub fn begin_raise(ps: &mut T6WeaponPs, env: &T6Env, now: i32, spread: f32, alt: bool, a: i32) {
+    ps.gun_timer_ms = now;
+    ps.sight_spread_factor = spread;
+    ps.gun_phase = if alt {
         state::RAISING_ALTSWITCH
     } else {
         state::RAISING
@@ -492,15 +496,15 @@ pub fn finish_change(
     facts: &FactsTable,
     out: &mut SwitchOut,
 ) {
-    if !state::is_dropping(ps.weaponstate) {
+    if !state::is_dropping(ps.gun_phase) {
         return;
     }
-    let drop_state = ps.weaponstate;
-    let allowed = !env.mantle_weapon_inactive
-        && ps.weap_flags & wf::WEAPONS_DISABLED == 0
-        && env.pm_flags & pmf::LADDER == 0
+    let drop_state = ps.gun_phase;
+    let allowed = !env.gun_stowed_while_climbing
+        && ps.weapon_state_bits & wf::WEAPONS_DISABLED == 0
+        && env.movement_state_bits & pmf::LADDER == 0
         && ps.has_weapon(cmd.weapon)
-        && ps.weap_flags & wf::DISABLE_SWITCH_TO_NONE == 0
+        && ps.weapon_state_bits & wf::DISABLE_SWITCH_TO_NONE == 0
         && (!env.using_vehicle_weapon || core(facts, cmd.weapon).can_use_in_vehicle);
     let mut new = if allowed { cmd.weapon } else { 0 };
     if !ps.has_weapon(new) {
@@ -513,10 +517,10 @@ pub fn finish_change(
     } else {
         0
     };
-    if core(facts, ps.weapon).inventory_type == inventory::ALTMODE
+    if core(facts, ps.weapon).carry_slot_kind == inventory::ALTMODE
         && ps.last_weapon_alt_mode_switch == 0
     {
-        ps.weapon = 0;
+        ps.weapon = Default::default();
     }
     let new = ps.weapon;
     let n = core(facts, new);
@@ -524,30 +528,30 @@ pub fn finish_change(
     ps.ads_zoom_select = 0;
     ps.ads_zoom_latch_time = 0;
 
-    if ps.weap_flags & wf::WEAPONS_DISABLED != 0 {
-        ps.weaponstate = state::OFFHAND_INIT;
+    if ps.weapon_state_bits & wf::WEAPONS_DISABLED != 0 {
+        ps.gun_phase = state::OFFHAND_INIT;
         return;
     }
     if old == new {
-        ps.weaponstate = state::READY;
+        ps.gun_phase = state::READY;
         ps.weaponstate_left = state::READY;
-        start_anim(ps, env, anim::IDLE, n.dual_wield);
+        start_anim(ps, env, anim::REST, n.dual_wield);
         return;
     }
 
     let first = !ps.ever_had_weapon(new)
         && !matches!(
-            env.pm_type,
-            pm_type::LASTSTAND_TRANSITION | pm_type::LASTSTAND
+            env.movement_mode,
+            movement_mode::LASTSTAND_TRANSITION | movement_mode::LASTSTAND
         );
     ps.set_ever_had(new, true);
     let alt = is_alt_switch(ps, facts, old, new);
     out.empty_raise_flag = Some(false);
 
-    let (a, time, spread) = if alt {
-        let spread = ps.aim_spread_scale.max(SPREAD_ALT_MIN);
-        if !cmd.held(crate::cmd::button::ATTACK) {
-            ps.weapon_shot_count = 0;
+    let (a, now, spread) = if alt {
+        let spread = ps.sight_spread_factor.max(SPREAD_ALT_MIN);
+        if !cmd.held(crate::cmd::button::FIRE_BIT) {
+            ps.weapon_shot_count = Default::default();
         }
         (anim::ALTSWITCHTO, t.alt_raise, spread)
     } else {
@@ -557,14 +561,14 @@ pub fn finish_change(
         }
         let quick = is_quick_switch(facts, old, new, drop_state);
         if n.no_drops_or_raises {
-            (anim::IDLE, 0, SPREAD_RAISE)
+            (anim::REST, 0, SPREAD_RAISE)
         } else if empty {
-            (anim::EMPTY_RAISE, t.empty_raise, SPREAD_RAISE)
+            (anim::EMPTY_TAKE_OUT, t.empty_raise, SPREAD_RAISE)
         } else if first {
-            ps.set_ever_had_all(true);
-            (anim::FIRST_RAISE, t.first_raise, SPREAD_RAISE)
+            ps.mark_all_owned(true);
+            (anim::FIRST_TAKE_OUT, t.first_raise, SPREAD_RAISE)
         } else if quick {
-            (anim::QUICK_RAISE, t.quick_raise, SPREAD_RAISE)
+            (anim::FAST_TAKE_OUT, t.quick_raise, SPREAD_RAISE)
         } else {
             (anim::RAISE, t.raise, SPREAD_RAISE)
         }
@@ -572,38 +576,38 @@ pub fn finish_change(
 
     if n.no_drops_or_raises {
         // BO2 stores the anim number as the state here: READY for a plain change (the alt case is the same quirk).
-        ps.weaponstate = a;
-        ps.weapon_time = time;
-        ps.aim_spread_scale = spread;
+        ps.gun_phase = a;
+        ps.gun_timer_ms = now;
+        ps.sight_spread_factor = spread;
         out.prone_override = true;
-        start_anim(ps, env, anim::IDLE, n.dual_wield);
+        start_anim(ps, env, anim::REST, n.dual_wield);
     } else if !is_ads_only_change(facts, old, new) {
-        begin_raise(ps, env, time, spread, alt, a);
+        begin_raise(ps, env, now, spread, alt, a);
         out.prone_override = true;
     }
     // ADS-only pairs get no raise: the state stays dropping at 0 ms and the next change check snaps it to READY.
 
-    if n.weap_type == weap_type::RIOTSHIELD {
+    if n.gun_family_code == gun_family_code::RIOTSHIELD {
         out.reset_riotshield_model = true;
     }
 
     take_clip_only_if_empty(ps, facts, old);
 
     if old == 0 || alt {
-        out.add(events::EV_RAISE_PICKUP_WEAPON);
+        out.push_id(EV_RAISE_PICKUP_WEAPON);
         if !first {
             return;
         }
     } else {
-        out.add(if first {
-            events::EV_FIRST_RAISE_WEAPON
+        out.push_id(if first {
+            EV_FIRST_RAISE_WEAPON
         } else {
-            events::EV_RAISE_WEAPON
+            EV_RAISE_WEAPON
         });
         if matches!(
-            env.pm_type,
-            pm_type::LASTSTAND | pm_type::REVIVEE | pm_type::LASTSTAND_TRANSITION
-        ) || env.pm_flags & PMF_NO_RAISE_SCRIPT != 0
+            env.movement_mode,
+            movement_mode::LASTSTAND | movement_mode::REVIVEE | movement_mode::LASTSTAND_TRANSITION
+        ) || env.movement_state_bits & PMF_NO_RAISE_SCRIPT != 0
             || !env.view_height_settled
         {
             return;
@@ -623,7 +627,7 @@ fn take_clip_only_if_empty(ps: &mut T6WeaponPs, facts: &FactsTable, old: u32) {
         return;
     }
     let c = core(facts, old);
-    if c.clip_only
+    if c.motion_clip_exclusive
         && ps.ammo_in_clip(facts, old) == 0
         && ps.ammo_not_in_clip(facts, old) == 0
         && !c.has_detonator
@@ -635,12 +639,12 @@ fn take_clip_only_if_empty(ps: &mut T6WeaponPs, facts: &FactsTable, old: u32) {
 
 /// The raise timer ran out: READY on both hands, anim IDLE.
 pub fn finish_raise(ps: &mut T6WeaponPs, env: &T6Env) {
-    if !state::is_raising(ps.weaponstate) {
+    if !state::is_raising(ps.gun_phase) {
         return;
     }
-    ps.weaponstate = state::READY;
+    ps.gun_phase = state::READY;
     ps.weaponstate_left = state::READY;
-    start_anim(ps, env, anim::IDLE, true);
+    start_anim(ps, env, anim::REST, true);
 }
 
 /// End-of-tick step: with both timers at 0, a raise ends or a drop ends (and the next raise starts) on this tick.
@@ -656,10 +660,10 @@ pub fn finish_if_due(
     if time != 0 || delay != 0 {
         return false;
     }
-    if state::is_raising(ps.weaponstate) {
+    if state::is_raising(ps.gun_phase) {
         finish_raise(ps, env);
         true
-    } else if state::is_dropping(ps.weaponstate) {
+    } else if state::is_dropping(ps.gun_phase) {
         finish_change(ps, cmd, env, facts, out);
         true
     } else {
@@ -673,22 +677,22 @@ pub fn finish_if_due(
 
 /// Server: the gun in hand has nothing left at all → `EV_NOAMMO`, which makes the client switch away.
 /// Detonator and wire/TV-guided guns stay in hand.
-pub fn switch_if_empty(ps: &T6WeaponPs, facts: &FactsTable, out: &mut SwitchOut) {
-    let c = core(facts, ps.weapon);
+pub fn switch_if_empty(player: &T6WeaponPs, facts: &FactsTable, out: &mut SwitchOut) {
+    let c = core(facts, player.weapon);
     if c.unlimited_ammo
-        || ps.weap_flags & wf::NO_AMMO_SWITCH != 0
+        || player.weapon_state_bits & wf::NO_AMMO_SWITCH != 0
         || c.has_detonator
         || matches!(c.guided_missile_type, GUIDED_WIRE | GUIDED_TV)
     {
         return;
     }
-    if ps.ammo_in_clip(facts, ps.weapon) != 0 || ps.ammo_not_in_clip(facts, ps.weapon) != 0 {
+    if player.ammo_in_clip(facts, player.weapon) != 0 || player.ammo_not_in_clip(facts, player.weapon) != 0 {
         return;
     }
-    if c.dual_wield && ps.ammo_in_clip(facts, c.dual_wield_weapon) != 0 {
+    if c.dual_wield && player.ammo_in_clip(facts, c.dual_wield_weapon) != 0 {
         return;
     }
-    out.add(events::EV_NOAMMO);
+    out.push_id(EV_NOAMMO);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -701,7 +705,7 @@ pub struct ClientSwitch {
     /// The gun put in the command's weapon field.
     pub selected: u32,
     /// The last real primary picked (what leaving an item or killstreak goes back to).
-    pub last_primary: u32,
+    pub previous_main_weapon: u32,
     /// For each held slot: the mode that gun was last used in (base gun or its alt), 0 = base.
     pub last_mode: [u32; MAX_HELD],
     /// Ms since the last cycle (for `cg_weaponCycleDelay`, 0 in BO2 so it never blocks).
@@ -727,17 +731,17 @@ fn cycle_candidate(
         || c.dual_wield && ps.ammo_in_clip(facts, c.dual_wield_weapon) != 0;
     has_ammo
         && !matches!(
-            c.inventory_type,
+            c.carry_slot_kind,
             inventory::ALTMODE
                 | inventory::DWLEFTHAND
                 | inventory::ITEM
                 | inventory::OFFHAND
-                | inventory::MELEE
+                | inventory::CLOSE_COMBAT
         )
-        && c.weap_class != weap_class::KILLSTREAK_ALT_STORED_WEAPON
+        && c.weap_class != gun_kind_ids::KILLSTREAK_ALT_STORED_WEAPON
         // bo2mp, his 10-20 ask: the knife the melee key swings is never walked to. BO2's held
         // Combat Knife (use-as-melee) is a real gun pick and stays.
-        && !(c.weap_type == crate::facts::weap_type::MELEE && !facts.get(w).melee.use_as_melee)
+        && !(c.gun_family_code == crate::facts::gun_family_code::CLOSE_COMBAT && !facts.get(w).melee.use_as_melee)
 }
 
 impl ClientSwitch {
@@ -748,15 +752,15 @@ impl ClientSwitch {
         // A pick that is not an alt mode forgets that gun's last mode (BO2's CG_UpdateLastWeaponForAlt).
         if let Some(i) = ps.held_slot(w) {
             let base = core(facts, w);
-            if base.inventory_type != inventory::ALTMODE {
+            if base.carry_slot_kind != inventory::ALTMODE {
                 self.last_mode[i] = 0;
             }
-            if base.inventory_type == inventory::PRIMARY {
-                self.last_primary = w;
+            if base.carry_slot_kind == inventory::PRIMARY {
+                self.previous_main_weapon = w;
             }
         }
         // An alt-mode pick is remembered on its base gun's slot.
-        if core(facts, w).inventory_type == inventory::ALTMODE
+        if core(facts, w).carry_slot_kind == inventory::ALTMODE
             && let Some(i) = ps.held_slot(core(facts, w).alt_weapon)
         {
             self.last_mode[i] = w;
@@ -775,13 +779,13 @@ impl ClientSwitch {
         forward: bool,
         need_ammo: bool,
     ) -> Option<u32> {
-        if env.pm_type > pm_type::LASTSTAND_TRANSITION || env.e_flags2 & EF2_WEAPON_LOCKED != 0 {
+        if env.movement_mode > movement_mode::LASTSTAND_TRANSITION || env.e_flags2 & EF2_WEAPON_LOCKED != 0 {
             return None;
         }
         let cur = self.selected;
         let c = core(facts, cur);
         let mut skip = 0;
-        if c.inventory_type == inventory::ALTMODE {
+        if c.carry_slot_kind == inventory::ALTMODE {
             // In the other mode: the first press goes back to the base gun, unless the mode disables switching
             // (select fire, Hybrid): then the cycle moves on and the gun keeps its mode for next time.
             let base = c.alt_weapon;
@@ -791,12 +795,12 @@ impl ClientSwitch {
             }
             skip = base;
         }
-        if c.inventory_type != inventory::PRIMARY
-            && c.inventory_type != inventory::ALTMODE
-            && self.last_primary != 0
-            && ps.has_weapon(self.last_primary)
+        if c.carry_slot_kind != inventory::PRIMARY
+            && c.carry_slot_kind != inventory::ALTMODE
+            && self.previous_main_weapon != 0
+            && ps.has_weapon(self.previous_main_weapon)
         {
-            let w = self.last_primary;
+            let w = self.previous_main_weapon;
             self.select(ps, facts, w);
             return Some(w);
         }
@@ -836,7 +840,7 @@ impl ClientSwitch {
         let c = core(facts, self.selected);
         let other = c.alt_weapon;
         if other == 0
-            || !ps.has_weapon(other) && core(facts, other).inventory_type != inventory::ALTMODE
+            || !ps.has_weapon(other) && core(facts, other).carry_slot_kind != inventory::ALTMODE
         {
             return None;
         }
@@ -849,18 +853,18 @@ impl ClientSwitch {
 
     /// The command's alt-mode memory for `weapon` (what the server keeps so an alt-mode gun knows its base gun):
     /// a base gun sends its alt mode; an alt mode sends the held gun it belongs to, else what the server last kept.
-    pub fn cmd_alt_memory(ps: &T6WeaponPs, facts: &FactsTable, weapon: u32) -> u32 {
-        if weapon == 0 {
+    pub fn cmd_alt_memory(ps: &T6WeaponPs, facts: &FactsTable, gun: u32) -> u32 {
+        if gun == 0 {
             return 0;
         }
-        let c = core(facts, weapon);
-        if c.inventory_type != inventory::ALTMODE {
+        let c = core(facts, gun);
+        if c.carry_slot_kind != inventory::ALTMODE {
             return c.alt_weapon;
         }
         ps.held
             .iter()
             .map(|h| h.weapon)
-            .find(|&w| w != 0 && w != weapon && core(facts, w).alt_weapon == weapon)
+            .find(|&w| w != 0 && w != gun && core(facts, w).alt_weapon == gun)
             .unwrap_or(ps.last_weapon_alt_mode_switch)
     }
 
@@ -885,7 +889,7 @@ impl ClientSwitch {
         facts: &FactsTable,
         left: bool,
     ) -> Option<u32> {
-        if env.pm_type > pm_type::LASTSTAND_TRANSITION {
+        if env.movement_mode > movement_mode::LASTSTAND_TRANSITION {
             return None;
         }
         let held = ps.weapon;
@@ -897,18 +901,18 @@ impl ClientSwitch {
             return None;
         }
         if held == 0 {
-            let w = self.last_primary;
+            let w = self.previous_main_weapon;
             if w != 0 && ps.has_weapon(w) {
                 self.select(ps, facts, w);
                 return Some(w);
             }
         }
-        if ps.weap_flags & wf::NO_AMMO_SWITCH != 0
+        if ps.weapon_state_bits & wf::NO_AMMO_SWITCH != 0
             || times(facts, held).cancel_auto_holster_when_empty
         {
             return None;
         }
-        let alt_mode = c.inventory_type == inventory::ALTMODE;
+        let alt_mode = c.carry_slot_kind == inventory::ALTMODE;
         if alt_mode {
             let base = c.alt_weapon;
             if !ps.has_weapon(base) {
@@ -955,7 +959,7 @@ mod tests {
     fn gun(class: u8, sw: SwitchFacts) -> T6WeaponFacts {
         let mut f = T6WeaponFacts::default();
         f.core.weap_class = class;
-        f.core.clip_size = 30;
+        f.core.magazine_capacity = 30;
         f.switch = sw;
         f
     }
@@ -985,7 +989,7 @@ mod tests {
     /// Real patch-zone numbers (SWITCH.md section 8).
     fn table() -> FactsTable {
         let mut t = FactsTable::new();
-        let mut an94 = gun(weap_class::RIFLE, sw(400, 600, 250, 400, 1600, 850, 700));
+        let mut an94 = gun(gun_kind_ids::RIFLE, sw(400, 600, 250, 400, 1600, 850, 700));
         an94.core.alt_weapon = GL_AN94;
         // an94_mp's reload numbers (window 4's dump), for the mid-reload trace.
         an94.reload.reload = 2475;
@@ -995,30 +999,30 @@ mod tests {
         t.set(
             MP7,
             "mp7_mp",
-            gun(weap_class::SMG, sw(350, 500, 250, 300, 1000, 800, 0)),
+            gun(gun_kind_ids::SMG, sw(350, 500, 250, 300, 1000, 800, 0)),
         );
         t.set(
             FIVESEVEN,
             "fiveseven_mp",
-            gun(weap_class::PISTOL, sw(250, 250, 250, 250, 850, 250, 0)),
+            gun(gun_kind_ids::PISTOL, sw(250, 250, 250, 250, 850, 250, 0)),
         );
         t.set(
             DSR,
             "dsr50_mp",
-            gun(weap_class::RIFLE, sw(750, 750, 250, 500, 1750, 1000, 0)),
+            gun(gun_kind_ids::RIFLE, sw(750, 750, 250, 500, 1750, 1000, 0)),
         );
-        let mut gl = gun(weap_class::RIFLE, sw(600, 550, 250, 550, 1400, 550, 700));
-        gl.core.inventory_type = inventory::ALTMODE;
+        let mut gl = gun(gun_kind_ids::RIFLE, sw(600, 550, 250, 550, 1400, 550, 700));
+        gl.core.carry_slot_kind = inventory::ALTMODE;
         gl.core.alt_weapon = AN94;
         // gl_ files ignore attachments, so the launcher keeps its own rounds.
         gl.core.ignore_attachments = true;
         t.set(GL_AN94, "gl_an94_mp", gl);
         for (w, other) in [(OPTIC_A, OPTIC_B), (OPTIC_B, OPTIC_A)] {
-            let mut f = gun(weap_class::RIFLE, sw(400, 600, 250, 400, 1600, 850, 0));
+            let mut f = gun(gun_kind_ids::RIFLE, sw(400, 600, 250, 400, 1600, 850, 0));
             f.core.alt_weapon = other;
             f.core.alt_weapon_ads_only = true;
             if w == OPTIC_B {
-                f.core.inventory_type = inventory::ALTMODE;
+                f.core.carry_slot_kind = inventory::ALTMODE;
             }
             t.set(w, if w == OPTIC_A { "optic_a" } else { "optic_b" }, f);
         }
@@ -1047,9 +1051,9 @@ mod tests {
     /// One weapon tick of the parts this file owns, in BO2's order. `other_states` lets a test stand in for a
     /// mechanic owned by another file (it just counts that state's timer down).
     fn tick(ps: &mut T6WeaponPs, cmd: &T6Cmd, env: &T6Env, t: &FactsTable, out: &mut SwitchOut) {
-        let step = timer_step(ps, env, t, cmd.msec);
-        ps.weapon_time = (ps.weapon_time - step).max(0);
-        ps.weapon_delay = (ps.weapon_delay - step).max(0);
+        let step = timer_step(ps, env, t, cmd.frame_ms);
+        ps.gun_timer_ms = (ps.gun_timer_ms - step).max(0);
+        ps.weapon_ready_wait = (ps.weapon_ready_wait - step).max(0);
         check_for_change(ps, cmd, env, t, out);
         finish_if_due(ps, cmd, env, t, out);
     }
@@ -1071,22 +1075,22 @@ mod tests {
         let mut ms = 0;
         let mut raise_at = -1;
         for _ in 0..400 {
-            let before = ps.weaponstate;
+            let before = ps.gun_phase;
             tick(ps, cmd, env, t, out);
-            ms += cmd.msec;
-            if state::is_dropping(before) && state::is_raising(ps.weaponstate) {
+            ms += cmd.frame_ms;
+            if state::is_dropping(before) && state::is_raising(ps.gun_phase) {
                 raise_at = ms;
             }
-            if ps.weaponstate == state::READY && ps.weapon == cmd.weapon {
+            if ps.gun_phase == state::READY && ps.weapon == cmd.weapon {
                 return (raise_at, ms);
             }
         }
-        panic!("never READY: state {}", ps.weaponstate);
+        panic!("never READY: state {}", ps.gun_phase);
     }
 
     fn cmd(weapon: u32, msec: i32) -> T6Cmd {
         T6Cmd {
-            msec,
+            frame_ms: msec,
             weapon,
             ..T6Cmd::default()
         }
@@ -1104,17 +1108,17 @@ mod tests {
         let c = cmd(MP7, 50);
         // Tick 0 starts the drop: 400 ms on the clock, DROP anim.
         check_for_change(&mut ps, &c, &env(), &t, &mut out);
-        assert_eq!(ps.weaponstate, state::DROPPING);
-        assert_eq!(ps.weapon_time, 400);
-        assert_eq!(anim::number(ps.weap_anim), anim::DROP);
+        assert_eq!(ps.gun_phase, state::DROPPING);
+        assert_eq!(ps.gun_timer_ms, 400);
+        assert_eq!(anim::number(ps.gun_clip), anim::PUT_AWAY);
         let (raise_at, ready_at) = run(&mut ps, &c, &env(), &t, &mut out);
         assert_eq!((raise_at, ready_at), (400, 900));
         assert_eq!(
             ids(&out),
             vec![
-                events::EV_WEAPON_SWITCH_STARTED,
-                events::EV_PUTAWAY_WEAPON,
-                events::EV_RAISE_WEAPON
+                EV_WEAPON_SWITCH_STARTED,
+                EV_PUTAWAY_WEAPON,
+                EV_RAISE_WEAPON
             ]
         );
         assert_eq!(
@@ -1143,14 +1147,14 @@ mod tests {
         let mut out = SwitchOut::default();
         let c = cmd(FIVESEVEN, 50);
         check_for_change(&mut ps, &c, &env(), &t, &mut out);
-        assert_eq!(ps.weaponstate, state::DROPPING_QUICK);
-        assert_eq!(anim::number(ps.weap_anim), anim::QUICK_DROP);
+        assert_eq!(ps.gun_phase, state::DROPPING_QUICK);
+        assert_eq!(anim::number(ps.gun_clip), anim::FAST_PUT_AWAY);
         // AN-94 quick drop 250, Five-seven quick raise 250.
         assert_eq!(run(&mut ps, &c, &env(), &t, &mut out), (250, 500));
-        assert_eq!(anim::number(ps.weap_anim), anim::IDLE);
+        assert_eq!(anim::number(ps.gun_clip), anim::REST);
         let back = cmd(AN94, 50);
         check_for_change(&mut ps, &back, &env(), &t, &mut out);
-        assert_eq!(ps.weaponstate, state::DROPPING);
+        assert_eq!(ps.gun_phase, state::DROPPING);
         // Five-seven drop 250, AN-94 raise 600.
         assert_eq!(run(&mut ps, &back, &env(), &t, &mut out), (250, 850));
     }
@@ -1170,17 +1174,17 @@ mod tests {
     fn b_mid_reload_switch_goes_at_once_and_stops_the_reload_sound() {
         let t = table();
         let mut ps = player(&[AN94, MP7], AN94);
-        ps.weaponstate = state::RELOADING;
-        ps.weapon_time = 1500;
+        ps.gun_phase = state::RELOADING;
+        ps.gun_timer_ms = 1500;
         let mut out = SwitchOut::default();
         let c = cmd(MP7, 50);
         check_for_change(&mut ps, &c, &env(), &t, &mut out);
-        assert_eq!(ps.weaponstate, state::DROPPING);
-        assert_eq!(ps.weapon_time, 400);
+        assert_eq!(ps.gun_phase, state::DROPPING);
+        assert_eq!(ps.gun_timer_ms, 400);
         assert_eq!(
             out.events[0],
             Event {
-                id: events::EV_STOP_WEAPON_SOUND,
+                id: EV_STOP_WEAPON_SOUND,
                 parm: state::RELOADING as u32,
                 predictable: true
             }
@@ -1191,22 +1195,22 @@ mod tests {
     fn c_mid_fire_switch_waits_for_the_fire_time() {
         let t = table();
         let mut ps = player(&[AN94, MP7], AN94);
-        ps.weaponstate = state::FIRING;
-        ps.weapon_time = 96;
+        ps.gun_phase = state::FIRING;
+        ps.gun_timer_ms = 96;
         let mut out = SwitchOut::default();
         let c = cmd(MP7, 16);
         let mut ms = 0;
         // The fire file would drop FIRING back to READY when its time is up; stand in for it here.
-        while ps.weaponstate == state::FIRING {
-            ps.weapon_time = (ps.weapon_time - c.msec).max(0);
+        while ps.gun_phase == state::FIRING {
+            ps.gun_timer_ms = (ps.gun_timer_ms - c.frame_ms).max(0);
             check_for_change(&mut ps, &c, &env(), &t, &mut out);
-            if ps.weaponstate == state::FIRING && ps.weapon_time == 0 {
-                ps.weaponstate = state::READY;
+            if ps.gun_phase == state::FIRING && ps.gun_timer_ms == 0 {
+                ps.gun_phase = state::READY;
                 check_for_change(&mut ps, &c, &env(), &t, &mut out);
             }
-            ms += c.msec;
+            ms += c.frame_ms;
         }
-        assert_eq!(ps.weaponstate, state::DROPPING);
+        assert_eq!(ps.gun_phase, state::DROPPING);
         assert_eq!(ms, 96);
     }
 
@@ -1221,7 +1225,7 @@ mod tests {
         let c = cmd(DSR, 50);
         check_for_change(&mut ps, &c, &env(), &t, &mut out);
         assert_eq!(run(&mut ps, &c, &env(), &t, &mut out), (400, 2150));
-        assert!(ids(&out).contains(&events::EV_FIRST_RAISE_WEAPON));
+        assert!(ids(&out).contains(&EV_FIRST_RAISE_WEAPON));
         assert_eq!(out.scripts.last(), Some(&AnimScript::FirstRaiseWeapon));
         assert!(
             ps.ever_had_weapon(MP7),
@@ -1246,25 +1250,25 @@ mod tests {
     fn e_alt_switch_uses_alt_anims_and_times() {
         let t = table();
         let mut ps = player(&[AN94, GL_AN94], AN94);
-        ps.aim_spread_scale = 40.0;
+        ps.sight_spread_factor = 40.0;
         let mut out = SwitchOut::default();
         let mut c = cmd(GL_AN94, 50);
         c.last_weapon_alt_mode_switch = AN94;
         check_for_change(&mut ps, &c, &env(), &t, &mut out);
-        assert_eq!(ps.weaponstate, state::DROPPING_ALTSWITCH);
-        assert_eq!(anim::number(ps.weap_anim), anim::ALTSWITCHFROM);
-        assert_eq!(ps.weapon_time, 0, "base iAltDropTime is 0 on these guns");
+        assert_eq!(ps.gun_phase, state::DROPPING_ALTSWITCH);
+        assert_eq!(anim::number(ps.gun_clip), anim::ALTSWITCHFROM);
+        assert_eq!(ps.gun_timer_ms, 0, "base iAltDropTime is 0 on these guns");
         // The zero-length drop ends on the press tick: the launcher comes up on its own alt raise time.
         finish_if_due(&mut ps, &c, &env(), &t, &mut out);
         assert_eq!(ps.weapon, GL_AN94);
-        assert_eq!(ps.weaponstate, state::RAISING_ALTSWITCH);
-        assert_eq!(anim::number(ps.weap_anim), anim::ALTSWITCHTO);
-        assert_eq!(ps.weapon_time, 700);
+        assert_eq!(ps.gun_phase, state::RAISING_ALTSWITCH);
+        assert_eq!(anim::number(ps.gun_clip), anim::ALTSWITCHTO);
+        assert_eq!(ps.gun_timer_ms, 700);
         let (_, ready_at) = run(&mut ps, &c, &env(), &t, &mut out);
         assert_eq!(ready_at, 700);
-        assert_eq!(ps.aim_spread_scale, 128.0);
-        assert!(ids(&out).contains(&events::EV_WEAPON_ALT));
-        assert!(ids(&out).contains(&events::EV_RAISE_PICKUP_WEAPON));
+        assert_eq!(ps.sight_spread_factor, 128.0);
+        assert!(ids(&out).contains(&EV_WEAPON_ALT));
+        assert!(ids(&out).contains(&EV_RAISE_PICKUP_WEAPON));
         assert!(!out.scripts.contains(&AnimScript::DropWeapon));
     }
 
@@ -1276,9 +1280,9 @@ mod tests {
         check_for_change(&mut ps, &cmd(MP7, 50), &env(), &t, &mut out);
         tick(&mut ps, &cmd(MP7, 50), &env(), &t, &mut out);
         tick(&mut ps, &cmd(AN94, 50), &env(), &t, &mut out);
-        assert_eq!(ps.weaponstate, state::READY);
-        assert_eq!(ps.weapon_time, 0);
-        assert_eq!(anim::number(ps.weap_anim), anim::FORCE_IDLE);
+        assert_eq!(ps.gun_phase, state::READY);
+        assert_eq!(ps.gun_timer_ms, 0);
+        assert_eq!(anim::number(ps.gun_clip), anim::FORCE_IDLE);
     }
 
     #[test]
@@ -1288,10 +1292,10 @@ mod tests {
         let mut out = SwitchOut::default();
         check_for_change(&mut ps, &cmd(MP7, 50), &env(), &t, &mut out);
         tick(&mut ps, &cmd(MP7, 50), &env(), &t, &mut out);
-        assert_eq!(ps.weapon_time, 350);
+        assert_eq!(ps.gun_timer_ms, 350);
         tick(&mut ps, &cmd(FIVESEVEN, 50), &env(), &t, &mut out);
-        assert_eq!(ps.weaponstate, state::DROPPING, "the drop is not restarted");
-        assert_eq!(ps.weapon_time, 300);
+        assert_eq!(ps.gun_phase, state::DROPPING, "the drop is not restarted");
+        assert_eq!(ps.gun_timer_ms, 300);
         let c = cmd(FIVESEVEN, 50);
         let (raise_at, ready_at) = run(&mut ps, &c, &env(), &t, &mut out);
         // The Five-seven comes up quick (pistol), from the normal drop's end at 400.
@@ -1302,12 +1306,12 @@ mod tests {
     fn f_switch_during_raise_starts_a_new_drop() {
         let t = table();
         let mut ps = player(&[AN94, MP7], MP7);
-        ps.weaponstate = state::RAISING;
-        ps.weapon_time = 300;
+        ps.gun_phase = state::RAISING;
+        ps.gun_timer_ms = 300;
         let mut out = SwitchOut::default();
         check_for_change(&mut ps, &cmd(AN94, 50), &env(), &t, &mut out);
-        assert_eq!(ps.weaponstate, state::DROPPING);
-        assert_eq!(ps.weapon_time, 350);
+        assert_eq!(ps.gun_phase, state::DROPPING);
+        assert_eq!(ps.gun_timer_ms, 350);
     }
 
     #[test]
@@ -1320,13 +1324,13 @@ mod tests {
         press(&mut ps, &c, &env(), &t, &mut out);
         assert_eq!(ps.weapon, OPTIC_B);
         assert_eq!(
-            ps.weaponstate,
+            ps.gun_phase,
             state::DROPPING_ALTSWITCH,
             "no raise for an ADS-only pair"
         );
         tick(&mut ps, &c, &env(), &t, &mut out);
-        assert_eq!(ps.weaponstate, state::READY);
-        assert_eq!(anim::number(ps.weap_anim), anim::FORCE_IDLE);
+        assert_eq!(ps.gun_phase, state::READY);
+        assert_eq!(anim::number(ps.gun_clip), anim::FORCE_IDLE);
     }
 
     #[test]
@@ -1338,9 +1342,9 @@ mod tests {
         begin_change(&mut ps, &cmd(MP7, 50), &e, &t, MP7, false, &mut out);
         assert!(out.prone_override, "the drop");
         let mut out = SwitchOut::default();
-        ps.weapon_time = 0;
+        ps.gun_timer_ms = Default::default();
         finish_change(&mut ps, &cmd(MP7, 50), &e, &t, &mut out);
-        assert_eq!(ps.weaponstate, state::RAISING);
+        assert_eq!(ps.gun_phase, state::RAISING);
         assert!(out.prone_override, "the raise");
         // Nothing in hand: the drop is skipped but still asks.
         let mut ps = player(&[MP7], 0);
@@ -1354,10 +1358,10 @@ mod tests {
         let t = table();
         for s in [state::MELEE_INIT, 50, 31] {
             let mut ps = player(&[AN94, MP7], AN94);
-            ps.weaponstate = s;
+            ps.gun_phase = s;
             let mut out = SwitchOut::default();
             check_for_change(&mut ps, &cmd(MP7, 50), &env(), &t, &mut out);
-            assert_eq!(ps.weaponstate, s);
+            assert_eq!(ps.gun_phase, s);
         }
     }
 
@@ -1369,7 +1373,7 @@ mod tests {
         ps.set_pool_slot(MP7, 0);
         let mut out = SwitchOut::default();
         switch_if_empty(&ps, &t, &mut out);
-        assert_eq!(ids(&out), vec![events::EV_NOAMMO]);
+        assert_eq!(ids(&out), vec![EV_NOAMMO]);
         let mut cl = ClientSwitch {
             selected: MP7,
             ..ClientSwitch::default()
@@ -1420,8 +1424,8 @@ mod tests {
         let mut mp7 = t.get(MP7);
         mp7.core.alt_weapon = SF_MP7;
         t.set(MP7, "mp7_mp", mp7);
-        let mut sf = gun(weap_class::SMG, sw(350, 500, 250, 300, 1000, 800, 0));
-        sf.core.inventory_type = inventory::ALTMODE;
+        let mut sf = gun(gun_kind_ids::SMG, sw(350, 500, 250, 300, 1000, 800, 0));
+        sf.core.carry_slot_kind = inventory::ALTMODE;
         sf.core.alt_weapon = MP7;
         sf.core.alt_weapon_disable_switching = true;
         t.set(SF_MP7, "sf_mp7_mp", sf);
@@ -1454,7 +1458,7 @@ mod tests {
         dry(&mut ps, MP7);
         assert_eq!(client(MP7).on_no_ammo(&ps, &env(), &t, false), None);
         let t = table();
-        ps.weap_flags |= wf::NO_AMMO_SWITCH;
+        ps.weapon_state_bits |= wf::NO_AMMO_SWITCH;
         assert_eq!(client(MP7).on_no_ammo(&ps, &env(), &t, false), None);
     }
 
@@ -1462,7 +1466,7 @@ mod tests {
     fn f_clip_only_gun_still_switches() {
         let mut t = table();
         let mut f = t.get(MP7);
-        f.core.clip_only = true;
+        f.core.motion_clip_exclusive = true;
         t.set(MP7, "mp7_mp", f);
         let mut ps = player(&[AN94, MP7], MP7);
         dry(&mut ps, MP7);
@@ -1499,7 +1503,7 @@ mod tests {
         let t = table();
         let ps = player(&[AN94, MP7], 0);
         let mut cl = ClientSwitch {
-            last_primary: MP7,
+            previous_main_weapon: MP7,
             ..ClientSwitch::default()
         };
         assert_eq!(cl.on_no_ammo(&ps, &env(), &t, false), Some(MP7));
@@ -1556,24 +1560,24 @@ mod tests {
         let mut ps = player(&[AN94, MP7], AN94);
         let mut out = SwitchOut::default();
         let mut e = env();
-        e.mantle_weapon_inactive = true;
-        e.mantle_flags = MANTLE_CAP_DROP;
+        e.gun_stowed_while_climbing = true;
+        e.ledge_climb_bits = MANTLE_CAP_DROP;
         e.mantle_time_left = 120;
         begin_change(&mut ps, &cmd(MP7, 50), &e, &t, MP7, false, &mut out);
-        assert_eq!(ps.weaponstate, state::DROPPING);
-        assert_eq!(ps.weapon_time, 120);
+        assert_eq!(ps.gun_phase, state::DROPPING);
+        assert_eq!(ps.gun_timer_ms, 120);
         // More mantle left than the drop: the drop keeps its own 400.
         let mut ps = player(&[AN94, MP7], AN94);
         e.mantle_time_left = 900;
         begin_change(&mut ps, &cmd(MP7, 50), &e, &t, MP7, false, &mut out);
-        assert_eq!(ps.weapon_time, 400);
+        assert_eq!(ps.gun_timer_ms, 400);
     }
 
     #[test]
     fn empty_clip_only_gun_is_taken_when_put_away() {
         let mut t = table();
         let mut f = t.get(DSR);
-        f.core.clip_only = true;
+        f.core.motion_clip_exclusive = true;
         t.set(DSR, "dsr50_mp", f);
         let mut ps = player(&[AN94, DSR], DSR);
         ps.set_clip_slot(DSR, 0);
@@ -1608,7 +1612,7 @@ mod tests {
     fn switching_to_a_riot_shield_resets_its_model() {
         let mut t = table();
         let mut f = t.get(MP7);
-        f.core.weap_type = weap_type::RIOTSHIELD;
+        f.core.gun_family_code = gun_family_code::RIOTSHIELD;
         t.set(MP7, "riotshield_mp", f);
         let mut ps = player(&[AN94, MP7], AN94);
         let mut out = SwitchOut::default();
@@ -1633,7 +1637,7 @@ mod tests {
         ps.set_pool_slot(AN94, 0);
         let mut out = SwitchOut::default();
         switch_if_empty(&ps, &t, &mut out);
-        assert_eq!(ids(&out), vec![events::EV_NOAMMO]);
+        assert_eq!(ids(&out), vec![EV_NOAMMO]);
         for guided in [GUIDED_WIRE, GUIDED_TV] {
             let mut f = t.get(AN94);
             f.core.guided_missile_type = guided;
@@ -1649,7 +1653,7 @@ mod tests {
         let mut out = SwitchOut::default();
         switch_if_empty(&ps, &t, &mut out);
         assert!(out.events.is_empty());
-        ps.weap_flags |= wf::NO_AMMO_SWITCH;
+        ps.weapon_state_bits |= wf::NO_AMMO_SWITCH;
         f.core.has_detonator = false;
         t.set(AN94, "an94_mp", f);
         switch_if_empty(&ps, &t, &mut out);
@@ -1684,13 +1688,13 @@ mod tests {
             ),
         ];
         let out_dir = std::env::var("SWITCH_TRACE_OUT").ok();
-        let mut failed = Vec::new();
+        let mut failed = Vec::<_>::new();
         for (name, script) in scripts {
-            let mut runner = crate::trace::Runner::new(&t);
+            let mut runner = crate::trace::ScenarioDriver::new(&t);
             // The runner's `select` does not fill the alt-mode memory yet: the launcher belongs to the AN-94.
             runner.cmd.last_weapon_alt_mode_switch = AN94;
             let r = runner.run_script(script).expect(name);
-            let text = r.lines.join(
+            let text = r.log_rows.join(
                 "
 ",
             );

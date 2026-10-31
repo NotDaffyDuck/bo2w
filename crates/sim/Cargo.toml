@@ -1,36 +1,33 @@
-[package]
-name = "sim"
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-description = "Turns client commands into snapshots: the one simulation path that live play, prediction and replay all run."
-
-[dependencies]
+package.name = "sim"
+package.description = "Turns client commands into snapshots: the one simulation path that live play, prediction and replay all run."
+package.publish.workspace = true
+package.edition.workspace = true
+package.version = "0.1.0"
+lints.workspace = true
 # Engine basics.
-bevy_ecs.workspace = true
-diag.workspace = true
-glam.workspace = true
-perf.workspace = true
-sha2.workspace = true
+dependencies.diag.workspace = true
+dependencies.perf.workspace = true
+dependencies.bevy_ecs.workspace = true
+dependencies.glam.workspace = true
+dependencies.sha2.workspace = true
 # Math, animation and models.
-anim_t6.workspace = true
-fx_t6.workspace = true
-game_math.workspace = true
-xanim_t6.workspace = true
-xmodel_runtime.workspace = true
+dependencies.game_math.workspace = true
+dependencies.xanim_t6.workspace = true
+dependencies.anim_t6.workspace = true
+dependencies.fx_t6.workspace = true
+dependencies.xmodel_runtime.workspace = true
 # Black Ops II rules and data.
-asset_world.workspace = true # vision sets, read from the map's assets
-bo2_profile.workspace = true
-clipmap_t6.workspace = true # BO2 world traces
-entity_t6.workspace = true
-gamemode_t6.workspace = true
-glass_t6.workspace = true # server-side glass
-gsc_t6.workspace = true # Zombies scripts
-hud_t6.workspace = true
-movement_t6.workspace = true # BO2 movement, on in every game
-playerstate_t6.workspace = true
-trace_t6.workspace = true
-weapon_t6.workspace = true # BO2 guns
-
-[lints]
-workspace = true
+dependencies.asset_world.workspace = true # vision sets, read from the map's assets
+dependencies.bo2_profile.workspace = true
+dependencies.clipmap_t6.workspace = true # BO2 world traces
+dependencies.entity_t6.workspace = true
+dependencies.gamemode_t6.workspace = true
+dependencies.glass_t6.workspace = true # server-side glass
+dependencies.gsc_t6.workspace = true # Zombies scripts
+dependencies.hud_t6.workspace = true
+dependencies.movement_t6.workspace = true # BO2 movement, on in every game
+dependencies.playerstate_t6.workspace = true
+dependencies.trace_t6.workspace = true
+dependencies.weapon_t6.workspace = true # BO2 guns
+# Tests that replay a move on a real map's collision (T6_ZONE_DIR).
+dev-dependencies.asset_t6.workspace = true

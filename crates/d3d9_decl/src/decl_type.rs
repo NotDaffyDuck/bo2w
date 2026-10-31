@@ -1,92 +1,102 @@
-//! Element data formats a declaration can name.
+//! Storage formats for the elements of a vertex declaration.
 
-/// How one declaration element is stored. The `T6*` formats are engine-private
-/// packings with raw codes outside the D3D9 range; the vertex stage unpacks
-/// them with the helper functions the emitter prepends.
+/// The memory layout of one element. Codes 0x40 to 0x42 are packings of this
+/// engine that sit past the D3D9 numbering; the vertex shader we emit starts
+/// with helpers that unpack them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum DeclType {
-    Float2,
+pub enum VertexElementFormat {
+    /// Code 1: two 32-bit floats.
+    TwoFloats,
+    /// Code 15: two 16-bit floats.
     Float16x2,
-    Float3,
-    Float4,
-    D3dColor,
-    UByte4,
-    UByte4N,
-    /// Signed 10:10:10 unit vector in one u32 (normals, tangents). Code 0x40.
+    /// Code 2: three 32-bit floats.
+    ThreeFloats,
+    /// Code 3: four 32-bit floats.
+    QuadFloat,
+    /// Code 4: a colour, four bytes.
+    PackedColorBytes,
+    /// Code 5: four bytes read as integers.
+    FourBytesRaw,
+    /// Code 8: four bytes scaled to 0..1.
+    FourBytesNormalised,
+    /// Code 0x40: a unit vector as signed 10:10:10 in a u32 (surface directions,
+    /// tangents).
     T6UnitVec,
-    /// Two half floats in one u32, u in the low half. Code 0x41.
+    /// Code 0x41: u and v as half floats sharing a u32, u in the low 16 bits.
     T6TexCoord,
-    /// Four u32s spanning a world vertex texture coordinate and its lightmap
-    /// coordinate. Code 0x42.
+    /// Code 0x42: four u32s carrying a world vertex's texture coordinate and its
+    /// lightmap coordinate.
     T6WorldTexLmap,
-    /// A code this crate has no name for.
+    /// Any code with no name above, kept as read.
     Unknown(u8),
 }
 
-impl DeclType {
-    pub const fn from_raw(raw: u8) -> Self {
-        match raw {
-            1 => Self::Float2,
-            2 => Self::Float3,
-            3 => Self::Float4,
-            4 => Self::D3dColor,
-            5 => Self::UByte4,
-            8 => Self::UByte4N,
+impl VertexElementFormat {
+    /// Names a raw declaration type code.
+    pub const fn from_raw(code: u8) -> Self {
+        match code {
+            1 => Self::TwoFloats,
+            2 => Self::ThreeFloats,
+            3 => Self::QuadFloat,
+            4 => Self::PackedColorBytes,
+            5 => Self::FourBytesRaw,
+            8 => Self::FourBytesNormalised,
             15 => Self::Float16x2,
             0x40 => Self::T6UnitVec,
             0x41 => Self::T6TexCoord,
             0x42 => Self::T6WorldTexLmap,
-            other => Self::Unknown(other),
+            unnamed => Self::Unknown(unnamed),
         }
     }
 
-    /// Bytes one element occupies; `None` for a type this crate cannot size.
+    /// How many bytes one element takes, or `None` when the format is unknown.
     pub const fn byte_len(self) -> Option<u8> {
-        match self {
+        let width: u8 = match self {
+            Self::TwoFloats => 8,
+            Self::ThreeFloats => 12,
+            Self::QuadFloat | Self::T6WorldTexLmap => 16,
             Self::Float16x2
-            | Self::D3dColor
-            | Self::UByte4
-            | Self::UByte4N
+            | Self::PackedColorBytes
+            | Self::FourBytesRaw
+            | Self::FourBytesNormalised
             | Self::T6UnitVec
-            | Self::T6TexCoord => Some(4),
-            Self::Float2 => Some(8),
-            Self::Float3 => Some(12),
-            Self::Float4 | Self::T6WorldTexLmap => Some(16),
-            Self::Unknown(_) => None,
-        }
+            | Self::T6TexCoord => 4,
+            _ => return None,
+        };
+        Some(width)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::VertexElementFormat;
 
     #[test]
-    fn known_codes_have_names_and_sizes() {
-        let cases = [
-            (1, DeclType::Float2, 8),
-            (2, DeclType::Float3, 12),
-            (3, DeclType::Float4, 16),
-            (4, DeclType::D3dColor, 4),
-            (5, DeclType::UByte4, 4),
-            (8, DeclType::UByte4N, 4),
-            (15, DeclType::Float16x2, 4),
-            (0x40, DeclType::T6UnitVec, 4),
-            (0x41, DeclType::T6TexCoord, 4),
-            (0x42, DeclType::T6WorldTexLmap, 16),
+    fn every_named_code_maps_and_sizes() {
+        let table = [
+            (1, VertexElementFormat::TwoFloats, 8),
+            (2, VertexElementFormat::ThreeFloats, 12),
+            (3, VertexElementFormat::QuadFloat, 16),
+            (4, VertexElementFormat::PackedColorBytes, 4),
+            (5, VertexElementFormat::FourBytesRaw, 4),
+            (8, VertexElementFormat::FourBytesNormalised, 4),
+            (15, VertexElementFormat::Float16x2, 4),
+            (0x40, VertexElementFormat::T6UnitVec, 4),
+            (0x41, VertexElementFormat::T6TexCoord, 4),
+            (0x42, VertexElementFormat::T6WorldTexLmap, 16),
         ];
-        for (raw, kind, bytes) in cases {
-            assert_eq!(DeclType::from_raw(raw), kind);
-            assert_eq!(kind.byte_len(), Some(bytes));
+        for (code, format, size) in table {
+            assert_eq!(VertexElementFormat::from_raw(code), format);
+            assert_eq!(format.byte_len(), Some(size));
         }
     }
 
     #[test]
-    fn unnamed_codes_keep_their_value_and_have_no_size() {
-        for raw in [0, 6, 7, 9, 14, 16, 0x3f, 0x43, 0xff] {
-            let kind = DeclType::from_raw(raw);
-            assert_eq!(kind, DeclType::Unknown(raw));
-            assert_eq!(kind.byte_len(), None);
+    fn other_codes_round_trip_without_a_size() {
+        for code in [0, 6, 7, 9, 14, 16, 0x3f, 0x43, 0xff] {
+            let format = VertexElementFormat::from_raw(code);
+            assert_eq!(format, VertexElementFormat::Unknown(code));
+            assert!(format.byte_len().is_none());
         }
     }
 }

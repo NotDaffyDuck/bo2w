@@ -4,104 +4,104 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::argument::mtl_arg;
-use crate::catalog::{RuntimeImageId, RuntimeMaterial, RuntimePass, RuntimeTextureBinding};
-use crate::{RuntimeArgumentBinding, RuntimeShaderStage};
+use crate::argument::arg_kind;
+use crate::catalog::{LiveImageId, LiveMaterial, LivePassRecord, LiveTextureBinding};
+use crate::{LiveArgumentBinding, LiveShaderStage};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ExecutableArgumentBinding {
-    MaterialTexture {
-        destination: u16,
-        name_hash: u32,
-        texture: RuntimeTextureBinding,
+pub enum RunnableParamSource {
+    ShaderSamplerImage {
+        slot_reg: u16,
+        label_digest: u32,
+        texture: LiveTextureBinding,
     },
-    CodeTexture {
-        destination: u16,
+    EngineSuppliedTexture {
+        slot_reg: u16,
         index: u32,
-        sampler_state: u8,
-        image: Option<RuntimeImageId>,
+        texture_sampling_mode: u8,
+        image: Option<LiveImageId>,
     },
-    MaterialConstant {
-        stage: RuntimeShaderStage,
-        destination: u16,
-        name_hash: u32,
-        words: [u32; 4],
+    ShaderParameterValue {
+        stage: LiveShaderStage,
+        slot_reg: u16,
+        label_digest: u32,
+        lane_bits: [u32; 4],
     },
-    LiteralConstant {
-        stage: RuntimeShaderStage,
-        destination: u16,
-        words: [u32; 4],
+    InlineConstant {
+        stage: LiveShaderStage,
+        slot_reg: u16,
+        lane_bits: [u32; 4],
     },
-    CodeConstant {
-        stage: RuntimeShaderStage,
-        destination: u16,
+    EngineConstant {
+        stage: LiveShaderStage,
+        slot_reg: u16,
         index: u16,
-        first_row: u8,
-        row_count: u8,
-        rows: Arc<[[u32; 4]]>,
+        row_base: u8,
+        line_total: u8,
+        row_data: Arc<[[u32; 4]]>,
     },
 }
 
 /// An argument the engine fills in per draw rather than the material.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PackedCodeArg {
+pub enum PackedCodeParam {
     Constant {
-        stage: RuntimeShaderStage,
-        destination: u16,
+        stage: LiveShaderStage,
+        slot_reg: u16,
         index: u16,
-        first_row: u8,
-        row_count: u8,
+        row_base: u8,
+        line_total: u8,
     },
     Sampler {
-        destination: u16,
+        slot_reg: u16,
         index: u32,
     },
     Unknown {
-        argument_type: u16,
+        kind_code: u16,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreparedArgSlice {
+pub struct PreparedParamSpan {
     /// One entry per argument; `None` where the argument is not material-local
     /// or the material has no value for it.
-    pub local: Vec<Option<ExecutableArgumentBinding>>,
-    pub code: Vec<PackedCodeArg>,
+    pub local: Vec<Option<RunnableParamSource>>,
+    pub code: Vec<PackedCodeParam>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreparedArgBelts {
-    pub per_prim: PreparedArgSlice,
-    pub per_obj: PreparedArgSlice,
-    pub stable: PreparedArgSlice,
+pub struct PreparedParamStrips {
+    pub each_triangle_batch_inputs: PreparedParamSpan,
+    pub each_mesh_inputs: PreparedParamSpan,
+    pub stable: PreparedParamSpan,
 }
 
-impl PreparedArgBelts {
+impl PreparedParamStrips {
     /// The belts in the order their locals are written into the banks.
-    pub(super) fn in_bank_order(&self) -> [&PreparedArgSlice; 3] {
-        [&self.per_prim, &self.per_obj, &self.stable]
+    pub(super) fn in_bank_order(&self) -> [&PreparedParamSpan; 3] {
+        [&self.each_triangle_batch_inputs, &self.each_mesh_inputs, &self.stable]
     }
 
     /// `None` when the pass's belt counts do not add up to its argument list.
-    pub(super) fn from_pass(material: &RuntimeMaterial, pass: &RuntimePass) -> Option<Self> {
-        let per_prim = usize::from(pass.per_prim_arg_count);
-        let per_obj = usize::from(pass.per_obj_arg_count);
-        let stable = usize::from(pass.stable_arg_count);
-        if per_prim.saturating_add(per_obj).saturating_add(stable) != pass.arguments.len() {
+    pub(super) fn from_pass(material: &LiveMaterial, pass: &LivePassRecord) -> Option<Self> {
+        let each_triangle_batch_inputs = usize::from(pass.per_prim_arg_tally);
+        let each_mesh_inputs = usize::from(pass.per_obj_arg_tally);
+        let stable = usize::from(pass.stable_arg_tally);
+        if each_triangle_batch_inputs.saturating_add(each_mesh_inputs).saturating_add(stable) != pass.arguments.len() {
             return None;
         }
-        let (prim_args, rest) = pass.arguments.split_at(per_prim);
-        let (obj_args, stable_args) = rest.split_at(per_obj);
+        let (prim_args, rest) = pass.arguments.split_at(each_triangle_batch_inputs);
+        let (obj_args, stable_args) = rest.split_at(each_mesh_inputs);
         Some(Self {
-            per_prim: PreparedArgSlice::new(material, prim_args),
-            per_obj: PreparedArgSlice::new(material, obj_args),
-            stable: PreparedArgSlice::new(material, stable_args),
+            each_triangle_batch_inputs: PreparedParamSpan::new(material, prim_args),
+            each_mesh_inputs: PreparedParamSpan::new(material, obj_args),
+            stable: PreparedParamSpan::new(material, stable_args),
         })
     }
 }
 
-impl PreparedArgSlice {
-    fn new(material: &RuntimeMaterial, args: &[RuntimeArgumentBinding]) -> Self {
+impl PreparedParamSpan {
+    fn new(material: &LiveMaterial, args: &[LiveArgumentBinding]) -> Self {
         Self {
             local: bind_material_locals(material, args),
             code: args.iter().filter_map(code_arg).collect(),
@@ -109,30 +109,30 @@ impl PreparedArgSlice {
     }
 }
 
-fn code_arg(argument: &RuntimeArgumentBinding) -> Option<PackedCodeArg> {
+fn code_arg(argument: &LiveArgumentBinding) -> Option<PackedCodeParam> {
     match *argument {
-        RuntimeArgumentBinding::CodeConstant {
+        LiveArgumentBinding::EngineConstant {
             stage,
-            destination,
+            destination: dest,
             index,
-            first_row,
-            row_count,
-        } => Some(PackedCodeArg::Constant {
+            row_base: first_row,
+            line_total,
+        } => Some(PackedCodeParam::Constant {
             stage,
-            destination,
+            slot_reg: dest,
             index,
-            first_row,
-            row_count,
+            row_base: first_row,
+            line_total,
         }),
-        RuntimeArgumentBinding::CodeTexture { destination, index } => {
-            Some(PackedCodeArg::Sampler { destination, index })
+        LiveArgumentBinding::EngineSuppliedTexture { destination: dest, index } => {
+            Some(PackedCodeParam::Sampler { slot_reg: dest, index })
         }
-        RuntimeArgumentBinding::Unknown { argument_type, .. } => {
-            Some(PackedCodeArg::Unknown { argument_type })
+        LiveArgumentBinding::Unknown { kind_code: kind, .. } => {
+            Some(PackedCodeParam::Unknown { kind_code: kind })
         }
-        RuntimeArgumentBinding::MaterialTexture { .. }
-        | RuntimeArgumentBinding::MaterialConstant { .. }
-        | RuntimeArgumentBinding::LiteralConstant { .. } => None,
+        LiveArgumentBinding::ShaderSamplerImage { .. }
+        | LiveArgumentBinding::ShaderParameterValue { .. }
+        | LiveArgumentBinding::InlineConstant { .. } => None,
     }
 }
 
@@ -145,92 +145,92 @@ struct Cursors {
     constants: usize,
 }
 
-fn find_sorted<T: Copy>(table: &[(u32, T)], cursor: &mut usize, wanted: u32) -> Option<T> {
+fn seek_ascending<T: Copy>(table: &[(u32, T)], at: &mut usize, wanted: u32) -> Option<T> {
     // Remapped code samplers can ask for hashes outside the authored order.
-    if table.get(*cursor).is_none_or(|&(hash, _)| hash > wanted) {
-        *cursor = 0;
+    if table.get(*at).is_none_or(|&(hash, _)| hash > wanted) {
+        *at = 0;
     }
-    while let Some(&(hash, value)) = table.get(*cursor) {
+    while let Some(&(hash, value)) = table.get(*at) {
         match hash.cmp(&wanted) {
             Ordering::Equal => return Some(value),
             Ordering::Greater => return None,
-            Ordering::Less => *cursor += 1,
+            Ordering::Less => *at += 1,
         }
     }
     None
 }
 
 fn bind_one(
-    material: &RuntimeMaterial,
-    argument: &RuntimeArgumentBinding,
+    material: &LiveMaterial,
+    argument: &LiveArgumentBinding,
     cursors: &mut Cursors,
-) -> Option<ExecutableArgumentBinding> {
+) -> Option<RunnableParamSource> {
     match *argument {
-        RuntimeArgumentBinding::MaterialTexture {
-            destination,
-            name_hash,
+        LiveArgumentBinding::ShaderSamplerImage {
+            destination: dest,
+            label_digest,
         } => {
-            let texture = find_sorted(&material.textures, &mut cursors.textures, name_hash)??;
-            Some(ExecutableArgumentBinding::MaterialTexture {
-                destination,
-                name_hash,
+            let texture = seek_ascending(&material.textures, &mut cursors.textures, label_digest)??;
+            Some(RunnableParamSource::ShaderSamplerImage {
+                slot_reg: dest,
+                label_digest,
                 texture,
             })
         }
-        RuntimeArgumentBinding::MaterialConstant {
+        LiveArgumentBinding::ShaderParameterValue {
             stage,
-            destination,
-            name_hash,
+            destination: dest,
+            label_digest,
         } => {
-            let words = find_sorted(&material.constants, &mut cursors.constants, name_hash)?;
-            Some(ExecutableArgumentBinding::MaterialConstant {
+            let words = seek_ascending(&material.constants, &mut cursors.constants, label_digest)?;
+            Some(RunnableParamSource::ShaderParameterValue {
                 stage,
-                destination,
-                name_hash,
-                words,
+                slot_reg: dest,
+                label_digest,
+                lane_bits: words,
             })
         }
-        RuntimeArgumentBinding::LiteralConstant {
+        LiveArgumentBinding::InlineConstant {
             stage,
-            destination,
+            destination: dest,
             words,
-        } => Some(ExecutableArgumentBinding::LiteralConstant {
+        } => Some(RunnableParamSource::InlineConstant {
             stage,
-            destination,
-            words: words?,
+            slot_reg: dest,
+            lane_bits: words?,
         }),
-        RuntimeArgumentBinding::CodeTexture { .. }
-        | RuntimeArgumentBinding::CodeConstant { .. }
-        | RuntimeArgumentBinding::Unknown { .. } => None,
+        LiveArgumentBinding::EngineSuppliedTexture { .. }
+        | LiveArgumentBinding::EngineConstant { .. }
+        | LiveArgumentBinding::Unknown { .. } => None,
     }
 }
 
 /// Argument kinds in the order the authored argument list groups them.
 const AUTHORED_KIND_ORDER: [u16; 8] = [
-    mtl_arg::MATERIAL_VERTEX_CONST,
-    mtl_arg::LITERAL_VERTEX_CONST,
-    mtl_arg::MATERIAL_PIXEL_SAMPLER,
-    mtl_arg::CODE_VERTEX_CONST,
-    mtl_arg::CODE_PIXEL_SAMPLER,
-    mtl_arg::CODE_PIXEL_CONST,
-    mtl_arg::MATERIAL_PIXEL_CONST,
-    mtl_arg::LITERAL_PIXEL_CONST,
+    arg_kind::SURFACE_VERTEX_CONSTANT,
+    arg_kind::INLINE_VERTEX_CONSTANT,
+    arg_kind::SURFACE_FRAGMENT_SAMPLER,
+    arg_kind::ENGINE_VERTEX_CONSTANT,
+    arg_kind::ENGINE_FRAGMENT_SAMPLER,
+    arg_kind::ENGINE_FRAGMENT_CONSTANT,
+    arg_kind::SURFACE_FRAGMENT_CONSTANT,
+    arg_kind::INLINE_FRAGMENT_CONSTANT,
 ];
 
 fn bind_material_locals(
-    material: &RuntimeMaterial,
-    args: &[RuntimeArgumentBinding],
-) -> Vec<Option<ExecutableArgumentBinding>> {
+    material: &LiveMaterial,
+    args: &[LiveArgumentBinding],
+) -> Vec<Option<RunnableParamSource>> {
     let mut bound = vec![None; args.len()];
     let mut cursors = Cursors::default();
     let mut next = 0;
     for kind in AUTHORED_KIND_ORDER {
         // Vertex and pixel constants are separate tables in the source data,
         // so the constant search restarts when the pixel constants begin.
-        if kind == mtl_arg::MATERIAL_PIXEL_CONST {
+        if kind == arg_kind::SURFACE_FRAGMENT_CONSTANT {
             cursors.constants = 0;
         }
-        while next < args.len() && args[next].mtl_arg_type() == kind {
+        while next < args.len() && args[next].material_argument_kind() == kind {
             bound[next] = bind_one(material, &args[next], &mut cursors);
             next += 1;
         }

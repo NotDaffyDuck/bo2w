@@ -1,8 +1,10 @@
 pub(crate) fn milliseconds() -> u32 {
     use std::sync::OnceLock;
     use std::time::Instant;
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    static STARTED: OnceLock<Instant> = OnceLock::new();
 
-    const UPTIME_BIAS_MS: u32 = 60_000;
-    ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u32 + UPTIME_BIAS_MS
+    /// The clock starts a minute in so nothing sees a time of zero.
+    const HEAD_START_MS: u32 = 60_000;
+    let since_start = STARTED.get_or_init(Instant::now).elapsed();
+    since_start.as_millis() as u32 + HEAD_START_MS
 }

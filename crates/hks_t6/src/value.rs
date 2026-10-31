@@ -3,18 +3,14 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::Proto;
 
-/// A native function: (VM, arguments) -> results.
-pub type NativeFn =
-    dyn Fn(&mut crate::vm::Vm, Vec<Value>) -> Result<Vec<Value>, crate::vm::LuaError>;
-
 pub struct Native {
     pub name: &'static str,
-    pub f: Box<NativeFn>,
+    /// (VM, arguments) -> results.
+    pub f: Box<dyn Fn(&mut crate::vm::Vm, Vec<Value>) -> Result<Vec<Value>, crate::vm::LuaError>>,
 }
 
 /// An upvalue: open while its local is still on the stack (the stack
@@ -32,21 +28,19 @@ pub struct Closure {
 
 /// Engine-side data a script holds (an LUI element, a material).
 pub struct UserData {
-    pub kind: &'static str,
+    pub type_tag: &'static str,
     pub data: RefCell<Box<dyn std::any::Any>>,
-    pub meta: RefCell<Option<TableRef>>,
+    pub meta: RefCell<Option<Rc<RefCell<LuaTable>>>>,
 }
-
-pub type TableRef = Rc<RefCell<Table>>;
 
 #[derive(Clone, Default)]
 pub enum Value {
     #[default]
     Nil,
-    Bool(bool),
+    Boolean(bool),
     Num(f32),
     Str(Rc<str>),
-    Table(TableRef),
+    Table(Rc<RefCell<LuaTable>>),
     Func(Rc<Closure>),
     Native(Rc<Native>),
     User(Rc<UserData>),
@@ -58,13 +52,13 @@ impl Value {
     }
 
     pub fn truthy(&self) -> bool {
-        !matches!(self, Value::Nil | Value::Bool(false))
+        !matches!(*self, Value::Nil | Value::Boolean(false))
     }
 
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Nil => "nil",
-            Value::Bool(_) => "boolean",
+            Value::Boolean(_) => "boolean",
             Value::Num(_) => "number",
             Value::Str(_) => "string",
             Value::Table(_) => "table",
@@ -88,7 +82,7 @@ impl Value {
         }
     }
 
-    pub fn table(&self) -> Option<&TableRef> {
+    pub fn table(&self) -> Option<&Rc<RefCell<LuaTable>>> {
         match self {
             Value::Table(t) => Some(t),
             _ => None,
@@ -100,7 +94,7 @@ impl Value {
     pub fn raw_eq(&self, o: &Value) -> bool {
         match (self, o) {
             (Value::Nil, Value::Nil) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Num(a), Value::Num(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Table(a), Value::Table(b)) => Rc::ptr_eq(a, b),
@@ -142,13 +136,13 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Nil => f.write_str("nil"),
-            Value::Bool(b) => write!(f, "{b}"),
+            Value::Boolean(b) => write!(f, "{b}"),
             Value::Num(n) => f.write_str(&format_number(*n)),
             Value::Str(s) => f.write_str(s),
             Value::Table(t) => write!(f, "table: {:p}", Rc::as_ptr(t)),
             Value::Func(c) => write!(f, "function: {:p}", Rc::as_ptr(c)),
             Value::Native(n) => write!(f, "function: builtin {}", n.name),
-            Value::User(u) => write!(f, "userdata {}: {:p}", u.kind, Rc::as_ptr(u)),
+            Value::User(u) => write!(f, "userdata {}: {:p}", u.type_tag, Rc::as_ptr(u)),
         }
     }
 }
@@ -175,11 +169,11 @@ impl PartialEq for Key {
 
 impl Eq for Key {}
 
-impl Hash for Key {
-    fn hash<H: Hasher>(&self, h: &mut H) {
+impl std::hash::Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
         match &self.0 {
             Value::Nil => 0u8.hash(h),
-            Value::Bool(b) => b.hash(h),
+            Value::Boolean(b) => b.hash(h),
             Value::Num(n) => {
                 // -0 and 0 are one key.
                 let n = if *n == 0.0 { 0.0f32 } else { *n };
@@ -197,16 +191,16 @@ impl Hash for Key {
 /// A table: an array part for 1..n and a hash part for the rest, in
 /// insertion order so `next` is stable while a loop runs.
 #[derive(Default)]
-pub struct Table {
+pub struct LuaTable {
     pub array: Vec<Value>,
     pub hash: HashMap<Key, usize>,
     pub entries: Vec<(Key, Value)>,
-    pub meta: Option<TableRef>,
+    pub meta: Option<Rc<RefCell<LuaTable>>>,
 }
 
-impl Table {
-    pub fn new_ref() -> TableRef {
-        Rc::new(RefCell::new(Table::default()))
+impl LuaTable {
+    pub fn new_ref() -> Rc<RefCell<LuaTable>> {
+        Rc::new(RefCell::new(LuaTable::default()))
     }
 
     fn array_index(k: &Value) -> Option<usize> {
@@ -218,7 +212,7 @@ impl Table {
         }
     }
 
-    pub fn get(&self, k: &Value) -> Value {
+    pub fn read_key(&self, k: &Value) -> Value {
         if let Some(i) = Self::array_index(k)
             && i < self.array.len()
         {
@@ -231,10 +225,10 @@ impl Table {
     }
 
     pub fn get_str(&self, k: &str) -> Value {
-        self.get(&Value::str(k))
+        self.read_key(&Value::str(k))
     }
 
-    pub fn set(&mut self, k: Value, v: Value) {
+    pub fn store(&mut self, k: Value, v: Value) {
         if let Some(i) = Self::array_index(&k) {
             if i < self.array.len() {
                 self.array[i] = v;
@@ -278,7 +272,7 @@ impl Table {
     }
 
     pub fn set_str(&mut self, k: &str, v: Value) {
-        self.set(Value::str(k), v);
+        self.store(Value::str(k), v);
     }
 
     /// The border `#t` gives.

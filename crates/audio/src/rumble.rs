@@ -6,14 +6,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use asset_audio::SoundCatalog;
-use asset_core::AssetNamespace;
+use asset_audio::AudioRoster;
+use asset_core::AssetCategoryScope;
 use bevy::input::gamepad::{GamepadRumbleIntensity, GamepadRumbleRequest};
 use bevy::prelude::*;
-use net::{LocalPresentClient, PresentedSnapshot};
-
-/// Motor level over normalised time: (position 0..=1, level) points in order.
-type Curve = Vec<(f32, f32)>;
+use net::{HostViewClient, ShownWorldFrame};
 
 /// Black Ops II's client keeps this many rumbles at once.
 const RUMBLE_SLOTS_T6: usize = 32;
@@ -34,11 +31,11 @@ const SILENT: GamepadRumbleIntensity = GamepadRumbleIntensity {
 #[derive(Clone, Debug)]
 pub(crate) struct Rumble {
     name: String,
-    duration_ms: i32,
+    len_ms: i32,
     /// The strong (low-frequency) motor.
-    low: Curve,
+    low: Vec<(f32, f32)>,
     /// The weak (high-frequency) motor.
-    high: Curve,
+    high: Vec<(f32, f32)>,
     /// How far a broadcast rumble is felt.
     range: f32,
     fade_with_distance: bool,
@@ -48,27 +45,27 @@ pub(crate) struct Rumble {
 
 /// The text of a rumble-folder rawfile out of a bank.
 fn rumble_text<'a>(
-    bank: &'a SoundCatalog,
-    namespace: AssetNamespace,
+    bank: &'a AudioRoster,
+    cue_ns: AssetCategoryScope,
     name: &str,
 ) -> Result<&'a str, String> {
     let mut key = format!("rumble/{name}");
-    if namespace == AssetNamespace::T6 {
+    if cue_ns == AssetCategoryScope::T6 {
         key.make_ascii_lowercase();
     }
     let bytes = bank
         .rawfiles
-        .get(&(namespace, key.clone()))
-        .ok_or_else(|| format!("missing {key}"))?;
+        .get(&(cue_ns, key.clone()))
+        .ok_or_else(|| ["missing ", key.as_str()].concat())?;
     std::str::from_utf8(bytes).map_err(|_| format!("invalid text in {key}"))
 }
 
 /// Reads one `RUMBLEGRAPHFILE` motor curve.
 fn read_curve(
-    bank: &SoundCatalog,
-    namespace: AssetNamespace,
+    bank: &AudioRoster,
+    namespace: AssetCategoryScope,
     file: Option<&str>,
-) -> Result<Curve, String> {
+) -> Result<Vec<(f32, f32)>, String> {
     let file = file
         .filter(|file| !file.is_empty())
         .ok_or_else(|| "missing rumble graph name".to_owned())?;
@@ -90,7 +87,7 @@ fn read_curve(
             .filter(|number| number.is_finite())
             .ok_or_else(|| format!("invalid rumble graph point: {file}"))
     };
-    let mut curve: Curve = Vec::with_capacity(count);
+    let mut curve: Vec<(f32, f32)> = Vec::with_capacity(count);
     for _ in 0..count {
         let position = next_number()?;
         let level = next_number()?;
@@ -103,9 +100,9 @@ fn read_curve(
 }
 
 impl Rumble {
-    pub(crate) fn prepare(
-        bank: &SoundCatalog,
-        namespace: AssetNamespace,
+    pub(crate) fn stage(
+        bank: &AudioRoster,
+        namespace: AssetCategoryScope,
         name: &str,
     ) -> Result<Arc<Self>, String> {
         let definition = rumble_text(bank, namespace, name)?.trim_end_matches('\0');
@@ -117,11 +114,11 @@ impl Rumble {
         let (mut duration, mut low, mut high) = (None, None, None);
         let (mut range, mut fade_with_distance, mut broadcast) = (0.0, false, false);
         let flag = |value: &str| value.parse::<i32>().is_ok_and(|number| number != 0);
-        while let Some(field) = parts.next() {
+        while let Some(setting) = parts.next() {
             let value = parts
                 .next()
-                .ok_or_else(|| format!("missing {field} value: {name}"))?;
-            match field {
+                .ok_or_else(|| format!("missing {setting} value: {name}"))?;
+            match setting {
                 "duration" => duration = value.parse::<f32>().ok(),
                 "lowRumbleFile" => low = Some(value),
                 "highRumbleFile" => high = Some(value),
@@ -137,7 +134,7 @@ impl Rumble {
             .ok_or_else(|| format!("invalid rumble duration: {name}"))?;
         Ok(Arc::new(Self {
             name: name.to_owned(),
-            duration_ms: (seconds * 1000.0).max(1.0) as i32,
+            len_ms: (seconds * 1000.0).max(1.0) as i32,
             low: read_curve(bank, namespace, low)?,
             high: read_curve(bank, namespace, high)?,
             range,
@@ -148,7 +145,7 @@ impl Rumble {
 
     /// Both motors `elapsed_ms` into the rumble.
     fn intensity(&self, elapsed_ms: i32) -> GamepadRumbleIntensity {
-        let at = (elapsed_ms as f32 / self.duration_ms as f32).clamp(0.0, 1.0);
+        let at = (elapsed_ms as f32 / self.len_ms as f32).clamp(0.0, 1.0);
         GamepadRumbleIntensity {
             strong_motor: level_at(&self.low, at),
             weak_motor: level_at(&self.high, at),
@@ -174,7 +171,7 @@ fn level_at(curve: &[(f32, f32)], at: f32) -> f32 {
 
 #[derive(Message)]
 pub(crate) struct PlayRumble {
-    pub bank_revision: u64,
+    pub catalog_edition: u64,
     pub rumble: Arc<Rumble>,
 }
 
@@ -199,25 +196,34 @@ pub struct CodeRumbleStopT6 {
 /// The plain mixer: what is playing on the pad right now.
 #[derive(Default)]
 struct RumblePlayback {
-    owner: Option<(frame::WorldGeneration, sim::ClientId, sim::LifeSequence, u64)>,
-    last_time: i32,
+    owner_ent: Option<(
+        frame::LevelGeneration,
+        sim::ClientId,
+        sim::LifeSequence,
+        u64,
+    )>,
+    previous_stamp: i32,
     /// (start ms, rumble) for each one playing.
     active: Vec<(i32, Arc<Rumble>)>,
     /// What was last sent to the pad.
     output: Option<(Entity, GamepadRumbleIntensity)>,
-    selected: Option<Entity>,
+    chosen: Option<Entity>,
     next_refresh_ms: i32,
+    /// bo2zm: the looping rumble `bo2zm_rumble` names, and when it plays again.
+    looped: Option<String>,
+    next_loop_ms: i32,
+    prepared: std::collections::HashMap<(u64, String), Result<Arc<Rumble>, String>>,
 }
 
 impl RumblePlayback {
     /// Starts `rumble`, first dropping the one nearest its end if the mixer is full.
-    fn push(&mut self, now: i32, rumble: Arc<Rumble>) {
+    fn put(&mut self, now: i32, rumble: Arc<Rumble>) {
         if self.active.len() >= MIXER_LIMIT {
             let soonest = self
                 .active
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, (start, rumble))| start.saturating_add(rumble.duration_ms))
+                .min_by_key(|(_, (start, rumble))| start.saturating_add(rumble.len_ms))
                 .map(|(index, _)| index);
             if let Some(index) = soonest {
                 self.active.swap_remove(index);
@@ -234,7 +240,7 @@ impl RumblePlayback {
     }
 }
 
-pub(crate) fn register(app: &mut App) {
+pub(crate) fn wire_up(app: &mut App) {
     app.add_message::<PlayRumble>()
         .add_message::<CodeRumbleT6>()
         .add_message::<CodeRumbleStopT6>()
@@ -245,55 +251,55 @@ pub(crate) fn register(app: &mut App) {
             Update,
             (
                 update_t6
-                    .run_if(crate::shellshock::bank_is_t6)
-                    .before(update),
-                update,
+                    .run_if(crate::shock_sound::bank_is_t6)
+                    .before(refresh),
+                refresh,
             )
-                .in_set(net::ClientSet::Effects)
-                .after(crate::entity_events::play_viewmodel_notetrack_messages),
+                .in_set(net::ClientStep::Effects)
+                .after(crate::ent_sounds::voice_first_person_anim_cues),
         );
 }
 
-fn now_ms(time: &Time) -> i32 {
+fn clock_millis(time: &Time) -> i32 {
     (time.elapsed_secs_f64() * 1000.0) as i32
 }
 
-fn update(
-    mut requests: MessageReader<PlayRumble>,
-    bank: Option<Res<crate::SoundBank>>,
-    presented: Res<PresentedSnapshot>,
-    local: Res<LocalPresentClient>,
-    generation: Res<frame::WorldGeneration>,
+fn refresh(
+    mut weapon_rumbles: MessageReader<PlayRumble>,
+    bank: Option<Res<crate::AudioCatalogRes>>,
+    presented: Res<ShownWorldFrame>,
+    local: Res<HostViewClient>,
+    generation: Res<frame::LevelGeneration>,
     time: Res<Time>,
     devices: Res<frame::InputDevices>,
     mut tests: MessageReader<frame::TestControllerRumble>,
     gamepads: Query<Entity, With<Gamepad>>,
     mut state: Local<RumblePlayback>,
     mut output: MessageWriter<GamepadRumbleRequest>,
-    settings: Res<frame::GameSettings>,
+    settings: Res<frame::PlayerPrefsBundle>,
     active: Option<Res<frame::ActivePad>>,
     (t6, namespace): (
         Option<Res<RumblesT6>>,
-        Option<Res<crate::ambient::SoundBankNamespace>>,
+        Option<Res<crate::map_sound_set::CatalogNameSpace>>,
     ),
 ) {
     // Black Ops II plays its rumbles through its own slots (`update_t6`).
-    let t6 = t6.filter(|_| crate::shellshock::bank_is_t6(namespace));
-    let now = now_ms(&time);
+    let t6 = t6.filter(|_| crate::shock_sound::bank_is_t6(namespace));
+    let now = clock_millis(&time);
 
     let selected = active
         .and_then(|active| active.0)
         .filter(|pad| gamepads.contains(*pad));
-    if state.selected != selected {
+    if state.chosen != selected {
         state.active.clear();
         state.silence(&mut output);
-        state.selected = selected;
+        state.chosen = selected;
         state.next_refresh_ms = 0;
     }
     let pad = match selected {
         Some(pad) if settings.pad_vibration && devices.focused => pad,
         _ => {
-            requests.clear();
+            weapon_rumbles.clear();
             tests.clear();
             state.active.clear();
             state.silence(&mut output);
@@ -303,38 +309,68 @@ fn update(
 
     // Whose rumbles these are: this client, this life, this bank.
     let owner = bank.as_ref().and_then(|bank| {
-        let meta = presented.snapshot()?.meta.for_client(local.0)?;
-        (meta.lifecycle == sim::ClientLifecycle::Alive).then_some((
+        let seat = presented.snapshot()?.meta.for_client(local.0)?;
+        (seat.lifecycle == sim::PlayerSessionStage::Alive).then_some((
             *generation,
             local.0,
-            meta.life_sequence,
+            seat.life_sequence,
             bank.0.revision(),
         ))
     });
-    if owner != state.owner || now < state.last_time {
+    if owner != state.owner_ent || now < state.previous_stamp {
         state.active.clear();
         state.silence(&mut output);
-        state.owner = owner;
+        state.owner_ent = owner;
     }
-    state.last_time = now;
+    state.previous_stamp = now;
     state
         .active
-        .retain(|(start, rumble)| now.saturating_sub(*start) < rumble.duration_ms);
+        .retain(|(start, rumble)| now.saturating_sub(*start) < rumble.len_ms);
 
     if t6.is_some() {
-        requests.clear();
+        weapon_rumbles.clear();
     }
-    for request in requests.read() {
-        if owner.is_some_and(|owner| owner.3 == request.bank_revision) {
-            state.push(now, Arc::clone(&request.rumble));
+    for request in weapon_rumbles.read() {
+        if owner.is_some_and(|owner| owner.3 == request.catalog_edition) {
+            state.put(now, Arc::clone(&request.rumble));
+        }
+    }
+    // bo2zm: the rumble the server names in `bo2zm_rumble` (Origins' staff
+    // charge, zm_tomb.csc player_staff_charge_rumble), again every 0.1 s
+    // until the name changes.
+    let looped = presented
+        .snapshot()
+        .and_then(|s| s.meta.script_dvars(local.0).string("bo2zm_rumble").map(str::to_owned))
+        .filter(|name| !name.is_empty());
+    if looped != state.looped {
+        state.looped = looped;
+        state.next_loop_ms = now;
+    }
+    if let (Some(loop_name), Some(snd_bank), Some(owner)) = (state.looped.clone(), bank.as_ref(), owner)
+        && now >= state.next_loop_ms
+    {
+        state.next_loop_ms = now.saturating_add(100);
+        let prepared = state
+            .prepared
+            .entry((owner.3, loop_name.clone()))
+            .or_insert_with(|| {
+                let r = Rumble::stage(&snd_bank.0, asset_core::AssetCategoryScope::T6, &loop_name);
+                if let Err(error) = &r {
+                    diag::warn!(Audio, "sound: rumble `{loop_name}` turned down: {error}");
+                }
+                r
+            })
+            .clone();
+        if let Ok(rumble) = prepared {
+            state.put(now, rumble);
         }
     }
     if tests.read().next().is_some() {
-        state.push(
+        state.put(
             now,
             Arc::new(Rumble {
                 name: String::new(),
-                duration_ms: 400,
+                len_ms: 400,
                 low: vec![(0.0, 0.6), (1.0, 0.0)],
                 high: vec![(0.0, 0.4), (1.0, 0.0)],
                 range: 0.0,
@@ -382,12 +418,12 @@ enum SourceT6 {
 }
 
 impl SourceT6 {
-    fn same(self, other: Self) -> bool {
-        match (self, other) {
-            (Self::Entity(a, _), Self::Entity(b, _)) => a == b,
-            (Self::Position(a), Self::Position(b)) => a == b,
-            _ => false,
+    /// Same entity number, or same spot; never an entity and a spot.
+    fn same(self, unmatched: Self) -> bool {
+        if let (Self::Entity(mine, _), Self::Entity(theirs, _)) = (self, unmatched) {
+            return mine == theirs;
         }
+        matches!((self, unmatched), (Self::Position(here), Self::Position(there)) if here == there)
     }
 
     fn number(self) -> Option<u16> {
@@ -402,13 +438,13 @@ impl SourceT6 {
 struct SlotT6 {
     rumble: Arc<Rumble>,
     source: SourceT6,
-    looping: bool,
+    repeats: bool,
     start: i32,
 }
 
 impl SlotT6 {
     fn ends_at(&self) -> i32 {
-        self.start.saturating_add(self.rumble.duration_ms)
+        self.start.saturating_add(self.rumble.len_ms)
     }
 }
 
@@ -418,11 +454,11 @@ enum CueT6 {
     Play {
         name: String,
         source: SourceT6,
-        looping: bool,
+        repeats: bool,
     },
     Stop {
         name: String,
-        number: u16,
+        entity: u16,
     },
     StopAll,
 }
@@ -434,28 +470,28 @@ pub(crate) struct CuesT6(Vec<CueT6>);
 /// looping flag is set, and the motor levels they drive this frame.
 #[derive(Resource)]
 pub(crate) struct RumblesT6 {
-    slots: Vec<Option<SlotT6>>,
+    slot_list: Vec<Option<SlotT6>>,
     loop_flags: HashSet<u16>,
-    owner: Option<(frame::WorldGeneration, sim::ClientId, u64)>,
-    last_time: i32,
+    source_ent: Option<(frame::LevelGeneration, sim::ClientId, u64)>,
+    previous_stamp: i32,
     motors: GamepadRumbleIntensity,
 }
 
 impl Default for RumblesT6 {
     fn default() -> Self {
         Self {
-            slots: vec![None; RUMBLE_SLOTS_T6],
+            slot_list: vec![None; RUMBLE_SLOTS_T6],
             loop_flags: HashSet::new(),
-            owner: None,
-            last_time: 0,
+            source_ent: None,
+            previous_stamp: 0,
             motors: SILENT,
         }
     }
 }
 
 impl RumblesT6 {
-    fn clear(&mut self) {
-        self.slots.fill(None);
+    fn drop_all(&mut self) {
+        self.slot_list.fill(None);
         self.motors = SILENT;
     }
 
@@ -467,13 +503,13 @@ impl RumblesT6 {
         &mut self,
         rumble: Arc<Rumble>,
         source: SourceT6,
-        looping: bool,
+        repeats: bool,
         now: i32,
         own: Option<u16>,
     ) {
-        let repeat = self.slots.iter().flatten().any(|slot| {
+        let repeat = self.slot_list.iter().flatten().any(|slot| {
             slot.start == now
-                && slot.looping == looping
+                && slot.repeats == repeats
                 && slot.source.same(source)
                 && slot.rumble.name == rumble.name
         });
@@ -481,35 +517,35 @@ impl RumblesT6 {
             return;
         }
 
-        let free = self.slots.iter().position(Option::is_none);
-        let index = free.unwrap_or_else(|| {
-            let replaceable = |slot: &SlotT6| {
-                !slot.looping && (own.is_none() || slot.source.number() != own)
-            };
-            self.slots
+        let free = self.slot_list.iter().position(Option::is_none);
+        let bay_no = free.unwrap_or_else(|| {
+            let replaceable =
+                |slot: &SlotT6| !slot.repeats && (own.is_none() || slot.source.number() != own);
+            self.slot_list
                 .iter()
                 .enumerate()
-                .filter_map(|(index, slot)| Some((index, slot.as_ref()?)))
+                .filter_map(|(bay_no, slot)| Some((bay_no, slot.as_ref()?)))
                 .filter(|(_, slot)| replaceable(slot))
                 .min_by_key(|(_, slot)| slot.ends_at().saturating_sub(now))
-                .map_or(0, |(index, _)| index)
+                .map_or(0, |(bay_no, _)| bay_no)
         });
-        self.slots[index] = Some(SlotT6 {
+        self.slot_list[bay_no] = Some(SlotT6 {
             rumble,
             source,
-            looping,
+            repeats,
             start: now,
         });
     }
 
     /// The game's `CG_StopRumble`: the first rumble of that name on the entity stops.
     fn stop(&mut self, name: &str, number: u16) {
-        let hit = self.slots.iter_mut().find(|slot| {
-            slot.as_ref()
-                .is_some_and(|slot| slot.source.number() == Some(number) && slot.rumble.name == name)
+        let hit = self.slot_list.iter_mut().find(|slot| {
+            slot.as_ref().is_some_and(|slot| {
+                slot.source.number() == Some(number) && slot.rumble.name == name
+            })
         });
-        if let Some(slot) = hit {
-            *slot = None;
+        if let Some(slot_no) = hit {
+            *slot_no = None;
         }
     }
 
@@ -518,7 +554,7 @@ impl RumblesT6 {
     /// rumble on an entity that is gone. The motors take the strongest of the
     /// rest, a broadcast rumble weaker with distance from the view (or
     /// nothing past its range).
-    fn tick(
+    fn beat(
         &mut self,
         now: i32,
         ear: Option<Vec3>,
@@ -526,7 +562,7 @@ impl RumblesT6 {
         origin_of: impl Fn(Entity) -> Option<[f32; 3]>,
     ) {
         let mut motors = SILENT;
-        for entry in &mut self.slots {
+        for entry in &mut self.slot_list {
             let Some(slot) = entry else {
                 continue;
             };
@@ -534,41 +570,38 @@ impl RumblesT6 {
             let source_gone = match slot.source {
                 SourceT6::Entity(number, began_as) => {
                     entity_now(number) != began_as
-                        || (slot.looping && !self.loop_flags.contains(&number))
+                        || (slot.repeats && !self.loop_flags.contains(&number))
                 }
                 SourceT6::Position(_) => false,
             };
-            let finished = !slot.looping && elapsed >= slot.rumble.duration_ms;
+            let finished = !slot.repeats && elapsed >= slot.rumble.len_ms;
             if source_gone || finished {
                 *entry = None;
                 continue;
             }
 
-            let into = if slot.looping {
-                elapsed.rem_euclid(slot.rumble.duration_ms.max(1))
+            let into = if slot.repeats {
+                elapsed.rem_euclid(slot.rumble.len_ms.max(1))
             } else {
                 elapsed
             };
-            let scale = if slot.rumble.broadcast {
+            let amount = if slot.rumble.broadcast {
                 let origin = match slot.source {
                     SourceT6::Entity(_, began_as) => began_as.and_then(&origin_of),
                     SourceT6::Position(point) => Some(point),
                 };
-                match origin.zip(ear) {
-                    Some((origin, ear)) => {
-                        broadcast_scale(&slot.rumble, Vec3::from_array(origin).distance(ear))
-                    }
-                    None => 0.0,
-                }
+                origin.zip(ear).map_or(0.0, |(from, listener)| {
+                    broadcast_scale(&slot.rumble, Vec3::from_array(from).distance(listener))
+                })
             } else {
                 1.0
             };
-            if scale <= 0.0 {
+            if amount <= 0.0 {
                 continue;
             }
             let level = slot.rumble.intensity(into);
-            motors.strong_motor = motors.strong_motor.max(level.strong_motor * scale);
-            motors.weak_motor = motors.weak_motor.max(level.weak_motor * scale);
+            motors.strong_motor = motors.strong_motor.max(level.strong_motor * amount);
+            motors.weak_motor = motors.weak_motor.max(level.weak_motor * amount);
         }
         self.motors = motors;
     }
@@ -590,67 +623,69 @@ fn broadcast_scale(rumble: &Rumble, distance: f32) -> f32 {
 /// reused later).
 fn queue_rumble_t6(
     ev: On<net::EntityRumble>,
-    adopted: Option<Res<net::LastAdoptedSnapshot>>,
-    namespace: Option<Res<crate::ambient::SoundBankNamespace>>,
+    adopted: Option<Res<net::NewestTakenSnapshot>>,
+    namespace: Option<Res<crate::map_sound_set::CatalogNameSpace>>,
     mut cues: ResMut<CuesT6>,
 ) {
-    use entity_t6::EntityEventKind as Kind;
+    use entity_t6::EventCode;
 
-    if ev.in_killcam || !crate::shellshock::bank_is_t6(namespace) {
+    if ev.replaying_final_death || !crate::shock_sound::bank_is_t6(namespace) {
         return;
     }
     let event = ev.event;
     let rumble_name = || {
         let index = u8::try_from(event.payload.event_parm).ok()?;
-        let alias = adopted.as_ref()?.sound_alias_name(index)?;
+        let alias = adopted.as_ref()?.sound_cue_name(index)?;
         alias.strip_prefix("rumble:").map(str::to_ascii_lowercase)
     };
     let number = u16::try_from(event.payload.number).ok();
     let entity = (ev.entity != Entity::PLACEHOLDER).then_some(ev.entity);
 
     let cue = match event.event {
-        Kind::STOP_ALL_RUMBLES => Some(CueT6::StopAll),
-        Kind::STOP_RUMBLE => rumble_name()
-            .zip(number)
-            .map(|(name, number)| CueT6::Stop { name, number }),
-        Kind::PLAY_RUMBLE_ON_ENT | Kind::PLAY_RUMBLELOOP_ON_ENT => {
+        EventCode::STOP_ALL_RUMBLES => Some(CueT6::StopAll),
+        EventCode::STOP_RUMBLE => rumble_name().zip(number).map(|(name, number)| CueT6::Stop {
+            name,
+            entity: number,
+        }),
+        EventCode::PLAY_RUMBLE_ON_ENT | EventCode::PLAY_RUMBLELOOP_ON_ENT => {
             rumble_name().zip(number).map(|(name, number)| CueT6::Play {
                 name,
                 source: SourceT6::Entity(number, entity),
-                looping: event.event == Kind::PLAY_RUMBLELOOP_ON_ENT,
+                repeats: event.event == EventCode::PLAY_RUMBLELOOP_ON_ENT,
             })
         }
-        Kind::PLAY_RUMBLE_ON_POS | Kind::PLAY_RUMBLELOOP_ON_POS => {
+        EventCode::PLAY_RUMBLE_ON_POS | EventCode::PLAY_RUMBLELOOP_ON_POS => {
             rumble_name().map(|name| CueT6::Play {
                 name,
                 source: SourceT6::Position(event.payload.origin.map(f32::trunc)),
-                looping: event.event == Kind::PLAY_RUMBLELOOP_ON_POS,
+                repeats: event.event == EventCode::PLAY_RUMBLELOOP_ON_POS,
             })
         }
         _ => None,
     };
-    match cue {
-        Some(cue) => cues.0.push(cue),
-        None => diag::warn!(
+    let Some(cue) = cue else {
+        diag::warn!(
             Audio,
             "audio: rumble event {:#x} on {} names no rumble (parm {}; typed gap)",
             event.event.0,
             event.payload.number,
             event.payload.event_parm
-        ),
-    }
+        );
+        return;
+    };
+    cues.0.push(cue);
 }
 
 /// Loads a named Black Ops II rumble, remembering a failure as `None`.
-fn load_rumble_t6(bank: &SoundCatalog, name: &str) -> Option<Arc<Rumble>> {
-    match Rumble::prepare(bank, AssetNamespace::T6, name) {
+fn load_rumble_t6(bank: &AudioRoster, name: &str) -> Option<Arc<Rumble>> {
+    match Rumble::stage(bank, AssetCategoryScope::T6, name) {
         Ok(rumble) if rumble.broadcast && rumble.range <= 0.0 => {
-            diag::warn!(Audio, "audio: rumble `{name}` is broadcast with no range");
+            diag::warn!(Audio, "sound: rumble `{name}` sent to all, no range set");
             None
         }
         Ok(rumble) => Some(rumble),
         Err(error) => {
-            diag::warn!(Audio, "audio: rumble `{name}`: {error} (typed gap)");
+            diag::warn!(Audio, "sound: rumble `{name}` failed: {error} (typed gap)");
             None
         }
     }
@@ -663,85 +698,101 @@ fn load_rumble_t6(bank: &SoundCatalog, name: &str) -> Option<Arc<Rumble>> {
 /// anywhere in its range. The weapon's own (notetrack) rumbles share the slots.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_t6(
-    (mut requests, mut code, mut code_stops): (
+    (mut weapon_rumbles, mut code, mut code_stops): (
         MessageReader<PlayRumble>,
         MessageReader<CodeRumbleT6>,
         MessageReader<CodeRumbleStopT6>,
     ),
     (mut cues, mut rumbles): (ResMut<CuesT6>, ResMut<RumblesT6>),
-    bank: Option<Res<crate::SoundBank>>,
-    (presented, local, generation, view): (
-        Res<PresentedSnapshot>,
-        Res<LocalPresentClient>,
-        Res<frame::WorldGeneration>,
-        Res<frame::ViewSubject>,
+    bank: Option<Res<crate::AudioCatalogRes>>,
+    (shown, me, revision_no, view): (
+        Res<ShownWorldFrame>,
+        Res<HostViewClient>,
+        Res<frame::LevelGeneration>,
+        Res<frame::EyeSubject>,
     ),
     time: Res<Time>,
-    (slots, runtimes): (Option<Res<net::CEntitySlots>>, Query<&net::CEntityRuntime>),
-    listeners: Query<&Transform, With<crate::playback::AmbientListener>>,
+    (slots, pose_states): (
+        Option<Res<net::EntityTableCells>>,
+        Query<&net::ClientEntityPoseState>,
+    ),
+    ears_q: Query<&Transform, With<crate::play_core::BackgroundHearer>>,
     mut loaded: Local<(u64, HashMap<String, Option<Arc<Rumble>>>)>,
 ) {
-    let now = now_ms(&time);
-    let owner = bank
+    let now = clock_millis(&time);
+    let owner_id = bank
         .as_ref()
-        .map(|bank| (*generation, local.0, bank.0.revision()));
-    if owner != rumbles.owner || now < rumbles.last_time {
-        rumbles.clear();
+        .map(|bank| (*revision_no, me.0, bank.0.revision()));
+    if owner_id != rumbles.source_ent || now < rumbles.previous_stamp {
+        rumbles.drop_all();
         rumbles.loop_flags.clear();
-        rumbles.owner = owner;
+        rumbles.source_ent = owner_id;
     }
-    rumbles.last_time = now;
+    rumbles.previous_stamp = now;
 
-    let own = u16::try_from(local.0.0).ok();
-    let own_view = matches!(*view, frame::ViewSubject::Own { client } if client == local.0.0)
-        && presented
-            .player(local.0)
-            .is_some_and(|state| state.pm_type != playerstate_t6::game::PM_TYPE_SPECTATOR);
+    let own = u16::try_from(me.0.0).ok();
+    let own_view = matches!(*view, frame::EyeSubject::Own { client } if client == me.0.0)
+        && shown
+            .player(me.0)
+            .is_some_and(|state| state.movement_mode != playerstate_t6::game::MOVE_MODE_OBSERVER);
     let Some(bank) = bank.filter(|_| own_view) else {
-        requests.clear();
+        weapon_rumbles.clear();
         code.clear();
         code_stops.clear();
         cues.0.clear();
-        rumbles.clear();
+        rumbles.drop_all();
         return;
     };
     if loaded.0 != bank.0.revision() {
         *loaded = (bank.0.revision(), HashMap::new());
     }
 
-    let entity_now = |number: u16| slots.as_ref().and_then(|slots| slots.entity_for_number(number));
+    let entity_now = |number: u16| {
+        slots
+            .as_ref()
+            .and_then(|slots| slots.object_at_index(number))
+    };
 
     // The weapon's own rumbles go on the viewer.
     if let Some(own) = own {
         let own_entity = entity_now(own);
-        for request in requests.read() {
-            if request.bank_revision == bank.0.revision() {
+        for request in weapon_rumbles.read() {
+            if request.catalog_edition == bank.0.revision() {
                 let rumble = Arc::clone(&request.rumble);
-                rumbles.play(rumble, SourceT6::Entity(own, own_entity), false, now, Some(own));
+                rumbles.play(
+                    rumble,
+                    SourceT6::Entity(own, own_entity),
+                    false,
+                    now,
+                    Some(own),
+                );
             }
         }
     } else {
-        requests.clear();
+        weapon_rumbles.clear();
     }
     for request in code.read() {
         cues.0.push(CueT6::Play {
             name: request.name.to_owned(),
             source: SourceT6::Entity(request.number, entity_now(request.number)),
-            looping: false,
+            repeats: false,
         });
     }
 
     for cue in std::mem::take(&mut cues.0) {
         match cue {
-            CueT6::StopAll => rumbles.clear(),
-            CueT6::Stop { name, number } => {
+            CueT6::StopAll => rumbles.drop_all(),
+            CueT6::Stop {
+                name,
+                entity: number,
+            } => {
                 rumbles.loop_flags.remove(&number);
                 rumbles.stop(&name, number);
             }
             CueT6::Play {
                 name,
                 source,
-                looping,
+                repeats: looping,
             } => {
                 // The entity's looping flag is set whether or not this client feels it.
                 if let Some(number) = source.number().filter(|_| looping) {
@@ -767,9 +818,9 @@ fn update_t6(
         rumbles.stop(stop.name, stop.number);
     }
 
-    let ear = listeners.iter().next().map(|at| at.translation);
-    rumbles.tick(now, ear, entity_now, |entity| {
-        runtimes.get(entity).ok().map(|runtime| runtime.origin)
+    let ear = ears_q.iter().next().map(|at| at.translation);
+    rumbles.beat(now, ear, entity_now, |entity| {
+        pose_states.get(entity).ok().map(|runtime| runtime.origin)
     });
 }
 
@@ -780,7 +831,7 @@ mod tests {
     fn rumble(name: &str, ms: i32, broadcast: bool, range: f32, fade: bool) -> Arc<Rumble> {
         Arc::new(Rumble {
             name: name.to_owned(),
-            duration_ms: ms,
+            len_ms: ms,
             low: vec![(0.0, 1.0), (1.0, 1.0)],
             high: vec![(0.0, 0.5), (1.0, 0.5)],
             range,
@@ -789,18 +840,23 @@ mod tests {
         })
     }
 
-    fn entity(raw: u32) -> Option<Entity> {
+    fn ent(raw: u32) -> Option<Entity> {
         Some(Entity::from_raw_u32(raw).unwrap())
     }
 
     /// Ticks with entity 3 present (as entity 7) and everything at the origin.
     fn tick_at(slots: &mut RumblesT6, now: i32, ear: Vec3) {
-        let seven = entity(7).unwrap();
-        slots.tick(now, Some(ear), |n| (n == 3).then_some(seven), |_| Some([0.0; 3]));
+        let seven = ent(7).unwrap();
+        slots.beat(
+            now,
+            Some(ear),
+            |n| (n == 3).then_some(seven),
+            |_| Some([0.0; 3]),
+        );
     }
 
     fn occupied(slots: &RumblesT6) -> usize {
-        slots.slots.iter().flatten().count()
+        slots.slot_list.iter().flatten().count()
     }
 
     #[test]
@@ -825,8 +881,20 @@ mod tests {
     #[test]
     fn a_rumble_ends_and_a_loop_starts_over() {
         let mut slots = RumblesT6::default();
-        slots.play(rumble("once", 500, false, 0.0, false), SourceT6::Entity(3, entity(7)), false, 0, Some(3));
-        slots.play(rumble("loop", 500, true, 1000.0, false), SourceT6::Position([0.0; 3]), true, 0, Some(3));
+        slots.play(
+            rumble("once", 500, false, 0.0, false),
+            SourceT6::Entity(3, ent(7)),
+            false,
+            0,
+            Some(3),
+        );
+        slots.play(
+            rumble("loop", 500, true, 1000.0, false),
+            SourceT6::Position([0.0; 3]),
+            true,
+            0,
+            Some(3),
+        );
         tick_at(&mut slots, 499, Vec3::ZERO);
         assert_eq!(occupied(&slots), 2);
         tick_at(&mut slots, 500, Vec3::ZERO);
@@ -844,7 +912,13 @@ mod tests {
         let mut slots = RumblesT6::default();
         slots.loop_flags.insert(3);
         for name in ["a", "b"] {
-            slots.play(rumble(name, 500, true, 1000.0, false), SourceT6::Entity(3, entity(7)), true, 0, Some(1));
+            slots.play(
+                rumble(name, 500, true, 1000.0, false),
+                SourceT6::Entity(3, ent(7)),
+                true,
+                0,
+                Some(1),
+            );
         }
         tick_at(&mut slots, 2000, Vec3::ZERO);
         assert_eq!(occupied(&slots), 2);
@@ -859,7 +933,13 @@ mod tests {
     #[test]
     fn a_rumble_on_an_entity_that_is_gone_stops() {
         let mut slots = RumblesT6::default();
-        slots.play(rumble("a", 500, true, 1000.0, false), SourceT6::Entity(3, entity(9)), false, 0, Some(1));
+        slots.play(
+            rumble("a", 500, true, 1000.0, false),
+            SourceT6::Entity(3, ent(9)),
+            false,
+            0,
+            Some(1),
+        );
         tick_at(&mut slots, 10, Vec3::ZERO);
         assert_eq!(occupied(&slots), 0);
     }
@@ -869,7 +949,7 @@ mod tests {
         let mut slots = RumblesT6::default();
         for index in 0..RUMBLE_SLOTS_T6 {
             let source = if index == 0 {
-                SourceT6::Entity(3, entity(7))
+                SourceT6::Entity(3, ent(7))
             } else {
                 SourceT6::Position([index as f32, 0.0, 0.0])
             };
@@ -885,10 +965,14 @@ mod tests {
         // Slot 0 (the viewer's, shortest) and slot 1 (a loop) are passed over; slot 2 goes.
         let fresh = || rumble("new", 1000, true, 100.0, false);
         slots.play(fresh(), SourceT6::Position([0.0; 3]), false, 5, Some(3));
-        assert_eq!(slots.slots[2].as_ref().unwrap().rumble.name, "new");
+        assert_eq!(slots.slot_list[2].as_ref().unwrap().rumble.name, "new");
         // The same rumble from the same spot in the same frame is not started twice.
         slots.play(fresh(), SourceT6::Position([0.0; 3]), false, 5, Some(3));
-        let copies = slots.slots.iter().flatten().filter(|s| s.rumble.name == "new");
+        let copies = slots
+            .slot_list
+            .iter()
+            .flatten()
+            .filter(|s| s.rumble.name == "new");
         assert_eq!(copies.count(), 1);
     }
 }

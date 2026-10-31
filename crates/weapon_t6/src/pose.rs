@@ -5,10 +5,10 @@
 
 use crate::pm::spread::{rd_f32, rd_i32};
 use crate::state;
-use fastfile_t6::layout::WeaponDef as D;
+use fastfile_t6::layout::WeaponDef;
 
 /// The pose numbers from the weapon file (the stand and strafe turn include the attachments'
-/// overrides, folded in by `SpreadFacts::apply_attachments`).
+/// overrides, folded in by `SpreadFacts::fold_in_addons`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PoseFacts {
     pub stand_move: [f32; 3],
@@ -21,7 +21,7 @@ pub struct PoseFacts {
     pub prone_rot: [f32; 3],
     pub ducked_ofs: [f32; 3],
     pub prone_ofs: [f32; 3],
-    pub ads_aim_pitch: f32,
+    pub aimed_pitch: f32,
     pub stand_min_speed: f32,
     pub ducked_min_speed: f32,
     pub prone_min_speed: f32,
@@ -51,37 +51,37 @@ fn vec3(def: &[u8], at: usize) -> [f32; 3] {
 impl PoseFacts {
     pub fn read(def: &[u8]) -> Self {
         Self {
-            stand_move: vec3(def, D::vStandMove),
-            stand_rot: vec3(def, D::vStandRot),
-            strafe_move: vec3(def, D::vStrafeMove),
-            strafe_rot: vec3(def, D::vStrafeRot),
-            ducked_move: vec3(def, D::vDuckedMove),
-            ducked_rot: vec3(def, D::vDuckedRot),
-            prone_move: vec3(def, D::vProneMove),
-            prone_rot: vec3(def, D::vProneRot),
-            ducked_ofs: vec3(def, D::vDuckedOfs),
-            prone_ofs: vec3(def, D::vProneOfs),
-            ads_aim_pitch: rd_f32(def, D::fAdsAimPitch),
-            stand_min_speed: rd_f32(def, D::fStandMoveMinSpeed),
-            ducked_min_speed: rd_f32(def, D::fDuckedMoveMinSpeed),
-            prone_min_speed: rd_f32(def, D::fProneMoveMinSpeed),
-            pos_move_rate: rd_f32(def, D::fPosMoveRate),
-            pos_prone_move_rate: rd_f32(def, D::fPosProneMoveRate),
-            pos_rot_rate: rd_f32(def, D::fPosRotRate),
-            pos_prone_rot_rate: rd_f32(def, D::fPosProneRotRate),
-            sprint_ofs: vec3(def, D::vSprintOfs),
-            sprint_rot: vec3(def, D::vSprintRot),
-            dtp_ofs: vec3(def, D::vDtpOfs),
-            dtp_rot: vec3(def, D::vDtpRot),
-            slide_ofs: vec3(def, D::vSlideOfs),
-            slide_rot: vec3(def, D::vSlideRot),
-            mantle_ofs: vec3(def, D::vMantleOfs),
-            mantle_rot: vec3(def, D::vMantleRot),
-            sprint_in_ms: rd_i32(def, D::sprintInTime),
-            sprint_out_ms: rd_i32(def, D::sprintOutTime),
-            dtp_in_ms: rd_i32(def, D::dtpInTime),
-            dtp_out_ms: rd_i32(def, D::dtpOutTime),
-            slide_in_ms: rd_i32(def, D::slideInTime),
+            stand_move: vec3(def, WeaponDef::vStandMove),
+            stand_rot: vec3(def, WeaponDef::vStandRot),
+            strafe_move: vec3(def, WeaponDef::vStrafeMove),
+            strafe_rot: vec3(def, WeaponDef::vStrafeRot),
+            ducked_move: vec3(def, WeaponDef::vDuckedMove),
+            ducked_rot: vec3(def, WeaponDef::vDuckedRot),
+            prone_move: vec3(def, WeaponDef::vProneMove),
+            prone_rot: vec3(def, WeaponDef::vProneRot),
+            ducked_ofs: vec3(def, WeaponDef::vDuckedOfs),
+            prone_ofs: vec3(def, WeaponDef::vProneOfs),
+            aimed_pitch: rd_f32(def, WeaponDef::fAdsAimPitch),
+            stand_min_speed: rd_f32(def, WeaponDef::fStandMoveMinSpeed),
+            ducked_min_speed: rd_f32(def, WeaponDef::fDuckedMoveMinSpeed),
+            prone_min_speed: rd_f32(def, WeaponDef::fProneMoveMinSpeed),
+            pos_move_rate: rd_f32(def, WeaponDef::fPosMoveRate),
+            pos_prone_move_rate: rd_f32(def, WeaponDef::fPosProneMoveRate),
+            pos_rot_rate: rd_f32(def, WeaponDef::fPosRotRate),
+            pos_prone_rot_rate: rd_f32(def, WeaponDef::fPosProneRotRate),
+            sprint_ofs: vec3(def, WeaponDef::vSprintOfs),
+            sprint_rot: vec3(def, WeaponDef::vSprintRot),
+            dtp_ofs: vec3(def, WeaponDef::vDtpOfs),
+            dtp_rot: vec3(def, WeaponDef::vDtpRot),
+            slide_ofs: vec3(def, WeaponDef::vSlideOfs),
+            slide_rot: vec3(def, WeaponDef::vSlideRot),
+            mantle_ofs: vec3(def, WeaponDef::vMantleOfs),
+            mantle_rot: vec3(def, WeaponDef::vMantleRot),
+            sprint_in_ms: rd_i32(def, WeaponDef::sprintInTime),
+            sprint_out_ms: rd_i32(def, WeaponDef::sprintOutTime),
+            dtp_in_ms: rd_i32(def, WeaponDef::dtpInTime),
+            dtp_out_ms: rd_i32(def, WeaponDef::dtpOutTime),
+            slide_in_ms: rd_i32(def, WeaponDef::slideInTime),
         }
     }
 }
@@ -97,18 +97,18 @@ pub struct PoseInput {
     pub diving: bool,
     pub on_ladder: bool,
     /// The right hand's and the left hand's weapon state, and the right hand's timer (ms).
-    pub weaponstate: i32,
+    pub gun_phase: i32,
     pub weaponstate_left: i32,
-    pub weapon_time: i32,
+    pub gun_timer_ms: i32,
     /// How far the aim is in (`fWeaponPosFrac`).
     pub frac: f32,
-    pub xyspeed: f32,
+    pub ground_velocity: f32,
     /// The player's top speed (`ps.speed`).
     pub speed: f32,
     pub velocity: [f32; 3],
-    pub viewangles: [f32; 3],
+    pub look_angles: [f32; 3],
     /// Seconds this frame.
-    pub frametime: f32,
+    pub step_millis_elapsed: f32,
     /// The player or the gun has the fast sprint recovery perk (57).
     pub fast_sprint_recovery: bool,
     /// `perk_sprintRecoveryMultiplier` (0.3).
@@ -126,18 +126,18 @@ pub struct BasePose {
 
 impl BasePose {
     /// One frame: build this frame's target, then ease toward it.
-    pub fn step(&mut self, f: &PoseFacts, aim_down_sight: bool, i: &PoseInput) {
-        let (origin, angles) = target(f, aim_down_sight, i);
+    pub fn step(&mut self, f: &PoseFacts, scoped_aiming: bool, i: &PoseInput) {
+        let (shift, turn) = target(f, scoped_aiming, i);
         let (move_rate, rot_rate) = if i.prone {
             (f.pos_prone_move_rate, f.pos_prone_rot_rate)
         } else {
             (f.pos_move_rate, f.pos_rot_rate)
         };
-        let o = (move_rate * i.frametime).min(1.0);
-        let a = (rot_rate * i.frametime).min(1.0);
+        let o = (move_rate * i.step_millis_elapsed).min(1.0);
+        let a = (rot_rate * i.step_millis_elapsed).min(1.0);
         for k in 0..3 {
-            self.origin[k] += (origin[k] - self.origin[k]) * o;
-            self.angles[k] += (angles[k] - self.angles[k]) * a;
+            self.origin[k] += (shift[k] - self.origin[k]) * o;
+            self.angles[k] += (turn[k] - self.angles[k]) * a;
         }
     }
 }
@@ -149,47 +149,47 @@ fn add(v: &mut [f32; 3], d: [f32; 3], k: f32) {
 }
 
 /// This frame's pose before easing (origin, angles).
-pub fn target(f: &PoseFacts, aim_down_sight: bool, i: &PoseInput) -> ([f32; 3], [f32; 3]) {
-    let mut origin = [0.0; 3];
-    let mut angles = [0.0; 3];
-    let min_speed = if i.prone {
+pub fn target(f: &PoseFacts, scoped_aiming: bool, i: &PoseInput) -> ([f32; 3], [f32; 3]) {
+    let mut ofs = [0.0; 3];
+    let mut rot = [0.0; 3];
+    let slowest_pace = if i.prone {
         f.prone_min_speed
     } else if i.ducked {
         f.ducked_min_speed
     } else {
         f.stand_min_speed
     };
-    let moving = i.xyspeed > min_speed && i.speed > min_speed;
-    let reloading = i.weaponstate == state::RELOADING || i.weaponstate_left == state::RELOADING;
+    let moving = i.ground_velocity > slowest_pace && i.speed > slowest_pace;
+    let reloading = i.gun_phase == state::RELOADING || i.weaponstate_left == state::RELOADING;
     if i.prone || i.ducked {
-        stance(f, aim_down_sight, i, &mut origin, &mut angles);
+        stance(f, scoped_aiming, i, &mut ofs, &mut rot);
     }
     if moving && !i.on_ladder && !reloading {
-        movement(f, i, min_speed, &mut origin, &mut angles);
+        movement(f, i, slowest_pace, &mut ofs, &mut rot);
     }
-    weapon_state(f, i, &mut origin, &mut angles);
-    (origin, angles)
+    weapon_state(f, i, &mut ofs, &mut rot);
+    (ofs, rot)
 }
 
 /// The crouched or prone offset (none mid-melee) and, for a gun with sights, its aim pitch.
 fn stance(
     f: &PoseFacts,
-    aim_down_sight: bool,
+    scoped_aiming: bool,
     i: &PoseInput,
-    origin: &mut [f32; 3],
-    angles: &mut [f32; 3],
+    shift: &mut [f32; 3],
+    turn: &mut [f32; 3],
 ) {
     let meleeing = matches!(
-        i.weaponstate,
+        i.gun_phase,
         state::MELEE_INIT | state::MELEE_FIRE | state::MELEE_END
     );
     if i.ducked && !meleeing {
-        add(origin, f.ducked_ofs, 1.0);
+        add(shift, f.ducked_ofs, 1.0);
     } else if i.prone && !meleeing {
-        add(origin, f.prone_ofs, 1.0);
+        add(shift, f.prone_ofs, 1.0);
     }
-    if aim_down_sight {
-        angles[0] += f.ads_aim_pitch * i.frac;
+    if scoped_aiming {
+        turn[0] += f.aimed_pitch * i.frac;
     }
 }
 
@@ -197,45 +197,45 @@ fn stance(
 fn movement(
     f: &PoseFacts,
     i: &PoseInput,
-    min_speed: f32,
-    origin: &mut [f32; 3],
-    angles: &mut [f32; 3],
+    slowest_pace: f32,
+    shift: &mut [f32; 3],
+    turn: &mut [f32; 3],
 ) {
-    let (mv, rot) = if i.prone && !i.diving {
+    let (mv, turn_matrix) = if i.prone && !i.diving {
         (f.prone_move, f.prone_rot)
     } else if i.ducked {
         (f.ducked_move, f.ducked_rot)
     } else {
         (f.stand_move, f.stand_rot)
     };
-    let speed_frac = ((i.xyspeed - min_speed) / (i.speed - min_speed)).min(1.0);
+    let pace_frac = ((i.ground_velocity - slowest_pace) / (i.speed - slowest_pace)).min(1.0);
     let angle_weight = 1.0 - i.frac;
-    add(origin, mv, speed_frac);
-    add(angles, rot, angle_weight * speed_frac);
-    let right = view_right(i.viewangles);
-    let strafe = (i.velocity[0] * right[0] + i.velocity[1] * right[1]) * speed_frac / i.xyspeed;
-    add(origin, f.strafe_move, strafe);
-    add(angles, f.strafe_rot, strafe * angle_weight);
+    add(shift, mv, pace_frac);
+    add(turn, turn_matrix, angle_weight * pace_frac);
+    let right = eye_right(i.look_angles);
+    let strafe = (i.velocity[0] * right[0] + i.velocity[1] * right[1]) * pace_frac / i.ground_velocity;
+    add(shift, f.strafe_move, strafe);
+    add(turn, f.strafe_rot, strafe * angle_weight);
 }
 
 /// AngleVectors' right vector.
-fn view_right(a: [f32; 3]) -> [f32; 3] {
-    let (sp, cp) = a[0].to_radians().sin_cos();
+fn eye_right(a: [f32; 3]) -> [f32; 3] {
+    let (sp, codepoint) = a[0].to_radians().sin_cos();
     let (sy, cy) = a[1].to_radians().sin_cos();
     let (sr, cr) = a[2].to_radians().sin_cos();
-    [-sr * sp * cy + cr * sy, -sr * sp * sy - cr * cy, -sr * cp]
+    [-sr * sp * cy + cr * sy, -(sr * sp * sy + cr * cy), -sr * codepoint]
 }
 
 /// The sprint, dive and slide offsets by the weapon state, else the climb's. (BO2 first gives a
 /// rider with the gun out the ride offset; an MP ride here hides the gun, so that branch is not
 /// needed.)
-fn weapon_state(f: &PoseFacts, i: &PoseInput, origin: &mut [f32; 3], angles: &mut [f32; 3]) {
-    let (k, ofs, rot) = match i.weaponstate {
+fn weapon_state(f: &PoseFacts, i: &PoseInput, shift: &mut [f32; 3], turn: &mut [f32; 3]) {
+    let (k, ofs, turn_matrix) = match i.gun_phase {
         state::SPRINT_RAISE..=state::SPRINT_DROP => (sprint_lerp(f, i), f.sprint_ofs, f.sprint_rot),
         state::DTP_IN..=state::DTP_OUT => (dtp_lerp(f, i), f.dtp_ofs, f.dtp_rot),
         state::SLIDE_IN => {
             let k = if f.slide_in_ms != 0 {
-                1.0 - i.weapon_time as f32 / f.slide_in_ms as f32
+                1.0 - i.gun_timer_ms as f32 / f.slide_in_ms as f32
             } else {
                 1.0
             };
@@ -249,23 +249,23 @@ fn weapon_state(f: &PoseFacts, i: &PoseInput, origin: &mut [f32; 3], angles: &mu
     if k <= 0.0 {
         return;
     }
-    add(origin, ofs, k);
-    add(angles, rot, k);
+    add(shift, ofs, k);
+    add(turn, turn_matrix, k);
 }
 
 /// GetSprintLerp: in from the start of the raise, out over the drop; the fast recovery perk
 /// cuts the drop's share.
 fn sprint_lerp(f: &PoseFacts, i: &PoseInput) -> f32 {
-    let t = i.weapon_time as f32;
-    let k = if i.weaponstate == state::SPRINT_DROP && f.sprint_out_ms != 0 {
+    let t = i.gun_timer_ms as f32;
+    let k = if i.gun_phase == state::SPRINT_DROP && f.sprint_out_ms != 0 {
         t / f.sprint_out_ms as f32
-    } else if i.weaponstate == state::SPRINT_RAISE && f.sprint_in_ms != 0 {
+    } else if i.gun_phase == state::SPRINT_RAISE && f.sprint_in_ms != 0 {
         1.0 - t / f.sprint_in_ms as f32
     } else {
         1.0
     };
     if i.fast_sprint_recovery
-        && i.weaponstate == state::SPRINT_DROP
+        && i.gun_phase == state::SPRINT_DROP
         && i.sprint_recovery_multiplier != 0.0
     {
         k * i.sprint_recovery_multiplier
@@ -276,10 +276,10 @@ fn sprint_lerp(f: &PoseFacts, i: &PoseInput) -> f32 {
 
 /// GetDTPLerp: in over the dive's start, out over its end.
 fn dtp_lerp(f: &PoseFacts, i: &PoseInput) -> f32 {
-    let t = i.weapon_time as f32;
-    if i.weaponstate == state::DTP_OUT && f.dtp_out_ms != 0 {
+    let t = i.gun_timer_ms as f32;
+    if i.gun_phase == state::DTP_OUT && f.dtp_out_ms != 0 {
         t / f.dtp_out_ms as f32
-    } else if i.weaponstate == state::DTP_IN && f.dtp_in_ms != 0 {
+    } else if i.gun_phase == state::DTP_IN && f.dtp_in_ms != 0 {
         1.0 - t / f.dtp_in_ms as f32
     } else {
         1.0
@@ -300,7 +300,7 @@ mod tests {
             prone_move: [3.0, 0.0, 0.0],
             ducked_ofs: [0.0, 0.0, -1.0],
             prone_ofs: [0.0, 0.0, -2.0],
-            ads_aim_pitch: 5.0,
+            aimed_pitch: 5.0,
             stand_min_speed: 10.0,
             ducked_min_speed: 10.0,
             prone_min_speed: 10.0,
@@ -326,7 +326,7 @@ mod tests {
         PoseInput {
             speed: 190.0,
             sprint_recovery_multiplier: 0.3,
-            frametime: 0.05,
+            step_millis_elapsed: 0.05,
             ..PoseInput::default()
         }
     }
@@ -335,14 +335,14 @@ mod tests {
     fn the_sprint_offset_eases_in_over_the_raise_and_is_full_in_the_loop() {
         let f = facts();
         let half = PoseInput {
-            weaponstate: state::SPRINT_RAISE,
-            weapon_time: 100,
+            gun_phase: state::SPRINT_RAISE,
+            gun_timer_ms: 100,
             ..still()
         };
         assert_eq!(target(&f, true, &half).0, [-0.5, 0.0, -1.5]);
         let full = PoseInput {
-            weaponstate: state::SPRINT_LOOP,
-            weapon_time: 0,
+            gun_phase: state::SPRINT_LOOP,
+            gun_timer_ms: Default::default(),
             ..still()
         };
         assert_eq!(target(&f, true, &full).1, [10.0, 20.0, 0.0]);
@@ -352,8 +352,8 @@ mod tests {
     fn the_sprint_drop_runs_out_with_the_timer_and_the_recovery_perk_cuts_it() {
         let f = facts();
         let drop = PoseInput {
-            weaponstate: state::SPRINT_DROP,
-            weapon_time: 100,
+            gun_phase: state::SPRINT_DROP,
+            gun_timer_ms: 100,
             ..still()
         };
         assert_eq!(target(&f, true, &drop).0, [-0.25, 0.0, -0.75]);
@@ -369,20 +369,20 @@ mod tests {
     fn a_dive_and_a_slide_carry_their_own_offsets() {
         let f = facts();
         let dive = PoseInput {
-            weaponstate: state::DTP_IN,
-            weapon_time: 50,
+            gun_phase: state::DTP_IN,
+            gun_timer_ms: 50,
             ..still()
         };
         assert_eq!(target(&f, true, &dive).0, [0.0, 0.0, -2.0]);
         let dive_out = PoseInput {
-            weaponstate: state::DTP_OUT,
-            weapon_time: 150,
+            gun_phase: state::DTP_OUT,
+            gun_timer_ms: 150,
             ..still()
         };
         assert_eq!(target(&f, true, &dive_out).0, [0.0, 0.0, -2.0]);
         let slide = PoseInput {
-            weaponstate: state::SLIDE_IN,
-            weapon_time: 125,
+            gun_phase: state::SLIDE_IN,
+            gun_timer_ms: 125,
             ..still()
         };
         assert_eq!(target(&f, true, &slide).0, [0.0, 1.0, 0.0]);
@@ -412,7 +412,7 @@ mod tests {
             ([0.0, 0.0, -1.0], [5.0, 0.0, 0.0])
         );
         let melee = PoseInput {
-            weaponstate: state::MELEE_FIRE,
+            gun_phase: state::MELEE_FIRE,
             ..crouch
         };
         assert_eq!(target(&f, true, &melee), ([0.0; 3], [5.0, 0.0, 0.0]));
@@ -433,7 +433,7 @@ mod tests {
         let f = facts();
         // Straight ahead at yaw 0 (right is -y): half speed, no sideways lean.
         let walk = PoseInput {
-            xyspeed: 100.0,
+            ground_velocity: 100.0,
             velocity: [100.0, 0.0, 0.0],
             ..still()
         };
@@ -442,8 +442,8 @@ mod tests {
         assert!((a[1] - 1.0).abs() < 1e-6, "{a:?}");
         // Stepping right at full speed leans the gun all the way.
         let right = PoseInput {
-            xyspeed: 190.0,
-            velocity: [0.0, -190.0, 0.0],
+            ground_velocity: 190.0,
+            velocity: [0f32, -190.0, 0.0],
             ..still()
         };
         let (o, a) = target(&f, true, &right);
@@ -471,7 +471,7 @@ mod tests {
         let f = facts();
         let crawl = PoseInput {
             prone: true,
-            xyspeed: 190.0,
+            ground_velocity: 190.0,
             velocity: [190.0, 0.0, 0.0],
             ..still()
         };
@@ -487,7 +487,7 @@ mod tests {
     fn the_pose_eases_by_the_guns_rates_and_prone_has_its_own() {
         let f = facts();
         let loop_ = PoseInput {
-            weaponstate: state::SPRINT_LOOP,
+            gun_phase: state::SPRINT_LOOP,
             ..still()
         };
         let mut p = BasePose::default();

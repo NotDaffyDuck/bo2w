@@ -13,10 +13,10 @@
 use super::Pm;
 use crate::env::{ef, ef2, pmf};
 use crate::events::{AnimScript, EV_DEPLOY_RIOTSHIELD, EV_LOWER_RIOTSHIELD, EV_PREP_RIOTSHIELD};
-use crate::facts::weap_type;
+use crate::facts::gun_family_code;
 use crate::player::wf;
-use crate::{anim, base, state};
-use fastfile_t6::layout::{WeaponDef as D, WeaponVariantDef as V};
+use {crate::anim, crate::base, crate::state};
+use fastfile_t6::layout::{WeaponDef, WeaponVariantDef};
 
 /// weapFlags bits that block raising a shield.
 const WF_NO_SHIELD: u64 = wf::DISABLE_SWITCH_TO_NONE | wf::GATE_100;
@@ -50,23 +50,23 @@ fn rd_i32(b: &[u8], at: usize) -> i32 {
 impl ShieldFacts {
     pub fn read(variant: &[u8], def: &[u8]) -> Self {
         Self {
-            hold_fire_time: rd_i32(def, D::iHoldFireTime),
-            fire_time: rd_i32(def, D::iFireTime),
-            fire_delay: rd_i32(def, D::iFireDelay),
-            reload_time: rd_i32(variant, V::iReloadTime),
-            mountable: def.get(D::mountableWeapon).is_some_and(|&b| b != 0),
-            deploy_time: rd_i32(def, D::deployTime),
-            breakdown_time: rd_i32(def, D::breakdownTime),
+            hold_fire_time: rd_i32(def, WeaponDef::iHoldFireTime),
+            fire_time: rd_i32(def, WeaponDef::iFireTime),
+            fire_delay: rd_i32(def, WeaponDef::iFireDelay),
+            reload_time: rd_i32(variant, WeaponVariantDef::iReloadTime),
+            mountable: def.get(WeaponDef::mountableWeapon).is_some_and(|&b| b != 0),
+            deploy_time: rd_i32(def, WeaponDef::deployTime),
+            breakdown_time: rd_i32(def, WeaponDef::breakdownTime),
         }
     }
 }
 
 // Inputs from window 1's shared files, in one place so a rename there is one line here.
 fn held_now(pm: &Pm) -> bool {
-    pm.cmd.buttons & crate::cmd::button::ATTACK != 0
+    pm.cmd.buttons & crate::cmd::button::FIRE_BIT != 0
 }
 fn held_before(pm: &Pm) -> bool {
-    pm.cmd.old_buttons & crate::cmd::button::ATTACK != 0
+    pm.cmd.last_tick_buttons & crate::cmd::button::FIRE_BIT != 0
 }
 fn can_place(pm: &Pm) -> bool {
     !pm.env.riotshield_blocked
@@ -78,7 +78,7 @@ fn weapon_parm(pm: &Pm) -> u32 {
 }
 
 fn is_shield(pm: &Pm) -> bool {
-    pm.ps.weapon != 0 && pm.weapon_facts().core.weap_type == weap_type::RIOTSHIELD
+    pm.ps.weapon != 0 && pm.weapon_facts().core.gun_family_code == gun_family_code::RIOTSHIELD
 }
 
 /// BG_SetRiotshieldModel: the held shield's red "can't place" model on or off. In zombies it
@@ -100,8 +100,8 @@ fn set_model(pm: &mut Pm, red: bool) {
 
 /// UpdateRiotShieldSwitchingFlag: the shield-switch flag only lives through a switch.
 pub fn update_switching_flag(pm: &mut Pm) {
-    if !(state::RAISING..=state::DROPPING_ALTSWITCH).contains(&pm.ps.weaponstate) {
-        pm.ps.weap_flags &= !wf::RIOTSHIELD_SWITCH;
+    if !(state::RAISING..=state::DROPPING_ALTSWITCH).contains(&pm.ps.gun_phase) {
+        pm.ps.weapon_state_bits &= !wf::RIOTSHIELD_SWITCH;
     }
 }
 
@@ -116,7 +116,7 @@ pub fn check_for_deploy(pm: &mut Pm) {
     if !pm.weapon_facts().shield.mountable {
         return;
     }
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     let busy = (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&s)
         || (state::RAISING..=state::DROPPING_ALTSWITCH).contains(&s)
         || (state::DTP_IN..=state::DTP_OUT).contains(&s)
@@ -125,18 +125,18 @@ pub fn check_for_deploy(pm: &mut Pm) {
         return;
     }
     let reloading = (state::RELOADING..=state::RELOAD_QUICK_EMPTY).contains(&s);
-    if pm.ps.weap_flags & wf::DEPLOY_REQUEST == 0
+    if pm.ps.weapon_state_bits & wf::DEPLOY_REQUEST == 0
         || reloading
         || pm.ps.ammo_in_clip(pm.facts, pm.ps.weapon) < 1
     {
-        if pm.ps.weap_flags & wf::MOUNTED != 0 {
-            pm.ps.weap_flags &= !wf::MOUNTED;
+        if pm.ps.weapon_state_bits & wf::MOUNTED != 0 {
+            pm.ps.weapon_state_bits &= !wf::MOUNTED;
             deploy_state(pm, state::BREAKING_DOWN);
         }
         return;
     }
-    pm.ps.weap_flags &= !wf::DEPLOY_REQUEST;
-    if pm.env.on_ground && pm.env.velocity_z >= 0.0 {
+    pm.ps.weapon_state_bits &= !wf::DEPLOY_REQUEST;
+    if pm.env.grounded_now && pm.env.velocity_z >= 0.0 {
         deploy_state(pm, state::DEPLOYING);
     }
 }
@@ -149,9 +149,9 @@ fn deploy_state(pm: &mut Pm, to: i32) {
     } else {
         (f.breakdown_time, anim::BREAKING_DOWN)
     };
-    pm.ps.weaponstate = to;
-    pm.ps.weapon_time = time;
-    pm.ps.weapon_delay = 0;
+    pm.ps.gun_phase = to;
+    pm.ps.gun_timer_ms = time;
+    pm.ps.weapon_ready_wait = 0;
     base::start_anim(pm, a, false);
 }
 
@@ -161,7 +161,7 @@ fn holding_grenade(pm: &Pm) -> bool {
         return false;
     }
     let core = pm.weapon_facts().core;
-    (core.weap_type == weap_type::GRENADE || core.weap_type == weap_type::MINE)
+    (core.gun_family_code == gun_family_code::GRENADE || core.gun_family_code == gun_family_code::MINE)
         && !core.hold_button_to_throw
         && pm.cmd.buttons & super::fire::fire_button(pm, false) != 0
 }
@@ -170,16 +170,16 @@ fn holding_grenade(pm: &Pm) -> bool {
 pub fn check_for_deploy_riotshield(pm: &mut Pm) {
     if !is_shield(pm)
         || pm.env.waterlevel >= UNDERWATER
-        || pm.env.e_flags & EF_DEPLOYED != 0
-        || pm.ps.weap_flags & WF_NO_SHIELD != 0
+        || pm.env.ent_bits & EF_DEPLOYED != 0
+        || pm.ps.weapon_state_bits & WF_NO_SHIELD != 0
         || pm.env.using_vehicle_weapon
-        || pm.env.e_flags & ef::GATE_4000 != 0
-        || pm.env.pm_flags & pmf::SPRINT != 0
+        || pm.env.ent_bits & ef::GATE_4000 != 0
+        || pm.env.movement_state_bits & pmf::SPRINT != 0
         || holding_grenade(pm)
     {
         return;
     }
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     // RIOTSHIELD_END (34) is allowed: a fresh press while lowering raises it again.
     let busy = (state::DROPPING..=state::DROPPING_ALTSWITCH).contains(&s)
         || (state::RIOTSHIELD_PREPARE..state::RIOTSHIELD_END).contains(&s)
@@ -188,7 +188,7 @@ pub fn check_for_deploy_riotshield(pm: &mut Pm) {
         || (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&s);
     if busy
         || pm.env.e_flags2 & ef2::WEAPON_LOCKED != 0
-        || pm.ps.weap_flags & wf::CHANGE_LOCKED != 0
+        || pm.ps.weapon_state_bits & wf::CHANGE_LOCKED != 0
         || !held_now(pm)
         || held_before(pm)
     {
@@ -202,35 +202,35 @@ fn prepare(pm: &mut Pm) {
     if pm.env.waterlevel >= UNDERWATER {
         return;
     }
-    pm.ps.weaponstate = state::RIOTSHIELD_PREPARE;
-    pm.ps.weapon_time = pm.weapon_facts().shield.hold_fire_time;
-    pm.ps.weapon_delay = 0;
+    pm.ps.gun_phase = state::RIOTSHIELD_PREPARE;
+    pm.ps.gun_timer_ms = pm.weapon_facts().shield.hold_fire_time;
+    pm.ps.weapon_ready_wait = 0;
     let parm = weapon_parm(pm);
-    pm.add_predictable_event(EV_PREP_RIOTSHIELD, parm);
-    base::start_anim(pm, anim::HOLD_FIRE, false);
-    base::start_anim(pm, anim::HOLD_FIRE, true);
+    pm.queue_forecast_happening(EV_PREP_RIOTSHIELD, parm);
+    base::start_anim(pm, anim::FIRE_HELD, false);
+    base::start_anim(pm, anim::FIRE_HELD, true);
     base::set_prone_override(pm);
 }
 
 /// PM_Weapon_RiotshieldHold (runs when PREPARE ends): the shield is up, the preview starts.
 pub fn riotshield_hold(pm: &mut Pm) {
     pm.server_print("end weapon (riotshield hold)");
-    pm.ps.weaponstate = state::RIOTSHIELD_HOLD;
-    pm.ps.weapon_time = 0;
-    pm.ps.weapon_delay = 0;
+    pm.ps.gun_phase = state::RIOTSHIELD_HOLD;
+    pm.ps.gun_timer_ms = 0;
+    pm.ps.weapon_ready_wait = 0;
 }
 
 /// PM_Weapon_Riotshield (runs when START ends): the shield goes into the ground.
 pub fn riotshield(pm: &mut Pm) {
     let parm = weapon_parm(pm);
-    pm.add_predictable_event(EV_DEPLOY_RIOTSHIELD, parm);
+    pm.queue_forecast_happening(EV_DEPLOY_RIOTSHIELD, parm);
     // PM_WeaponUseAmmo(1): nothing spent while player_sustainAmmo is on.
     if !pm.env.dvars.player_sustain_ammo {
         let w = pm.ps.weapon;
         let clip = pm.ps.ammo_in_clip(pm.facts, w);
         pm.ps.set_ammo_in_clip(pm.facts, w, clip - clip.min(1));
     }
-    pm.ps.weaponstate = state::RIOTSHIELD_END;
+    pm.ps.gun_phase = state::RIOTSHIELD_END;
 }
 
 /// PM_Weapon_RiotshieldStart (runs each tick in HOLD): preview the spot while fire is held,
@@ -244,31 +244,31 @@ pub fn riotshield_start(pm: &mut Pm) {
         let ok = can_place(pm);
         set_model(pm, !ok);
         if ok {
-            pm.ps.weap_flags &= !wf::RIOTSHIELD_CANT_PLACE;
+            pm.ps.weapon_state_bits &= !wf::RIOTSHIELD_CANT_PLACE;
         } else {
-            pm.ps.weap_flags |= wf::RIOTSHIELD_CANT_PLACE;
+            pm.ps.weapon_state_bits |= wf::RIOTSHIELD_CANT_PLACE;
         }
         if held_before(pm) && held_now(pm) {
-            pm.ps.weapon_delay = 1;
+            pm.ps.weapon_ready_wait = 1;
             return;
         }
         set_model(pm, false);
         if ok {
-            pm.ps.weaponstate = state::RIOTSHIELD_START;
-            pm.ps.weapon_time = f.fire_time;
-            pm.ps.weapon_delay = f.fire_delay;
+            pm.ps.gun_phase = state::RIOTSHIELD_START;
+            pm.ps.gun_timer_ms = f.fire_time;
+            pm.ps.weapon_ready_wait = f.fire_delay;
             base::start_anim(pm, anim::ATTACK, false);
             pm.out.scripts.push(AnimScript::FireWeapon);
             return;
         }
     }
     // A bad spot, or the weapon is no longer a shield: lower it.
-    pm.ps.weaponstate = state::RIOTSHIELD_END;
-    pm.ps.weapon_time = lower_time;
-    pm.ps.weapon_delay = 0;
+    pm.ps.gun_phase = state::RIOTSHIELD_END;
+    pm.ps.gun_timer_ms = lower_time;
+    pm.ps.weapon_ready_wait = 0;
     base::start_anim(pm, anim::RELOAD, false);
     let parm = weapon_parm(pm);
-    pm.add_predictable_event(EV_LOWER_RIOTSHIELD, parm);
+    pm.queue_forecast_happening(EV_LOWER_RIOTSHIELD, parm);
 }
 
 #[cfg(test)]
@@ -277,9 +277,9 @@ mod tests {
     use crate::cmd::{T6Cmd, button};
     use crate::env::T6Env;
     use crate::events::{EV_DEPLOY_RIOTSHIELD, EV_LOWER_RIOTSHIELD, EV_PREP_RIOTSHIELD};
-    use crate::facts::{FactsTable, T6WeaponFacts, weap_type};
+    use crate::facts::{FactsTable, T6WeaponFacts, gun_family_code};
     use crate::player::{T6WeaponPs, wf};
-    use crate::{anim, state, tick};
+    use {crate::anim, crate::state, crate::tick};
 
     const SHIELD: u32 = 1;
     const MOUNT: u32 = 2;
@@ -288,8 +288,8 @@ mod tests {
     fn facts() -> FactsTable {
         let mut t = FactsTable::new();
         let mut s = T6WeaponFacts::default();
-        s.core.weap_type = weap_type::RIOTSHIELD;
-        s.core.clip_size = 1;
+        s.core.gun_family_code = gun_family_code::RIOTSHIELD;
+        s.core.magazine_capacity = 1;
         s.shield = ShieldFacts {
             hold_fire_time: 125,
             fire_time: 500,
@@ -299,7 +299,7 @@ mod tests {
         };
         t.set(SHIELD, "riotshield_mp", s);
         let mut m = T6WeaponFacts::default();
-        m.core.clip_size = 30;
+        m.core.magazine_capacity = 30;
         m.shield = ShieldFacts {
             mountable: true,
             deploy_time: 600,
@@ -325,10 +325,10 @@ mod tests {
             let facts = facts();
             let mut ps = T6WeaponPs::default();
             ps.give(w);
-            ps.set_clip_slot(w, facts.get(w).core.clip_size);
+            ps.set_clip_slot(w, facts.get(w).core.magazine_capacity);
             ps.weapon = w;
             let cmd = T6Cmd {
-                msec,
+                frame_ms: msec,
                 weapon: w,
                 ..T6Cmd::default()
             };
@@ -348,19 +348,19 @@ mod tests {
 
         fn hold(&mut self, on: bool) {
             if on {
-                self.cmd.buttons |= button::ATTACK;
+                self.cmd.buttons |= button::FIRE_BIT;
             } else {
-                self.cmd.buttons &= !button::ATTACK;
+                self.cmd.buttons &= !button::FIRE_BIT;
             }
         }
 
-        fn run(&mut self, n: usize) {
+        fn step_n(&mut self, n: usize) {
             for _ in 0..n {
-                self.cmd.server_time += self.cmd.msec;
+                self.cmd.authority_clock_ms += self.cmd.frame_ms;
                 let out = tick::run(&mut self.ps, &self.cmd, &mut self.env, &self.facts);
-                self.cmd.old_buttons = self.cmd.buttons;
+                self.cmd.last_tick_buttons = self.cmd.buttons;
                 let evs = out.events.iter().map(|e| e.id).collect();
-                self.log.push((self.ps.weaponstate, evs));
+                self.log.push((self.ps.gun_phase, evs));
             }
         }
 
@@ -395,9 +395,9 @@ mod tests {
         let mut s = Sim::new(SHIELD, msec);
         s.env.riotshield_blocked = blocked;
         s.hold(true);
-        s.run(1);
+        s.step_n(1);
         s.hold(false);
-        s.run(60);
+        s.step_n(60);
         s
     }
 
@@ -430,9 +430,9 @@ mod tests {
         let mut s = Sim::new(SHIELD, 50);
         s.env.dvars.player_sustain_ammo = true;
         s.hold(true);
-        s.run(1);
+        s.step_n(1);
         s.hold(false);
-        s.run(20);
+        s.step_n(20);
         assert_eq!(s.first_event(EV_DEPLOY_RIOTSHIELD), 12);
         assert_eq!(s.ps.clip_slot(SHIELD), 1);
     }
@@ -462,23 +462,23 @@ mod tests {
         let mut s = Sim::new(SHIELD, 50);
         s.env.riotshield_blocked = true;
         s.hold(true);
-        s.run(20);
-        assert_eq!(s.ps.weaponstate, state::RIOTSHIELD_HOLD);
-        assert_eq!(s.ps.weapon_delay, 1);
+        s.step_n(20);
+        assert_eq!(s.ps.gun_phase, state::RIOTSHIELD_HOLD);
+        assert_eq!(s.ps.weapon_ready_wait, 1);
         assert_eq!(s.model(), 1, "red over a bad spot");
-        assert_ne!(s.ps.weap_flags & wf::RIOTSHIELD_CANT_PLACE, 0);
+        assert_ne!(s.ps.weapon_state_bits & wf::RIOTSHIELD_CANT_PLACE, 0);
         // The spot turns good while still held: normal model, flag off, still waiting.
         s.env.riotshield_blocked = false;
-        s.run(1);
+        s.step_n(1);
         assert_eq!(
-            (s.model(), s.ps.weap_flags & wf::RIOTSHIELD_CANT_PLACE),
+            (s.model(), s.ps.weapon_state_bits & wf::RIOTSHIELD_CANT_PLACE),
             (0, 0)
         );
-        assert_eq!(s.ps.weaponstate, state::RIOTSHIELD_HOLD);
+        assert_eq!(s.ps.gun_phase, state::RIOTSHIELD_HOLD);
         s.hold(false);
-        s.run(1);
-        assert_eq!(s.ps.weaponstate, state::RIOTSHIELD_START);
-        assert_eq!(anim::number(s.ps.weap_anim), anim::ATTACK);
+        s.step_n(1);
+        assert_eq!(s.ps.gun_phase, state::RIOTSHIELD_START);
+        assert_eq!(anim::number(s.ps.gun_clip), anim::ATTACK);
     }
 
     #[test]
@@ -486,12 +486,12 @@ mod tests {
         let mut s = Sim::new(SHIELD, 50);
         s.env.riotshield_blocked = true;
         s.hold(true);
-        s.run(5);
+        s.step_n(5);
         assert_eq!(s.model(), 1);
         s.hold(false);
-        s.run(1);
-        assert_eq!(s.ps.weaponstate, state::RIOTSHIELD_END);
-        assert_eq!(anim::number(s.ps.weap_anim), anim::RELOAD);
+        s.step_n(1);
+        assert_eq!(s.ps.gun_phase, state::RIOTSHIELD_END);
+        assert_eq!(anim::number(s.ps.gun_clip), anim::RELOAD);
         assert_eq!(s.model(), 0, "MP: red off on release");
     }
 
@@ -501,33 +501,33 @@ mod tests {
         s.env.zombies = true;
         s.env.riotshield_blocked = true;
         s.hold(true);
-        s.run(5);
+        s.step_n(5);
         s.hold(false);
-        s.run(1);
+        s.step_n(1);
         assert_eq!(s.model(), 1, "zombies only ever turns the red model on");
     }
 
     #[test]
     fn only_a_fresh_press_raises_it() {
         let mut s = Sim::new(SHIELD, 50);
-        s.cmd.old_buttons = button::ATTACK;
+        s.cmd.last_tick_buttons = button::FIRE_BIT;
         s.hold(true);
-        s.run(1);
-        assert_eq!(s.ps.weaponstate, state::READY, "fire held from before");
+        s.step_n(1);
+        assert_eq!(s.ps.gun_phase, state::READY, "fire held from before");
         let mut s = Sim::new(SHIELD, 50);
         s.env.waterlevel = 4;
         s.hold(true);
-        s.run(1);
-        assert_ne!(s.ps.weaponstate, state::RIOTSHIELD_PREPARE, "under water");
+        s.step_n(1);
+        assert_ne!(s.ps.gun_phase, state::RIOTSHIELD_PREPARE, "under water");
         let mut s = Sim::new(SHIELD, 50);
-        s.ps.weap_flags |= wf::CHANGE_LOCKED;
+        s.ps.weapon_state_bits |= wf::CHANGE_LOCKED;
         s.hold(true);
-        s.run(1);
-        assert_eq!(s.ps.weaponstate, state::READY, "weapon change locked");
+        s.step_n(1);
+        assert_eq!(s.ps.gun_phase, state::READY, "weapon change locked");
         let mut s = Sim::new(MOUNT, 50);
         s.hold(true);
-        s.run(1);
-        assert_ne!(s.ps.weaponstate, state::RIOTSHIELD_PREPARE, "not a shield");
+        s.step_n(1);
+        assert_ne!(s.ps.gun_phase, state::RIOTSHIELD_PREPARE, "not a shield");
     }
 
     #[test]
@@ -535,47 +535,47 @@ mod tests {
         let mut s = Sim::new(SHIELD, 50);
         s.env.riotshield_blocked = true;
         s.hold(true);
-        s.run(1);
+        s.step_n(1);
         s.hold(false);
-        s.run(4);
-        assert_eq!(s.ps.weaponstate, state::RIOTSHIELD_END);
+        s.step_n(4);
+        assert_eq!(s.ps.gun_phase, state::RIOTSHIELD_END);
         s.hold(true);
-        s.run(1);
-        assert_eq!(s.ps.weaponstate, state::RIOTSHIELD_PREPARE);
+        s.step_n(1);
+        assert_eq!(s.ps.gun_phase, state::RIOTSHIELD_PREPARE);
     }
 
     #[test]
     fn mountable_deploys_on_ground_and_breaks_down_when_the_request_ends() {
         let mut s = Sim::new(MOUNT, 50);
-        s.ps.weap_flags |= wf::DEPLOY_REQUEST;
-        s.run(1);
+        s.ps.weapon_state_bits |= wf::DEPLOY_REQUEST;
+        s.step_n(1);
         assert_eq!(
-            s.ps.weaponstate,
+            s.ps.gun_phase,
             state::READY,
             "in the air: request spent, no deploy"
         );
-        assert_eq!(s.ps.weap_flags & wf::DEPLOY_REQUEST, 0);
-        s.env.on_ground = true;
-        s.ps.weap_flags |= wf::DEPLOY_REQUEST;
-        s.run(1);
-        assert_eq!(s.ps.weaponstate, state::DEPLOYING);
-        assert_eq!(s.ps.weapon_time, 600);
-        assert_eq!(anim::number(s.ps.weap_anim), anim::DEPLOYING);
+        assert_eq!(s.ps.weapon_state_bits & wf::DEPLOY_REQUEST, 0);
+        s.env.grounded_now = true;
+        s.ps.weapon_state_bits |= wf::DEPLOY_REQUEST;
+        s.step_n(1);
+        assert_eq!(s.ps.gun_phase, state::DEPLOYING);
+        assert_eq!(s.ps.gun_timer_ms, 600);
+        assert_eq!(anim::number(s.ps.gun_clip), anim::DEPLOYING);
         // Once deployed the game marks it mounted; with no request left it breaks down.
-        s.run(11);
-        s.ps.weap_flags |= wf::MOUNTED;
-        s.run(1);
-        assert_eq!(s.ps.weaponstate, state::BREAKING_DOWN);
-        assert_eq!(anim::number(s.ps.weap_anim), anim::BREAKING_DOWN);
-        assert_eq!(s.ps.weap_flags & wf::MOUNTED, 0);
+        s.step_n(11);
+        s.ps.weapon_state_bits |= wf::MOUNTED;
+        s.step_n(1);
+        assert_eq!(s.ps.gun_phase, state::BREAKING_DOWN);
+        assert_eq!(anim::number(s.ps.gun_clip), anim::BREAKING_DOWN);
+        assert_eq!(s.ps.weapon_state_bits & wf::MOUNTED, 0);
     }
 
     #[test]
     fn switching_flag_clears_outside_a_switch() {
         let mut s = Sim::new(SHIELD, 50);
-        s.ps.weap_flags |= wf::RIOTSHIELD_SWITCH;
-        s.run(1);
-        assert_eq!(s.ps.weap_flags & wf::RIOTSHIELD_SWITCH, 0);
+        s.ps.weapon_state_bits |= wf::RIOTSHIELD_SWITCH;
+        s.step_n(1);
+        assert_eq!(s.ps.weapon_state_bits & wf::RIOTSHIELD_SWITCH, 0);
     }
 
     #[test]
@@ -599,9 +599,9 @@ mod tests {
             run 9 # PREPARE, HOLD, then the bad spot lowers it
             expect state RIOTSHIELD_END
         ";
-        let r = crate::trace::Runner::new(&f)
+        let r = crate::trace::ScenarioDriver::new(&f)
             .run_script(script)
             .expect("script runs");
-        assert_eq!(r.failures, 0, "{}", r.lines.join("\n"));
+        assert_eq!(r.failures, 0, "{}", r.log_rows.join("\n"));
     }
 }

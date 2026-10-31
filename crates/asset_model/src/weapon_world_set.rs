@@ -1,189 +1,180 @@
 //! Every weapon world model a session loaded, found by namespace and name.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use crate::skel_model::ModelSkel;
-use crate::weapon_world_entry::WorldWeaponEntry;
-use crate::ZoneOwner;
-use asset_core::AssetNamespace;
-use asset_material::{MaterialCatalog, MaterialDefinitions};
+use crate::skel_model::MeshRig;
+use crate::weapon_world_entry::LevelWeaponRecord;
+use asset_core::AssetCategoryScope;
+use asset_core::ZoneCustodian;
+use asset_material::MaterialDefinitions;
+use asset_material::SurfaceShaderRoster;
 
-/// A model's place in the set; names compare without case.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Address {
-    namespace: AssetNamespace,
-    name: String,
+fn shelf_for(space: AssetCategoryScope, label: &str) -> (AssetCategoryScope, String) {
+    let folded = label.to_ascii_lowercase();
+    (space, folded)
 }
 
-impl Address {
-    fn new(namespace: AssetNamespace, name: &str) -> Self {
-        Self {
-            namespace,
-            name: name.to_ascii_lowercase(),
-        }
-    }
-}
-
-/// A model with the zone that supplied it.
+/// A model with the shelf it sits on and the zone that brought it.
 #[derive(Clone, Debug)]
-struct Row {
-    address: Address,
-    zone: ZoneOwner,
-    entry: WorldWeaponEntry,
+struct Held {
+    shelf: (AssetCategoryScope, String),
+    brought_by: ZoneCustodian,
+    record: LevelWeaponRecord,
 }
 
-/// The finished set. Rows keep the order they were first added in, and a
-/// row's position in that order is its index.
+/// The finished set. Models keep the order they first came in, and that
+/// order gives each its row number.
 #[derive(Clone, Debug, Default)]
-pub struct WorldWeaponCatalog {
-    /// Zero until the set is sealed; any change to the set takes it back to zero.
-    identity: u64,
-    rows: Vec<Row>,
-    by_address: HashMap<Address, usize>,
+pub struct LevelWeaponRoster {
+    /// Zero until sealed; any change to the set clears it again.
+    stamp: u64,
+    held: Vec<Held>,
+    rows: HashMap<(AssetCategoryScope, String), usize>,
 }
 
-impl WorldWeaponCatalog {
+impl LevelWeaponRoster {
     /// A number no other sealed set shares, for telling two apart.
     pub fn identity(&self) -> u64 {
-        self.identity
+        let Self { stamp, .. } = self;
+        *stamp
     }
 
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.held.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.held.is_empty()
     }
 
-    pub fn index_by_name(&self, ns: AssetNamespace, name: &str) -> Option<usize> {
-        self.by_address.get(&Address::new(ns, name)).copied()
+    pub fn row_of(&self, space: AssetCategoryScope, label: &str) -> Option<usize> {
+        self.rows.get(&shelf_for(space, label)).copied()
     }
 
-    pub fn get(&self, ns: AssetNamespace, name: &str) -> Option<&WorldWeaponEntry> {
-        self.get_at(self.index_by_name(ns, name)?)
+    pub fn by_label(&self, space: AssetCategoryScope, label: &str) -> Option<&LevelWeaponRecord> {
+        self.row_of(space, label).and_then(|row| self.at_row(row))
     }
 
-    pub fn get_at(&self, index: usize) -> Option<&WorldWeaponEntry> {
-        self.rows.get(index).map(|row| &row.entry)
+    pub fn at_row(&self, row: usize) -> Option<&LevelWeaponRecord> {
+        self.held.get(row).map(|kept| &kept.record)
     }
 
-    pub fn name_at(&self, index: usize) -> Option<&str> {
-        self.rows.get(index).map(|row| row.address.name.as_str())
+    pub fn label_at(&self, row: usize) -> Option<&str> {
+        self.held.get(row).map(|kept| kept.shelf.1.as_str())
     }
 
-    pub fn zone_of(&self, index: usize) -> ZoneOwner {
-        self.rows.get(index).map(|row| row.zone).unwrap_or_default()
+    pub fn supplier_at(&self, row: usize) -> ZoneCustodian {
+        match self.held.get(row) {
+            Some(kept) => kept.brought_by,
+            None => ZoneCustodian::default(),
+        }
     }
 
-    pub fn contains(&self, ns: AssetNamespace, name: &str) -> bool {
-        self.by_address.contains_key(&Address::new(ns, name))
+    pub fn holds(&self, space: AssetCategoryScope, label: &str) -> bool {
+        self.rows.contains_key(&shelf_for(space, label))
     }
 
-    /// The names held for a namespace, in the order they were added.
-    pub fn names_in(&self, ns: AssetNamespace) -> impl Iterator<Item = &str> {
-        self.rows
+    /// The names on one namespace's shelves, in the order they came in.
+    pub fn labels_in(&self, space: AssetCategoryScope) -> impl Iterator<Item = &str> {
+        self.held
             .iter()
-            .filter(move |row| row.address.namespace == ns)
-            .map(|row| row.address.name.as_str())
+            .filter_map(move |kept| (kept.shelf.0 == space).then_some(kept.shelf.1.as_str()))
     }
 
-    /// Every name, whatever its namespace, in the order they were added.
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.rows.iter().map(|row| row.address.name.as_str())
+    /// Every name in every namespace, in the order they came in.
+    pub fn labels(&self) -> impl Iterator<Item = &str> {
+        self.held.iter().map(|kept| kept.shelf.1.as_str())
     }
 }
 
 /// A set still being filled. It reads as the set it will become.
 #[derive(Clone, Debug, Default)]
 pub struct WorldWeaponBuild {
-    catalog: WorldWeaponCatalog,
-    capture_zone: ZoneOwner,
-    capture_ns: AssetNamespace,
+    filling: LevelWeaponRoster,
+    credit_to: ZoneCustodian,
+    file_under: AssetCategoryScope,
 }
 
 impl std::ops::Deref for WorldWeaponBuild {
-    type Target = WorldWeaponCatalog;
+    type Target = LevelWeaponRoster;
 
-    fn deref(&self) -> &WorldWeaponCatalog {
-        &self.catalog
+    fn deref(&self) -> &LevelWeaponRoster {
+        &self.filling
     }
 }
 
 impl WorldWeaponBuild {
-    /// Gives the set its identity if it has none yet, and returns it.
+    /// Stamps the set if it has no stamp yet, and returns the stamp.
     pub fn seal_identity(&mut self) -> u64 {
-        static LAST_IDENTITY: AtomicU64 = AtomicU64::new(0);
-        if self.catalog.identity == 0 {
-            self.catalog.identity = LAST_IDENTITY.fetch_add(1, Ordering::Relaxed) + 1;
+        static STAMPS_GIVEN: AtomicU64 = AtomicU64::new(0);
+        if self.filling.stamp == 0 {
+            self.filling.stamp = STAMPS_GIVEN.fetch_add(1, Ordering::Relaxed) + 1;
         }
-        self.catalog.identity
+        self.filling.stamp
     }
 
-    pub fn publish(self) -> WorldWeaponCatalog {
-        self.catalog
+    /// The finished set; what models are filed and credited under goes with
+    /// the build.
+    pub fn publish(self) -> LevelWeaponRoster {
+        let Self { filling, .. } = self;
+        filling
     }
 
     /// The zone the models added from now on are credited to.
-    pub fn set_capture_zone(&mut self, zone: ZoneOwner) {
-        self.capture_zone = zone;
+    pub fn credit_new_to(&mut self, supplier: ZoneCustodian) {
+        self.credit_to = supplier;
     }
 
-    /// The namespace `insert_captured` files models under.
-    pub fn set_capture_ns(&mut self, ns: AssetNamespace) {
-        self.capture_ns = ns;
+    /// The namespace `add_captured` files models under.
+    pub fn file_new_under(&mut self, space: AssetCategoryScope) {
+        self.file_under = space;
     }
 
-    pub fn insert_captured(&mut self, skel: ModelSkel, materials: Option<&MaterialCatalog>) {
-        self.insert_in(self.capture_ns, skel, materials);
+    pub fn add_captured(&mut self, bone_rig: MeshRig, roster: Option<&SurfaceShaderRoster>) {
+        self.put_into_namespace(self.file_under, bone_rig, roster);
     }
 
-    /// Adds a model, replacing the one with the same namespace and name.
-    pub fn insert_in(
+    /// Adds a model, taking the place of one with the same namespace and name.
+    pub fn put_into_namespace(
         &mut self,
-        ns: AssetNamespace,
-        skel: ModelSkel,
-        materials: Option<&MaterialCatalog>,
+        space: AssetCategoryScope,
+        bone_rig: MeshRig,
+        roster: Option<&SurfaceShaderRoster>,
     ) {
-        let entry = WorldWeaponEntry::new(ns, skel, materials);
-        let address = Address::new(ns, &entry.skel.name);
-        self.put(Row {
-            address,
-            zone: self.capture_zone,
-            entry,
-        });
+        let record = LevelWeaponRecord::new(space, bone_rig, roster);
+        let shelf = shelf_for(space, &record.bone_rig.name);
+        let brought_by = self.credit_to;
+        self.shelve(Held { shelf, brought_by, record });
     }
 
-    /// Whether the row was added, as opposed to replacing one.
-    fn put(&mut self, row: Row) -> bool {
-        let catalog = &mut self.catalog;
-        catalog.identity = 0;
-        if let Some(&at) = catalog.by_address.get(&row.address) {
-            catalog.rows[at] = row;
-            return false;
+    /// True when the model went on a new shelf rather than replacing one.
+    fn shelve(&mut self, incoming: Held) -> bool {
+        let set = &mut self.filling;
+        set.stamp = 0;
+        match set.rows.get(&incoming.shelf).copied() {
+            Some(row) => {
+                set.held[row] = incoming;
+                false
+            }
+            None => {
+                set.rows.insert(incoming.shelf.clone(), set.held.len());
+                set.held.push(incoming);
+                true
+            }
         }
-        catalog.by_address.insert(row.address.clone(), catalog.rows.len());
-        catalog.rows.push(row);
-        true
     }
 
-    /// Takes in another build's models, each keeping its own zone, and says
-    /// how many names were new to this one.
-    pub fn absorb(&mut self, other: Self) -> usize {
-        other
-            .catalog
-            .rows
-            .into_iter()
-            .map(|row| self.put(row))
-            .filter(|added| *added)
-            .count()
+    /// Takes another build's models, each still credited to its own zone, and
+    /// counts the names this build did not have yet.
+    pub fn take_in(&mut self, incoming: Self) -> usize {
+        let held = incoming.filling.held.into_iter();
+        held.map(|kept| self.shelve(kept)).filter(|&fresh| fresh).count()
     }
 
-    pub fn resolve_materials(&mut self, materials: &MaterialDefinitions) {
-        for row in &mut self.catalog.rows {
-            row.entry.resolve_materials(materials);
-        }
+    pub fn bind_materials(&mut self, defs: &MaterialDefinitions) {
+        self.filling.held.iter_mut().for_each(|kept| kept.record.bind_materials(defs));
     }
 }
 
@@ -191,41 +182,41 @@ impl WorldWeaponBuild {
 mod tests {
     use super::*;
 
-    fn skel(name: &str) -> ModelSkel {
-        crate::fpv_mesh_catalog::test_support::skel(name, &[], false)
+    fn rig(label: &str) -> MeshRig {
+        crate::fpv_mesh_catalog::test_support::bone_rig(label, &[], false)
     }
 
     #[test]
     fn a_name_matches_without_regard_to_case_and_replaces_in_place() {
         let mut build = WorldWeaponBuild::default();
-        build.insert_in(AssetNamespace::T6, skel("W_Rifle"), None);
-        build.insert_in(AssetNamespace::T6, skel("w_rifle"), None);
+        build.put_into_namespace(AssetCategoryScope::T6, rig("W_Rifle"), None);
+        build.put_into_namespace(AssetCategoryScope::T6, rig("w_rifle"), None);
         assert_eq!(build.len(), 1);
-        assert_eq!(build.index_by_name(AssetNamespace::T6, "W_RIFLE"), Some(0));
-        assert_eq!(build.name_at(0), Some("w_rifle"));
+        assert_eq!(build.row_of(AssetCategoryScope::T6, "W_RIFLE"), Some(0));
+        assert_eq!(build.label_at(0), Some("w_rifle"));
     }
 
     #[test]
-    fn absorbing_counts_only_new_names_and_keeps_their_zones() {
+    fn taking_in_counts_only_new_names_and_keeps_their_zones() {
         let mut ours = WorldWeaponBuild::default();
-        ours.insert_in(AssetNamespace::T6, skel("w_rifle"), None);
+        ours.put_into_namespace(AssetCategoryScope::T6, rig("w_rifle"), None);
         let mut theirs = WorldWeaponBuild::default();
-        theirs.set_capture_zone(ZoneOwner::TEST);
-        theirs.insert_in(AssetNamespace::T6, skel("w_rifle"), None);
-        theirs.insert_in(AssetNamespace::T6, skel("w_pistol"), None);
-        assert_eq!(ours.absorb(theirs), 1);
+        theirs.credit_new_to(ZoneCustodian::TEST);
+        theirs.put_into_namespace(AssetCategoryScope::T6, rig("w_rifle"), None);
+        theirs.put_into_namespace(AssetCategoryScope::T6, rig("w_pistol"), None);
+        assert_eq!(ours.take_in(theirs), 1);
         assert_eq!(ours.len(), 2);
-        assert_eq!(ours.zone_of(0), ZoneOwner::TEST);
-        assert_eq!(ours.zone_of(1), ZoneOwner::TEST);
+        assert_eq!(ours.supplier_at(0), ZoneCustodian::TEST);
+        assert_eq!(ours.supplier_at(1), ZoneCustodian::TEST);
     }
 
     #[test]
-    fn a_sealed_identity_lasts_until_the_set_changes() {
+    fn a_stamp_lasts_until_the_set_changes() {
         let mut build = WorldWeaponBuild::default();
         let first = build.seal_identity();
         assert_ne!(first, 0);
         assert_eq!(build.seal_identity(), first);
-        build.insert_in(AssetNamespace::T6, skel("w_rifle"), None);
+        build.put_into_namespace(AssetCategoryScope::T6, rig("w_rifle"), None);
         assert_eq!(build.identity(), 0);
         assert_ne!(build.seal_identity(), first);
     }

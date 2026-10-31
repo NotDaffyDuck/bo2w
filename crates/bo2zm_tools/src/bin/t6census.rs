@@ -6,28 +6,26 @@
 //! engine's entry points (the map's `main`, the game type's `main`, every
 //! `codecallback_*`, the AI type and character scripts) to list the engine
 //! built-ins the reachable scripts call. Full lists go to
-//! `logs\m3census\`.
+//! `logs/m3census/` in the working directory (`T6CENSUS_OUT` to change it).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
 use asset_t6::capture_zone;
 use asset_t6::gsc::{GscArg, GscObject};
 
-const GAME: &str = r"C:\Program Files (x86)\Steam\steamapps\common\Call of Duty Black Ops II\zone\all";
-const PRE: [&str; 4] = ["code_post_gfx_zm", "common_zm", "patch_zm", "patch_ui_zm"];
-/// Multiplayer zones read before an `mp_` map (bo2mp; the map's own zone comes last).
-const PRE_MP: [&str; 5] = [
-    "code_post_gfx_mp",
-    "common_mp",
-    "patch_mp",
-    "ui_mp",
-    "patch_ui_mp",
+/// Zones read before the map's own, in load order: (stem, only for `mp_` maps).
+/// The mode suffix (`zm` or `mp`) is appended; the map's own zone comes last.
+const PRE_STEMS: [(&str, bool); 5] = [
+    ("code_post_gfx", false),
+    ("common", false),
+    ("patch", false),
+    ("ui", true),
+    ("patch_ui", false),
 ];
-const OUT_ZM: &str = r"logs\m3census";
-const OUT_MP: &str = r"logs\mpcensus";
+const OUT_ZM: &str = "logs/m3census";
+const OUT_MP: &str = "logs/mpcensus";
 
 const GET_FUNCTION: u8 = 0x15;
 const CALL_BUILTIN: u8 = 0x29;
@@ -38,7 +36,7 @@ const SCRIPT_THREAD_CALL: u8 = 0x32;
 const SCRIPT_METHOD_THREAD_CALL: u8 = 0x34;
 
 fn norm(s: &str) -> String {
-    let s = s.replace('\\', "/").to_ascii_lowercase();
+    let s = s.to_ascii_lowercase().replace('\\', "/");
     s.strip_suffix(".gsc").map_or(s.clone(), str::to_owned)
 }
 
@@ -47,17 +45,111 @@ struct Script {
     size: usize,
     obj: GscObject,
     /// Lower-case export name -> export index.
-    by_name: HashMap<String, usize>,
+    slot_of: HashMap<String, usize>,
 }
 
-fn main() -> ExitCode {
-    let map = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "zm_nuked".to_owned());
-    let dir = PathBuf::from(std::env::var("T6CENSUS_DIR").unwrap_or_else(|_| GAME.to_owned()));
+fn dump_flat(dir: &str, name: &str, blob: &[u8]) {
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(format!("{dir}/{}", name.replace(['/', '\\'], "__")), blob);
+}
+
+/// Everything before the map's own zone for a Zombies (`mp == false`) or
+/// multiplayer map.
+fn preload_zones(mp: bool) -> Vec<String> {
+    let suffix = if mp { "mp" } else { "zm" };
+    PRE_STEMS
+        .iter()
+        .filter(|(_key, mp_only)| mp || !mp_only)
+        .map(|(stem, _)| format!("{stem}_{suffix}"))
+        .collect()
+}
+
+/// The zone file for `z` under `dir`, when it exists.
+fn zone_file(dir: &std::path::Path, z: &str) -> Option<PathBuf> {
+    Some(dir.join(format!("{z}.ff"))).filter(|p| p.is_file())
+}
+
+/// `0x56` or `56`: an opcode byte (0 when it does not parse).
+fn parse_opcode(text: &str) -> u8 {
+    u8::from_str_radix(text.trim_start_matches("0x"), 16).unwrap_or(0)
+}
+
+/// Print the disassembly of `script::function` (function defaults to `main`).
+fn list_function(scripts: &BTreeMap<String, Script>, want: &str) -> Result<(), String> {
+    let (k, f) = want.rsplit_once("::").unwrap_or((want, "main"));
+    let s = scripts.get(&norm(k)).ok_or_else(|| format!("no script {k}"))?;
+    let i = *s
+        .slot_of
+        .get(&f.to_ascii_lowercase())
+        .ok_or_else(|| format!("no function {f} in {k}"))?;
+    println!("{k}::{f} ({} params) from {}", s.obj.exports[i].params, s.zone);
+    for o in s.obj.decode(i) {
+        let flags = match s.obj.import_flags.get(&o.at) {
+            Some(f) => format!(" [flags {f:#x}]"),
+            None => String::new(),
+        };
+        println!(
+            "  {:06x} {:<34} {:?}{flags}",
+            o.at,
+            asset_t6::gsc::op_name(o.op),
+            o.arg
+        );
+    }
+    Ok(())
+}
+
+/// The twelve smallest functions that use opcode `want`, then the total.
+fn smallest_users(scripts: &BTreeMap<String, Script>, want: u8) {
+    let mut users: Vec<(usize, String)> = scripts
+        .iter()
+        .flat_map(|(k, s)| (0..s.obj.exports.len()).map(move |i| (k, s, i)))
+        .filter_map(|(k, s, i)| {
+            let ops = s.obj.decode(i);
+            let uses = ops.iter().any(|o| o.op == want);
+            uses.then(|| (ops.len(), format!("{k}::{}", s.obj.exports[i].name)))
+        })
+        .collect();
+    users.sort();
+    for (n, h) in users.iter().take(12) {
+        println!("{n}	{h}");
+    }
+    println!("{} functions", users.len());
+}
+
+/// Functions that assign (or, with `T6CENSUS_READS`, also read) the field `want`.
+fn field_refs(scripts: &BTreeMap<String, Script>, want: &str) {
+    let reads = std::env::var("T6CENSUS_READS").is_ok();
+    for (k, s) in scripts {
+        for (i, export) in s.obj.exports.iter().enumerate() {
+            let n = s
+                .obj
+                .decode(i)
+                .iter()
+                .filter(|o| o.op == 0x21 || (reads && o.op == 0x20))
+                .filter(|o| matches!(&o.arg, GscArg::Str(f, _) if f.eq_ignore_ascii_case(want)))
+                .count();
+            if n > 0 {
+                println!("{k}::{} x{n}", export.name);
+            }
+        }
+    }
+}
+
+/// A run that already said why on its own.
+struct Failed;
+
+fn main() {
+    std::process::exit(match drive() {
+        Ok(()) => 0,
+        Err(Failed) => 1,
+    });
+}
+
+fn drive() -> Result<(), Failed> {
+    let map = std::env::args().nth(1).unwrap_or(String::from("zm_nuked"));
+    let dir = std::env::var_os("T6CENSUS_DIR").map_or_else(bo2zm_tools::zones_dir, PathBuf::from);
     let mp = map.starts_with("mp_");
-    let pre: &[&str] = if mp { &PRE_MP } else { &PRE };
-    let mut zones: Vec<String> = pre.iter().map(|z| (*z).to_owned()).collect();
+    let mut zones = preload_zones(mp);
     if map == "zm_nuked" {
         zones.push("dlczm0_load_zm".into());
     }
@@ -78,18 +170,27 @@ fn main() -> ExitCode {
     let mut overrides = Vec::new();
     let mut raw_names: BTreeMap<String, (String, usize)> = BTreeMap::new();
     for z in &zones {
-        let path = dir.join(format!("{z}.ff"));
-        if !path.is_file() {
+        let Some(path) = zone_file(&dir, z) else {
             println!("zone {z}: not present");
             continue;
-        }
+        };
         let cap = match capture_zone(&path) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("{z}: {e}");
-                return ExitCode::FAILURE;
+                return Err(Failed);
             }
         };
+        // T6CENSUS_XMODELS=<substring>: the zone's models whose name has it.
+        if let Ok(want) = std::env::var("T6CENSUS_XMODELS") {
+            let hits: Vec<&str> = cap
+                .xmodels
+                .iter()
+                .map(|m| m.name.as_str())
+                .filter(|n| n.contains(want.as_str()))
+                .collect();
+            println!("XMODELS {z}: {} of {} {hits:?}", hits.len(), cap.xmodels.len());
+        }
         if std::env::var("T6CENSUS_PATHS").is_ok() && !cap.path_nodes.is_empty() {
             let nodes = &cap.path_nodes;
             let mut types: BTreeMap<u32, usize> = BTreeMap::new();
@@ -115,7 +216,7 @@ fn main() -> ExitCode {
                     "  {:?} ty {} tn '{}' target '{}' anim '{}' links {:?}",
                     n.origin,
                     n.ty,
-                    n.targetname,
+                    n.target_key,
                     n.target,
                     n.animscript,
                     &n.links[..n.links.len().min(4)]
@@ -153,7 +254,7 @@ fn main() -> ExitCode {
                 println!("TABLE {z}: {} ({} x {})", t.name, t.rows, t.columns);
                 for r in 0..t.rows {
                     let row = &t.cells[r * t.columns..((r + 1) * t.columns).min(t.cells.len())];
-                    println!("{}", row.join("\t"));
+                    println!("{cells}", cells = row.join("\t"));
                 }
             }
         }
@@ -162,9 +263,7 @@ fn main() -> ExitCode {
             let Some(sname) = name.strip_prefix("script:") else {
                 if !name.starts_with(',') {
                     if let Ok(dir) = std::env::var("T6CENSUS_RAWDUMP") {
-                        let path = format!("{dir}/{}", name.replace(['/', '\\'], "__"));
-                        let _ = std::fs::create_dir_all(&dir);
-                        let _ = std::fs::write(path, &bytes);
+                        dump_flat(&dir, &name, &bytes);
                     }
                     raw_names.insert(name, (z.clone(), bytes.len()));
                 }
@@ -173,7 +272,7 @@ fn main() -> ExitCode {
             if let Some(f) = &find
                 && sname.contains(f.as_str())
             {
-                println!("FIND {z}: {sname} {} bytes", bytes.len());
+                println!("FIND {z}: {sname} {len} bytes", len = bytes.len());
             }
             if sname.starts_with(',') {
                 continue;
@@ -188,14 +287,12 @@ fn main() -> ExitCode {
             n += 1;
             let key = norm(sname);
             if let Ok(dir) = std::env::var("T6CENSUS_DUMPALL") {
-                let path = format!("{dir}/{}", sname.replace(['/', '\\'], "__"));
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(path, &bytes);
+                dump_flat(&dir, sname, &bytes);
             }
             if std::env::var("T6CENSUS_DUMP").is_ok_and(|d| d == key) {
                 let _ = std::fs::create_dir_all(out);
                 let _ = std::fs::write(format!("{out}/dump.bin"), &bytes);
-                println!("DUMPED {key} ({} bytes)", bytes.len());
+                println!("DUMPED {key} ({len} bytes)", len = bytes.len());
             }
             if let Some(old) = scripts.get(&key) {
                 overrides.push(format!(
@@ -205,7 +302,7 @@ fn main() -> ExitCode {
                     bytes.len()
                 ));
             }
-            let by_name = obj
+            let slot_of = obj
                 .exports
                 .iter()
                 .enumerate()
@@ -217,7 +314,7 @@ fn main() -> ExitCode {
                     zone: z.clone(),
                     size: bytes.len(),
                     obj,
-                    by_name,
+                    slot_of,
                 },
             );
         }
@@ -226,81 +323,29 @@ fn main() -> ExitCode {
 
     // `T6CENSUS_DIS=script::function`: a listing.
     if let Ok(want) = std::env::var("T6CENSUS_DIS") {
-        let (k, f) = want.rsplit_once("::").unwrap_or((want.as_str(), "main"));
-        let Some(s) = scripts.get(&norm(k)) else {
-            println!("no script {k}");
-            return ExitCode::FAILURE;
-        };
-        let Some(&i) = s.by_name.get(&f.to_ascii_lowercase()) else {
-            println!("no function {f} in {k}");
-            return ExitCode::FAILURE;
-        };
-        println!(
-            "{k}::{f} ({} params) from {}",
-            s.obj.exports[i].params, s.zone
-        );
-        for o in s.obj.decode(i) {
-            let flags = s
-                .obj
-                .import_flags
-                .get(&o.at)
-                .map_or(String::new(), |f| format!(" [flags {f:#x}]"));
-            println!(
-                "  {:06x} {:<34} {:?}{flags}",
-                o.at,
-                asset_t6::gsc::op_name(o.op),
-                o.arg
-            );
-        }
-        return ExitCode::SUCCESS;
+        return list_function(&scripts, &want).map_err(|msg| {
+            println!("{msg}");
+            Failed
+        });
     }
 
     // `T6CENSUS_OP=0x56`: the smallest functions using that opcode.
     if let Ok(want) = std::env::var("T6CENSUS_OP") {
-        let want = u8::from_str_radix(want.trim_start_matches("0x"), 16).unwrap_or(0);
-        let mut hits = Vec::new();
-        for (k, s) in &scripts {
-            for i in 0..s.obj.exports.len() {
-                let ops = s.obj.decode(i);
-                if ops.iter().any(|o| o.op == want) {
-                    hits.push((ops.len(), format!("{k}::{}", s.obj.exports[i].name)));
-                }
-            }
-        }
-        hits.sort();
-        for (n, h) in hits.iter().take(12) {
-            println!("{n}	{h}");
-        }
-        println!("{} functions", hits.len());
-        return ExitCode::SUCCESS;
+        smallest_users(&scripts, parse_opcode(&want));
+        return Ok(());
     }
 
     // `T6CENSUS_REF=field`: functions that take a reference to a field
     // (assign to it) by that name.
     if let Ok(want) = std::env::var("T6CENSUS_REF") {
-        for (k, s) in &scripts {
-            for i in 0..s.obj.exports.len() {
-                let n = s
-                    .obj
-                    .decode(i)
-                    .iter()
-                    .filter(|o| {
-                        (o.op == 0x21 || (std::env::var("T6CENSUS_READS").is_ok() && o.op == 0x20))
-                            && matches!(&o.arg, GscArg::Str(f, _) if f.eq_ignore_ascii_case(&want))
-                    })
-                    .count();
-                if n > 0 {
-                    println!("{k}::{} x{n}", s.obj.exports[i].name);
-                }
-            }
-        }
-        return ExitCode::SUCCESS;
+        field_refs(&scripts, &want);
+        return Ok(());
     }
 
     // Decoder check and opcode use over every function of every script.
     let (mut sh, mut sa, mut ih, mut ia, mut funcs) = (0, 0, 0, 0, 0);
-    let mut opcodes: BTreeMap<u8, usize> = BTreeMap::new();
-    let mut site_ops: BTreeMap<u8, usize> = BTreeMap::new();
+    let mut opcodes: BTreeMap<u8, usize> = BTreeMap::default();
+    let mut site_ops: BTreeMap<u8, usize> = BTreeMap::default();
     for s in scripts.values() {
         let (a, b, c, d) = s.obj.coverage();
         if (a != b || c != d) && std::env::var("T6CENSUS_MISMATCH").is_ok() {
@@ -334,18 +379,18 @@ fn main() -> ExitCode {
             Some(("", f)) => f.to_owned(),
             _ => lname,
         };
-        if let Some((ns, f)) = lname.split_once("::") {
-            let key = norm(ns);
+        if let Some((space, f)) = lname.split_once("::") {
+            let key = norm(space);
             let s = scripts.get(&key)?;
-            return s.by_name.get(f).map(|&i| (key, i));
+            return s.slot_of.get(f).map(|&i| (key, i));
         }
         let s = scripts.get(caller)?;
-        if let Some(&i) = s.by_name.get(&lname) {
+        if let Some(&i) = s.slot_of.get(&lname) {
             return Some((caller.to_owned(), i));
         }
         for inc in &s.obj.includes {
             let key = norm(inc);
-            if let Some(&i) = scripts.get(&key).and_then(|t| t.by_name.get(&lname)) {
+            if let Some(&i) = scripts.get(&key).and_then(|t| t.slot_of.get(&lname)) {
                 return Some((key, i));
             }
         }
@@ -380,14 +425,14 @@ fn main() -> ExitCode {
         .collect();
 
     // Walk.
-    let mut seen: BTreeSet<(String, usize)> = BTreeSet::new();
+    let mut met: BTreeSet<(String, usize)> = BTreeSet::new();
     let mut queue: VecDeque<(String, usize)> = entries.into_iter().collect();
     // builtin name -> (function sites, method sites, scripts)
     let mut builtins: BTreeMap<String, (usize, usize, BTreeSet<String>)> = BTreeMap::new();
-    let mut unresolved: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unknown: BTreeMap<String, usize> = BTreeMap::default();
     let mut pointer_builtins: BTreeSet<String> = BTreeSet::new();
     while let Some(f) = queue.pop_front() {
-        if !seen.insert(f.clone()) {
+        if !met.insert(f.clone()) {
             continue;
         }
         let s = &scripts[&f.0];
@@ -417,7 +462,7 @@ fn main() -> ExitCode {
                     None => {
                         let n = name.trim_start_matches("::").to_ascii_lowercase();
                         if n.contains("::") {
-                            *unresolved
+                            *unknown
                                 .entry(format!("{} <- {}", name, f.0))
                                 .or_default() += 1;
                         } else {
@@ -435,25 +480,25 @@ fn main() -> ExitCode {
             }
         }
     }
-    let reach_scripts: BTreeSet<&String> = seen.iter().map(|(k, _)| k).collect();
+    let reach_scripts: BTreeSet<&String> = met.iter().map(|(k, _)| k).collect();
     let nf = builtins.values().filter(|b| b.0 > 0).count();
     let nm = builtins.values().filter(|b| b.1 > 0).count();
     println!(
         "entries {}; reachable functions {} in {} scripts; builtins {} ({nf} as functions, {nm} as methods); \
          pointers to non-script names {}; unresolved script calls {}",
         entry_names.len(),
-        seen.len(),
+        met.len(),
         reach_scripts.len(),
         builtins.len(),
         pointer_builtins.len(),
-        unresolved.len()
+        unknown.len()
     );
 
     // Reports.
     let _ = std::fs::create_dir_all(out);
     let mut t = String::new();
     for (k, s) in &scripts {
-        let reach = seen.iter().filter(|(kk, _)| kk == k).count();
+        let reach = met.iter().filter(|(kk, _)| kk == k).count();
         let _ = writeln!(
             t,
             "{k}\t{}\t{}\t{} fns\t{reach} reached\tincl {}",
@@ -481,7 +526,7 @@ fn main() -> ExitCode {
     let _ = std::fs::write(format!("{out}/builtins.txt"), t);
     let _ = std::fs::write(
         format!("{out}/unresolved.txt"),
-        unresolved
+        unknown
             .iter()
             .map(|(k, v)| format!("{v}\t{k}\n"))
             .collect::<String>(),
@@ -516,10 +561,39 @@ fn main() -> ExitCode {
             .collect::<String>(),
     );
     let mut t = String::new();
-    for (k, i) in &seen {
+    for (k, i) in &met {
         let _ = writeln!(t, "{k}::{}", scripts[k].obj.exports[*i].name);
     }
     let _ = std::fs::write(format!("{out}/reached.txt"), t);
     println!("overrides {}; reports in {out}", overrides.len());
-    ExitCode::SUCCESS
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preload_zones_follow_the_mode() {
+        assert_eq!(
+            preload_zones(false),
+            ["code_post_gfx_zm", "common_zm", "patch_zm", "patch_ui_zm"]
+        );
+        assert_eq!(
+            preload_zones(true),
+            ["code_post_gfx_mp", "common_mp", "patch_mp", "ui_mp", "patch_ui_mp"]
+        );
+    }
+
+    #[test]
+    fn opcode_parses_with_or_without_prefix() {
+        assert_eq!(parse_opcode("0x56"), 0x56);
+        assert_eq!(parse_opcode("2a"), 0x2a);
+        assert_eq!(parse_opcode("zz"), 0);
+    }
+
+    #[test]
+    fn script_names_are_normalised() {
+        assert_eq!(norm(r"Maps\ZM_Nuked.GSC"), "maps/zm_nuked");
+    }
 }

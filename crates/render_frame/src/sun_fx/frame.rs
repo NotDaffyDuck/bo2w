@@ -5,14 +5,14 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SunEffectsFrame {
     /// Generation of the world the definition came from, if one is installed.
-    pub world_generation: Option<u64>,
+    pub level_generation: Option<u64>,
     pub camera_key: u64,
     /// The camera jumped since last frame, so fades should not interpolate.
     pub camera_cut: bool,
     pub dt_ms: i32,
     pub view_dot: f32,
     /// The sun's clip-space position.
-    pub clip: [f32; 4],
+    pub to_clip: [f32; 4],
     pub viewport_w: f32,
     pub viewport_h: f32,
     pub sprite_size: f32,

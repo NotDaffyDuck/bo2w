@@ -10,12 +10,18 @@
 //! server frames, as their packets arrive. So a takeweapon is seen by the same frame's notifies,
 //! before the client's next usercmd raises anything.
 
-use crate::events::{self, Event};
-use crate::facts::{FactsTable, fire_type, inventory, weap_class, weap_type};
+use crate::events::{
+    Event, EV_RELOAD_START_NOTIFY, EV_RELOAD_ADDAMMO, EV_DETONATE, EV_WEAPON_SWITCH_STARTED,
+    EV_PULLBACK_WEAPON, EV_PREP_OFFHAND, EV_FIRE_WEAPON, EV_FIRE_WEAPON_LASTSHOT,
+    EV_FIRE_WEAPON_LEFT, EV_FIRE_WEAPON_LASTSHOT_LEFT, EV_FIRE_WEAPON_MOUNTED_TURRET,
+    EV_FIRE_BARREL_1, EV_FIRE_BARREL_2, EV_FIRE_MELEE, EV_PREP_RIOTSHIELD, EV_DEPLOY_RIOTSHIELD,
+    EV_LOWER_RIOTSHIELD, name,
+};
+use crate::facts::{FactsTable, fire_type, inventory, gun_kind_ids, gun_family_code};
 use crate::player::{HeldWeapon, T6WeaponPs, wf};
 use crate::state;
 
-/// The `pm_flags` bit `initialweaponraise` clears.
+/// The `movement_state_bits` bit `initialweaponraise` clears.
 pub const PMF_INITIAL_RAISE_CLEARS: u32 = 0x400;
 
 /// What a builtin asks the game to do outside the weapon state.
@@ -32,7 +38,7 @@ pub struct Effects {
     pub gave: Vec<u32>,
     /// Deploy flags on the entity clear (a take while deploying / deployed / breaking down).
     pub clear_deployed: bool,
-    /// `pm_flags` bits to clear.
+    /// `movement_state_bits` bits to clear.
     pub clear_pm_flags: u32,
     /// A dive in the air ends at once (disableweapons mid-dive): flag off, velocity and jump
     /// time zeroed, the dive's end time set to now, sprint needs no fresh press. Movement applies it.
@@ -54,8 +60,8 @@ fn facts_of(facts: &FactsTable, w: u32) -> crate::facts::CoreFacts {
     facts.get(w).core
 }
 
-fn clip_size(facts: &FactsTable, w: u32) -> i32 {
-    facts_of(facts, w).clip_size.max(0)
+fn magazine_capacity(facts: &FactsTable, w: u32) -> i32 {
+    facts_of(facts, w).magazine_capacity.max(0)
 }
 
 /// A gun's alternate-mode chain (grenade launcher, second optic ...), without the gun itself.
@@ -104,14 +110,14 @@ pub fn give_weapon(
         return Ok(fx);
     }
     let c = facts_of(facts, w);
-    if c.weap_class == weap_class::TURRET || c.weap_class == weap_class::NON_PLAYER {
+    if c.weap_class == gun_kind_ids::TURRET || c.weap_class == gun_kind_ids::NON_PLAYER {
         return Err(ScriptError::NotPlayerWeapon(w));
     }
     hold_new(ps, w, model)?;
-    if c.weap_class == weap_class::ITEM {
+    if c.weap_class == gun_kind_ids::ITEM {
         return Ok(fx);
     }
-    if c.inventory_type == inventory::MELEE {
+    if c.carry_slot_kind == inventory::CLOSE_COMBAT {
         ps.melee_weapon = w;
     }
 
@@ -136,17 +142,17 @@ pub fn give_weapon(
             ps.set_ammo_not_in_clip(facts, g, start_stock(g));
         }
         if facts.ammo_clip_weapon(g) == g {
-            ps.set_ammo_in_clip(facts, g, clip_size(facts, g));
+            ps.set_ammo_in_clip(facts, g, magazine_capacity(facts, g));
         }
     }
 
-    if c.inventory_type == inventory::OFFHAND {
+    if c.carry_slot_kind == inventory::OFFHAND {
         let equipped = ps.off_hand_weapon;
         if equipped == 0 || !ps.has_weapon(equipped) {
             ps.off_hand_weapon = w;
         } else if !has_ammo(ps, facts, equipped) {
             let pick = ps.held.iter().map(|h| h.weapon).find(|&h| {
-                h != 0 && facts_of(facts, h).inventory_type == inventory::OFFHAND && has_ammo(ps, facts, h)
+                h != 0 && facts_of(facts, h).carry_slot_kind == inventory::OFFHAND && has_ammo(ps, facts, h)
             });
             if let Some(p) = pick {
                 ps.off_hand_weapon = p;
@@ -167,10 +173,10 @@ fn drop_slot(ps: &mut T6WeaponPs, facts: &FactsTable, w: u32) {
     if ps.has_weapon(pw) {
         ps.set_pool_slot(pw, 0);
     }
-    if let Some(c) = ps.ammo_in_clip.iter_mut().find(|c| c.weapon == w) {
+    if let Some(c) = ps.ammo_in_clip.iter_mut().find(|c| c.gun_id == w) {
         *c = Default::default();
     }
-    if let Some(p) = ps.ammo_not_in_clip.iter_mut().find(|p| p.weapon == w) {
+    if let Some(p) = ps.ammo_not_in_clip.iter_mut().find(|p| p.gun_id == w) {
         *p = Default::default();
     }
     ps.take(w);
@@ -181,7 +187,7 @@ fn drop_slot(ps: &mut T6WeaponPs, facts: &FactsTable, w: u32) {
 pub fn take_weapon(ps: &mut T6WeaponPs, facts: &FactsTable, w: u32) -> Effects {
     let mut fx = Effects::default();
     if w != 0 && ps.weapon == w {
-        ps.weapon = 0;
+        ps.weapon = Default::default();
         fx.zero_server_cmd_weapon = true;
     }
     if !ps.has_weapon(w) {
@@ -201,9 +207,9 @@ pub fn take_weapon(ps: &mut T6WeaponPs, facts: &FactsTable, w: u32) -> Effects {
     if c.dual_wield && c.dual_wield_weapon != 0 {
         drop_slot(ps, facts, c.dual_wield_weapon);
     }
-    if (state::DEPLOYING..=state::BREAKING_DOWN).contains(&ps.weaponstate) {
+    if (state::DEPLOYING..=state::BREAKING_DOWN).contains(&ps.gun_phase) {
         fx.clear_deployed = true;
-        ps.weaponstate = state::READY;
+        ps.gun_phase = state::READY;
         ps.weaponstate_left = state::READY;
     }
     drop_slot(ps, facts, w);
@@ -213,14 +219,14 @@ pub fn take_weapon(ps: &mut T6WeaponPs, facts: &FactsTable, w: u32) -> Effects {
 /// takeallweapons().
 pub fn take_all_weapons(ps: &mut T6WeaponPs, facts: &FactsTable) -> Effects {
     let mut fx = Effects::default();
-    ps.weapon = 0;
+    ps.weapon = Default::default();
     fx.zero_server_cmd_weapon = true;
-    let held: Vec<u32> = ps
+    let held = ps
         .held
         .iter()
         .map(|h| h.weapon)
         .filter(|&w| w != 0)
-        .collect();
+        .collect::<Vec<u32>>();
     for w in held {
         let f = take_weapon(ps, facts, w);
         fx.clear_deployed |= f.clear_deployed;
@@ -246,7 +252,7 @@ pub fn switch_to_weapon(
         return (true, fx);
     }
     if immediate {
-        ps.weapon = 0;
+        ps.weapon = Default::default();
     }
     fx.select = Some(w);
     (true, fx)
@@ -265,9 +271,9 @@ pub fn set_spawn_weapon(
     }
     let mut fx = Effects::default();
     ps.weapon = w;
-    ps.weaponstate = state::READY;
+    ps.gun_phase = state::READY;
     ps.set_ever_had(w, true);
-    if facts_of(facts, w).inventory_type == inventory::ALTMODE {
+    if facts_of(facts, w).carry_slot_kind == inventory::ALTMODE {
         let base = facts_of(facts, w).alt_weapon;
         ps.set_ever_had(base, true);
         ps.last_weapon_alt_mode_switch = base;
@@ -289,42 +295,42 @@ pub fn initial_weapon_raise(ps: &mut T6WeaponPs, w: u32, bot: bool) -> (bool, Ef
 }
 
 /// seteverhadweaponall(bool): false = every held gun first-raises again.
-pub fn set_ever_had_weapon_all(ps: &mut T6WeaponPs, value: bool) {
-    ps.set_ever_had_all(value);
+pub fn set_ever_had_weapon_all(ps: &mut T6WeaponPs, on: bool) {
+    ps.mark_all_owned(on);
 }
 
 /// isswitchingweapons(): raising or dropping.
 pub fn is_switching_weapons(ps: &T6WeaponPs) -> bool {
-    (state::RAISING..=state::DROPPING_ALTSWITCH).contains(&ps.weaponstate)
+    (state::RAISING..=state::DROPPING_ALTSWITCH).contains(&ps.gun_phase)
 }
 
 /// isreloading(): the reload family 11-18 (not a dual wield's per-hand 9/10).
 pub fn is_reloading(ps: &T6WeaponPs) -> bool {
-    (state::RELOADING..=state::RELOAD_QUICK_EMPTY).contains(&ps.weaponstate)
+    (state::RELOADING..=state::RELOAD_QUICK_EMPTY).contains(&ps.gun_phase)
 }
 
 /// isthrowinggrenade(): the offhand family 22-29.
 pub fn is_throwing_grenade(ps: &T6WeaponPs) -> bool {
-    (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&ps.weaponstate)
+    (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&ps.gun_phase)
 }
 
 /// isfiring(): firing, the two rechamber states, the continuous-fire loop, or a melee swing.
 pub fn is_firing(ps: &T6WeaponPs) -> bool {
     matches!(
-        ps.weaponstate,
+        ps.gun_phase,
         state::FIRING | state::RECHAMBER_START | state::RECHAMBERING | state::CONT_FIRE_LOOP
     ) || is_meleeing(ps)
 }
 
 /// ismeleeing(): the three melee states.
 pub fn is_meleeing(ps: &T6WeaponPs) -> bool {
-    (state::MELEE_INIT..=state::MELEE_END).contains(&ps.weaponstate)
+    (state::MELEE_INIT..=state::MELEE_END).contains(&ps.gun_phase)
 }
 
 /// hasagrenadepulledback(): offhand init, prepare, hold, start, or the throw itself.
 pub fn has_a_grenade_pulled_back(ps: &T6WeaponPs) -> bool {
     matches!(
-        ps.weaponstate,
+        ps.gun_phase,
         state::OFFHAND_INIT
             | state::OFFHAND_PREPARE
             | state::OFFHAND_HOLD
@@ -335,7 +341,7 @@ pub fn has_a_grenade_pulled_back(ps: &T6WeaponPs) -> bool {
 
 /// isusingoffhand(): either offhand-in-use flag on the weapon flags.
 pub fn is_using_offhand(ps: &T6WeaponPs) -> bool {
-    ps.weap_flags & (wf::USING_OFFHAND | wf::WEAPONS_DISABLED) != 0
+    ps.weapon_state_bits & (wf::USING_OFFHAND | wf::WEAPONS_DISABLED) != 0
 }
 
 /// hasperk()'s other half (BG_HasPerk): a perk the weapon in the arms grants through its
@@ -345,10 +351,10 @@ pub fn weapon_grants_perk(ps: &T6WeaponPs, facts: &FactsTable, perk: u32) -> boo
 }
 
 /// disableweapons(): the next switch goes to no weapon. A dive still in the air is ended.
-pub fn disable_weapons(ps: &mut T6WeaponPs, pm_flags: u32) -> Effects {
-    ps.weap_flags |= wf::DISABLE_SWITCH_TO_NONE;
+pub fn disable_weapons(ps: &mut T6WeaponPs, movement_state_bits: u32) -> Effects {
+    ps.weapon_state_bits |= wf::DISABLE_SWITCH_TO_NONE;
     let mut fx = Effects::default();
-    if pm_flags & crate::env::pmf::DTP_AIR != 0 {
+    if movement_state_bits & crate::env::pmf::DTP_AIR != 0 {
         fx.clear_pm_flags = crate::env::pmf::DTP_AIR;
         fx.end_dive = true;
     }
@@ -357,16 +363,16 @@ pub fn disable_weapons(ps: &mut T6WeaponPs, pm_flags: u32) -> Effects {
 
 /// enableweapons().
 pub fn enable_weapons(ps: &mut T6WeaponPs) {
-    ps.weap_flags &= !wf::DISABLE_SWITCH_TO_NONE;
+    ps.weapon_state_bits &= !wf::DISABLE_SWITCH_TO_NONE;
 }
 
 /// disableweaponcycling() / enableweaponcycling(): the flag that keeps the gun in hand when it
 /// runs dry.
-pub fn set_weapon_cycling(ps: &mut T6WeaponPs, enabled: bool) {
-    if enabled {
-        ps.weap_flags &= !wf::NO_AMMO_SWITCH;
+pub fn set_weapon_cycling(ps: &mut T6WeaponPs, on: bool) {
+    if on {
+        ps.weapon_state_bits &= !wf::NO_AMMO_SWITCH;
     } else {
-        ps.weap_flags |= wf::NO_AMMO_SWITCH;
+        ps.weapon_state_bits |= wf::NO_AMMO_SWITCH;
     }
 }
 
@@ -386,7 +392,7 @@ pub fn set_weapon_ammo_clip(
     if !ps.has_weapon(w) {
         return Err(ScriptError::NotHeld(w));
     }
-    let n = count.clamp(0, clip_size(facts, w));
+    let n = count.clamp(0, magazine_capacity(facts, w));
     ps.set_ammo_in_clip(facts, w, n);
     if facts_of(facts, w).dual_wield {
         let partner = facts_of(facts, ps.weapon).dual_wield_weapon;
@@ -394,7 +400,7 @@ pub fn set_weapon_ammo_clip(
             if !ps.has_weapon(partner) {
                 return Err(ScriptError::NotHeld(partner));
             }
-            ps.set_ammo_in_clip(facts, partner, clip_size(facts, partner));
+            ps.set_ammo_in_clip(facts, partner, magazine_capacity(facts, partner));
         }
     }
     Ok(())
@@ -412,13 +418,13 @@ pub fn get_weapon_ammo_clip(ps: &T6WeaponPs, facts: &FactsTable, w: u32) -> i32 
 /// One notify on the player entity. `weapons` are its arguments in GSC order (0 = "none");
 /// `flag` is a bool argument instead (`deploy_riotshield`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Notify {
+pub struct WeaponNotify {
     pub name: &'static str,
     pub weapons: Vec<u32>,
     pub flag: Option<bool>,
 }
 
-impl Notify {
+impl WeaponNotify {
     fn new(name: &'static str, weapons: &[u32]) -> Self {
         Self {
             name,
@@ -447,7 +453,7 @@ impl Notify {
             .iter()
             .map(|&w| {
                 if w == 0 {
-                    "none".to_owned()
+                    String::from("none")
                 } else {
                     facts.name(w).to_owned()
                 }
@@ -459,48 +465,54 @@ impl Notify {
 
 /// What a usercmd's client events tell the script, in event order. `grenade_fire`,
 /// `grenade_launcher_fire` and `missile_fire` carry an entity and come from the game side.
-pub fn event_notifies(ps: &T6WeaponPs, facts: &FactsTable, evs: &[Event], out: &mut Vec<Notify>) {
+pub fn event_notifies(player: &T6WeaponPs, facts: &FactsTable, evs: &[Event], out: &mut Vec<WeaponNotify>) {
     for e in evs {
         match e.id {
-            events::EV_RELOAD_START_NOTIFY => out.push(Notify::new("reload_start", &[])),
-            events::EV_RELOAD_ADDAMMO => out.push(Notify::new("reload", &[])),
-            events::EV_WEAPON_SWITCH_STARTED => {
-                out.push(Notify::new("weapon_switch_started", &[e.parm]))
+            EV_RELOAD_START_NOTIFY => out.push(WeaponNotify::new("reload_start", &[])),
+            EV_RELOAD_ADDAMMO => out.push(WeaponNotify::new("reload", &[])),
+            // A held detonator went off (C4, the Time Bomb's remote): no arguments.
+            EV_DETONATE => out.push(WeaponNotify::new("detonate", &[])),
+            EV_WEAPON_SWITCH_STARTED => {
+                out.push(WeaponNotify::new("weapon_switch_started", &[e.parm]))
             }
-            events::EV_PULLBACK_WEAPON | events::EV_PREP_OFFHAND => {
+            EV_PULLBACK_WEAPON | EV_PREP_OFFHAND => {
                 let w = if e.parm != 0 {
                     e.parm
                 } else {
-                    ps.off_hand_weapon
+                    player.off_hand_weapon
                 };
                 if w != 0 {
-                    out.push(Notify::new("grenade_pullback", &[w]));
+                    out.push(WeaponNotify::new("grenade_pullback", &[w]));
                 }
             }
-            events::EV_FIRE_WEAPON
-            | events::EV_FIRE_WEAPON_LASTSHOT
-            | events::EV_FIRE_WEAPON_LEFT
-            | events::EV_FIRE_WEAPON_LASTSHOT_LEFT
-            | events::EV_FIRE_WEAPON_MOUNTED_TURRET
-            | events::EV_FIRE_BARREL_1
-            | events::EV_FIRE_BARREL_2 => out.push(Notify::new("weapon_fired", &[ps.weapon])),
-            events::EV_FIRE_MELEE => {
-                let c = facts_of(facts, ps.weapon);
-                let w = if c.weap_type == weap_type::MELEE || c.inventory_type == inventory::MELEE {
-                    ps.weapon
+            EV_FIRE_WEAPON
+            | EV_FIRE_WEAPON_LASTSHOT
+            | EV_FIRE_WEAPON_LEFT
+            | EV_FIRE_WEAPON_LASTSHOT_LEFT
+            | EV_FIRE_WEAPON_MOUNTED_TURRET
+            | EV_FIRE_BARREL_1
+            | EV_FIRE_BARREL_2 => {
+                // FireWeapon names the charged level's weapon.
+                let w = crate::pm::fire::weapon_for_bullets(facts, e.parm, player.weapon);
+                out.push(WeaponNotify::new("weapon_fired", &[w]))
+            }
+            EV_FIRE_MELEE => {
+                let c = facts_of(facts, player.weapon);
+                let w = if c.gun_family_code == gun_family_code::CLOSE_COMBAT || c.carry_slot_kind == inventory::CLOSE_COMBAT {
+                    player.weapon
                 } else {
-                    ps.melee_weapon
+                    player.melee_weapon
                 };
-                out.push(Notify::new("weapon_melee", &[w]));
+                out.push(WeaponNotify::new("weapon_melee", &[w]));
             }
             // ClientEvents: the detonator pressed (C4's watcher sets the charges off).
-            events::EV_DETONATE => out.push(Notify::new("detonate", &[])),
+            EV_DETONATE => out.push(WeaponNotify::new("detonate", &[])),
             // ClientEvents: the shield coming up, planted (1), or lowered while still in hand (0).
-            events::EV_PREP_RIOTSHIELD => out.push(Notify::new("raise_riotshield", &[])),
-            events::EV_DEPLOY_RIOTSHIELD => out.push(Notify::with_flag("deploy_riotshield", true)),
-            events::EV_LOWER_RIOTSHIELD => {
-                if facts_of(facts, ps.weapon).weap_type == weap_type::RIOTSHIELD {
-                    out.push(Notify::with_flag("deploy_riotshield", false));
+            EV_PREP_RIOTSHIELD => out.push(WeaponNotify::new("raise_riotshield", &[])),
+            EV_DEPLOY_RIOTSHIELD => out.push(WeaponNotify::with_flag("deploy_riotshield", true)),
+            EV_LOWER_RIOTSHIELD => {
+                if facts_of(facts, player.weapon).gun_family_code == gun_family_code::RIOTSHIELD {
+                    out.push(WeaponNotify::with_flag("deploy_riotshield", false));
                 }
             }
             _ => {}
@@ -510,8 +522,8 @@ pub fn event_notifies(ps: &T6WeaponPs, facts: &FactsTable, evs: &[Event], out: &
 
 /// ClientThink_real: a new press of the client's double-tap button (two quick Use/Reload taps)
 /// tells the script `doubletap_detonate` (C4's alt detonate), before the move and its events.
-pub fn double_tap_notify() -> Notify {
-    Notify::new("doubletap_detonate", &[])
+pub fn double_tap_notify() -> WeaponNotify {
+    WeaponNotify::new("doubletap_detonate", &[])
 }
 
 /// The per-client memory BO2 keeps for the per-frame notifies.
@@ -525,25 +537,25 @@ pub struct NotifyWatch {
 impl NotifyWatch {
     /// Once per server frame, after the usercmds: weapon_change, weapon_raising,
     /// weapon_change_complete, begin_firing / end_firing.
-    pub fn frame(&mut self, ps: &T6WeaponPs, pm_type: i32, out: &mut Vec<Notify>) {
+    pub fn frame(&mut self, ps: &T6WeaponPs, movement_mode: i32, out: &mut Vec<WeaponNotify>) {
         if ps.weapon != self.last_weapon {
-            out.push(Notify::new("weapon_change", &[ps.weapon, self.last_weapon]));
+            out.push(WeaponNotify::new("weapon_change", &[ps.weapon, self.last_weapon]));
             self.last_weapon = ps.weapon;
         }
-        let raising = state::is_raising(ps.weaponstate);
+        let raising = state::is_raising(ps.gun_phase);
         if raising {
             if !self.previously_began_raise {
-                out.push(Notify::new("weapon_raising", &[ps.weapon]));
+                out.push(WeaponNotify::new("weapon_raising", &[ps.weapon]));
             }
             self.previously_began_raise = true;
         } else if self.previously_began_raise {
-            out.push(Notify::new("weapon_change_complete", &[ps.weapon]));
+            out.push(WeaponNotify::new("weapon_change_complete", &[ps.weapon]));
             self.previously_began_raise = false;
         }
-        let firing = matches!(ps.weaponstate, state::FIRING | state::CONT_FIRE_LOOP)
-            && pm_type < crate::env::pm_type::DEAD;
+        let firing = matches!(ps.gun_phase, state::FIRING | state::CONT_FIRE_LOOP)
+            && movement_mode < crate::env::movement_mode::DEAD;
         if firing != self.previously_firing {
-            out.push(Notify::new(
+            out.push(WeaponNotify::new(
                 if firing { "begin_firing" } else { "end_firing" },
                 &[],
             ));
@@ -580,12 +592,12 @@ pub struct ScriptTrace<'f> {
     pub rtt: i32,
     pending: Vec<(i32, u32)>,
     /// Notifies of the last tick (for `expect notify`).
-    last_notifies: Vec<Notify>,
+    last_notifies: Vec<WeaponNotify>,
     /// GSC calls made since the last step, printed before its line.
     script_lines: Vec<String>,
     /// `on` handlers: notify name and the command it runs.
     handlers: Vec<(String, Vec<String>)>,
-    pub lines: Vec<String>,
+    pub log_rows: Vec<String>,
     pub failures: usize,
 }
 
@@ -599,18 +611,18 @@ impl<'f> ScriptTrace<'f> {
                 ..Default::default()
             },
             cmd: crate::cmd::T6Cmd {
-                msec: 50,
+                frame_ms: 50,
                 ..Default::default()
             },
             facts,
             watch: NotifyWatch::default(),
             now: 0,
             rtt: 1,
-            pending: Vec::new(),
+            pending: Default::default(),
             last_notifies: Vec::new(),
             script_lines: Vec::new(),
             handlers: Vec::new(),
-            lines: Vec::new(),
+            log_rows: Vec::new(),
             failures: 0,
         }
     }
@@ -620,7 +632,7 @@ impl<'f> ScriptTrace<'f> {
     }
 
     /// Runs the `on` handlers for these notifies (a woken script thread).
-    fn wake(&mut self, notifies: &[Notify]) {
+    fn wake(&mut self, notifies: &[WeaponNotify]) {
         let handlers = self.handlers.clone();
         for x in notifies {
             for (name, cmd) in handlers.iter().filter(|h| h.0 == x.name) {
@@ -644,17 +656,18 @@ impl<'f> ScriptTrace<'f> {
         if name.eq_ignore_ascii_case("none") {
             return Ok(0);
         }
-        self.facts
+        let &Self { facts, .. } = self;
+        facts
             .find(name)
             .ok_or_else(|| format!("no weapon named {name}"))
     }
 
-    fn apply(&mut self, call: &str, fx: Effects) {
+    fn run_call(&mut self, call: &str, fx: Effects) {
         if let Some(w) = fx.select {
             self.pending.push((self.rtt, w));
         }
         if fx.clear_pm_flags != 0 {
-            self.env.pm_flags &= !fx.clear_pm_flags;
+            self.env.movement_state_bits &= !fx.clear_pm_flags;
         }
         let mut note = format!("{:>6} gsc {call}", self.now);
         if fx.zero_server_cmd_weapon {
@@ -666,11 +679,11 @@ impl<'f> ScriptTrace<'f> {
     /// One server frame (its scripts already ran), then one usercmd from the client.
     pub fn step(&mut self) {
         let mut n = Vec::new();
-        self.watch.frame(&self.ps, self.env.pm_type, &mut n);
+        self.watch.frame(&self.ps, self.env.movement_mode, &mut n);
         self.wake(&n);
         let frame_notifies = n.len();
-        self.now += self.cmd.msec;
-        self.cmd.server_time = self.now;
+        self.now += self.cmd.frame_ms;
+        self.cmd.authority_clock_ms = self.now;
         // The weapon-select message reaches the client; its usercmd carries the gun from then on.
         for p in &mut self.pending {
             p.0 -= 1;
@@ -679,29 +692,30 @@ impl<'f> ScriptTrace<'f> {
             self.cmd.weapon = self.pending.remove(i).1;
         }
         let out = crate::tick::run(&mut self.ps, &self.cmd, &mut self.env, self.facts);
-        event_notifies(&self.ps, self.facts, &out.events, &mut n);
+        let &mut Self { facts, .. } = self;
+        event_notifies(&self.ps, facts, &out.events, &mut n);
         let from_events = n[frame_notifies..].to_vec();
         self.wake(&from_events);
-        let ps = &self.ps;
-        let ever = ps.ever_had_weapon(ps.weapon);
+        let cur = &self.ps;
+        let ever = cur.ever_had_weapon(cur.weapon);
         let mut line = format!(
             "{:>6} {:<12} {:<18} t{:>5} {:<14} ever {} clip {:>3}",
             self.now,
-            self.wname(ps.weapon),
-            state::name(ps.weaponstate),
-            ps.weapon_time,
-            crate::anim::name(ps.weap_anim),
+            self.wname(cur.weapon),
+            state::name(cur.gun_phase),
+            cur.gun_timer_ms,
+            crate::anim::name(cur.gun_clip),
             u8::from(ever),
-            ps.ammo_in_clip(self.facts, ps.weapon),
+            cur.ammo_in_clip(facts, cur.weapon),
         );
         for e in &out.events {
-            line.push_str(&format!(" | ev {}", events::name(e.id)));
+            line.push_str(&format!(" | ev {}", name(e.id)));
         }
         for x in &n {
             line.push_str(&format!(" | notify {}", x.describe(self.facts)));
         }
-        self.lines.append(&mut self.script_lines);
-        self.lines.push(line);
+        self.log_rows.append(&mut self.script_lines);
+        self.log_rows.push(line);
         self.last_notifies = n;
     }
 
@@ -709,9 +723,9 @@ impl<'f> ScriptTrace<'f> {
         let what = *words.get(1).ok_or("expect what?")?;
         let rest = words[2..].join(" ");
         let got = match what {
-            "state" => state::name(self.ps.weaponstate).to_owned(),
+            "state" => state::name(self.ps.gun_phase).to_owned(),
             "weapon" => self.wname(self.ps.weapon).to_owned(),
-            "anim" => crate::anim::name(self.ps.weap_anim).to_owned(),
+            "anim" => crate::anim::name(self.ps.gun_clip).to_owned(),
             "everhad" => {
                 let w = self.id(words.get(2).ok_or("expect everhad NAME 0|1")?)?;
                 let got = u8::from(self.ps.ever_had_weapon(w)).to_string();
@@ -772,13 +786,14 @@ impl<'f> ScriptTrace<'f> {
     fn check(&mut self, n: usize, what: &str, want: &str, got: &str) -> Result<(), String> {
         if !want.eq_ignore_ascii_case(got) {
             self.failures += 1;
-            self.lines
+            self.log_rows
                 .push(format!("FAIL line {n}: {what} want {want}, got {got}"));
         }
         Ok(())
     }
 
     fn command(&mut self, n: usize, w: &[&str]) -> Result<(), String> {
+        let &mut Self { facts, .. } = self;
         let arg = |i: usize| {
             w.get(i)
                 .copied()
@@ -792,13 +807,13 @@ impl<'f> ScriptTrace<'f> {
         let script_err = |e: ScriptError| format!("line {n}: script error {e:?}");
         let no_ammo = |_: u32| 0;
         match w[0] {
-            "msec" => self.cmd.msec = num(1)? as i32,
+            "msec" => self.cmd.frame_ms = num(1)? as i32,
             "rtt" => self.rtt = num(1)? as i32,
             "spawn" => {
                 let g = self.id(arg(1)?)?;
-                give_weapon(&mut self.ps, self.facts, g, 0, &no_ammo).map_err(script_err)?;
+                give_weapon(&mut self.ps, facts, g, 0, &no_ammo).map_err(script_err)?;
                 self.ps.weapon = g;
-                self.ps.weaponstate = state::READY;
+                self.ps.gun_phase = state::READY;
                 self.ps.set_ever_had(g, true);
                 self.cmd.weapon = g;
                 self.watch.last_weapon = g;
@@ -806,57 +821,57 @@ impl<'f> ScriptTrace<'f> {
             "give" => {
                 let g = self.id(arg(1)?)?;
                 let fx =
-                    give_weapon(&mut self.ps, self.facts, g, 0, &no_ammo).map_err(script_err)?;
-                self.apply(&format!("giveweapon {}", arg(1)?), fx);
+                    give_weapon(&mut self.ps, facts, g, 0, &no_ammo).map_err(script_err)?;
+                self.run_call(&format!("giveweapon {}", arg(1)?), fx);
             }
             "take" => {
                 let g = self.id(arg(1)?)?;
-                let fx = take_weapon(&mut self.ps, self.facts, g);
-                self.apply(&format!("takeweapon {}", arg(1)?), fx);
+                let fx = take_weapon(&mut self.ps, facts, g);
+                self.run_call(&format!("takeweapon {}", arg(1)?), fx);
             }
             "takeall" => {
                 let fx = take_all_weapons(&mut self.ps, self.facts);
-                self.apply("takeallweapons", fx);
+                self.run_call("takeallweapons", fx);
             }
             "switch" | "switchnow" => {
                 let g = self.id(arg(1)?)?;
                 let (ok, fx) = switch_to_weapon(&mut self.ps, g, w[0] == "switchnow", false);
-                self.apply(&format!("{} {} -> {ok}", w[0], arg(1)?), fx);
+                self.run_call(&format!("{} {} -> {ok}", w[0], arg(1)?), fx);
             }
             "spawnweapon" => {
                 let g = self.id(arg(1)?)?;
                 let fx =
-                    set_spawn_weapon(&mut self.ps, self.facts, g, false).map_err(script_err)?;
-                self.apply(&format!("setspawnweapon {}", arg(1)?), fx);
+                    set_spawn_weapon(&mut self.ps, facts, g, false).map_err(script_err)?;
+                self.run_call(&format!("setspawnweapon {}", arg(1)?), fx);
             }
             "initialraise" => {
                 let g = self.id(arg(1)?)?;
                 let (ok, fx) = initial_weapon_raise(&mut self.ps, g, false);
-                self.apply(&format!("initialweaponraise {} -> {ok}", arg(1)?), fx);
+                self.run_call(&format!("initialweaponraise {} -> {ok}", arg(1)?), fx);
             }
             "everhadall" => {
                 set_ever_had_weapon_all(&mut self.ps, num(1)? != 0.0);
-                self.apply(
+                self.run_call(
                     &format!("seteverhadweaponall {}", arg(1)?),
                     Effects::default(),
                 );
             }
             "setclip" => {
                 let g = self.id(arg(1)?)?;
-                set_weapon_ammo_clip(&mut self.ps, self.facts, g, num(2)? as i32)
+                set_weapon_ammo_clip(&mut self.ps, facts, g, num(2)? as i32)
                     .map_err(script_err)?;
-                self.apply(
+                self.run_call(
                     &format!("setweaponammoclip {} {}", arg(1)?, arg(2)?),
                     Effects::default(),
                 );
             }
             "disable" => {
-                let fx = disable_weapons(&mut self.ps, self.env.pm_flags);
-                self.apply("disableweapons", fx);
+                let fx = disable_weapons(&mut self.ps, self.env.movement_state_bits);
+                self.run_call("disableweapons", fx);
             }
             "enable" => {
                 enable_weapons(&mut self.ps);
-                self.apply("enableweapons", Effects::default());
+                self.run_call("enableweapons", Effects::default());
             }
             "on" => {
                 let name = arg(1)?.to_owned();
@@ -869,10 +884,10 @@ impl<'f> ScriptTrace<'f> {
             "select" => self.cmd.weapon = self.id(arg(1)?)?,
             "hold" | "release" => {
                 let bit = match arg(1)? {
-                    "attack" => crate::cmd::button::ATTACK,
-                    "ads" => crate::cmd::button::ADS,
-                    "reload" => crate::cmd::button::RELOAD,
-                    "melee" => crate::cmd::button::MELEE,
+                    "attack" => crate::cmd::button::FIRE_BIT,
+                    "ads" => crate::cmd::button::AIM_BIT,
+                    "reload" => crate::cmd::button::REFILL_BIT,
+                    "melee" => crate::cmd::button::CLOSE_COMBAT,
                     b => return Err(format!("line {n}: button {b}?")),
                 };
                 if w[0] == "hold" {
@@ -888,7 +903,7 @@ impl<'f> ScriptTrace<'f> {
             }
             "wait" => {
                 // GSC wait: whole server frames.
-                let ticks = ((num(1)? * 1000.0) / f64::from(self.cmd.msec.max(1))).ceil() as i32;
+                let ticks = ((num(1)? * 1000.0) / f64::from(self.cmd.frame_ms.max(1))).ceil() as i32;
                 for _ in 0..ticks.max(1) {
                     self.step();
                 }
@@ -910,7 +925,8 @@ impl<'f> ScriptTrace<'f> {
                 .split('#')
                 .next()
                 .unwrap_or("")
-                .split_whitespace()
+                .split(char::is_whitespace)
+                .filter(|piece| !piece.is_empty())
                 .collect();
             match w.as_slice() {
                 ["facts", path] => {
@@ -922,7 +938,7 @@ impl<'f> ScriptTrace<'f> {
                     let ia = t.find(a).ok_or(format!("no weapon {a}"))?;
                     let ib = t.find(b).ok_or(format!("no weapon {b}"))?;
                     let mut f = t.get(ia);
-                    match *kind {
+                    match &**kind {
                         "dual" => f.core.dual_wield_weapon = ib,
                         "alt" => f.core.alt_weapon = ib,
                         k => return Err(format!("link {k}?")),
@@ -973,9 +989,9 @@ mod tests {
         assert!(weapon_grants_perk(&ps, &facts, perk::ARMORPIERCING));
         assert!(!weapon_grants_perk(&ps, &facts, perk::FASTRELOAD));
         // A knife swing puts the knife in the arms.
-        ps.weaponstate = state::MELEE_FIRE;
+        ps.gun_phase = state::MELEE_FIRE;
         assert!(!weapon_grants_perk(&ps, &facts, perk::BULLETPENETRATION));
-        ps.weaponstate = state::READY;
+        ps.gun_phase = state::READY;
         ps.weapon = 1;
         assert!(!weapon_grants_perk(&ps, &facts, perk::BULLETPENETRATION));
     }
@@ -984,7 +1000,7 @@ mod tests {
         let facts: &'static FactsTable = Box::leak(Box::new(demo_facts()));
         let mut t = ScriptTrace::new(facts);
         t.run_script(script).unwrap();
-        for l in &t.lines {
+        for l in &t.log_rows {
             println!("{l}");
         }
         t
@@ -995,32 +1011,32 @@ mod tests {
     #[test]
     fn bind_trace_files() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/gun/traces");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(found) = std::fs::read_dir(&dir) else {
             return;
         };
         let mut ran = 0;
-        for e in entries.flatten() {
-            let path = e.path();
-            if path.extension().is_none_or(|x| x != "trace") {
+        for e in found.flatten() {
+            let entry_path = e.path();
+            if entry_path.extension().is_none_or(|x| x != "trace") {
                 continue;
             }
-            let script = std::fs::read_to_string(&path).unwrap();
+            let script = std::fs::read_to_string(&entry_path).unwrap();
             let facts = match ScriptTrace::load_facts(&script) {
                 Ok(Some(f)) => f,
                 // No facts line: a gun_trace file (window 3's fire traces), not a bind trace.
                 Ok(None) => continue,
                 Err(e) => {
-                    println!("skip {}: {e}", path.display());
+                    println!("skip {}: {e}", entry_path.display());
                     continue;
                 }
             };
             let mut t = ScriptTrace::new(&facts);
             t.run_script(&script)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                .unwrap_or_else(|e| panic!("{}: {e}", entry_path.display()));
             if std::env::var("GUN_SCRIPT_TRACE_OUT").is_ok() {
-                std::fs::write(path.with_extension("out"), t.lines.join("\n") + "\n").unwrap();
+                std::fs::write(entry_path.with_extension("out"), t.log_rows.join("\n") + "\n").unwrap();
             }
-            assert_eq!(t.failures, 0, "{}:\n{}", path.display(), t.lines.join("\n"));
+            assert_eq!(t.failures, 0, "{}:\n{}", entry_path.display(), t.log_rows.join("\n"));
             ran += 1;
         }
         println!("{ran} trace files");
@@ -1062,7 +1078,7 @@ mod tests {
         ");
         assert_eq!(t.failures, 0);
         assert!(
-            !t.lines.iter().any(|l| l.contains("DROPPING ")),
+            !t.log_rows.iter().any(|l| l.contains("DROPPING ")),
             "no drop on canswap"
         );
     }
@@ -1103,7 +1119,7 @@ mod tests {
             expect notify weapon_change(demo_pistol, none)
         ");
         assert_eq!(t.failures, 0);
-        assert!(!t.lines.iter().any(|l| l.contains("DROPPING ")));
+        assert!(!t.log_rows.iter().any(|l| l.contains("DROPPING ")));
     }
 
     #[test]
@@ -1206,7 +1222,7 @@ mod tests {
             (state::RIOTSHIELD_PREPARE, false, false, false),
             (state::RELOADING_LEFT, false, false, false),
         ] {
-            ps.weaponstate = s;
+            ps.gun_phase = s;
             assert_eq!(
                 (
                     is_switching_weapons(&ps),
@@ -1227,7 +1243,7 @@ mod tests {
             (state::OFFHAND, false, false, true),
             (state::OFFHAND_HOLDUSE, false, false, false),
         ] {
-            ps.weaponstate = s;
+            ps.gun_phase = s;
             assert_eq!(
                 (
                     is_firing(&ps),
@@ -1238,7 +1254,7 @@ mod tests {
                 "state {s}"
             );
         }
-        ps.weap_flags = wf::WEAPONS_DISABLED;
+        ps.weapon_state_bits = wf::WEAPONS_DISABLED;
         assert!(is_using_offhand(&ps));
     }
 
@@ -1292,7 +1308,7 @@ mod tests {
             expect clip fiveseven_lh_mp 3
         ")
         .unwrap();
-        for l in &t.lines {
+        for l in &t.log_rows {
             println!("{l}");
         }
         assert_eq!(t.failures, 0);

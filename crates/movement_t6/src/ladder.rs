@@ -15,27 +15,30 @@
 //! ladder controls. Without the BO2 gun brain the riot shield's states
 //! cannot be seen.
 
-use game_math::angle_subtract;
+use game_math::degree_gap;
 use crate::bridge::{
-    CheckLadderContext, LADDER_JUMP_BLOCK_MS, LADDER_TRACE_DIST_AIR, LADDER_TRACE_DIST_WALK,
-    LadderAttachBackend, LadderTraceHit, MoveBounds, Pml, SURF_LADDER, WalkMoveContext, accelerate,
+    RungGrabArgs, RUNG_LEAP_LOCKOUT_MS, RUNG_PROBE_REACH_AIRBORNE, RUNG_PROBE_REACH_FOOTED,
+    RungGripSource, RungProbeContact, HullExtents, TickLocals, FLOOR_IS_RUNGS, FootedStepArgs, accelerate,
     ladder_attract_velocity, step_slide_move,
 };
-use playerstate_t6::game::{ENTITYNUM_NONE, PM_TYPE_DEAD, PlayerState, UserCmd, pm_flags};
+use playerstate_t6::game::NO_ENTITY_SLOT;
+use playerstate_t6::game::MOVE_KIND_DEAD;
+use playerstate_t6::game::AvatarState;
+use playerstate_t6::game::InputCommand;
+use playerstate_t6::game::movement_state_bits;
 
 use crate::air::{air_move, cmd_scale};
 use crate::frame::BodyAnims;
 use crate::gjk::Bo2Collision;
 use crate::view::bo2_vectoyaw;
 
-/// The fast-climb perk (BO2's specialty_fastladderclimb, perk 17), in the
-/// player's first perk word.
-pub const PERK_FASTLADDERCLIMB: u32 = 1 << 17;
+/// The fast-climb perk (BO2's specialty_fastladderclimb, perk 17).
+pub use playerstate_t6::perks::PERK_FASTLADDERCLIMB;
 
 /// BO2's `perk_fastLadderClimbMultiplier`.
 const FAST_LADDER_CLIMB_SCALE: f32 = 1.75;
 
-/// A timer from a landing or a push (pm_flags 0x80 and 0x100, the ones
+/// A timer from a landing or a push (movement_state_bits 0x80 and 0x100, the ones
 /// PM_DropTimers ends) keeps the player off ladders while it runs.
 const TIMER_FLAGS: u32 = 0x180;
 
@@ -43,17 +46,18 @@ const TIMER_FLAGS: u32 = 0x180;
 /// hold a ladder.
 const PRONE_VIEW_HEIGHTS: [i32; 2] = [22, 11];
 
-/// Looking up or down sets the climb: (pitch's sine + 0.25) * 2.5, -1 to 1.
-const UPSCALE_BIAS: f32 = 0.25;
-const UPSCALE_MUL: f32 = 2.5;
+/// Pitch to climb rate: (sine of the pitch + 0.25) * 2.5, held to -1..1.
+const PITCH_OFFSET: f32 = 0.25;
+const PITCH_GAIN: f32 = 2.5;
 
-/// The keys' push: up and down at half the speed, sideways at a fifth.
-const CLIMB_WISH_SCALE: f32 = 0.5;
-const SIDE_WISH_SCALE: f32 = 0.2;
-const LADDER_ACCEL: f32 = 9.0;
+/// How hard the keys push: half speed up and down, a fifth sideways, with
+/// acceleration 9.
+const UP_PUSH: f32 = 0.5;
+const SIDE_PUSH: f32 = 0.2;
+const CLIMB_ACCELERATION: f32 = 9.0;
 
 /// Sideways drift with no sideways key falls by 16 times the frame's time.
-const SIDE_DAMPING: f32 = 16.0;
+const DRIFT_DECAY: f32 = 16.0;
 
 /// On a ladder the legs turn at most this far from the view.
 const MOVEMENT_DIR_CAP: i32 = 75;
@@ -61,208 +65,13 @@ const MOVEMENT_DIR_CAP: i32 = 75;
 /// Which entity the last ladder trace hit, so a ladder on a moving thing
 /// carries the climber.
 pub(crate) trait LadderHitEntity {
-    /// The entity the last `ladder_trace` hit (the world counts as one), or
+    /// The entity the last `rung_probe` hit (the world counts as one), or
     /// `None` when it hit no entity.
     fn last_hit_entity(&self) -> Option<i32>;
 }
 
-/// PM_CheckLadderMove: hold on, grab, or let go (and fall). True when a
-/// player hanging on in the air lost the ladder: the legs play the jump.
-pub(crate) fn check_ladder_move(
-    ps: &mut PlayerState,
-    pml: &mut Pml,
-    context: CheckLadderContext,
-    backend: &mut (impl LadderAttachBackend + LadderHitEntity),
-) -> bool {
-    // On the ground, or swimming, a fall off a ladder is over.
-    if context.walking || ps.waterlevel > 3 {
-        ps.pm_flags &= !pm_flags::LADDER_FALL;
-    }
-    if ps.pm_time != 0 && ps.pm_flags & pm_flags::LADDER == 0 && ps.pm_flags & TIMER_FLAGS != 0 {
-        return false;
-    }
-    let dist = if context.walking {
-        LADDER_TRACE_DIST_WALK
-    } else {
-        LADDER_TRACE_DIST_AIR
-    };
-    // Hanging on in the air, look for the ladder behind its face; otherwise
-    // straight ahead.
-    let hanging = ps.pm_flags & pm_flags::LADDER != 0 && ps.ground_entity_num == ENTITYNUM_NONE;
-    let dir = if hanging {
-        let v = ps.v_ladder_vec;
-        [-v[0], -v[1], -v[2]]
-    } else {
-        let [x, y] = context.forward_xy;
-        let mut len = libm::sqrtf(x * x + y * y);
-        if len <= 0.0 {
-            len = 1.0;
-        }
-        let inv = 1.0 / len;
-        [x * inv, y * inv, 0.0]
-    };
-    if ps.pm_type >= PM_TYPE_DEAD {
-        ps.ground_entity_num = ENTITYNUM_NONE;
-        pml.walking = 0;
-        pml.ground_plane = 0;
-        pml.almost_ground_plane = 0;
-        let_go(ps);
-        return false;
-    }
-    if ps.pm_flags & pm_flags::LADDER_FALL != 0
-        || PRONE_VIEW_HEIGHTS.contains(&ps.view_height_target)
-        || context.server_time.wrapping_sub(ps.jump_time) < LADDER_JUMP_BLOCK_MS
-        || crate::gun::riot_shield(ps)
-    {
-        let_go(ps);
-        return false;
-    }
-    // On the ground, only walking into the ladder grabs it.
-    let grabbed = backend
-        .ladder_trace(ps.origin, dir, dist)
-        .filter(|hit| is_ladder(hit) && (!context.walking || context.forwardmove > 0));
-    let Some(hit) = grabbed else {
-        let_go(ps);
-        return hanging;
-    };
-    if ps.pm_flags & pm_flags::LADDER != 0 {
-        ride(ps, backend);
-        return false;
-    }
-    // A new ladder: its face is the one the player looks back at.
-    ps.v_ladder_vec = hit.normal;
-    let back = [-hit.normal[0], -hit.normal[1], -hit.normal[2]];
-    if backend.ladder_trace(ps.origin, back, dist).is_some_and(|hit| is_ladder(&hit)) {
-        ride(ps, backend);
-        ps.pm_flags |= pm_flags::LADDER;
-    } else {
-        let_go(ps);
-    }
-    false
-}
-
-/// The ladder's entity becomes the mover the climber rides.
-fn ride(ps: &mut PlayerState, backend: &impl LadderHitEntity) {
-    if let Some(entity) = backend.last_hit_entity() {
-        ps.mover_entity_num = entity;
-    }
-}
-
-fn is_ladder(hit: &LadderTraceHit) -> bool {
-    hit.fraction < 1.0 && hit.surface_flags & SURF_LADDER != 0
-}
-
-/// Off the ladder, the player falls (and cannot grab one until landing).
-fn let_go(ps: &mut PlayerState) {
-    if ps.pm_flags & pm_flags::LADDER != 0 {
-        ps.pm_flags = (ps.pm_flags & !pm_flags::LADDER) | pm_flags::LADDER_FALL;
-    }
-}
-
-/// PM_LadderMove: a jump pushes off; otherwise looking up or down with the
-/// forward key climbs, the sideways keys move along the face, and the step
-/// and slide runs without gravity.
-pub(crate) fn ladder_move<C: Bo2Collision>(
-    ps: &mut PlayerState,
-    pml: &mut Pml,
-    cmd: &mut UserCmd,
-    context: WalkMoveContext,
-    bounds: MoveBounds,
-    collision: &C,
-    body: &mut BodyAnims,
-) -> f32 {
-    let zombies = context.feel.zombies;
-    // Climbing keeps the ladder's mover from timing out.
-    ps.mover_timestamp = cmd.server_time;
-    if crate::walk::jump_check(ps, pml, cmd, &context) {
-        body.jump = true;
-        return air_move(ps, pml, cmd, context.air, bounds, collision, zombies, context.lunge);
-    }
-
-    let mut upscale = ((pml.forward[2] + UPSCALE_BIAS) * UPSCALE_MUL).clamp(-1.0, 1.0);
-
-    let [fx, fy, _] = pml.forward;
-    let inv = 1.0 / nonzero(libm::sqrtf(fx * fx + fy * fy));
-    pml.forward = [fx * inv, fy * inv, 0.0];
-
-    // The sideways direction, flat, then laid on the ladder's face; BO2 does
-    // not make it whole again.
-    let [rx, ry, _] = pml.right;
-    let inv = 1.0 / nonzero(libm::sqrtf(rx * rx + ry * ry));
-    pml.right = project_on_plane([rx * inv, ry * inv, 0.0], ps.v_ladder_vec);
-
-    let scale = cmd_scale(ps, cmd, context.air.player_spectate_speed_scale);
-    if ps.perks[0] & PERK_FASTLADDERCLIMB != 0 {
-        upscale *= FAST_LADDER_CLIMB_SCALE;
-    }
-
-    let mut wish = [0.0_f32; 3];
-    if cmd.forwardmove != 0 {
-        wish[2] = upscale * CLIMB_WISH_SCALE * scale * f32::from(cmd.forwardmove);
-    }
-    if cmd.rightmove != 0 {
-        let side = scale * SIDE_WISH_SCALE * f32::from(cmd.rightmove);
-        wish[2] += pml.right[2] * side;
-        wish[0] = pml.right[0] * side;
-        wish[1] = pml.right[1] * side;
-    }
-    let wishspeed = libm::sqrtf(wish[1] * wish[1] + wish[0] * wish[0] + wish[2] * wish[2]);
-    let inv = 1.0 / nonzero(wishspeed);
-    let wishdir = [wish[0] * inv, wish[1] * inv, wish[2] * inv];
-    accelerate(ps, pml, &wishdir, wishspeed, LADDER_ACCEL);
-
-    // No forward key: the climb slows to a stop by gravity's amount.
-    if cmd.forwardmove == 0 {
-        let fall = ps.gravity as f32 * pml.frametime;
-        let z = ps.velocity[2];
-        ps.velocity[2] = if z <= 0.0 {
-            let z = fall + z;
-            if z < 0.0 { z } else { 0.0 }
-        } else {
-            let z = z - fall;
-            if 0.0 < z { z } else { 0.0 }
-        };
-    }
-    if cmd.rightmove == 0 {
-        side_damping(ps, pml.right, pml.frametime);
-    }
-    if pml.walking == 0 {
-        ladder_attract_velocity(ps);
-    }
-
-    let step = if collision.gjk_on() {
-        crate::gjk::step::step_slide_move(
-            ps,
-            pml,
-            collision,
-            bounds.mins,
-            bounds.maxs,
-            bounds.tracemask,
-            false,
-            zombies,
-        )
-    } else {
-        step_slide_move(
-            ps,
-            pml,
-            collision,
-            bounds.mins,
-            bounds.maxs,
-            bounds.tracemask,
-            None,
-            zombies,
-        )
-    };
-
-    let facing = bo2_vectoyaw(ps.v_ladder_vec[0], ps.v_ladder_vec[1]) + 180.0;
-    let dir = angle_subtract(facing, ps.viewangles[1]) as i32;
-    let dir = if dir.abs() > MOVEMENT_DIR_CAP {
-        if dir < 1 { -MOVEMENT_DIR_CAP } else { MOVEMENT_DIR_CAP }
-    } else {
-        dir
-    };
-    ps.movement_dir = i32::from(dir as i8);
-    step
+fn negated(v: [f32; 3]) -> [f32; 3] {
+    v.map(|c| -c)
 }
 
 /// A zero (or broken) length divides as 1.
@@ -270,37 +79,210 @@ fn nonzero(len: f32) -> f32 {
     if 0.0 <= -len { 1.0 } else { len }
 }
 
-/// ProjectPointOnPlane: `point` less its part along the (unit) `normal`.
-fn project_on_plane(point: [f32; 3], normal: [f32; 3]) -> [f32; 3] {
-    let d = -(point[1] * normal[1] + normal[0] * point[0] + point[2] * normal[2]);
-    [
-        normal[0] * d + point[0],
-        d * normal[1] + point[1],
-        d * normal[2] + point[2],
-    ]
+/// The x and y of a direction scaled to unit length on the floor (z = 0).
+fn floor_unit(x: f32, y: f32) -> [f32; 3] {
+    let k = 1.0 / nonzero(libm::sqrtf(x * x + y * y));
+    [x * k, y * k, 0.0]
+}
+
+/// A trace that stopped on a ladder's face.
+fn is_ladder(strike: &RungProbeContact) -> bool {
+    strike.surf_bits & FLOOR_IS_RUNGS != 0 && strike.travelled < 1.0
+}
+
+/// Why a player cannot hold a ladder this frame, short of finding none.
+fn barred(avatar: &AvatarState, authority_clock_ms: i32) -> bool {
+    let lying = PRONE_VIEW_HEIGHTS.contains(&avatar.eye_height_goal);
+    let just_jumped = authority_clock_ms.wrapping_sub(avatar.hop_start_ms) < RUNG_LEAP_LOCKOUT_MS;
+    avatar.movement_state_bits & movement_state_bits::LADDER_FALL != 0 || lying || just_jumped || crate::gun::riot_shield(avatar)
+}
+
+/// PM_CheckLadderMove: hold on, grab, or let go (and fall). True when a
+/// player hanging on in the air lost the ladder: the legs play the jump.
+pub(crate) fn check_ladder_move(
+    avatar: &mut AvatarState,
+    tick_vars: &mut TickLocals,
+    frame_ctx: RungGrabArgs,
+    backend: &mut (impl RungGripSource + LadderHitEntity),
+) -> bool {
+    // Standing, or under water, ends a fall off a ladder.
+    if avatar.waterlevel > 3 || frame_ctx.on_foot {
+        avatar.movement_state_bits &= !movement_state_bits::LADDER_FALL;
+    }
+    let holding = avatar.movement_state_bits & movement_state_bits::LADDER != 0;
+    let timer_running = avatar.move_timer != 0 && avatar.movement_state_bits & TIMER_FLAGS != 0;
+    if timer_running && !holding {
+        return false;
+    }
+    if avatar.movement_mode >= MOVE_KIND_DEAD {
+        // The dead leave the ground as well as the ladder.
+        avatar.standing_on = NO_ENTITY_SLOT;
+        tick_vars.leave_ground();
+        release(avatar);
+        return false;
+    }
+    if barred(avatar, frame_ctx.authority_clock_ms) {
+        release(avatar);
+        return false;
+    }
+    let reach = match frame_ctx.on_foot {
+        true => RUNG_PROBE_REACH_FOOTED,
+        false => RUNG_PROBE_REACH_AIRBORNE,
+    };
+    // In the air on a ladder the probe goes into its face; otherwise along
+    // the flat view.
+    let airborne_on_it = holding && avatar.standing_on == NO_ENTITY_SLOT;
+    let probe = match airborne_on_it {
+        true => negated(avatar.ladder_normal_dir),
+        false => floor_unit(frame_ctx.ahead_planar[0], frame_ctx.ahead_planar[1]),
+    };
+    let found = backend.rung_probe(avatar.origin, probe, reach).filter(is_ladder);
+    // From the ground only pushing forward takes hold.
+    let pushing = frame_ctx.thrust_ahead > 0 || !frame_ctx.on_foot;
+    let face = match found {
+        Some(strike) if pushing => strike.facing,
+        _ => {
+            release(avatar);
+            return airborne_on_it;
+        }
+    };
+    if !holding {
+        // A fresh ladder: keep its face, and take it only if looking back
+        // at that face finds the ladder too.
+        avatar.ladder_normal_dir = face;
+        let confirmed = backend.rung_probe(avatar.origin, negated(face), reach).is_some_and(|h| is_ladder(&h));
+        if !confirmed {
+            return false;
+        }
+        avatar.movement_state_bits |= movement_state_bits::LADDER;
+    }
+    // The ladder's entity becomes the mover the climber rides.
+    if let Some(entity) = backend.last_hit_entity() {
+        avatar.mover_entity_num = entity;
+    }
+    false
+}
+
+/// Off the ladder, the player falls (and cannot grab one until landing).
+fn release(avatar: &mut AvatarState) {
+    if avatar.movement_state_bits & movement_state_bits::LADDER == 0 {
+        return;
+    }
+    avatar.movement_state_bits &= !movement_state_bits::LADDER;
+    avatar.movement_state_bits |= movement_state_bits::LADDER_FALL;
+}
+
+/// PM_LadderMove: a jump pushes off; otherwise looking up or down with the
+/// forward key climbs, the sideways keys move along the face, and the step
+/// and slide runs without gravity.
+pub(crate) fn ladder_move<C: Bo2Collision>(
+    avatar: &mut AvatarState,
+    tick_vars: &mut TickLocals,
+    ucmd: &mut InputCommand,
+    frame_ctx: FootedStepArgs,
+    bounds: HullExtents,
+    solids: &C,
+    body: &mut BodyAnims,
+) -> f32 {
+    let zombies = frame_ctx.feel.zombies;
+    // Climbing keeps the ladder's mover from timing out.
+    avatar.mover_timestamp = ucmd.authority_clock_ms;
+    if crate::walk::jump_check(avatar, tick_vars, ucmd, &frame_ctx) {
+        body.jump = true;
+        return air_move(avatar, tick_vars, ucmd, frame_ctx.air, bounds, solids, zombies, frame_ctx.lunge);
+    }
+
+    let mut rate = ((tick_vars.fwd_axis[2] + PITCH_OFFSET) * PITCH_GAIN).clamp(-1.0, 1.0);
+    tick_vars.fwd_axis = floor_unit(tick_vars.fwd_axis[0], tick_vars.fwd_axis[1]);
+    // Sideways: flattened, then laid on the face, and BO2 leaves it short.
+    tick_vars.right_axis = onto_plane(floor_unit(tick_vars.right_axis[0], tick_vars.right_axis[1]), avatar.ladder_normal_dir);
+
+    let scale = cmd_scale(avatar, ucmd, frame_ctx.air.observer_pace_ratio);
+    if avatar.has_perk_bit(PERK_FASTLADDERCLIMB) {
+        rate *= FAST_LADDER_CLIMB_SCALE;
+    }
+    push_along_ladder(avatar, tick_vars, ucmd, rate, scale);
+
+    if ucmd.thrust_ahead == 0 {
+        // No forward key: gravity's worth of the climb is taken away, never
+        // past a stop.
+        let fall = avatar.gravity as f32 * tick_vars.step_millis_elapsed;
+        let vz = avatar.velocity[2];
+        let next = match vz <= 0.0 {
+            true => Some(fall + vz).filter(|z| *z < 0.0),
+            false => Some(vz - fall).filter(|z| *z > 0.0),
+        };
+        avatar.velocity[2] = next.unwrap_or(0.0);
+    }
+    if ucmd.thrust_lateral == 0 {
+        side_damping(avatar, tick_vars.right_axis, tick_vars.step_millis_elapsed);
+    }
+    if tick_vars.walking == 0 {
+        ladder_attract_velocity(avatar);
+    }
+
+    let HullExtents { lo_corner: box_lo, hi_corner: box_hi, collide_filter: mask } = bounds;
+    let stepped = match solids.gjk_on() {
+        true => crate::gjk::step::step_slide_move(avatar, tick_vars, solids, box_lo, box_hi, mask, false, zombies),
+        false => step_slide_move(avatar, tick_vars, solids, box_lo, box_hi, mask, None, zombies),
+    };
+
+    // The legs turn toward the ladder, within the cap of the view.
+    let toward_ladder = bo2_vectoyaw(avatar.ladder_normal_dir[0], avatar.ladder_normal_dir[1]) + 180.0;
+    let turn = (degree_gap(toward_ladder, avatar.look_angles[1]) as i32).clamp(-MOVEMENT_DIR_CAP, MOVEMENT_DIR_CAP);
+    avatar.move_heading = i32::from(turn as i8);
+    stepped
+}
+
+/// The keys' wish: forward climbs at `rate`, sideways runs along the face;
+/// accelerated toward at the ladder's rate.
+fn push_along_ladder(avatar: &mut AvatarState, tick_vars: &mut TickLocals, ucmd: &InputCommand, rate: f32, factor: f32) {
+    let climb = match ucmd.thrust_ahead {
+        0 => 0.0,
+        f => rate * UP_PUSH * factor * f32::from(f),
+    };
+    let mut wish = [0.0, 0.0, climb];
+    if ucmd.thrust_lateral != 0 {
+        let side = factor * SIDE_PUSH * f32::from(ucmd.thrust_lateral);
+        let r = tick_vars.right_axis;
+        wish = [r[0] * side, r[1] * side, wish[2] + r[2] * side];
+    }
+    let speed = libm::sqrtf(wish[0] * wish[0] + wish[1] * wish[1] + wish[2] * wish[2]);
+    let k = 1.0 / nonzero(speed);
+    accelerate(avatar, tick_vars, &wish.map(|c| c * k), speed, CLIMB_ACCELERATION);
+}
+
+/// ProjectPointOnPlane: `p` less its part along the (unit) `n`.
+fn onto_plane(p: [f32; 3], n: [f32; 3]) -> [f32; 3] {
+    let along = p[0] * n[0] + p[1] * n[1] + p[2] * n[2];
+    let back = -along;
+    [p[0] + back * n[0], p[1] + back * n[1], p[2] + back * n[2]]
 }
 
 /// With no sideways key, the drift along the face falls by 16 times the
 /// frame's time. Under one unit the step is a whole unit, so a drift under
 /// one unit a second turns round (BO2 does this too).
-fn side_damping(ps: &mut PlayerState, right: [f32; 3], frametime: f32) {
-    let [x, y, _] = right;
-    let len = nonzero(libm::sqrtf(y * y + x * x));
-    let rx = x * (1.0 / len);
-    let ry = y * (1.0 / len);
-    let drift = ry * ps.velocity[1] + ps.velocity[0] * rx;
+fn side_damping(avatar: &mut AvatarState, side_axis: [f32; 3], step_millis_elapsed: f32) {
+    let axis = floor_unit(side_axis[0], side_axis[1]);
+    let drift = axis[0] * avatar.velocity[0] + axis[1] * avatar.velocity[1];
     if drift == 0.0 {
         return;
     }
-    ps.velocity[0] += rx * -drift;
-    ps.velocity[1] += ry * -drift;
-    let mut slow = frametime * drift * SIDE_DAMPING;
-    if slow.abs() < drift.abs() {
-        if slow.abs() < 1.0 {
-            slow = if 0.0 <= slow { 1.0 } else { -1.0 };
-        }
-        ps.velocity[0] += rx * (drift - slow);
-        ps.velocity[1] += ry * (drift - slow);
+    let mut add_along = |amount: f32| {
+        avatar.velocity[0] += axis[0] * amount;
+        avatar.velocity[1] += axis[1] * amount;
+    };
+    // All of it goes, then what survives the decay comes back.
+    add_along(-drift);
+    let decay = step_millis_elapsed * drift * DRIFT_DECAY;
+    let survives = decay.abs() < drift.abs();
+    if survives {
+        let step = match decay.abs() < 1.0 {
+            false => decay,
+            true if decay >= 0.0 => 1.0,
+            true => -1.0,
+        };
+        add_along(drift - step);
     }
 }
 
@@ -308,308 +290,250 @@ fn side_damping(ps: &mut PlayerState, right: [f32; 3], frametime: f32) {
 mod tests {
     use super::*;
     use alloc::vec::Vec;
-    use crate::bridge::{
-        AirMoveContext, Bo2Feel, CmdScaleWalkContext, CollisionBackend, GroundTraceInput,
-        JumpLaunchContext,
-    };
-    use trace_t6::Trace;
+    use crate::testing::{Open, tick_vars, walk_context};
+    use crate::gun::t6::{DETONATING, RIOTSHIELD_END, RIOTSHIELD_PREPARE};
 
-    /// A ladder face every probe hits (or none), remembering where each
-    /// probe looked.
-    struct Probe {
-        hit: Option<LadderTraceHit>,
-        dirs: Vec<[f32; 3]>,
+    /// A ladder face looking along -x, half way along the probe.
+    const FACE: RungProbeContact = RungProbeContact {
+        travelled: 0.5,
+        facing: [-1.0, 0.0, 0.0],
+        surf_bits: FLOOR_IS_RUNGS,
+    };
+
+    /// Answers every probe the same way and notes where each one looked.
+    #[derive(Default)]
+    struct Rail {
+        answer: Option<RungProbeContact>,
+        looked: Vec<[f32; 3]>,
         entity: Option<i32>,
     }
 
-    impl LadderAttachBackend for Probe {
-        fn ladder_trace(&mut self, _origin: [f32; 3], dir: [f32; 3], _dist: f32) -> Option<LadderTraceHit> {
-            self.dirs.push(dir);
-            self.hit
+    impl Rail {
+        fn face() -> Self {
+            Rail { answer: Some(FACE), ..Rail::default() }
         }
     }
 
-    impl LadderHitEntity for Probe {
+    impl RungGripSource for Rail {
+        fn rung_probe(&mut self, _: [f32; 3], heading: [f32; 3], _: f32) -> Option<RungProbeContact> {
+            self.looked.push(heading);
+            self.answer
+        }
+    }
+
+    impl LadderHitEntity for Rail {
         fn last_hit_entity(&self) -> Option<i32> {
             self.entity
         }
     }
 
-    /// A ladder face looking along -x, half way along the probe.
-    const FACE: LadderTraceHit = LadderTraceHit {
-        fraction: 0.5,
-        normal: [-1.0, 0.0, 0.0],
-        surface_flags: SURF_LADDER,
-    };
-
-    fn probe(hit: Option<LadderTraceHit>) -> Probe {
-        Probe {
-            hit,
-            dirs: Vec::new(),
-            entity: None,
-        }
+    /// Runs the check at t = 10 s, looking along +x.
+    fn grab(avatar: &mut AvatarState, on_foot: bool, thrust_ahead: i8, rail: &mut Rail) -> (bool, TickLocals) {
+        let mut tick_vars = tick_vars(on_foot);
+        let frame_ctx = RungGrabArgs { authority_clock_ms: 10_000, on_foot: on_foot, ahead_planar: [2.0, 0.0], thrust_ahead };
+        let jumped = check_ladder_move(avatar, &mut tick_vars, frame_ctx, rail);
+        (jumped, tick_vars)
     }
 
-    fn check(ps: &mut PlayerState, pml: &mut Pml, walking: bool, forwardmove: i8, probe: &mut Probe) -> bool {
-        let context = CheckLadderContext {
-            server_time: 10_000,
-            walking,
-            forward_xy: [2.0, 0.0],
-            forwardmove,
-        };
-        check_ladder_move(ps, pml, context, probe)
+    fn standing() -> AvatarState {
+        let mut avatar = AvatarState::ZERO;
+        avatar.eye_height_goal = 60;
+        avatar
     }
 
-    fn on_ladder() -> PlayerState {
-        let mut ps = PlayerState::ZERO;
-        ps.pm_flags = pm_flags::LADDER;
-        ps.ground_entity_num = ENTITYNUM_NONE;
-        ps.v_ladder_vec = FACE.normal;
-        ps.view_height_target = 60;
-        ps
+    fn hanging() -> AvatarState {
+        let mut avatar = standing();
+        avatar.movement_state_bits = movement_state_bits::LADDER;
+        avatar.standing_on = NO_ENTITY_SLOT;
+        avatar.ladder_normal_dir = FACE.facing;
+        avatar
+    }
+
+    fn holds(avatar: &AvatarState) -> bool {
+        avatar.movement_state_bits & movement_state_bits::LADDER != 0
+    }
+
+    fn falling(avatar: &AvatarState) -> bool {
+        avatar.movement_state_bits & movement_state_bits::LADDER_FALL != 0
     }
 
     #[test]
     fn walking_into_a_ladder_grabs_it() {
-        let mut ps = PlayerState::ZERO;
-        ps.view_height_target = 60;
-        let mut pml = crate::testing::pml(true);
-        let mut rail = probe(Some(FACE));
-        check(&mut ps, &mut pml, true, 127, &mut rail);
-        assert_ne!(ps.pm_flags & pm_flags::LADDER, 0);
-        assert_eq!(ps.v_ladder_vec, FACE.normal);
+        let (mut avatar, mut rail) = (standing(), Rail::face());
+        grab(&mut avatar, true, 127, &mut rail);
+        assert!(holds(&avatar));
+        assert_eq!(avatar.ladder_normal_dir, FACE.facing);
         // Ahead first, then back at the face.
-        assert_eq!(rail.dirs, [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]);
+        assert_eq!(rail.looked, [[1.0, 0.0, 0.0]; 2]);
     }
 
     #[test]
     fn standing_still_on_the_ground_does_not_grab() {
-        let mut ps = PlayerState::ZERO;
-        ps.view_height_target = 60;
-        let mut pml = crate::testing::pml(true);
-        check(&mut ps, &mut pml, true, 0, &mut probe(Some(FACE)));
-        assert_eq!(ps.pm_flags & pm_flags::LADDER, 0);
+        let mut avatar = standing();
+        grab(&mut avatar, true, 0, &mut Rail::face());
+        assert!(!holds(&avatar));
     }
 
     #[test]
     fn hanging_on_looks_behind_the_face() {
-        let mut ps = on_ladder();
-        let mut pml = crate::testing::pml(false);
-        let mut rail = probe(Some(FACE));
-        check(&mut ps, &mut pml, false, 0, &mut rail);
-        assert_ne!(ps.pm_flags & pm_flags::LADDER, 0);
-        assert_eq!(rail.dirs, [[1.0, 0.0, 0.0]]);
+        let (mut avatar, mut rail) = (hanging(), Rail::face());
+        grab(&mut avatar, false, 0, &mut rail);
+        assert!(holds(&avatar));
+        assert_eq!(rail.looked, [[1.0, 0.0, 0.0]]);
     }
 
     #[test]
     fn the_riot_shield_lets_go_but_a_detonator_does_not() {
-        for state in crate::gun::t6::RIOTSHIELD_PREPARE..=crate::gun::t6::RIOTSHIELD_END {
-            let mut ps = on_ladder();
-            ps.weapon_state_t6 = state;
-            let mut pml = crate::testing::pml(false);
-            check(&mut ps, &mut pml, false, 0, &mut probe(Some(FACE)));
-            assert_eq!(ps.pm_flags & pm_flags::LADDER, 0, "{state}");
-            assert_ne!(ps.pm_flags & pm_flags::LADDER_FALL, 0, "{state}");
+        for state in RIOTSHIELD_PREPARE..=RIOTSHIELD_END {
+            let mut avatar = hanging();
+            avatar.weapon_state_t6 = state;
+            grab(&mut avatar, false, 0, &mut Rail::face());
+            assert!(!holds(&avatar) && falling(&avatar), "{state}");
         }
-        let mut ps = on_ladder();
-        ps.weapon_state_t6 = crate::gun::t6::DETONATING;
-        let mut pml = crate::testing::pml(false);
-        check(&mut ps, &mut pml, false, 0, &mut probe(Some(FACE)));
-        assert_ne!(ps.pm_flags & pm_flags::LADDER, 0);
+        let mut avatar = hanging();
+        avatar.weapon_state_t6 = DETONATING;
+        grab(&mut avatar, false, 0, &mut Rail::face());
+        assert!(holds(&avatar));
     }
 
     #[test]
     fn losing_the_ladder_in_the_air_plays_the_jump() {
-        let mut ps = on_ladder();
-        let mut pml = crate::testing::pml(false);
-        assert!(check(&mut ps, &mut pml, false, 0, &mut probe(None)));
-        assert_ne!(ps.pm_flags & pm_flags::LADDER_FALL, 0);
-        // Holding on: none.
-        let mut ps = on_ladder();
-        assert!(!check(&mut ps, &mut pml, false, 0, &mut probe(Some(FACE))));
-        // On the ground when it goes, or never on one: none.
-        let mut ps = on_ladder();
-        ps.ground_entity_num = 0;
-        assert!(!check(&mut ps, &mut pml, false, 0, &mut probe(None)));
-        let mut ps = PlayerState::ZERO;
-        ps.ground_entity_num = ENTITYNUM_NONE;
-        ps.view_height_target = 60;
-        assert!(!check(&mut ps, &mut pml, false, 0, &mut probe(None)));
+        let gone = |avatar: &mut AvatarState| grab(avatar, false, 0, &mut Rail::default()).0;
+        let mut avatar = hanging();
+        assert!(gone(&mut avatar));
+        assert!(falling(&avatar));
+        // Still holding: no jump.
+        assert!(!grab(&mut hanging(), false, 0, &mut Rail::face()).0);
+        // Lost while on the ground, or never held: no jump.
+        let mut grounded = hanging();
+        grounded.standing_on = 0;
+        assert!(!gone(&mut grounded));
+        let mut never = standing();
+        never.standing_on = NO_ENTITY_SLOT;
+        assert!(!gone(&mut never));
         // The riot shield, lying down, a fresh jump or dying let go without it.
-        let mut ps = on_ladder();
-        ps.weapon_state_t6 = crate::gun::t6::RIOTSHIELD_PREPARE;
-        assert!(!check(&mut ps, &mut pml, false, 0, &mut probe(None)));
-        let mut ps = on_ladder();
-        ps.view_height_target = PRONE_VIEW_HEIGHTS[0];
-        assert!(!check(&mut ps, &mut pml, false, 0, &mut probe(None)));
-        let mut ps = on_ladder();
-        ps.jump_time = 10_000;
-        assert!(!check(&mut ps, &mut pml, false, 0, &mut probe(None)));
-        let mut ps = on_ladder();
-        ps.pm_type = PM_TYPE_DEAD;
-        assert!(!check(&mut ps, &mut pml, false, 0, &mut probe(None)));
-        assert_eq!(ps.pm_flags & pm_flags::LADDER, 0);
+        let tweaks: [fn(&mut AvatarState); 4] = [
+            |avatar| avatar.weapon_state_t6 = RIOTSHIELD_PREPARE,
+            |avatar| avatar.eye_height_goal = PRONE_VIEW_HEIGHTS[0],
+            |avatar| avatar.hop_start_ms = 10_000,
+            |avatar| avatar.movement_mode = MOVE_KIND_DEAD,
+        ];
+        for tweak in tweaks {
+            let mut avatar = hanging();
+            tweak(&mut avatar);
+            assert!(!gone(&mut avatar));
+            assert!(!holds(&avatar));
+        }
     }
 
     #[test]
     fn a_ladder_on_a_moving_thing_is_ridden() {
+        let mut rail = Rail { entity: Some(40), ..Rail::face() };
         // Grabbing one.
-        let mut ps = PlayerState::ZERO;
-        ps.view_height_target = 60;
-        let mut pml = crate::testing::pml(false);
-        let mut rail = probe(Some(FACE));
-        rail.entity = Some(40);
-        check(&mut ps, &mut pml, false, 0, &mut rail);
-        assert_ne!(ps.pm_flags & pm_flags::LADDER, 0);
-        assert_eq!(ps.mover_entity_num, 40);
+        let mut avatar = standing();
+        grab(&mut avatar, false, 0, &mut rail);
+        assert!(holds(&avatar));
+        assert_eq!(avatar.mover_entity_num, 40);
         // Holding on keeps it.
-        let mut ps = on_ladder();
-        let mut pml = crate::testing::pml(false);
-        check(&mut ps, &mut pml, false, 0, &mut rail);
-        assert_eq!(ps.mover_entity_num, 40);
+        let mut avatar = hanging();
+        grab(&mut avatar, false, 0, &mut rail);
+        assert_eq!(avatar.mover_entity_num, 40);
         // A trace that hit no entity leaves the mover alone.
-        let mut ps = on_ladder();
-        ps.mover_entity_num = 41;
-        let mut pml = crate::testing::pml(false);
-        check(&mut ps, &mut pml, false, 0, &mut probe(Some(FACE)));
-        assert_eq!(ps.mover_entity_num, 41);
-    }
-
-    #[test]
-    fn climbing_stamps_the_movers_time() {
-        let mut ps = climber();
-        ps.mover_timestamp = 0;
-        climb(&mut ps, [1.0, 0.0, 0.0], [0.0, -1.0, 0.0], 0, 0);
-        assert_eq!(ps.mover_timestamp, 10_000);
+        let mut avatar = hanging();
+        avatar.mover_entity_num = 41;
+        grab(&mut avatar, false, 0, &mut Rail::face());
+        assert_eq!(avatar.mover_entity_num, 41);
     }
 
     #[test]
     fn prone_and_a_fresh_jump_let_go() {
-        for (height, jump_time) in [(11, 0), (22, 0), (60, 9_800)] {
-            let mut ps = on_ladder();
-            ps.view_height_target = height;
-            ps.jump_time = jump_time;
-            let mut pml = crate::testing::pml(false);
-            check(&mut ps, &mut pml, false, 0, &mut probe(Some(FACE)));
-            assert_eq!(ps.pm_flags & pm_flags::LADDER, 0, "{height} {jump_time}");
+        for (height, hop_start_ms) in [(11, 0), (22, 0), (60, 9_800)] {
+            let mut avatar = hanging();
+            avatar.eye_height_goal = height;
+            avatar.hop_start_ms = hop_start_ms;
+            grab(&mut avatar, false, 0, &mut Rail::face());
+            assert!(!holds(&avatar), "{height} {hop_start_ms}");
         }
     }
 
     #[test]
     fn the_dead_let_go_and_leave_the_ground() {
-        let mut ps = on_ladder();
-        ps.pm_type = PM_TYPE_DEAD;
-        ps.ground_entity_num = 1022;
-        let mut pml = crate::testing::pml(true);
-        check(&mut ps, &mut pml, true, 127, &mut probe(Some(FACE)));
-        assert_eq!(ps.ground_entity_num, ENTITYNUM_NONE);
-        assert_eq!((pml.walking, pml.ground_plane, pml.almost_ground_plane), (0, 0, 0));
-        assert_ne!(ps.pm_flags & pm_flags::LADDER_FALL, 0);
+        let mut avatar = hanging();
+        avatar.movement_mode = MOVE_KIND_DEAD;
+        avatar.standing_on = 1022;
+        let (_, tick_vars) = grab(&mut avatar, true, 127, &mut Rail::face());
+        assert_eq!(avatar.standing_on, NO_ENTITY_SLOT);
+        assert_eq!([tick_vars.walking, tick_vars.standing_on_floor, tick_vars.near_floor_contact], [0; 3]);
+        assert!(falling(&avatar));
     }
 
     #[test]
     fn a_running_timer_skips_the_check() {
-        let mut ps = PlayerState::ZERO;
-        ps.view_height_target = 60;
-        ps.pm_time = 100;
-        ps.pm_flags = 0x80;
-        let mut pml = crate::testing::pml(true);
-        let mut rail = probe(Some(FACE));
-        check(&mut ps, &mut pml, true, 127, &mut rail);
-        assert!(rail.dirs.is_empty());
+        let mut avatar = standing();
+        avatar.move_timer = 100;
+        avatar.movement_state_bits = 0x80;
+        let mut rail = Rail::face();
+        grab(&mut avatar, true, 127, &mut rail);
+        assert!(rail.looked.is_empty());
     }
 
     #[test]
     fn side_drift_dies_away() {
-        let mut ps = PlayerState::ZERO;
-        ps.velocity = [100.0, 0.0, 0.0];
-        side_damping(&mut ps, [1.0, 0.0, 0.0], 0.05);
-        assert!((ps.velocity[0] - 20.0).abs() < 1e-4, "{}", ps.velocity[0]);
+        let along_x = [1.0, 0.0, 0.0];
+        let damped = |velocity: [f32; 3], step_millis_elapsed: f32| {
+            let mut avatar = AvatarState::ZERO;
+            avatar.velocity = velocity;
+            side_damping(&mut avatar, along_x, step_millis_elapsed);
+            avatar.velocity
+        };
+        let v = damped([100.0, 0.0, 0.0], 0.05);
+        assert!((v[0] - 20.0).abs() < 1e-4, "{}", v[0]);
         // A long frame stops it dead.
-        ps.velocity = [100.0, 0.0, 0.0];
-        side_damping(&mut ps, [1.0, 0.0, 0.0], 0.1);
-        assert_eq!(ps.velocity[0], 0.0);
+        assert_eq!(damped([100.0, 0.0, 0.0], 0.1)[0], 0.0);
         // Under one unit the drift turns round.
-        ps.velocity = [0.5, 0.0, 0.0];
-        side_damping(&mut ps, [1.0, 0.0, 0.0], 0.05);
-        assert!((ps.velocity[0] + 0.5).abs() < 1e-6, "{}", ps.velocity[0]);
+        let v = damped([0.5, 0.0, 0.0], 0.05);
+        assert!((v[0] + 0.5).abs() < 1e-6, "{}", v[0]);
         // Up and down are left alone.
-        ps.velocity = [0.0, 0.0, 50.0];
-        side_damping(&mut ps, [1.0, 0.0, 0.0], 0.05);
-        assert_eq!(ps.velocity, [0.0, 0.0, 50.0]);
+        assert_eq!(damped([0.0, 0.0, 50.0], 0.05), [0.0, 0.0, 50.0]);
     }
 
-    /// Nothing to hit anywhere.
-    struct Open;
-
-    impl Bo2Collision for Open {}
-
-    impl CollisionBackend for Open {
-        fn trace(&self, _input: GroundTraceInput) -> Trace {
-            Trace {
-                fraction: 1.0,
-                ..Trace::default()
-            }
-        }
+    /// The climber: hanging on, 190 speed, 800 gravity.
+    fn climber() -> AvatarState {
+        let mut avatar = hanging();
+        avatar.speed = 190;
+        avatar.gravity = 800_i32;
+        avatar
     }
 
-    fn walk_context() -> WalkMoveContext {
-        let air = AirMoveContext {
-            player_spectate_speed_scale: 1.0,
-            shellshock_gravity_scale: 1.0,
-            shellshock_gravity_bias: 0.0,
+    const LEFT: [f32; 3] = [0.0, -1.0, 0.0];
+
+    /// One climbing frame with these view directions and keys; gives back
+    /// the frame's directions afterwards.
+    fn climb(avatar: &mut AvatarState, fwd: [f32; 3], rgt: [f32; 3], keys: [i8; 2]) -> TickLocals {
+        let mut tick_vars = tick_vars(false);
+        tick_vars.fwd_axis = fwd;
+        tick_vars.right_axis = rgt;
+        let mut ucmd = InputCommand {
+            authority_clock_ms: 10_000,
+            thrust_ahead: keys[0],
+            thrust_lateral: keys[1],
+            ..InputCommand::default()
         };
-        WalkMoveContext {
-            cmd_scale: CmdScaleWalkContext {
-                player_back_speed_scale: 0.7,
-                player_strafe_speed_scale: 0.8,
-                player_sprint_speed_scale: 1.5,
-                player_last_stand_crawl_speed_scale: 0.15,
-                weapon_move_speed_scale: 1.0,
-                weapon_ads_move_speed_scale: 1.0,
-                shellshock_movement_scale: 1.0,
-                prone_lerp_ms: 0,
-            },
-            weapon_move_scale: 1.0,
-            old_buttons: 0,
-            jump: JumpLaunchContext {
-                jump_height: 39.0,
-                dive: false,
-                crouch_jump_scale: 1.0,
-                jump_ladder_push_vel: 128.0,
-            },
-            air,
-            feel: Bo2Feel::BO2_MP,
-            lunge: None,
-        }
-    }
-
-    const BOUNDS: MoveBounds = MoveBounds {
-        mins: [-15.0, -15.0, 0.0],
-        maxs: [15.0, 15.0, 70.0],
-        tracemask: 1,
-    };
-
-    /// One climbing frame: returns the player and the frame's directions.
-    fn climb(ps: &mut PlayerState, forward: [f32; 3], right: [f32; 3], forwardmove: i8, rightmove: i8) -> Pml {
-        let mut pml = crate::testing::pml(false);
-        pml.forward = forward;
-        pml.right = right;
-        let mut cmd = UserCmd {
-            server_time: 10_000,
-            forwardmove,
-            rightmove,
-            ..UserCmd::default()
+        let bounds = HullExtents {
+            lo_corner: [-15.0_f32, -15.0, 0.0],
+            hi_corner: [15.0_f32, 15.0, 70.0],
+            collide_filter: 1,
         };
-        ladder_move(ps, &mut pml, &mut cmd, walk_context(), BOUNDS, &Open, &mut BodyAnims::default());
-        pml
+        ladder_move(avatar, &mut tick_vars, &mut ucmd, walk_context(), bounds, &Open, &mut BodyAnims::default());
+        tick_vars
     }
 
-    fn climber() -> PlayerState {
-        let mut ps = on_ladder();
-        ps.speed = 190;
-        ps.gravity = 800;
-        ps
+    #[test]
+    fn climbing_stamps_the_movers_time() {
+        let mut avatar = climber();
+        avatar.mover_timestamp = 0;
+        climb(&mut avatar, [1.0, 0.0, 0.0], LEFT, [0, 0]);
+        assert_eq!(avatar.mover_timestamp, 10_000);
     }
 
     #[test]
@@ -617,10 +541,11 @@ mod tests {
         // Looking well up: the climb is at its full rate.
         let up = [0.6, 0.0, 0.8];
         let mut plain = climber();
-        climb(&mut plain, up, [0.0, -1.0, 0.0], 127, 0);
         let mut quick = climber();
-        quick.perks[0] = PERK_FASTLADDERCLIMB;
-        climb(&mut quick, up, [0.0, -1.0, 0.0], 127, 0);
+        quick.set_perk(PERK_FASTLADDERCLIMB, true);
+        for avatar in [&mut plain, &mut quick] {
+            climb(avatar, up, LEFT, [127, 0]);
+        }
         assert!(plain.velocity[2] > 0.0);
         let ratio = quick.velocity[2] / plain.velocity[2];
         assert!((ratio - FAST_LADDER_CLIMB_SCALE).abs() < 1e-4, "{ratio}");
@@ -628,44 +553,39 @@ mod tests {
 
     #[test]
     fn looking_down_climbs_down() {
-        let mut ps = climber();
-        climb(&mut ps, [0.6, 0.0, -0.8], [0.0, -1.0, 0.0], 127, 0);
-        assert!(ps.velocity[2] < 0.0);
+        let mut avatar = climber();
+        climb(&mut avatar, [0.6, 0.0, -0.8], LEFT, [127, 0]);
+        assert!(avatar.velocity[2] < 0.0);
     }
 
     #[test]
     fn the_sideways_direction_keeps_its_length_on_the_face() {
-        let mut ps = climber();
-        let pml = climb(&mut ps, [0.8, 0.6, 0.0], [0.6, -0.8, 0.0], 0, 0);
-        assert!(pml.right[0].abs() < 1e-6, "{:?}", pml.right);
-        assert!((pml.right[1] + 0.8).abs() < 1e-6, "{:?}", pml.right);
+        let tick_vars = climb(&mut climber(), [0.8, 0.6, 0.0], [0.6, -0.8, 0.0], [0, 0]);
+        assert!(tick_vars.right_axis[0].abs() < 1e-6, "{:?}", tick_vars.right_axis);
+        assert!((tick_vars.right_axis[1] + 0.8).abs() < 1e-6, "{:?}", tick_vars.right_axis);
     }
 
     #[test]
     fn the_legs_face_the_ladder_within_75_degrees() {
-        let mut ps = climber();
         // The ladder's yaw comes out a hair under 180 in single precision
         // and the angle is cut toward zero (30 would give -29), so test off
         // the whole number.
-        ps.viewangles[1] = 30.5;
-        climb(&mut ps, [1.0, 0.0, 0.0], [0.0, -1.0, 0.0], 0, 0);
-        assert_eq!(ps.movement_dir, -30);
-        ps.viewangles[1] = 100.0;
-        climb(&mut ps, [1.0, 0.0, 0.0], [0.0, -1.0, 0.0], 0, 0);
-        assert_eq!(ps.movement_dir, -MOVEMENT_DIR_CAP);
-        ps.viewangles[1] = -120.0;
-        climb(&mut ps, [1.0, 0.0, 0.0], [0.0, -1.0, 0.0], 0, 0);
-        assert_eq!(ps.movement_dir, MOVEMENT_DIR_CAP);
+        let mut avatar = climber();
+        for (yaw, legs) in [(30.5, -30), (100.0, -MOVEMENT_DIR_CAP), (-120.0, MOVEMENT_DIR_CAP)] {
+            avatar.look_angles[1] = yaw;
+            climb(&mut avatar, [1.0, 0.0, 0.0], LEFT, [0, 0]);
+            assert_eq!(avatar.move_heading, legs, "{yaw}");
+        }
     }
 
     #[test]
     fn no_forward_key_slows_the_climb_to_a_stop() {
-        let mut ps = climber();
-        ps.velocity = [0.0, 0.0, 30.0];
-        climb(&mut ps, [1.0, 0.0, 0.0], [0.0, -1.0, 0.0], 0, 0);
-        assert_eq!(ps.velocity[2], 0.0);
-        ps.velocity = [0.0, 0.0, -50.0];
-        climb(&mut ps, [1.0, 0.0, 0.0], [0.0, -1.0, 0.0], 0, 0);
-        assert!((ps.velocity[2] + 10.0).abs() < 1e-4, "{}", ps.velocity[2]);
+        let mut avatar = climber();
+        avatar.velocity = [0.0_f32, 0.0, 30.0];
+        climb(&mut avatar, [1.0, 0.0, 0.0], LEFT, [0, 0]);
+        assert_eq!(avatar.velocity[2], 0.0);
+        avatar.velocity = [0.0_f32, 0.0, -50.0];
+        climb(&mut avatar, [1.0, 0.0, 0.0], LEFT, [0, 0]);
+        assert!((avatar.velocity[2] + 10.0).abs() < 1e-4, "{}", avatar.velocity[2]);
     }
 }

@@ -47,7 +47,7 @@ const RING: [[f32; 2]; 12] = [
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hull {
     /// Middle of the shape, from the player's origin.
-    pub center: [f32; 3],
+    pub core_pt: [f32; 3],
     pub half_height: f32,
     pub capsule_radius: f32,
     /// Corner radius of the 12-sided ring: `capsule_radius / cos(15)`.
@@ -61,20 +61,20 @@ pub struct Hull {
 
 /// Black Ops II's player shape from the player's box. `adjust_height` is the
 /// dvar phys_player_collision_adjust_height (0 by default).
-pub fn player_hull(mins: [f32; 3], maxs: [f32; 3], adjust_height: f32) -> Hull {
+pub fn player_hull(box_lo: [f32; 3], box_hi: [f32; 3], adjust_height: f32) -> Hull {
     let adj = RADIUS_ADJUST - TRACE_MARGIN;
     let low = |a: usize| {
-        if mins[a] + adj <= maxs[a] {
-            mins[a] + adj
+        if box_lo[a] + adj <= box_hi[a] {
+            box_lo[a] + adj
         } else {
-            maxs[a]
+            box_hi[a]
         }
     };
     let high = |a: usize| {
-        if mins[a] <= maxs[a] - adj {
-            maxs[a] - adj
+        if box_lo[a] <= box_hi[a] - adj {
+            box_hi[a] - adj
         } else {
-            mins[a]
+            box_lo[a]
         }
     };
     let dim_x = high(0) - low(0);
@@ -89,13 +89,21 @@ pub fn player_hull(mins: [f32; 3], maxs: [f32; 3], adjust_height: f32) -> Hull {
     }
     let cos15 = libm::cosf(core::f32::consts::PI / 12.0);
     Hull {
-        center: [0.0, 0.0, (high(2) + low(2)) * 0.5 + adjust_height],
+        core_pt: [0.0, 0.0, (high(2) + low(2)) * 0.5 + adjust_height],
         half_height,
         capsule_radius: radius,
         polygon_radius: radius / cos15,
         geom_radius: RADIUS_ADJUST,
-        head_offset: if HEAD_OFFSET < half_height { HEAD_OFFSET } else { half_height },
-        foot_offset: if FOOT_OFFSET < half_height { FOOT_OFFSET } else { half_height },
+        head_offset: if HEAD_OFFSET < half_height {
+            HEAD_OFFSET
+        } else {
+            half_height
+        },
+        foot_offset: if FOOT_OFFSET < half_height {
+            FOOT_OFFSET
+        } else {
+            half_height
+        },
         capsule: false,
     }
 }
@@ -105,10 +113,14 @@ impl Hull {
     /// II picks it: the ring corner nearest d's heading, upper ring when d
     /// points up, lower ring when down, or the cap's tip when that is farther.
     pub fn support(&self, d: [f32; 3]) -> [f32; 3] {
-        let c = self.center;
+        let c = self.core_pt;
         if self.capsule {
             let reach = self.half_height - self.capsule_radius;
-            let z = if d[2] * (2.0 * reach) >= 0.0 { c[2] + reach } else { c[2] - reach };
+            let z = if d[2] * (2.0 * reach) >= 0.0 {
+                c[2] + reach
+            } else {
+                c[2] - reach
+            };
             return [c[0], c[1], z];
         }
         let tau = core::f32::consts::TAU;
@@ -118,9 +130,15 @@ impl Hull {
         }
         let corner = ((heading * 12.0 * 0.159_154_94 + 0.5) as i32 % 12) as usize;
         let (ring_z, tip_z) = if d[2] < 0.0 {
-            (c[2] + self.foot_offset - self.half_height, c[2] - self.half_height)
+            (
+                c[2] + self.foot_offset - self.half_height,
+                c[2] - self.half_height,
+            )
         } else {
-            (c[2] + self.half_height - self.head_offset, c[2] + self.half_height)
+            (
+                c[2] + self.half_height - self.head_offset,
+                c[2] + self.half_height,
+            )
         };
         let [cos, sin] = RING[corner];
         let ring = [
@@ -129,7 +147,11 @@ impl Hull {
             ring_z,
         ];
         let tip = [c[0], c[1], tip_z];
-        if dot(d, sub(ring, tip)) >= 0.0 { ring } else { tip }
+        if dot(d, minus(ring, tip)) >= 0.0 {
+            ring
+        } else {
+            tip
+        }
     }
 
     /// The skin GJK adds around the shape: just the skin for the 12-sided
@@ -147,19 +169,22 @@ impl Hull {
     pub fn calc_aabb(&self) -> ([f32; 3], [f32; 3]) {
         let r = self.polygon_radius + self.geom_radius;
         let h = self.half_height + self.geom_radius;
-        let c = self.center;
-        ([c[0] - r, c[1] - r, c[2] - h], [c[0] + r, c[1] + r, c[2] + h])
+        let c = self.core_pt;
+        (
+            [c[0] - r, c[1] - r, c[2] - h],
+            [c[0] + r, c[1] + r, c[2] + h],
+        )
     }
 
     /// Whether a contact `z` (from the player's origin) is low enough to be
     /// the feet: the bottom 2.125 units standing.
-    pub fn is_foot(&self, z: f32) -> bool {
-        let bottom = self.center[2] - self.half_height;
+    pub fn is_foot(&self, height_z: f32) -> bool {
+        let bottom = self.core_pt[2] - self.half_height;
         if self.capsule {
-            z <= bottom + self.capsule_radius - 1.0
+            height_z <= bottom + self.capsule_radius - 1.0
         } else {
             let sin30 = libm::sinf(core::f32::consts::FRAC_PI_6);
-            z <= bottom + self.foot_offset - sin30 * self.geom_radius
+            height_z <= bottom + self.foot_offset - sin30 * self.geom_radius
         }
     }
 }
@@ -173,45 +198,48 @@ pub const MAX_MOVER_VERTS: usize = 32;
 /// it has no skin, and GJK starts from its local origin.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MoverBrush {
-    verts: [[f32; 3]; MAX_MOVER_VERTS],
+    vertex_points: [[f32; 3]; MAX_MOVER_VERTS],
     count: usize,
-    mins: [f32; 3],
-    maxs: [f32; 3],
+    box_lo: [f32; 3],
+    box_hi: [f32; 3],
 }
 
 impl MoverBrush {
     /// The brush with these corners (repeats dropped). None when there are
     /// none, or more than [`MAX_MOVER_VERTS`] different ones.
     pub fn new(points: &[[f32; 3]]) -> Option<Self> {
-        let mut verts = [[0.0; 3]; MAX_MOVER_VERTS];
+        let mut vertex_points = [[0.0; 3]; MAX_MOVER_VERTS];
         let mut count = 0;
-        let mut mins = [f32::MAX; 3];
-        let mut maxs = [f32::MIN; 3];
+        let mut lowest = [f32::MAX; 3];
+        let mut highest = [f32::MIN; 3];
         for &p in points {
-            if verts[..count].contains(&p) {
+            if vertex_points[..count].contains(&p) {
                 continue;
             }
             if count == MAX_MOVER_VERTS {
                 return None;
             }
-            verts[count] = p;
+            vertex_points[count] = p;
             count += 1;
-            for a in 0..3 {
-                mins[a] = mins[a].min(p[a]);
-                maxs[a] = maxs[a].max(p[a]);
-            }
+            lowest = core::array::from_fn(|a| lowest[a].min(p[a]));
+            highest = core::array::from_fn(|a| highest[a].max(p[a]));
         }
-        (count > 0).then_some(Self { verts, count, mins, maxs })
+        (count > 0).then_some(Self {
+            vertex_points,
+            count,
+            box_lo: lowest,
+            box_hi: highest,
+        })
     }
 
     /// The corners.
-    pub fn verts(&self) -> &[[f32; 3]] {
-        &self.verts[..self.count]
+    pub fn vertex_points(&self) -> &[[f32; 3]] {
+        &self.vertex_points[..self.count]
     }
 
     /// The box round the corners, from the vehicle's origin.
     pub fn bounds(&self) -> ([f32; 3], [f32; 3]) {
-        (self.mins, self.maxs)
+        (self.box_lo, self.box_hi)
     }
 }
 
@@ -227,14 +255,14 @@ impl Mover {
     pub fn support(&self, d: [f32; 3]) -> [f32; 3] {
         match self {
             Mover::Body(hull) => hull.support(d),
-            Mover::Brush(brush) => super::farthest(brush.verts().iter().copied(), d),
+            Mover::Brush(brush) => super::farthest(brush.vertex_points().iter().copied(), d),
         }
     }
 
     /// Where GJK starts from: the body's middle, the brush's local origin.
     pub fn center(&self) -> [f32; 3] {
         match self {
-            Mover::Body(hull) => hull.center,
+            Mover::Body(hull) => hull.core_pt,
             Mover::Brush(_) => [0.0; 3],
         }
     }
@@ -256,9 +284,9 @@ impl Mover {
     }
 
     /// Whether a contact `z` is at the feet: only a body has feet.
-    pub fn is_foot(&self, z: f32) -> bool {
+    pub fn is_foot(&self, height_z: f32) -> bool {
         match self {
-            Mover::Body(hull) => hull.is_foot(z),
+            Mover::Body(hull) => hull.is_foot(height_z),
             Mover::Brush(_) => false,
         }
     }
@@ -268,7 +296,10 @@ impl Mover {
     /// vehicle's brush is always itself.
     pub fn against(&self, brush: bool) -> Mover {
         match *self {
-            Mover::Body(hull) => Mover::Body(Hull { capsule: !brush, ..hull }),
+            Mover::Body(hull) => Mover::Body(Hull {
+                capsule: !brush,
+                ..hull
+            }),
             Mover::Brush(b) => Mover::Brush(b),
         }
     }
@@ -278,9 +309,9 @@ impl Mover {
 /// `normal . x >= rs`. Inactive planes are skipped.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SolvePlane {
-    pub normal: [f32; 3],
+    pub facing: [f32; 3],
     pub rs: f32,
-    pub active: bool,
+    pub engaged: bool,
 }
 
 /// Black Ops II's plane solver: the smallest change to `start` that clears
@@ -304,11 +335,11 @@ pub fn project(start: [f32; 3], planes: &[SolvePlane]) -> [f32; 3] {
     while !planes.is_empty() {
         let mut deepest = 1.0e13f32;
         let mut chosen = None;
-        for (i, plane) in planes.iter().enumerate() {
-            if !plane.active || picked[i] {
+        for (i, cand) in planes.iter().enumerate() {
+            if !cand.engaged || picked[i] {
                 continue;
             }
-            let cut = dot(plane.normal, p) - plane.rs;
+            let cut = dot(cand.facing, p) - cand.rs;
             if cut < deepest {
                 deepest = cut;
                 chosen = Some(i);
@@ -320,12 +351,12 @@ pub fn project(start: [f32; 3], planes: &[SolvePlane]) -> [f32; 3] {
         }
         picked[new_plane] = true;
         let slot = (0..4).find(|s| set & (1 << s) == 0).expect("a free slot");
-        let n_new = planes[new_plane].normal;
+        let n_new = planes[new_plane].facing;
         slot_plane[slot] = new_plane;
         slot_e[slot] = planes[new_plane].rs - dot(n_new, start);
         gram[slot][slot] = 1.0;
         for j in (0..4).filter(|j| set & (1 << j) != 0) {
-            let g = dot(n_new, planes[slot_plane[j]].normal);
+            let g = dot(n_new, planes[slot_plane[j]].facing);
             gram[slot][j] = g;
             gram[j][slot] = g;
         }
@@ -373,24 +404,22 @@ pub fn project(start: [f32; 3], planes: &[SolvePlane]) -> [f32; 3] {
                     ],
                 ];
                 let det = m(0, 0) * adj[0][0] + m(0, 1) * adj[1][0] + m(0, 2) * adj[2][0];
-                let num = [0, 1, 2].map(|r| {
-                    adj[r][0] * rhs[0] + adj[r][1] * rhs[1] + adj[r][2] * rhs[2]
-                });
+                let num =
+                    [0, 1, 2].map(|r| adj[r][0] * rhs[0] + adj[r][1] * rhs[1] + adj[r][2] * rhs[2]);
                 if num.iter().all(|&x| x >= 0.0) && det > SOLVER_DEGENERATE {
                     let l = num.map(|x| x / det);
-                    let mut score = 0.0;
-                    for r in 0..3 {
-                        for c in 0..3 {
-                            score += l[r] * m(r, c) * l[c];
-                        }
-                    }
+                    // Row by row, left to right: the sum order is kept fixed.
+                    let score = (0..9).fold(0.0, |sum, cell| {
+                        let (row, col) = (cell / 3, cell % 3);
+                        sum + l[row] * m(row, col) * l[col]
+                    });
                     if score > best {
                         best = score;
                         best_set = (1 << slot) | (1 << j) | (1 << k);
                         best_lambda = [0.0; 4];
-                        for r in 0..3 {
-                            best_lambda[idx[r]] = l[r];
-                        }
+                        idx.iter()
+                            .zip(l)
+                            .for_each(|(&cand, weight)| best_lambda[cand] = weight);
                     }
                 }
             }
@@ -403,7 +432,7 @@ pub fn project(start: [f32; 3], planes: &[SolvePlane]) -> [f32; 3] {
         let lambda = best_lambda;
         p = start;
         for s in (0..4).filter(|s| set & (1 << s) != 0) {
-            let n = planes[slot_plane[s]].normal;
+            let n = planes[slot_plane[s]].facing;
             p = [
                 p[0] + lambda[s] * n[0],
                 p[1] + lambda[s] * n[1],
@@ -445,9 +474,11 @@ struct FaceVote {
 }
 
 impl FaceVote {
-    fn new() -> Self {
-        Self { nearest: -100_000.0, nearest_up: 0.0 }
-    }
+    /// Before any face: far outside everything, and not walkable.
+    const UNCAST: Self = Self {
+        nearest: -100_000.0,
+        nearest_up: 0.0,
+    };
 
     /// true: the point is on a walkable face, stop.
     fn face(&mut self, dist: f32, face: f32, up: f32) -> bool {
@@ -463,62 +494,60 @@ impl FaceVote {
 }
 
 /// The brush face rule: the brush's six box faces (low then high side, x
-/// then y then z), then its other faces (`[nx, ny, nz, dist]`). `point` and
-/// `up` are in the brush's own space.
+/// then y then z), then its other faces (`[facing_x, facing_y, facing_z, dist]`). `point` and
+/// `upward` are in the brush's own space.
 pub fn brush_face_walkable(
-    mins: [f32; 3],
-    maxs: [f32; 3],
+    box_lo: [f32; 3],
+    box_hi: [f32; 3],
     sides: &[[f32; 4]],
-    point: [f32; 3],
-    up: [f32; 3],
+    probe: [f32; 3],
+    upward: [f32; 3],
 ) -> bool {
-    let mut vote = FaceVote::new();
-    for a in 0..3 {
-        if vote.face(-point[a], -mins[a], -up[a]) || vote.face(point[a], maxs[a], up[a]) {
-            return true;
-        }
-    }
-    for side in sides {
-        let n = [side[0], side[1], side[2]];
-        if vote.face(dot(point, n), side[3], dot(up, n)) {
-            return true;
-        }
-    }
-    vote.nearest_up >= WALKABLE_NORMAL_Z
+    let mut vote = FaceVote::UNCAST;
+    let on_box_face = (0..3).any(|a| {
+        vote.face(-probe[a], -box_lo[a], -upward[a]) || vote.face(probe[a], box_hi[a], upward[a])
+    });
+    let on_side_face = on_box_face
+        || sides.iter().any(|&[nx, ny, nz, dist]| {
+            let normal = [nx, ny, nz];
+            vote.face(dot(probe, normal), dist, dot(upward, normal))
+        });
+    on_side_face || vote.nearest_up >= WALKABLE_NORMAL_Z
 }
 
 /// The terrain face rule, over triangles (skipping ones too thin to have a
 /// direction). No triangles: not walkable.
 pub fn triangles_face_walkable(
-    tris: impl IntoIterator<Item = [[f32; 3]; 3]>,
-    point: [f32; 3],
-    up: [f32; 3],
+    triangle_list: impl IntoIterator<Item = [[f32; 3]; 3]>,
+    probe: [f32; 3],
+    upward: [f32; 3],
 ) -> bool {
-    let mut vote = FaceVote::new();
-    for [v0, v1, v2] in tris {
-        let n = cross(sub(v0, v2), sub(v0, v1));
-        let len = libm::sqrtf(dot(n, n));
-        if len <= 0.0001 {
+    let mut vote = FaceVote::UNCAST;
+    for [v0, v1, v2] in triangle_list {
+        let normal = cross3(minus(v0, v2), minus(v0, v1));
+        let length = libm::sqrtf(dot(normal, normal));
+        if length <= 0.0001 {
             continue;
         }
-        let inv = 1.0 / len;
-        if vote.face(dot(point, n) * inv, dot(v0, n) * inv, dot(up, n) * inv) {
+        let inv = 1.0 / length;
+        let along = |v: [f32; 3]| dot(v, normal) * inv;
+        if vote.face(along(probe), along(v0), along(upward)) {
             return true;
         }
     }
-    // With no faces nothing voted, and the starting vote is not walkable.
+    // An empty list leaves the starting vote, which is not walkable.
     vote.nearest_up >= WALKABLE_NORMAL_Z
 }
 
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+fn dot(lhs: [f32; 3], rhs: [f32; 3]) -> f32 {
+    lhs[0] * rhs[0] + lhs[1] * rhs[1] + lhs[2] * rhs[2]
 }
 
-fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+fn minus(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    core::array::from_fn(|i| a[i] - b[i])
 }
 
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -529,9 +558,7 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const STAND_MINS: [f32; 3] = [-15.0, -15.0, 0.0];
-    const STAND_MAXS: [f32; 3] = [15.0, 15.0, 70.0];
+    use super::super::testkit::{MAXS, MINS};
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
@@ -545,8 +572,8 @@ mod tests {
     /// lying down: same width, middle 15 up.
     #[test]
     fn the_player_shape_matches_bo2s_numbers() {
-        let stand = player_hull(STAND_MINS, STAND_MAXS, 0.0);
-        assert_eq!(stand.center, [0.0, 0.0, 35.0]);
+        let stand = player_hull(MINS, MAXS, 0.0);
+        assert_eq!(stand.core_pt, [0.0, 0.0, 35.0]);
         assert_eq!(stand.half_height, 34.625);
         assert_eq!(stand.capsule_radius, 14.625);
         assert!(close(stand.polygon_radius, 14.625 / 0.965_925_8));
@@ -556,21 +583,21 @@ mod tests {
         let (lo, hi) = stand.calc_aabb();
         assert_eq!((lo[2], hi[2]), (-0.125, 70.125));
         assert!(close(hi[0], 14.625 / 0.965_925_8 + 0.5));
-        let prone = player_hull(STAND_MINS, [15.0, 15.0, 30.0], 0.0);
-        assert_eq!(prone.center[2], 15.0);
+        let prone = player_hull(MINS, [15.0, 15.0, 30.0], 0.0);
+        assert_eq!(prone.core_pt[2], 15.0);
         assert_eq!((prone.half_height, prone.capsule_radius), (14.625, 14.625));
         // A box only 20 tall: the width follows the height.
-        let short = player_hull(STAND_MINS, [15.0, 15.0, 20.0], 0.0);
+        let short = player_hull(MINS, [15.0, 15.0, 20.0], 0.0);
         assert_eq!(short.capsule_radius, (20.0 - 0.75) * 0.5);
         // The height dvar lifts the middle.
-        assert_eq!(player_hull(STAND_MINS, STAND_MAXS, 3.0).center[2], 38.0);
+        assert_eq!(player_hull(MINS, MAXS, 3.0).core_pt[2], 38.0);
     }
 
     /// Feet are the bottom 2.125 units standing (2.0 cone minus a 0.25 skin
     /// share); as a capsule, a unit less than its radius.
     #[test]
     fn feet_are_the_bottom_two_and_an_eighth() {
-        let mut stand = player_hull(STAND_MINS, STAND_MAXS, 0.0);
+        let mut stand = player_hull(MINS, MAXS, 0.0);
         assert!(stand.is_foot(2.125));
         assert!(!stand.is_foot(2.13));
         stand.capsule = true;
@@ -583,7 +610,7 @@ mod tests {
     /// a heading between corners rounds to the nearer one.
     #[test]
     fn the_shape_reaches_out_like_bo2s() {
-        let h = player_hull(STAND_MINS, STAND_MAXS, 0.0);
+        let h = player_hull(MINS, MAXS, 0.0);
         let r = h.polygon_radius;
         assert!(close3(h.support([1.0, 0.0, 0.1]), [r, 0.0, 69.625 - 10.0]));
         assert!(close3(h.support([1.0, 0.0, -0.1]), [r, 0.0, 0.375 + 2.0]));
@@ -599,12 +626,22 @@ mod tests {
         let steep = [0.2, 0.0, -1.0];
         assert!(close3(h.support(steep), [r, 0.0, 2.375]));
         let capsule = Hull { capsule: true, ..h };
-        assert!(close3(capsule.support([1.0, 0.0, 0.5]), [0.0, 0.0, 35.0 + 20.0]));
-        assert!(close3(capsule.support([1.0, 0.0, -0.5]), [0.0, 0.0, 35.0 - 20.0]));
+        assert!(close3(
+            capsule.support([1.0, 0.0, 0.5]),
+            [0.0, 0.0, 35.0 + 20.0]
+        ));
+        assert!(close3(
+            capsule.support([1.0, 0.0, -0.5]),
+            [0.0, 0.0, 35.0 - 20.0]
+        ));
     }
 
     fn plane(normal: [f32; 3], rs: f32) -> SolvePlane {
-        SolvePlane { normal, rs, active: true }
+        SolvePlane {
+            facing: normal,
+            rs,
+            engaged: true,
+        }
     }
 
     /// Nothing in the way: the move is kept.
@@ -613,7 +650,8 @@ mod tests {
         let v = [100.0, 50.0, -10.0];
         assert_eq!(project(v, &[plane([0.0, 0.0, 1.0], -20.0)]), v);
         assert_eq!(project(v, &[]), v);
-        let off = SolvePlane { active: false, ..plane([0.0, 0.0, 1.0], 0.0) };
+        let mut off = plane([0.0, 0.0, 1.0], 0.0);
+        off.engaged = false;
         assert_eq!(project(v, &[off]), v);
     }
 
@@ -663,7 +701,7 @@ mod tests {
         assert!(close3(out, [0.0, 3.0, 0.0]), "{out:?}");
         // Each plane alone would leave the other cut: the pair wins.
         for p in planes {
-            assert!(dot(p.normal, out) - p.rs > -1e-4);
+            assert!(dot(p.facing, out) - p.rs > -1e-4);
         }
     }
 
@@ -695,21 +733,21 @@ mod tests {
     /// halfway down the side is not.
     #[test]
     fn the_brush_face_rule_counts_the_top_edge() {
-        let (mins, maxs) = ([-32.0, -32.0, 0.0], [32.0, 32.0, 32.0]);
+        let (box_lo, box_hi) = ([-32.0, -32.0, 0.0], [32.0, 32.0, 32.0]);
         let up = [0.0, 0.0, 1.0];
-        assert!(brush_face_walkable(mins, maxs, &[], [32.0, 0.0, 32.0], up));
-        assert!(!brush_face_walkable(mins, maxs, &[], [32.0, 0.0, 16.0], up));
+        assert!(brush_face_walkable(box_lo, box_hi, &[], [32.0, 0.0, 32.0], up));
+        assert!(!brush_face_walkable(box_lo, box_hi, &[], [32.0, 0.0, 16.0], up));
         // A 60-degree ramp side cut across the box's top corner: on the ramp
         // only (below the top), the steep ramp decides: not walkable.
         let n = [0.866_025_4, 0.0, 0.5];
         let ramp = [n[0], n[1], n[2], dot(n, [28.0, 0.0, 32.0])];
         let on_ramp = [30.0, 0.0, 32.0 - 2.0 * 0.866_025_4 / 0.5];
-        assert!(!brush_face_walkable(mins, maxs, &[ramp], on_ramp, up));
+        assert!(!brush_face_walkable(box_lo, box_hi, &[ramp], on_ramp, up));
         // A gentle 30-degree ramp side: walkable.
         let n = [0.5, 0.0, 0.866_025_4];
         let ramp = [n[0], n[1], n[2], dot(n, [28.0, 0.0, 32.0])];
         let on_ramp = [30.0, 0.0, 32.0 - 2.0 * 0.5 / 0.866_025_4];
-        assert!(brush_face_walkable(mins, maxs, &[ramp], on_ramp, up));
+        assert!(brush_face_walkable(box_lo, box_hi, &[ramp], on_ramp, up));
     }
 
     /// Terrain: a flat triangle under the point is walkable, a wall triangle
@@ -725,6 +763,10 @@ mod tests {
         let down = [floor[0], floor[2], floor[1]];
         assert!(!triangles_face_walkable([down], [2.0, 2.0, 0.0], up));
         assert!(!triangles_face_walkable([wall], [0.0, 2.0, 2.0], up));
-        assert!(!triangles_face_walkable(core::iter::empty(), [0.0, 0.0, 0.0], up));
+        assert!(!triangles_face_walkable(
+            core::iter::empty(),
+            [0.0, 0.0, 0.0],
+            up
+        ));
     }
 }

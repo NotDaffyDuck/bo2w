@@ -8,22 +8,21 @@
 //! their origin and add one draw per surface.
 
 use bevy::prelude::*;
-use fx::FxModelInstance;
+use fx::MeshParticleCopy;
+use render_fx::ModelDrop;
 
-use crate::assemble::drawsurf::{
-    FxModelDrawPlan,
-    tess::{
-        smodel::{LodRampArgs, smodel_camera_lod},
-        xmodel::XModelSurfaceDraw,
+use crate::{
+    FxModelDrawList,
+    mesh_build::{
+        prop_mesh::{DetailRampArgs, prop_camera_detail},
+        figure_mesh::FigureFacetDraw,
     },
 };
-use crate::prepare::scene::{
-    model_lighting_atlas::WorldModelLightingAtlas,
-    model_lighting_cache::{
-        ModelLightingOwner, ModelLightingRequest, ModelLightingRequests, WorldModelLightingCache,
-    },
-    world::WorldScene,
+use crate::prepare::scene::model_illum_atlas::LevelModelIllumAtlas;
+use crate::prepare::scene::model_illum_cache::{
+    ModelIllumOwner, ModelIllumRequest, ModelIllumRequests, LevelModelIllumCache,
 };
+use crate::prepare::scene::world::LevelStage;
 
 /// The element flag that keeps an effect model out of the main view.
 const FX_ELEM_DONT_RENDER: i32 = 0x800;
@@ -40,11 +39,11 @@ fn frame_block(
     has_models: bool,
     has_atlas: bool,
     has_scene: bool,
-    has_cache: bool,
+    cached: bool,
 ) -> Option<FrameBlock> {
     if !has_models {
         Some(FrameBlock::NoCatalog)
-    } else if !(has_atlas && has_scene && has_cache) {
+    } else if !(has_atlas && has_scene && cached) {
         Some(FrameBlock::NoLighting)
     } else {
         None
@@ -52,32 +51,28 @@ fn frame_block(
 }
 
 /// The world's baked model lighting image counts as an atlas as well.
-fn scene_has_atlas(scene: Option<&WorldScene>) -> bool {
+fn scene_has_atlas(scene: Option<&LevelStage>) -> bool {
     scene.is_some_and(|world| {
-        world.model_lighting_image.is_some() && world.model_lighting_dims.is_some()
+        world.model_illum_image.is_some() && world.model_illum_dims.is_some()
     })
 }
 
 /// How far an instance reaches from its origin, as the catalog's radius
 /// stretched by the instance's scale.
-fn reach(radius: f32, scale: f32) -> f32 {
-    radius * scale.abs()
+fn reach(radius: f32, size_k: f32) -> f32 {
+    radius * size_k.abs()
 }
 
-fn placement(instance: &FxModelInstance) -> Mat4 {
-    Mat4::from_scale_rotation_translation(
-        Vec3::splat(instance.scale),
-        Quat::from_array(fx_t6::runtime::axis_to_quat(instance.axis)),
-        Vec3::from_array(instance.origin),
-    )
+fn placement(instance: &MeshParticleCopy) -> Mat4 {
+    let turn = Quat::from_array(fx_t6::runtime::axis_to_quat(instance.axes_m));
+    let size = Vec3::splat(instance.size_k);
+    Mat4::from_scale_rotation_translation(size, turn, instance.place_at.into())
 }
 
 /// The sphere shadow casters see; never smaller than one unit.
-fn caster_bound(radius: Option<f32>, instance: &FxModelInstance) -> Option<render_scene::XModelCasterBound> {
-    radius.map(|radius| render_scene::XModelCasterBound {
-        origin: instance.origin,
-        radius: reach(radius, instance.scale).max(1.0),
-    })
+fn caster_bound(radius: Option<f32>, instance: &MeshParticleCopy) -> Option<render_scene::XModelCasterBound> {
+    let origin = instance.place_at;
+    radius.map(|authored| render_scene::XModelCasterBound { origin, reach: reach(authored, instance.size_k).max(1.0) })
 }
 
 /// A reason to skip one instance; each is counted on the plan.
@@ -89,34 +84,39 @@ enum Skip {
     NoMaterial,
 }
 
-fn count(plan: &mut FxModelDrawPlan, why: Skip) {
-    let counter = match why {
-        Skip::NoCatalog => &mut plan.skipped_no_catalog,
-        Skip::DontRender => &mut plan.skipped_render_fx_flags,
-        Skip::NoLod => &mut plan.skipped_no_lod,
-        Skip::OutOfView => &mut plan.skipped_culled,
-        Skip::NoMaterial => &mut plan.skipped_no_material,
-    };
-    *counter = counter.saturating_add(1);
+impl Skip {
+    fn reason(self) -> ModelDrop {
+        match self {
+            Skip::NoCatalog => ModelDrop::NoCatalog,
+            Skip::DontRender => ModelDrop::RenderFlags,
+            Skip::NoLod => ModelDrop::NoLod,
+            Skip::OutOfView => ModelDrop::Culled,
+            Skip::NoMaterial => ModelDrop::NoMaterial,
+        }
+    }
+}
+
+fn count(plan: &mut FxModelDrawList, why: Skip) {
+    plan.dropped.add_to(why.reason(), 1);
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn fill_fx_model_plan(
-    instances: &[FxModelInstance],
-    models: Option<&asset_game::FxModelCatalog>,
-    atlas: Option<&WorldModelLightingAtlas>,
-    scene: Option<&WorldScene>,
-    atpoint: &render_scene::DynAtPointLookup,
+pub(super) fn fill_effect_model_plan(
+    inst_list: &[MeshParticleCopy],
+    models: Option<&asset_game::EffectMeshRoster>,
+    atlas: Option<&LevelModelIllumAtlas>,
+    scene: Option<&LevelStage>,
+    at_spot: &render_scene::LooseAtSpotLookup,
     eye: Vec3,
-    frustum_planes: &[[f32; 4]],
-    lod_ramp: LodRampArgs,
-    cache: Option<&WorldModelLightingCache>,
-    lighting_requests: &mut ModelLightingRequests,
-    plan: &mut FxModelDrawPlan,
+    view_volume_planes: &[[f32; 4]],
+    detail_ramp: DetailRampArgs,
+    cache: Option<&LevelModelIllumCache>,
+    illum_requests: &mut ModelIllumRequests,
+    plan: &mut FxModelDrawList,
 ) {
-    let total = u32::try_from(instances.len()).unwrap_or(u32::MAX);
-    plan.generated = total;
-    if instances.is_empty() {
+    let total = u32::try_from(inst_list.len()).unwrap_or(u32::MAX);
+    plan.emitted = total;
+    if inst_list.is_empty() {
         return;
     }
     let models = models.filter(|catalog| !catalog.is_empty());
@@ -128,77 +128,67 @@ pub(super) fn fill_fx_model_plan(
     );
     match block {
         Some(FrameBlock::NoCatalog) => {
-            plan.skipped_no_catalog = total;
+            plan.dropped.set_to(ModelDrop::NoCatalog, total);
             return;
         }
         Some(FrameBlock::NoLighting) => {
-            plan.skipped_no_lighting = total;
+            plan.dropped.set_to(ModelDrop::NoLighting, total);
             return;
         }
         None => {}
     }
     let Some(models) = models else { return };
 
-    for instance in instances {
-        let Some(entry) = models.get_at(instance.model_index) else {
+    for copy in inst_list {
+        let (spot, size) = (copy.place_at, copy.size_k);
+        let Some(entry) = models.record_at(copy.mesh_slot_number) else {
             count(plan, Skip::NoCatalog);
             continue;
         };
-        if instance.flags & FX_ELEM_DONT_RENDER != 0 {
+        if copy.copy_bits & FX_ELEM_DONT_RENDER != 0 {
             count(plan, Skip::DontRender);
             continue;
         }
-        let Some(lod) = smodel_camera_lod(
-            entry.skel.lod,
-            instance.origin,
-            instance.scale.abs(),
-            Some(eye),
-            lod_ramp,
-        ) else {
+        let Some(lod) = prop_camera_detail(entry.bone_rig.lod, spot, size.abs(), Some(eye), detail_ramp) else {
             count(plan, Skip::NoLod);
             continue;
         };
-        let radius = entry.skel.radius;
-        let outside = radius.is_some_and(|radius| {
-            dpvs_t6::scene_ent_sphere_culled(
-                instance.origin,
-                reach(radius, instance.scale),
-                frustum_planes,
-            )
-        });
+        let radius = entry.bone_rig.radius;
+        let outside = radius
+            .is_some_and(|authored| dpvs_t6::scene_ent_sphere_culled(spot, reach(authored, size), view_volume_planes));
         if outside {
             count(plan, Skip::OutOfView);
             continue;
         }
-        let Some(asset) = plan.asset(instance.model_index, lod) else {
+        let Some(asset) = plan.find_asset(copy.mesh_slot_number, lod) else {
             count(plan, Skip::NoMaterial);
             continue;
         };
-        let surfaces = asset.surfaces.clone();
+        let surfaces = asset.surf_list.clone();
 
-        let box_half = radius
-            .map(|radius| render_anim::radius_lighting_box_half(reach(radius, instance.scale)));
-        let lighting = lighting_requests.request(ModelLightingRequest {
-            owner: ModelLightingOwner::FxModel(instance.elem_handle),
-            origin: instance.origin,
-            lookup_fallback: atpoint.fallback(instance.origin, box_half),
+        let box_half = radius.map(|authored| render_anim::radius_lighting_box_half(reach(authored, size)));
+        let lighting = illum_requests.queue(ModelIllumRequest {
+            owner: ModelIllumOwner::EffectModel(copy.part_id),
+            origin: spot,
+            lookup_backup: at_spot.fallback(spot, box_half),
         });
-        let world_from_local = placement(instance);
-        let caster_bound = caster_bound(radius, instance);
-        for (surface, material) in surfaces {
-            plan.push_draw(XModelSurfaceDraw {
-                surface,
+        let local_to_world = placement(copy);
+        let caster_bound = caster_bound(radius, copy);
+        for (surf, material) in surfaces {
+            let colour_refusal = None;
+            plan.queue_draw(FigureFacetDraw {
+                surface: surf,
                 material,
-                world_from_local,
-                lighting_handle: 0,
-                pending_lighting: Some(lighting),
-                colour_refusal: None,
-                object_id: instance.elem_handle,
-                scene_light_index: 0,
-                reflection_probe_index: 0,
-                packed_lighting: None,
-                is_scope: false,
-                scene_entnum: None,
+                map_from_self: local_to_world,
+                illum_handle: 0,
+                queued_illum: Some(lighting),
+                colour_refusal,
+                object_tag: copy.part_id,
+                stage_light_index: 0,
+                env_probe_index: 0,
+                compact_illum: None,
+                is_scoped_view: false,
+                stage_actor_num: None,
                 caster_bound,
             });
         }
@@ -209,16 +199,16 @@ pub(super) fn fill_fx_model_plan(
 mod tests {
     use super::*;
 
-    fn instance(scale: f32, origin: [f32; 3]) -> FxModelInstance {
-        FxModelInstance {
-            def_name: String::new(),
-            def_index: 0,
-            model_index: 0,
-            elem_handle: 7,
-            origin,
-            axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            scale,
-            flags: 0,
+    fn instance(scale: f32, pos: [f32; 3]) -> MeshParticleCopy {
+        MeshParticleCopy {
+            definition_name: String::new(),
+            definition_slot: 0,
+            mesh_slot_number: 0,
+            part_id: 7,
+            place_at: pos,
+            axes_m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            size_k: scale,
+            copy_bits: 0,
         }
     }
 
@@ -263,16 +253,16 @@ mod tests {
     #[test]
     fn a_caster_is_at_least_one_unit_wide() {
         let tiny = caster_bound(Some(0.1), &instance(1.0, [0.0; 3])).unwrap();
-        assert_eq!(tiny.radius, 1.0);
+        assert_eq!(tiny.reach, 1.0);
         let big = caster_bound(Some(10.0), &instance(-3.0, [4.0, 5.0, 6.0])).unwrap();
-        assert_eq!(big.radius, 30.0);
+        assert_eq!(big.reach, 30.0);
         assert_eq!(big.origin, [4.0, 5.0, 6.0]);
         assert!(caster_bound(None, &instance(1.0, [0.0; 3])).is_none());
     }
 
     #[test]
     fn each_skip_has_its_own_counter() {
-        let mut plan = FxModelDrawPlan::default();
+        let mut plan = FxModelDrawList::without_geometry(0);
         for why in [Skip::NoCatalog, Skip::DontRender, Skip::NoLod, Skip::OutOfView] {
             count(&mut plan, why);
         }
@@ -280,60 +270,60 @@ mod tests {
         count(&mut plan, Skip::NoMaterial);
         assert_eq!(
             (
-                plan.skipped_no_catalog,
-                plan.skipped_render_fx_flags,
-                plan.skipped_no_lod,
-                plan.skipped_culled,
-                plan.skipped_no_material,
+                plan.dropped.count_of(ModelDrop::NoCatalog),
+                plan.dropped.count_of(ModelDrop::RenderFlags),
+                plan.dropped.count_of(ModelDrop::NoLod),
+                plan.dropped.count_of(ModelDrop::Culled),
+                plan.dropped.count_of(ModelDrop::NoMaterial),
             ),
             (1, 1, 1, 2, 1)
         );
-        assert_eq!(plan.skipped_no_lighting, 0);
+        assert_eq!(plan.dropped.count_of(ModelDrop::NoLighting), 0);
     }
 
     #[test]
     fn an_empty_frame_only_records_the_total() {
-        let mut plan = FxModelDrawPlan::default();
-        let mut requests = ModelLightingRequests::default();
-        let atpoint = render_scene::DynAtPointLookup::default();
-        fill_fx_model_plan(
+        let mut plan = FxModelDrawList::without_geometry(0);
+        let mut requests = ModelIllumRequests::default();
+        let at_spot = render_scene::LooseAtSpotLookup::default();
+        fill_effect_model_plan(
             &[],
             None,
             None,
             None,
-            &atpoint,
+            &at_spot,
             Vec3::ZERO,
             &[],
-            LodRampArgs::default(),
+            DetailRampArgs::default(),
             None,
             &mut requests,
             &mut plan,
         );
-        assert_eq!(plan.generated, 0);
-        assert_eq!(plan.skipped_no_catalog, 0);
+        assert_eq!(plan.emitted, 0);
+        assert_eq!(plan.dropped.count_of(ModelDrop::NoCatalog), 0);
     }
 
     #[test]
     fn a_missing_catalog_skips_the_whole_frame() {
-        let mut plan = FxModelDrawPlan::default();
-        let mut requests = ModelLightingRequests::default();
-        let atpoint = render_scene::DynAtPointLookup::default();
+        let mut plan = FxModelDrawList::without_geometry(0);
+        let mut requests = ModelIllumRequests::default();
+        let at_spot = render_scene::LooseAtSpotLookup::default();
         let frame = [instance(1.0, [0.0; 3]), instance(1.0, [5.0; 3])];
-        fill_fx_model_plan(
+        fill_effect_model_plan(
             &frame,
             None,
             None,
             None,
-            &atpoint,
+            &at_spot,
             Vec3::ZERO,
             &[],
-            LodRampArgs::default(),
+            DetailRampArgs::default(),
             None,
             &mut requests,
             &mut plan,
         );
-        assert_eq!(plan.generated, 2);
-        assert_eq!(plan.skipped_no_catalog, 2);
+        assert_eq!(plan.emitted, 2);
+        assert_eq!(plan.dropped.count_of(ModelDrop::NoCatalog), 2);
         assert!(plan.draws().is_empty());
     }
 }

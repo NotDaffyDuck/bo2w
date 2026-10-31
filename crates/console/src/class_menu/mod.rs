@@ -9,12 +9,15 @@ mod edit;
 mod fixture;
 mod publish;
 
-use bevy::{ecs::system::SystemParam, prelude::*};
+use bevy::ecs::system::SystemParam;
+use bevy::prelude::*;
 use frame::UiMenuDvars;
-use ui::{ClassEditRow, ClassLoadoutCatalog, ClassSlotState, SessionClassStore};
+use ui::{LoadoutEditorLine, LoadoutRoster, LoadoutSlotStatus, MatchLoadoutVault};
 
-use crate::feature_dispatch::ConsoleEcho;
-use crate::{CommandSpec, ConsoleCommand, ConsoleRegistry};
+use crate::tool_cmds::PromptReplyWriter;
+use crate::OrderBlueprint;
+use crate::TypedOrder;
+use crate::OrderCatalog;
 use browse::{Browse, PAGE_SIZE};
 use publish::{Words, publish};
 
@@ -34,18 +37,18 @@ const COMMANDS: [&str; 11] = [
     "ui_class_hover",
 ];
 
-pub(crate) fn register(registry: &mut ConsoleRegistry) {
-    for name in COMMANDS {
-        if registry.resolve(name).is_none() {
-            registry.register(CommandSpec::new(name));
+pub(crate) fn enlist(book: &mut OrderCatalog) {
+    for order in COMMANDS {
+        if book.look_up(order).is_none() {
+            book.enlist(OrderBlueprint::new(order));
         }
     }
 }
 
 /// The number a command names: a class, a row, a game, a choice.
-fn index(command: &ConsoleCommand) -> Result<usize, String> {
+fn index(command: &TypedOrder) -> Result<usize, String> {
     command
-        .args
+        .words
         .first()
         .and_then(|arg| arg.parse().ok())
         .ok_or_else(|| "Invalid class selection".to_owned())
@@ -54,64 +57,64 @@ fn index(command: &ConsoleCommand) -> Result<usize, String> {
 /// What the commands change and read.
 #[derive(SystemParam)]
 pub(crate) struct Menu<'w> {
-    store: ResMut<'w, SessionClassStore>,
-    catalog: Res<'w, ClassLoadoutCatalog>,
-    loc: Res<'w, asset_game::LocalizeCatalog>,
+    store: ResMut<'w, MatchLoadoutVault>,
+    roster: Res<'w, LoadoutRoster>,
+    loc: Res<'w, asset_game::TranslationStringIndex>,
     dvars: ResMut<'w, UiMenuDvars>,
 }
 
 impl Menu<'_> {
-    fn slot_at(&self, at: usize) -> Result<&ClassSlotState, String> {
+    fn slot_at(&self, at: usize) -> Result<&LoadoutSlotStatus, String> {
         self.store.slots.get(at).ok_or_else(|| NO_CLASS.to_owned())
     }
 
     fn run(
         &mut self,
         browse: &mut Browse,
-        command: &ConsoleCommand,
-        echo: &mut ConsoleEcho,
+        order: &TypedOrder,
+        echo: &mut PromptReplyWriter,
     ) -> Result<(), String> {
-        match command.name.as_str() {
-            "ui_class_hover" => browse.hover = index(command)?.min(PAGE_SIZE - 1),
+        match order.name.as_str() {
+            "ui_class_hover" => browse.hover = index(order)?.min(PAGE_SIZE - 1),
             "ui_class_preview_slot" => {
-                let at = index(command)?;
+                let at = index(order)?;
                 self.slot_at(at)?;
                 self.store.selected = at;
             }
             "ui_class_slot" => {
-                let at = index(command)?;
+                let at = index(order)?;
                 let name = self.slot_at(at)?.name.clone();
                 self.dvars.set("ui_class_name", name);
                 self.store.selected = at;
                 *browse = Browse::default();
             }
             "ui_class_edit" | "ui_class_attachments" => {
-                let row = ClassEditRow::ALL
-                    .get(index(command)?)
+                let row = LoadoutEditorLine::ALL
+                    .get(index(order)?)
                     .copied()
                     .ok_or("Unknown loadout slot")?;
-                let attachments = command.name == "ui_class_attachments";
+                let attachments = order.name == "ui_class_attachments";
                 if attachments && !edit::takes_attachments(row) {
                     return Err("This slot does not accept attachments".into());
                 }
                 browse.open_row(row, attachments);
             }
-            "ui_class_game" => browse.open_game(&self.catalog, index(command)?)?,
-            "ui_class_category" => browse.open_folder(&self.catalog, index(command)?)?,
+            "ui_class_game" => browse.open_game(&self.roster, index(order)?)?,
+            "ui_class_category" => browse.open_folder(&self.roster, index(order)?)?,
             "ui_class_page" => {
-                let delta = command
-                    .args
+                let delta = order
+                    .words
                     .first()
                     .and_then(|arg| arg.parse::<isize>().ok())
                     .ok_or("Invalid page")?;
                 let slot = self.store.slots.get(self.store.selected);
-                let choices = browse.choices(&self.catalog, slot).len();
+                let choices = browse.choices(&self.roster, slot).len();
                 browse.turn(delta, choices);
             }
-            "ui_class_pick" => self.pick(browse, command, echo)?,
+            "ui_class_pick" => self.pick(browse, order, echo)?,
             "ui_class_reset" => {
                 let at = self.store.selected;
-                let reset = edit::reset(&self.catalog, self.slot_at(at)?, at)?;
+                let reset = edit::reset(&self.roster, self.slot_at(at)?, at)?;
                 self.dvars.set("ui_class_name", &reset.name);
                 self.store.slots[at] = reset;
             }
@@ -130,8 +133,8 @@ impl Menu<'_> {
     fn pick(
         &mut self,
         browse: &mut Browse,
-        command: &ConsoleCommand,
-        echo: &mut ConsoleEcho,
+        command: &TypedOrder,
+        echo: &mut PromptReplyWriter,
     ) -> Result<(), String> {
         let row = browse.row.ok_or("No loadout slot selected")?;
         let at = index(command)?;
@@ -141,12 +144,12 @@ impl Menu<'_> {
         let selected = self.store.selected;
         let slot = self.store.slots.get(selected);
         let value = browse
-            .choices(&self.catalog, slot)
+            .choices(&self.roster, slot)
             .into_iter()
             .nth(browse.page * PAGE_SIZE + at)
             .ok_or("Item is unavailable")?;
         let picked = edit::pick(
-            &self.catalog,
+            &self.roster,
             slot.ok_or(NO_CLASS)?,
             row,
             &value,
@@ -156,7 +159,7 @@ impl Menu<'_> {
             "menu: class {} {} = {}",
             selected + 1,
             row.label(),
-            picked.row_value(row)
+            picked.value_in(row)
         ));
         self.store.slots[selected] = picked;
         browse.after_pick(row);
@@ -167,20 +170,20 @@ impl Menu<'_> {
 /// Runs the menu's commands, then shows the menu as it stands. A command that
 /// works clears the menu's status line (looking around does not); one that does
 /// not leaves its reason there and in the console.
-pub(crate) fn route(
-    mut commands: MessageReader<ConsoleCommand>,
+pub(crate) fn route_class_menu(
+    mut commands: MessageReader<TypedOrder>,
     mut browse: Local<Browse>,
     mut menu: Menu,
-    mut echo: ConsoleEcho,
+    mut echo: PromptReplyWriter,
 ) {
-    for command in commands
+    for order in commands
         .read()
-        .filter(|command| command.name.starts_with("ui_class_"))
+        .filter(|order| order.name.starts_with("ui_class_"))
     {
-        match menu.run(&mut browse, command, &mut echo) {
+        match menu.run(&mut browse, order, &mut echo) {
             Ok(())
                 if matches!(
-                    command.name.as_str(),
+                    order.name.as_str(),
                     "ui_class_hover" | "ui_class_preview_slot"
                 ) => {}
             Ok(()) => menu.dvars.set("ui_class_status", ""),
@@ -191,7 +194,7 @@ pub(crate) fn route(
         }
     }
     let words = Words {
-        catalog: &menu.catalog,
+        catalog: &menu.roster,
         loc: &menu.loc,
     };
     publish(&mut menu.dvars, &menu.store, &mut browse, &words);
@@ -199,41 +202,41 @@ pub(crate) fn route(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::class_menu::*;
     use crate::class_menu::fixture::{AK47, MP7, catalog, menu_app, slot};
-    use crate::feature_dispatch::testing::{feed, said};
+    use crate::tool_cmds::testing::{feed, said};
     use ui::classes::setup::CatalogResolver;
 
-    fn dvar(app: &App, name: &str) -> String {
+    fn dvar(app: &App, key: &str) -> String {
         app.world()
             .resource::<UiMenuDvars>()
-            .get(name)
+            .get(key)
             .unwrap_or("<unset>")
             .to_owned()
     }
 
-    fn set_dvar(app: &mut App, name: &str, value: &str) {
+    fn set_dvar(app: &mut App, key: &str, to: &str) {
         app.world_mut()
             .resource_mut::<UiMenuDvars>()
-            .set(name, value);
+            .set(key, to);
     }
 
-    fn classes(app: &App) -> &SessionClassStore {
-        app.world().resource::<SessionClassStore>()
+    fn classes(app: &App) -> &MatchLoadoutVault {
+        app.world().resource::<MatchLoadoutVault>()
     }
 
-    fn classes_mut(app: &mut App) -> Mut<'_, SessionClassStore> {
-        app.world_mut().resource_mut::<SessionClassStore>()
+    fn classes_mut(app: &mut App) -> Mut<'_, MatchLoadoutVault> {
+        app.world_mut().resource_mut::<MatchLoadoutVault>()
     }
 
     #[test]
     fn the_eleven_commands_are_registered_once_and_stay_out_of_the_way() {
-        let mut registry = ConsoleRegistry::default();
-        register(&mut registry);
-        register(&mut registry);
-        assert_eq!(registry.help_lines().len(), 11);
+        let mut book = OrderCatalog::default();
+        enlist(&mut book);
+        enlist(&mut book);
+        assert_eq!(book.usage_listing().len(), 11);
         for name in COMMANDS {
-            assert!(registry.resolve(name).is_some(), "{name}");
+            assert!(book.look_up(name).is_some(), "{name}");
         }
     }
 
@@ -263,11 +266,8 @@ mod tests {
         assert_eq!(dvar(&app, "ui_class_name"), "Class 4");
         assert_eq!(dvar(&app, "ui_class_title"), "Class 4");
         assert_eq!(dvar(&app, "ui_class_index"), "3");
-        assert_eq!(
-            dvar(&app, "ui_class_caption"),
-            "Classes",
-            "the row was closed"
-        );
+        let expected = "Classes";
+        assert_eq!(dvar(&app, "ui_class_caption"), expected, "the row was closed");
         assert!(said(&app).is_empty());
     }
 
@@ -279,11 +279,8 @@ mod tests {
         feed(&mut app, "ui_class_preview_slot 2");
         assert_eq!(classes(&app).selected, 2);
         assert_eq!(dvar(&app, "ui_class_title"), "Class 3");
-        assert_eq!(
-            dvar(&app, "ui_class_caption"),
-            "PRIMARY",
-            "the row stayed open"
-        );
+        let expected = "PRIMARY";
+        assert_eq!(dvar(&app, "ui_class_caption"), expected, "the row stayed open");
         assert_eq!(dvar(&app, "ui_class_name"), "<unset>");
         assert_eq!(dvar(&app, "ui_class_status"), "kept");
     }
@@ -323,11 +320,8 @@ mod tests {
         assert_eq!(dvar(&app, "ui_class_game_count"), "2");
         feed(&mut app, "ui_class_edit 8");
         assert_eq!(said(&app), ["menu: Unknown loadout slot"]);
-        assert_eq!(
-            dvar(&app, "ui_class_caption"),
-            "PRIMARY",
-            "still on the row"
-        );
+        let expected = "PRIMARY";
+        assert_eq!(dvar(&app, "ui_class_caption"), expected, "still on the row");
     }
 
     #[test]
@@ -339,11 +333,8 @@ mod tests {
 
         feed(&mut app, "ui_class_attachments 2");
         assert_eq!(said(&app), ["menu: This slot does not accept attachments"]);
-        assert_eq!(
-            dvar(&app, "ui_class_caption"),
-            "PRIMARY / ATTACHMENTS",
-            "what was open stays open"
-        );
+        let expected = "PRIMARY / ATTACHMENTS";
+        assert_eq!(dvar(&app, "ui_class_caption"), expected, "what was open stays open");
         feed(&mut app, "ui_class_attachments 1");
         assert_eq!(dvar(&app, "ui_class_caption"), "Secondary / ATTACHMENTS");
     }
@@ -360,11 +351,8 @@ mod tests {
         assert_eq!(dvar(&app, "ui_class_choice_0"), "MP7");
         feed(&mut app, "ui_class_game 0");
         assert_eq!(dvar(&app, "ui_class_game_label"), "T5");
-        assert_eq!(
-            dvar(&app, "ui_class_category_label"),
-            "",
-            "a new game has no category yet"
-        );
+        let expected = "";
+        assert_eq!(dvar(&app, "ui_class_category_label"), expected, "a new game has no category yet");
         assert_eq!(dvar(&app, "ui_class_category_count"), "1");
         assert_eq!(dvar(&app, "ui_class_category_0"), "ASSAULT RIFLES");
         assert_eq!(dvar(&app, "ui_class_picker_title"), "PRIMARY");
@@ -377,11 +365,8 @@ mod tests {
             &mut app,
             "ui_class_edit 0; ui_class_game 5; ui_class_category 0",
         );
-        assert_eq!(
-            said(&app),
-            ["menu: Game is unavailable", "menu: Category is unavailable",],
-            "no game is chosen so no category is listed"
-        );
+        let expected = ["menu: Game is unavailable", "menu: Category is unavailable",];
+        assert_eq!(said(&app), expected, "no game is chosen so no category is listed");
         assert_eq!(dvar(&app, "ui_class_game_label"), "");
     }
 
@@ -390,7 +375,7 @@ mod tests {
         let mut many = catalog();
         many.lethal = (0..23)
             .map(|n| format!("t6:weapon/nade{n}_mp").as_str().into())
-            .collect();
+            .collect::<Vec<frame::CustomClassGunChoice>>();
         app.insert_resource(many);
         feed(&mut app, "ui_class_edit 2");
         app
@@ -424,18 +409,12 @@ mod tests {
         feed(&mut app, "ui_class_hover 1");
         assert_eq!(dvar(&app, "ui_class_preview_title"), "MP7");
         feed(&mut app, "ui_class_hover 99");
-        assert_eq!(
-            dvar(&app, "ui_class_preview"),
-            "",
-            "the last row, and no error"
-        );
+        let expected = "";
+        assert_eq!(dvar(&app, "ui_class_preview"), expected, "the last row, and no error");
         assert!(said(&app).is_empty());
         feed(&mut app, "ui_class_hover 1; ui_class_game 1");
-        assert_eq!(
-            dvar(&app, "ui_class_preview_title"),
-            "AK-47",
-            "a new list starts at its first choice"
-        );
+        let expected = "AK-47";
+        assert_eq!(dvar(&app, "ui_class_preview_title"), expected, "a new list starts at its first choice");
     }
 
     #[test]
@@ -452,11 +431,8 @@ mod tests {
         ] {
             let mut app = menu_app();
             feed(&mut app, line);
-            assert_eq!(
-                said(&app).last().map(String::as_str),
-                Some(format!("menu: {why}").as_str()),
-                "{line}"
-            );
+            let expected = format!("menu: {why}");
+            assert_eq!(said(&app).last().map(String::as_str), Some(expected.as_str()), "{line}");
             assert_eq!(dvar(&app, "ui_class_status"), why, "{line}");
         }
         let mut app = menu_app();
@@ -470,7 +446,7 @@ mod tests {
         let refusal = edit::pick(
             &catalog(),
             &slot("Class 1"),
-            ClassEditRow::Primary,
+            LoadoutEditorLine::Primary,
             MP7,
             false,
         )
@@ -480,33 +456,27 @@ mod tests {
         assert_eq!(said(&app), [format!("menu: {refusal}")]);
         assert_eq!(dvar(&app, "ui_class_status"), refusal);
         assert_eq!(classes(&app).slots[0].primary, AK47);
-        assert_eq!(
-            dvar(&app, "ui_class_caption"),
-            "PRIMARY",
-            "the picker stays up"
-        );
+        let expected = "PRIMARY";
+        assert_eq!(dvar(&app, "ui_class_caption"), expected, "the picker stays up");
     }
 
     #[test]
     fn a_pick_that_works_changes_the_class_and_says_so() {
         let mut app = menu_app();
-        classes_mut(&mut app).slots[0].lock_reason = Some("a gun the catalog cannot place".into());
-        let other = catalog().options(ClassEditRow::Perk1)[1].clone();
+        classes_mut(&mut app).slots[0].frozen_because = Some("a gun the catalog cannot place".into());
+        let other = catalog().options(LoadoutEditorLine::Perk1)[1].clone();
         feed(&mut app, "ui_class_edit 4");
         set_dvar(&mut app, "ui_class_status", "old");
         feed(&mut app, "ui_class_pick 1");
         assert_eq!(said(&app), [format!("menu: class 1 Perk 1 = {other}")]);
-        assert_eq!(classes(&app).slots[0].perk1, other);
+        assert_eq!(classes(&app).slots[0].first_specialty, other);
         assert!(
             dvar(&app, "ui_class_status").starts_with("Class unavailable"),
             "the old line is gone; the guns still cannot be placed, and the menu says so"
         );
         assert_eq!(dvar(&app, "ui_class_value_4"), ui_value(&other));
-        assert_eq!(
-            dvar(&app, "ui_class_caption"),
-            "Perk 1",
-            "the row stays open"
-        );
+        let expected = "Perk 1";
+        assert_eq!(dvar(&app, "ui_class_caption"), expected, "the row stays open");
     }
 
     fn ui_value(key: &str) -> String {
@@ -516,15 +486,15 @@ mod tests {
     #[test]
     fn a_pick_goes_to_the_selected_class() {
         let mut app = menu_app();
-        classes_mut(&mut app).slots[4].lock_reason = Some("locked".into());
-        let other = catalog().options(ClassEditRow::Perk2)[1].clone();
+        classes_mut(&mut app).slots[4].frozen_because = Some("locked".into());
+        let other = catalog().options(LoadoutEditorLine::Perk2)[1].clone();
         feed(
             &mut app,
             "ui_class_slot 4; ui_class_edit 5; ui_class_pick 1",
         );
         assert_eq!(said(&app), [format!("menu: class 5 Perk 2 = {other}")]);
-        assert_eq!(classes(&app).slots[4].perk2, other);
-        assert_eq!(classes(&app).slots[0].perk2, "specialty_bulletdamage");
+        assert_eq!(classes(&app).slots[4].second_specialty, other);
+        assert_eq!(classes(&app).slots[0].second_specialty, "specialty_bulletdamage");
     }
 
     #[test]
@@ -540,10 +510,8 @@ mod tests {
 
         classes_mut(&mut app).selected = 40;
         feed(&mut app, "ui_class_reset");
-        assert_eq!(
-            said(&app).last().map(String::as_str),
-            Some("menu: Class is unavailable")
-        );
+        let expected = Some("menu: Class is unavailable");
+        assert_eq!(said(&app).last().map(String::as_str), expected);
     }
 
     #[test]

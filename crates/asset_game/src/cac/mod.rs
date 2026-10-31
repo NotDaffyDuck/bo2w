@@ -1,13 +1,13 @@
 //! What the class menu reads out of the authored tables: weapon groups, the
 //! stat bars and captions of a weapon, and the perk lists.
 
-mod category;
-mod perks;
-mod preview;
+mod placed_group;
+mod ability_rows;
+mod gun_showcase;
 
-pub use category::{CacAuthoredCategory, cac_category_from_item_group};
-pub use perks::{CacPerkRow, CacPerkSlot, perk_rows};
-pub use preview::{CacStatBar, CacWeaponPreview, weapon_preview};
+pub use placed_group::{LoadoutPlacedGroup, loadout_category_of_group};
+pub use ability_rows::{LoadoutPerkEntry, LoadoutAbilitySlot, default_class_perks, perk_rows};
+pub use gun_showcase::{LoadoutStatMeter, LoadoutGunShowcase, gun_preview};
 
 /// Columns of the weapon stats table.
 pub(crate) mod stats_col {
@@ -20,10 +20,10 @@ pub(crate) mod stats_col {
 
 /// Whether a table is the weapon stats table, whatever folder it sits in.
 #[must_use]
-pub fn is_stats_table_name(name: &str) -> bool {
+pub fn names_scoreboard_sheet(name: &str) -> bool {
     let unified = name.replace('\\', "/");
-    let leaf = unified.rsplit('/').next().unwrap_or(&unified);
-    leaf.eq_ignore_ascii_case("statstable.csv")
+    let base_file = unified.rsplit('/').next().unwrap_or(&unified);
+    base_file.eq_ignore_ascii_case("statstable.csv")
 }
 
 /// `@KEY` for a localized string cell, empty when the cell is.

@@ -16,7 +16,7 @@ pub struct T6Glass {
     pub server: Vec<T6GlassServerPane>,
     /// Each window definition the map uses, once, in the order they first
     /// appear: its whole-pane material and its shard material.
-    pub def_materials: Vec<(String, String)>,
+    pub fallback_shaders: Vec<(String, String)>,
 }
 
 /// What the game logic knows of one window.
@@ -27,15 +27,15 @@ pub struct T6GlassServerPane {
     pub absmin: [f32; 3],
     pub absmax: [f32; 3],
     /// The health the window's definition gives it.
-    pub max_health: i32,
+    pub hit_point_ceiling: i32,
 }
 
 impl T6Glass {
-    pub fn report_line(&self) -> String {
+    pub fn summary_text(&self) -> String {
         format!(
             "panes={} defs={} drawn={}",
             self.server.len(),
-            self.def_materials.len(),
+            self.fallback_shaders.len(),
             self.panes.len()
         )
     }
@@ -51,17 +51,17 @@ pub fn build_t6_glass(glasses: &[asset_t6::GlassRef]) -> Option<(T6Glass, Vec<T6
     let usable = glasses
         .iter()
         .enumerate()
-        .filter(|(_, window)| window.outline.len() >= MIN_OUTLINE_POINTS);
+        .filter(|entry| entry.1.outline.len() >= MIN_OUTLINE_POINTS);
     for (index, window) in usable {
-        if !known_defs.contains(&window.def_name.as_str()) {
-            known_defs.push(&window.def_name);
+        if !known_defs.contains(&window.definition_name.as_str()) {
+            known_defs.push(&window.definition_name);
             glass
-                .def_materials
+                .fallback_shaders
                 .push((window.pristine_material.clone(), window.shard_material.clone()));
         }
         placements.push(T6GlassPlacement {
             glass: index,
-            brush_model: window.brush_model,
+            solid_model: window.solid_model,
             origin: window.origin,
             angles: window.angles,
         });
@@ -69,7 +69,7 @@ pub fn build_t6_glass(glasses: &[asset_t6::GlassRef]) -> Option<(T6Glass, Vec<T6
             origin: window.origin,
             absmin: window.absmin,
             absmax: window.absmax,
-            max_health: window.max_health,
+            hit_point_ceiling: window.hit_point_ceiling,
         });
     }
     (!glass.server.is_empty()).then_some((glass, placements))
@@ -81,12 +81,12 @@ mod tests {
 
     fn window(def: &str, points: usize, health: i32) -> asset_t6::GlassRef {
         asset_t6::GlassRef {
-            def_name: def.into(),
+            definition_name: def.into(),
             outline: vec![[0.0, 0.0]; points],
             pristine_material: format!("{def}_whole"),
             shard_material: format!("{def}_shard"),
-            max_health: health,
-            brush_model: points as u32,
+            hit_point_ceiling: health,
+            solid_model: points as u32,
             ..Default::default()
         }
     }
@@ -96,10 +96,10 @@ mod tests {
         let (glass, placements) =
             build_t6_glass(&[window("a", 2, 10), window("a", 3, 20), window("a", 4, 30)]).unwrap();
         assert_eq!(glass.server.len(), 2);
-        assert_eq!(glass.server[0].max_health, 20);
+        assert_eq!(glass.server[0].hit_point_ceiling, 20);
         let kept: Vec<usize> = placements.iter().map(|place| place.glass).collect();
         assert_eq!(kept, [1, 2]);
-        assert_eq!(placements[1].brush_model, 4);
+        assert_eq!(placements[1].solid_model, 4);
     }
 
     #[test]
@@ -107,10 +107,10 @@ mod tests {
         let (glass, _) =
             build_t6_glass(&[window("a", 3, 1), window("b", 3, 1), window("a", 3, 1)]).unwrap();
         assert_eq!(
-            glass.def_materials,
+            glass.fallback_shaders,
             [("a_whole".into(), "a_shard".into()), ("b_whole".into(), "b_shard".into())]
         );
-        assert_eq!(glass.report_line(), "panes=3 defs=2 drawn=0");
+        assert_eq!(glass.summary_text(), "panes=3 defs=2 drawn=0");
     }
 
     #[test]

@@ -1,9 +1,8 @@
-[package]
-name = "fastfile_t5"
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-description = "Block layout and vertex declaration tables of retail BO1 zones. Nothing here reads a zone."
+package.name = "fastfile_t5"
+package.version = "0.1.0"
+package.edition.workspace = true
+package.publish.workspace = true
+package.description = "Block layout and vertex declaration tables of retail BO1 zones. Nothing here reads a zone."
 
 [lints]
 workspace = true

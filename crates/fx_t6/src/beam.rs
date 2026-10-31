@@ -1,28 +1,28 @@
 //! BO2's beam list and beam mesh (FX_Beam_*), from facts/fx-beam-laser-t6.md
 //! section 2. Item numbers below are that section's.
 
-use crate::runtime::{vec3_length_sq, vec3_normalize};
+use crate::runtime::vec3_normalize;
 
 /// Beams past this many in one frame are dropped (item 3). MW2 holds 48.
-pub const FX_BEAM_ADD_CAP: usize = 0x60;
+pub const RAY_QUEUE_LIMIT: usize = 0x60;
 
-pub const FX_BEAM_MAX_SEGMENTS: u8 = 0xff;
+pub const RAY_PIECE_LIMIT: u8 = 0xff;
 
 /// Plain tracers multiply their length by 8 before the segment divide (item 4).
 pub const FX_TRACER_SEGMENT_LENGTH_SCALE: f32 = 8.0;
 
 /// The flat delta is "no beam" under this projected span squared (item 14).
-pub const FX_BEAM_FLAT_DELTA_MIN_LEN_SQ: f32 = 2e-6;
+pub const RAY_LEVEL_STEP_SHORTEST_SQ: f32 = 2e-6;
 
 // BO2 unknown: the flat-delta near plane and perspective constant (item 14);
 // MW2's z-near 1 and K = 2047/2048 are kept.
-pub const FX_INFINITE_PERSPECTIVE_K: f32 = 2047.0 / 2048.0;
-pub const FX_CREATE_CLIP_ZNEAR: f32 = 1.0;
+pub const ENDLESS_DEPTH_SQUEEZE: f32 = 2047.0 / 2048.0;
+pub const BIRTH_FRONT_CLIP_DEPTH: f32 = 1.0;
 
 // BO2 unknown: the tracer path's near cut and first-person width cap are not
 // in the facts; MW2's values are kept.
-pub const FX_TRACER_MIN_DIST: f32 = 5.0;
-pub const FX_TRACER_FIRST_PERSON_MAX_WIDTH: f32 = 4.0;
+pub const BULLET_STREAK_SHORTEST: f32 = 5.0;
+pub const OWN_BULLET_STREAK_WIDEST: f32 = 4.0;
 
 /// A draw-surf override of 0 is drawn with this one (item 15).
 pub const FX_BEAM_DRAW_SURF_OVERRIDE_DEFAULT: u8 = 0x18;
@@ -30,17 +30,14 @@ pub const FX_BEAM_DRAW_SURF_OVERRIDE_DEFAULT: u8 = 0x18;
 /// The colour keys of a 5-colour beam change at these points along it (item 10).
 pub const FX_BEAM_COLOR_BREAKS: [f32; 3] = [0.1, 0.5, 0.9];
 
-/// Wiggle offsets by segment index mod 8 (item 8).
-pub const FX_BEAM_WIGGLE: [[f32; 2]; 8] = [
-    [0.0, 1.0],
-    [0.71, 0.71],
-    [1.0, 0.0],
-    [0.71, -0.71],
-    [0.0, -1.0],
-    [-0.71, -0.71],
-    [-1.0, 0.0],
-    [-0.71, 0.71],
-];
+/// The diagonal step of the wiggle compass, kept at the stored two-place value.
+const JITTER_DIAGONAL: f32 = 0.71;
+
+/// Wiggle offsets by segment index mod 8 (item 8): a compass walked clockwise from straight up.
+pub const RAY_JITTER: [[f32; 2]; 8] = {
+    let d = JITTER_DIAGONAL;
+    [[0.0, 1.0], [d, d], [1.0, 0.0], [d, -d], [0.0, -1.0], [-d, -d], [-1.0, 0.0], [-d, d]]
+};
 
 /// The beam's type byte and the union fields each type carries (items 1-2).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,21 +45,21 @@ pub enum FxBeamKind {
     Tracer(FxTracerBeam),
     SmokeTracer(FxTracerBeam),
     Laser {
-        end_radius: f32,
+        finish_reach: f32,
     },
     /// The flame's second quad mesh (item 15) is not built here.
     Flame {
-        end_radius: f32,
+        finish_reach: f32,
     },
     DemoLine,
     Arc {
-        end_radius: f32,
+        finish_reach: f32,
     },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FxTracerBeam {
-    pub wiggle_dist: f32,
+    pub sway_reach: f32,
     pub tex_repeats: f32,
     pub segment_len: f32,
 }
@@ -82,7 +79,7 @@ impl FxBeamKind {
 
     /// 5 colour keys for the two tracer types, begin and end for the rest (item 9).
     #[must_use]
-    pub const fn color_count(self) -> usize {
+    pub const fn tint_key_total(self) -> usize {
         match self {
             Self::Tracer(_) | Self::SmokeTracer(_) => 5,
             _ => 2,
@@ -98,28 +95,28 @@ impl FxBeamKind {
 }
 
 /// One queued beam. `colors` are BO2's packed bytes, RGBA; only the first
-/// `kind.color_count()` are read.
+/// `kind.tint_key_total()` are read.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FxBeamTess {
+pub struct EffectBeamStitch {
     pub kind: FxBeamKind,
-    pub depth_hack: bool,
+    pub near_layer_draw: bool,
     pub draw_surf_override: u8,
     pub begin: [f32; 3],
     pub end: [f32; 3],
     pub colors: [[u8; 4]; 5],
     pub radius: f32,
     /// Set by the caller (item 1): `tracer_segment_count` for tracers, 1 for lasers.
-    pub segment_count: u8,
+    pub piece_tally: u8,
 }
 
-impl FxBeamTess {
+impl EffectBeamStitch {
     /// Only lasers and arcs widen along the beam (item 7).
     // TODO(fact): item 7 also names the flame's union end radius; whether a
     // flame widens is not settled, so it keeps one width here.
     #[must_use]
-    pub const fn end_radius(&self) -> f32 {
+    pub const fn finish_reach(&self) -> f32 {
         match self.kind {
-            FxBeamKind::Laser { end_radius } | FxBeamKind::Arc { end_radius } => end_radius,
+            FxBeamKind::Laser { finish_reach } | FxBeamKind::Arc { finish_reach } => finish_reach,
             _ => self.radius,
         }
     }
@@ -135,50 +132,43 @@ impl FxBeamTess {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FxBeamVert {
-    pub xyz: [f32; 3],
-    pub uv: [f32; 2],
+pub struct RayCorner {
+    pub spot: [f32; 3],
+    pub sheet_uv: [f32; 2],
     /// Already packed for the vertex: RGB divided by 4 except on smoke tracers.
     pub color: [u8; 4],
 }
 
+/// Vertices of a beam with `ribbon_piece_total` steps: one cap at each end plus a
+/// left/right pair at every step boundary.
 #[inline]
 #[must_use]
-pub const fn beam_vert_count(seg_count: usize) -> usize {
-    2 * seg_count + 4
+pub const fn beam_vert_count(ribbon_piece_total: usize) -> usize {
+    (ribbon_piece_total + 2) * 2
 }
 
+/// Three indices per triangle: one triangle per cap, two per segment.
 #[inline]
 #[must_use]
-pub const fn beam_index_count(seg_count: usize) -> usize {
-    3 * (2 * seg_count + 2)
+pub const fn beam_index_count(ribbon_piece_total: usize) -> usize {
+    (ribbon_piece_total * 2 + 2) * 3
 }
 
 #[inline]
 #[must_use]
 pub fn beam_add_allows(live: usize) -> bool {
-    live < FX_BEAM_ADD_CAP
+    live < RAY_QUEUE_LIMIT
 }
 
 /// The tracer segment count (item 4): length over the screw distance,
 /// truncated, plain tracers at 8x length; under 2 is 1, 255 and up is 255.
 #[must_use]
-pub fn tracer_segment_count(smoke: bool, length: f32, screw_dist: f32) -> u8 {
+pub fn tracer_segment_count(smoke: bool, length: f32, spiral_pitch_distance: f32) -> u8 {
     // BO2 unknown: a zero screw distance; MW2's one segment is kept.
-    if screw_dist < 1e-5 {
-        return 1;
-    }
-    let length = if smoke {
-        length
-    } else {
-        length * FX_TRACER_SEGMENT_LENGTH_SCALE
-    };
-    let n = (length / screw_dist) as i32;
-    if n < 2 {
-        1
-    } else {
-        n.min(i32::from(FX_BEAM_MAX_SEGMENTS)) as u8
-    }
+    let degenerate = spiral_pitch_distance < 1e-5;
+    let scale = if smoke { 1.0 } else { FX_TRACER_SEGMENT_LENGTH_SCALE };
+    let raw = if degenerate { 1 } else { (length * scale / spiral_pitch_distance) as i32 };
+    raw.clamp(1, i32::from(RAY_PIECE_LIMIT)) as u8
 }
 
 /// A 0..1 colour as a beam key byte.
@@ -193,27 +183,22 @@ pub fn beam_color_key(color: [f32; 4]) -> [u8; 4] {
 #[must_use]
 pub fn beam_sample_color(kind: FxBeamKind, colors: &[[u8; 4]; 5], t: f32) -> [u8; 4] {
     let t = t.clamp(0.0, 1.0);
-    if kind.color_count() == 2 {
+    if kind.tint_key_total() == 2 {
         return blend_key(colors[0], colors[1], t);
     }
+    // The key pair is picked by how many break points `t` has passed.
     let [b0, b1, b2] = FX_BEAM_COLOR_BREAKS;
-    let (i, lo, hi) = if t < b0 {
-        (0, 0.0, b0)
-    } else if t < b1 {
-        (1, b0, b1)
-    } else if t < b2 {
-        (2, b1, b2)
-    } else {
-        (3, b2, 1.0)
-    };
-    blend_key(colors[i], colors[i + 1], (t - lo) / (hi - lo))
+    let stops = [0.0, b0, b1, b2, 1.0];
+    let pair = FX_BEAM_COLOR_BREAKS.iter().filter(|&&b| t >= b).count();
+    let span = stops[pair + 1] - stops[pair];
+    blend_key(colors[pair], colors[pair + 1], (t - stops[pair]) / span)
 }
 
 /// Linear on bytes, truncated, clamped to 0..255 (item 11).
 fn blend_key(a: [u8; 4], b: [u8; 4], f: f32) -> [u8; 4] {
-    core::array::from_fn(|c| {
-        let (a, b) = (f32::from(a[c]), f32::from(b[c]));
-        ((a + (b - a) * f) as i32).clamp(0, 255) as u8
+    core::array::from_fn(|ch| {
+        let (lo, hi) = (f32::from(a[ch]), f32::from(b[ch]));
+        ((lo + (hi - lo) * f) as i32).clamp(0, 255) as u8
     })
 }
 
@@ -222,27 +207,24 @@ fn blend_key(a: [u8; 4], b: [u8; 4], f: f32) -> [u8; 4] {
 #[inline]
 #[must_use]
 pub fn beam_vertex_color(kind: FxBeamKind, key: [u8; 4]) -> [u8; 4] {
-    if matches!(kind, FxBeamKind::SmokeTracer(_)) {
-        key
-    } else {
-        [key[0] >> 2, key[1] >> 2, key[2] >> 2, key[3]]
-    }
+    let shift = if matches!(kind, FxBeamKind::SmokeTracer(_)) { 0 } else { 2 };
+    let [r, g, b, a] = key;
+    [r >> shift, g >> shift, b >> shift, a]
 }
 
-/// The two body UVs of the vertex pair at `t` (item 12).
+/// The two body UVs of the vertex pair at `k` (item 12).
 #[must_use]
-pub fn beam_body_uvs(kind: FxBeamKind, t: f32) -> [[f32; 2]; 2] {
+pub fn beam_body_uvs(kind: FxBeamKind, k: f32) -> [[f32; 2]; 2] {
+    // The u coordinate for the types that run along the beam.
+    let along = |u: f32| [[u, 0.0], [u, 1.0]];
     match kind {
         FxBeamKind::Laser { .. } | FxBeamKind::DemoLine => [[1.0, 0.0], [0.0, 1.0]],
         // BO2 unknown: the tracer's u start value; u runs from 0 over the repeats.
-        FxBeamKind::Tracer(tr) => {
-            let u = t * tr.tex_repeats;
-            [[u, 0.0], [u, 1.0]]
-        }
+        FxBeamKind::Tracer(tr) => along(k * tr.tex_repeats),
         // BO2 unknown: the smoke tracer's tiled run, and the flame and arc
         // mappings, were not read exactly; MW2's run is kept.
         FxBeamKind::SmokeTracer(_) | FxBeamKind::Flame { .. } | FxBeamKind::Arc { .. } => {
-            [[t, 0.0], [t, 1.0]]
+            along(k)
         }
     }
 }
@@ -251,277 +233,262 @@ pub fn beam_body_uvs(kind: FxBeamKind, t: f32) -> [[f32; 2]; 2] {
 const BEAM_BEGIN_CAP_UV: [f32; 2] = [0.0, 0.5];
 const BEAM_END_CAP_UV: [f32; 2] = [1.0, 0.5];
 
+/// Column-major `m * v`: the columns of `m` weighted by the entries of `val`.
 #[inline]
 #[must_use]
-pub fn mat4_mul_vec4(m: &[f32; 16], v: [f32; 4]) -> [f32; 4] {
-    core::array::from_fn(|r| m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3])
+pub fn mat4_mul_vec4(m: &[f32; 16], val: [f32; 4]) -> [f32; 4] {
+    m.chunks_exact(4)
+        .zip(val)
+        .fold([0.0; 4], |acc, (column, weight)| {
+            [
+                acc[0] + column[0] * weight,
+                acc[1] + column[1] * weight,
+                acc[2] + column[2] * weight,
+                acc[3] + column[3] * weight,
+            ]
+        })
 }
 
 #[must_use]
-pub fn mat4_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
-    let mut out = [0.0; 16];
-    for col in 0..4 {
-        let c = mat4_mul_vec4(
-            a,
-            [b[4 * col], b[4 * col + 1], b[4 * col + 2], b[4 * col + 3]],
-        );
-        out[4 * col..4 * col + 4].copy_from_slice(&c);
+pub fn infinite_perspective_matrix(horizontal_cone_slope: f32, vertical_cone_slope: f32, front_clip_depth: f32) -> [f32; 16] {
+    // Column-major: a scaled diagonal, w taken from z, and the near-plane
+    // shift in the fourth column.
+    core::array::from_fn(|slot| match slot {
+        0 => ENDLESS_DEPTH_SQUEEZE / horizontal_cone_slope,
+        5 => ENDLESS_DEPTH_SQUEEZE / vertical_cone_slope,
+        10 => ENDLESS_DEPTH_SQUEEZE,
+        11 => 1.0,
+        14 => -front_clip_depth * ENDLESS_DEPTH_SQUEEZE,
+        _ => 0.0,
+    })
+}
+
+/// World to view: the three basis rows become the first three columns
+/// (transposed), and the translation is the origin projected on each.
+#[must_use]
+pub fn matrix_for_viewer(origin: [f32; 3], turn: [[f32; 3]; 3]) -> [f32; 16] {
+    let rows = [V3(turn[1]) * -1.0, V3(turn[2]), V3(turn[0])];
+    let origin = V3(origin);
+    let mut m = [0.0f32; 16];
+    for (j, column) in m.chunks_exact_mut(4).enumerate() {
+        let entry = |r: V3| if j < 3 { r.0[j] } else { -origin.dot(r) };
+        let w = if j == 3 { 1.0 } else { 0.0 };
+        column.copy_from_slice(&[entry(rows[0]), entry(rows[1]), entry(rows[2]), w]);
     }
-    out
-}
-
-#[must_use]
-pub fn infinite_perspective_matrix(tan_half_x: f32, tan_half_y: f32, z_near: f32) -> [f32; 16] {
-    let k = FX_INFINITE_PERSPECTIVE_K;
-    let mut m = [0.0; 16];
-    m[0] = k / tan_half_x;
-    m[5] = k / tan_half_y;
-    m[10] = k;
-    m[11] = 1.0;
-    m[14] = -z_near * k;
     m
 }
 
 #[must_use]
-pub fn matrix_for_viewer(origin: [f32; 3], axis: [[f32; 3]; 3]) -> [f32; 16] {
-    let right_n = scale(axis[1], -1.0);
-    let (up, fwd) = (axis[2], axis[0]);
-    [
-        right_n[0],
-        up[0],
-        fwd[0],
-        0.0,
-        right_n[1],
-        up[1],
-        fwd[1],
-        0.0,
-        right_n[2],
-        up[2],
-        fwd[2],
-        0.0,
-        -dot(origin, right_n),
-        -dot(origin, up),
-        -dot(origin, fwd),
-        1.0,
-    ]
-}
-
-#[must_use]
 pub fn create_clip_matrix(
-    origin: [f32; 3],
-    axis: [[f32; 3]; 3],
-    tan_half_x: f32,
-    tan_half_y: f32,
+    spot: [f32; 3],
+    turn: [[f32; 3]; 3],
+    horizontal_cone_slope: f32,
+    vertical_cone_slope: f32,
 ) -> [f32; 16] {
-    let proj = infinite_perspective_matrix(tan_half_x, tan_half_y, FX_CREATE_CLIP_ZNEAR);
-    mat4_mul(&proj, &matrix_for_viewer(origin, axis))
+    let view = matrix_for_viewer(spot, turn);
+    let projection = infinite_perspective_matrix(horizontal_cone_slope, vertical_cone_slope, BIRTH_FRONT_CLIP_DEPTH);
+    // The product projection * view, one view column at a time.
+    let mut clip = [0.0f32; 16];
+    for (dst, column) in clip.chunks_exact_mut(4).zip(view.chunks_exact(4)) {
+        dst.copy_from_slice(&mat4_mul_vec4(&projection, [column[0], column[1], column[2], column[3]]));
+    }
+    clip
 }
 
-/// Clips the homogeneous pair to the side of `plane` where it is >= 0;
+/// Keeps the part of the homogeneous pair on the side of `wall` where the
+/// plane equation is >= 0, moving whichever end is outside onto the plane;
 /// false when both ends are outside.
-pub fn beam_clip_against_plane(begin: &mut [f32; 4], end: &mut [f32; 4], plane: [f32; 4]) -> bool {
-    let d = |p: &[f32; 4]| plane[0] * p[0] + plane[1] * p[1] + plane[2] * p[2] + plane[3] * p[3];
-    let (d_begin, d_end) = (d(begin), d(end));
-    let (begin_in, end_in) = (d_begin >= 0.0, d_end >= 0.0);
-    if !begin_in && !end_in {
-        return false;
+pub fn beam_clip_against_plane(begin: &mut [f32; 4], to_pt: &mut [f32; 4], wall: [f32; 4]) -> bool {
+    let signed = |p: &[f32; 4]| p.iter().zip(wall).map(|(c, w)| c * w).sum::<f32>();
+    let (d_begin, d_end) = (signed(begin), signed(to_pt));
+    let (from, to) = (*to_pt, *begin);
+    // Where the pair crosses the plane, measured from the end point.
+    let crossing = || -> [f32; 4] {
+        let inv_gap = 1.0 / (d_end - d_begin);
+        core::array::from_fn(|i| (to[i] - from[i]) * inv_gap * d_end + from[i])
+    };
+    match (d_begin >= 0.0, d_end >= 0.0) {
+        (false, false) => false,
+        (true, true) => true,
+        (false, true) => {
+            *begin = crossing();
+            true
+        }
+        (true, false) => {
+            *to_pt = crossing();
+            true
+        }
     }
-    let denom = d_end - d_begin;
-    let t = if denom != 0.0 { 1.0 / denom } else { f32::MAX };
-    let hit: [f32; 4] = core::array::from_fn(|i| (begin[i] - end[i]) * t * d_end + end[i]);
-    if !end_in {
-        *end = hit;
-    }
-    if !begin_in {
-        *begin = hit;
-    }
-    true
 }
 
 /// The screen-flat direction of the beam, clipped to the near and far
 /// planes; None under the minimum span (FX_GenerateBeam_GetFlatDelta).
 #[must_use]
 pub fn generate_beam_get_flat_delta(
-    clip: &[f32; 16],
-    inv_clip: &[f32; 16],
-    begin: [f32; 3],
-    end: [f32; 3],
+    clip_m: &[f32; 16],
+    clip_inv: &[f32; 16],
+    from_pt: [f32; 3],
+    to_pt: [f32; 3],
 ) -> Option<[f32; 3]> {
-    let mut b = mat4_mul_vec4(clip, [begin[0], begin[1], begin[2], 1.0]);
-    let mut e = mat4_mul_vec4(clip, [end[0], end[1], end[2], 1.0]);
-    if !beam_clip_against_plane(&mut b, &mut e, [0.0, 0.0, 1.0, 0.0])
-        || !beam_clip_against_plane(&mut b, &mut e, [0.0, 0.0, -1.0, 1.0])
-    {
+    let to_clip = |p: [f32; 3]| mat4_mul_vec4(clip_m, [p[0], p[1], p[2], 1.0]);
+    let (mut b, mut e) = (to_clip(from_pt), to_clip(to_pt));
+    for plane in [[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, -1.0, 1.0]] {
+        if !beam_clip_against_plane(&mut b, &mut e, plane) {
+            return None;
+        }
+    }
+    if [b[3], e[3]].contains(&0.0) {
         return None;
     }
-    if b[3] == 0.0 || e[3] == 0.0 {
-        return None;
+    // The screen-space step between the two ends, taken back to world space.
+    let step = [e[0] / e[3] - b[0] / b[3], e[1] / e[3] - b[1] / b[3], 0.0, 0.0];
+    let world = mat4_mul_vec4(clip_inv, step);
+    match world.iter().map(|c| c * c).sum::<f32>() {
+        short if short < RAY_LEVEL_STEP_SHORTEST_SQ => None,
+        span_sq => Some((V3([world[0], world[1], world[2]]) * (1.0 / libm::sqrtf(span_sq))).0),
     }
-    let dx = e[0] / e[3] - b[0] / b[3];
-    let dy = e[1] / e[3] - b[1] / b[3];
-    let world = mat4_mul_vec4(inv_clip, [dx, dy, 0.0, 0.0]);
-    let len_sq = world.iter().map(|c| c * c).sum::<f32>();
-    if len_sq < FX_BEAM_FLAT_DELTA_MIN_LEN_SQ {
-        return None;
-    }
-    let inv = 1.0 / libm::sqrtf(len_sq);
-    Some([world[0] * inv, world[1] * inv, world[2] * inv])
-}
-
-#[must_use]
-pub fn beam_perp_from_flat(view_axis: [f32; 3], flat: [f32; 3]) -> Option<[f32; 3]> {
-    let p = cross(view_axis, flat);
-    (vec3_length_sq(p) != 0.0).then(|| vec3_normalize(p))
 }
 
 /// The flat and sideways directions without a clip matrix: the beam
 /// direction less its part along the view.
 #[must_use]
 pub fn beam_flat_basis(
-    begin: [f32; 3],
+    from_pt: [f32; 3],
     end: [f32; 3],
-    view_pos: [f32; 3],
-    view_fwd: [f32; 3],
+    eye_at: [f32; 3],
+    camera_ahead: [f32; 3],
 ) -> Option<([f32; 3], [f32; 3])> {
-    let delta = sub(end, begin);
-    let len_sq = vec3_length_sq(delta);
-    if len_sq < 1e-10 {
+    let (from_pt, end) = (V3(from_pt), V3(end));
+    let span = end - from_pt;
+    if span.magnitude_squared() < 1e-10 {
         return None;
     }
-    let beam_dir = scale(delta, 1.0 / libm::sqrtf(len_sq));
-    let mut fwd = vec3_normalize(view_fwd);
-    if vec3_length_sq(fwd) < 1e-6 {
-        fwd = vec3_normalize(sub(scale(add(begin, end), 0.5), view_pos));
-    }
-    if vec3_length_sq(fwd) < 1e-6 {
-        return None;
-    }
-    let mut flat = sub(beam_dir, scale(fwd, dot(beam_dir, fwd)));
-    if vec3_length_sq(flat) < 1e-8 {
-        flat = cross(fwd, [0.0, 1.0, 0.0]);
-        if vec3_length_sq(flat) < 1e-8 {
-            flat = cross(fwd, [1.0, 0.0, 0.0]);
-        }
-    }
-    let flat = vec3_normalize(flat);
-    let mut perp = cross(flat, fwd);
-    if vec3_length_sq(perp) < 1e-8 {
-        perp = cross(beam_dir, fwd);
-    }
-    if vec3_length_sq(perp) < 1e-8 {
-        return None;
-    }
-    Some((flat, vec3_normalize(perp)))
+    let dir = span * (1.0 / libm::sqrtf(span.magnitude_squared()));
+    // The view direction: as given, else toward the beam's midpoint.
+    let usable = |v: V3| (v.magnitude_squared() >= 1e-6).then_some(v);
+    let toward_mid = (from_pt + end) * 0.5 - V3(eye_at);
+    let fwd = V3(vec3_normalize(camera_ahead));
+    let fwd = usable(fwd).or_else(|| usable(V3(vec3_normalize(toward_mid.0))))?;
+    // Out of the view direction, then any axis that is not parallel to it.
+    let in_screen = dir - fwd * dir.dot(fwd);
+    let flat = [in_screen, fwd.cross(V3([0.0, 1.0, 0.0])), fwd.cross(V3([1.0, 0.0, 0.0]))]
+        .into_iter()
+        .find(|v| v.magnitude_squared() >= 1e-8)
+        .unwrap_or(fwd.cross(V3([1.0, 0.0, 0.0])));
+    let flat = V3(vec3_normalize(flat.0));
+    let perp = [flat.cross(fwd), dir.cross(fwd)]
+        .into_iter()
+        .find(|v| v.magnitude_squared() >= 1e-8)?;
+    Some((flat.0, vec3_normalize(perp.0)))
 }
 
 /// One beam's mesh (FX_Beam_GenerateVerts): a cap vertex, a pair a width
 /// apart at each segment step, a cap vertex. Returns the vertex and index
 /// counts, or None when the buffers are short or the beam has no flat delta.
 pub fn beam_generate_verts(
-    beam: &FxBeamTess,
-    view_pos: [f32; 3],
-    view_fwd: [f32; 3],
-    clip: Option<(&[f32; 16], &[f32; 16])>,
-    verts: &mut [FxBeamVert],
-    indices: &mut [u16],
+    strip: &EffectBeamStitch,
+    eye_at: [f32; 3],
+    camera_ahead: [f32; 3],
+    to_clip: Option<(&[f32; 16], &[f32; 16])>,
+    vertex_points: &mut [RayCorner],
+    tri_ids: &mut [u16],
 ) -> Option<(usize, usize)> {
-    let seg_count = usize::from(beam.segment_count.max(1));
-    let n_verts = beam_vert_count(seg_count);
-    let n_idx = beam_index_count(seg_count);
-    if verts.len() < n_verts || indices.len() < n_idx {
+    let steps = usize::from(strip.piece_tally.max(1));
+    let (vert_total, index_total) = (beam_vert_count(steps), beam_index_count(steps));
+    if vertex_points.len() < vert_total || tri_ids.len() < index_total {
         return None;
     }
-    let (flat, perp) = match clip {
-        Some((clip_m, inv_m)) => {
-            let flat = generate_beam_get_flat_delta(clip_m, inv_m, beam.begin, beam.end)?;
-            (flat, beam_perp_from_flat(view_fwd, flat)?)
+    let basis = if let Some((clip_m, inv_m)) = to_clip {
+        generate_beam_get_flat_delta(clip_m, inv_m, strip.begin, strip.end)
+            .and_then(|f| {
+                // Sideways: across both the view and the flat direction.
+                let side = V3(camera_ahead).cross(V3(f));
+                (side.magnitude_squared() != 0.0).then(|| (f, vec3_normalize(side.0)))
+            })
+    } else {
+        beam_flat_basis(strip.begin, strip.end, eye_at, camera_ahead)
+    };
+    let (flat, perp) = basis.map(|(f, p)| (V3(f), V3(p)))?;
+    let (begin, end) = (V3(strip.begin), V3(strip.end));
+    let kind = strip.kind;
+    let tint = |t: f32| beam_vertex_color(kind, beam_sample_color(kind, &strip.colors, t));
+    let wiggle = kind.tracer().map_or(0.0, |t| t.sway_reach);
+    let far_radius = strip.finish_reach();
+    let cap = |at: V3, uv: [f32; 2], t: f32| RayCorner { spot: at.0, sheet_uv: uv, color: tint(t) };
+
+    vertex_points[0] = cap(begin - flat * strip.radius, BEAM_BEGIN_CAP_UV, 0.0);
+    let body = &mut vertex_points[1..vert_total - 1];
+    for (step, pair) in body.chunks_exact_mut(2).enumerate() {
+        let t = step as f32 / steps as f32;
+        let [across, up] = RAY_JITTER[step % RAY_JITTER.len()];
+        let centre = begin + (end - begin) * t + perp * (across * wiggle) + flat * (up * wiggle);
+        let half_width = strip.radius + (far_radius - strip.radius) * t;
+        let texcoord_set = beam_body_uvs(kind, t);
+        let color = tint(t);
+        let sides = [centre - perp * half_width, centre + perp * half_width];
+        for ((vert, side), uv) in pair.iter_mut().zip(sides).zip(texcoord_set) {
+            *vert = RayCorner { spot: side.0, sheet_uv: uv, color };
         }
-        None => beam_flat_basis(beam.begin, beam.end, view_pos, view_fwd)?,
-    };
-    let kind = beam.kind;
-    let color_at = |t: f32| beam_vertex_color(kind, beam_sample_color(kind, &beam.colors, t));
-    let wiggle_dist = kind.tracer().map_or(0.0, |t| t.wiggle_dist);
-    let end_radius = beam.end_radius();
-
-    verts[0] = FxBeamVert {
-        xyz: sub(beam.begin, scale(flat, beam.radius)),
-        uv: BEAM_BEGIN_CAP_UV,
-        color: color_at(0.0),
-    };
-    for seg in 0..=seg_count {
-        let t = seg as f32 / seg_count as f32;
-        let [wx, wy] = FX_BEAM_WIGGLE[seg % 8].map(|w| w * wiggle_dist);
-        let base = add(
-            lerp(beam.begin, beam.end, t),
-            add(scale(perp, wx), scale(flat, wy)),
-        );
-        let radius = beam.radius + (end_radius - beam.radius) * t;
-        let color = color_at(t);
-        let [uv_a, uv_b] = beam_body_uvs(kind, t);
-        verts[1 + 2 * seg] = FxBeamVert {
-            xyz: sub(base, scale(perp, radius)),
-            uv: uv_a,
-            color,
-        };
-        verts[2 + 2 * seg] = FxBeamVert {
-            xyz: add(base, scale(perp, radius)),
-            uv: uv_b,
-            color,
-        };
     }
-    verts[n_verts - 1] = FxBeamVert {
-        xyz: add(beam.end, scale(flat, end_radius)),
-        uv: BEAM_END_CAP_UV,
-        color: color_at(1.0),
-    };
-    Some((n_verts, write_beam_indices(seg_count, indices)))
+    vertex_points[vert_total - 1] = cap(end + flat * far_radius, BEAM_END_CAP_UV, 1.0);
+    Some((vert_total, write_beam_indices(steps, tri_ids)))
 }
 
-fn write_beam_indices(seg_count: usize, out: &mut [u16]) -> usize {
-    out[..3].copy_from_slice(&[0, 2, 1]);
-    let mut i = 3;
-    for seg in 0..seg_count {
-        let o = (2 * seg) as u16;
-        out[i..i + 6].copy_from_slice(&[o + 2, o + 4, o + 1, o + 1, o + 4, o + 3]);
-        i += 6;
+/// Triangle list for the strip: a start triangle, a quad per step (two
+/// triangles), and an end triangle. Returns how many indices it wrote.
+/// The caller sizes `dst_ids` with `beam_index_count`.
+fn write_beam_indices(steps: usize, dst_ids: &mut [u16]) -> usize {
+    let tail = steps as u16 * 2;
+    let quads = (0..steps as u16).flat_map(|s| {
+        let left = s * 2 + 1;
+        [left + 1, left + 3, left, left, left + 3, left + 2]
+    });
+    let list = [0, 2, 1].into_iter().chain(quads).chain([tail + 1, tail + 2, tail + 3]);
+    dst_ids.iter_mut().zip(list).map(|(slot, index)| *slot = index).count()
+}
+
+/// A private 3-vector with the arithmetic the mesh code needs.
+#[derive(Clone, Copy, Debug)]
+struct V3([f32; 3]);
+
+impl core::ops::Add for V3 {
+    type Output = V3;
+    fn add(self, rhs: V3) -> V3 {
+        V3(core::array::from_fn(|i| self.0[i] + rhs.0[i]))
     }
-    let last = (2 * seg_count) as u16;
-    out[i..i + 3].copy_from_slice(&[last + 1, last + 2, last + 3]);
-    i + 3
 }
 
-#[inline]
-fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+impl core::ops::Sub for V3 {
+    type Output = V3;
+    fn sub(self, rhs: V3) -> V3 {
+        V3(core::array::from_fn(|i| self.0[i] - rhs.0[i]))
+    }
 }
 
-#[inline]
-fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+impl core::ops::Mul<f32> for V3 {
+    type Output = V3;
+    fn mul(self, factor: f32) -> V3 {
+        V3(self.0.map(|c| c * factor))
+    }
 }
 
-#[inline]
-fn scale(a: [f32; 3], s: f32) -> [f32; 3] {
-    [a[0] * s, a[1] * s, a[2] * s]
-}
+impl V3 {
+    fn dot(self, other: V3) -> f32 {
+        self.0.iter().zip(other.0).map(|(a, b)| a * b).sum()
+    }
 
-#[inline]
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
+    fn magnitude_squared(self) -> f32 {
+        self.dot(self)
+    }
 
-#[inline]
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-#[inline]
-fn lerp(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    add(a, scale(sub(b, a), t))
+    fn cross(self, other: V3) -> V3 {
+        let (a, b) = (self.0, other.0);
+        V3([
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ])
+    }
 }
 
 #[cfg(test)]
@@ -530,17 +497,24 @@ mod tests {
 
     const WHITE5: [[u8; 4]; 5] = [[255; 4]; 5];
 
-    fn laser(end_radius: f32) -> FxBeamTess {
-        FxBeamTess {
-            kind: FxBeamKind::Laser { end_radius },
-            depth_hack: false,
+    /// A 100-unit white laser along +x, one segment, 0.35 wide at the start.
+    fn laser(finish_reach: f32) -> EffectBeamStitch {
+        let mut end = [0.0; 3];
+        end[0] = 100.0;
+        EffectBeamStitch {
+            kind: FxBeamKind::Laser { finish_reach },
+            near_layer_draw: false,
             draw_surf_override: 0,
-            begin: [0.0, 0.0, 0.0],
-            end: [100.0, 0.0, 0.0],
+            begin: [0.0; 3],
+            end,
             colors: WHITE5,
             radius: 0.35,
-            segment_count: 1,
+            piece_tally: 1,
         }
+    }
+
+    fn blank_verts<const N: usize>() -> [RayCorner; N] {
+        [RayCorner { spot: [0.0; 3], sheet_uv: [0.0; 2], color: [0; 4] }; N]
     }
 
     #[test]
@@ -589,12 +563,12 @@ mod tests {
 
     #[test]
     fn only_laser_and_arc_widen() {
-        assert_eq!(laser(2.0).end_radius(), 2.0);
+        assert_eq!(laser(2.0).finish_reach(), 2.0);
         let mut b = laser(2.0);
-        b.kind = FxBeamKind::Flame { end_radius: 2.0 };
-        assert_eq!(b.end_radius(), 0.35);
-        b.kind = FxBeamKind::Arc { end_radius: 3.0 };
-        assert_eq!(b.end_radius(), 3.0);
+        b.kind = FxBeamKind::Flame { finish_reach: 2.0 };
+        assert_eq!(b.finish_reach(), 0.35);
+        b.kind = FxBeamKind::Arc { finish_reach: 3.0 };
+        assert_eq!(b.finish_reach(), 3.0);
     }
 
     #[test]
@@ -607,27 +581,16 @@ mod tests {
 
     #[test]
     fn laser_mesh_uses_fixed_uvs_and_widens() {
-        let b = laser(1.0);
-        let mut verts = [FxBeamVert {
-            xyz: [0.0; 3],
-            uv: [0.0; 2],
-            color: [0; 4],
-        }; 6];
+        let mut vertex_points = blank_verts::<6>();
         let mut idx = [0u16; 12];
-        let got = beam_generate_verts(
-            &b,
-            [50.0, -100.0, 0.0],
-            [0.0, 1.0, 0.0],
-            None,
-            &mut verts,
-            &mut idx,
-        );
+        let looking_north = ([50.0, -100.0, 0.0], [0.0, 1.0, 0.0]);
+        let got = beam_generate_verts(&laser(1.0), looking_north.0, looking_north.1, None, &mut vertex_points, &mut idx);
         assert_eq!(got, Some((6, 12)));
-        assert_eq!((verts[1].uv, verts[2].uv), ([1.0, 0.0], [0.0, 1.0]));
-        let width = |a: &FxBeamVert, b: &FxBeamVert| libm::sqrtf(vec3_length_sq(sub(a.xyz, b.xyz)));
-        assert!((width(&verts[1], &verts[2]) - 0.7).abs() < 1e-5);
-        assert!((width(&verts[3], &verts[4]) - 2.0).abs() < 1e-5);
-        assert_eq!(verts[1].color, [63, 63, 63, 255]);
+        assert_eq!((vertex_points[1].sheet_uv, vertex_points[2].sheet_uv), ([1.0, 0.0], [0.0, 1.0]));
+        let width = |a: &RayCorner, b: &RayCorner| libm::sqrtf((V3(a.spot) - V3(b.spot)).magnitude_squared());
+        assert!((width(&vertex_points[1], &vertex_points[2]) - 0.7).abs() < 1e-5);
+        assert!((width(&vertex_points[3], &vertex_points[4]) - 2.0).abs() < 1e-5);
+        assert_eq!(vertex_points[1].color, [63, 63, 63, 255]);
         assert_eq!(&idx[..6], &[0, 2, 1, 2, 4, 1]);
         assert_eq!(&idx[9..], &[3, 4, 5]);
     }
@@ -635,14 +598,10 @@ mod tests {
     #[test]
     fn short_buffers_build_nothing() {
         let b = laser(1.0);
-        let mut verts = [FxBeamVert {
-            xyz: [0.0; 3],
-            uv: [0.0; 2],
-            color: [0; 4],
-        }; 5];
+        let mut vertex_points = blank_verts::<5>();
         let mut idx = [0u16; 12];
         assert!(
-            beam_generate_verts(&b, [0.0; 3], [0.0, 1.0, 0.0], None, &mut verts, &mut idx)
+            beam_generate_verts(&b, [0.0; 3], [0.0, 1.0, 0.0], None, &mut vertex_points, &mut idx)
                 .is_none()
         );
     }
@@ -651,5 +610,48 @@ mod tests {
     fn beam_cap_is_96() {
         assert!(beam_add_allows(95));
         assert!(!beam_add_allows(96));
+    }
+
+    #[test]
+    fn clipping_moves_only_the_outside_end_onto_the_plane() {
+        let plane = [1.0, 0.0, 0.0, 0.0];
+        let (mut begin, mut end) = ([-2.0, 5.0, 0.0, 1.0], [2.0, 5.0, 0.0, 1.0]);
+        assert!(beam_clip_against_plane(&mut begin, &mut end, plane));
+        assert_eq!((begin, end), ([0.0, 5.0, 0.0, 1.0], [2.0, 5.0, 0.0, 1.0]));
+        let (mut a, mut b) = ([-2.0, 0.0, 0.0, 1.0], [-1.0, 0.0, 0.0, 1.0]);
+        assert!(!beam_clip_against_plane(&mut a, &mut b, plane));
+        assert_eq!((a[0], b[0]), (-2.0, -1.0));
+    }
+
+    #[test]
+    fn viewer_matrix_puts_the_eye_at_the_origin() {
+        let axis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let m = matrix_for_viewer([3.0, 4.0, 5.0], axis);
+        let eye = mat4_mul_vec4(&m, [3.0, 4.0, 5.0, 1.0]);
+        assert_eq!(eye, [0.0, 0.0, 0.0, 1.0]);
+        // One unit ahead of the eye lands on the view's depth axis.
+        let ahead = mat4_mul_vec4(&m, [4.0, 4.0, 5.0, 1.0]);
+        assert_eq!(ahead, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn flat_basis_is_perpendicular_to_the_view() {
+        let (flat, perp) =
+            beam_flat_basis([0.0, 0.0, 0.0], [10.0, 0.0, 5.0], [0.0, -50.0, 0.0], [0.0, 1.0, 0.0])
+                .expect("a beam across the view");
+        assert!(V3(flat).dot(V3([0.0, 1.0, 0.0])).abs() < 1e-6);
+        assert!(V3(flat).dot(V3(perp)).abs() < 1e-6);
+        assert!(beam_flat_basis([1.0; 3], [1.0; 3], [0.0; 3], [0.0, 1.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn index_list_walks_the_strip() {
+        // Filled with a marker so an unwritten slot would show.
+        let mut out = [u16::MAX; 18];
+        assert_eq!(write_beam_indices(2, &mut out), beam_index_count(2));
+        assert_eq!(
+            out,
+            [0, 2, 1, 2, 4, 1, 1, 4, 3, 4, 6, 3, 3, 6, 5, 5, 6, 7]
+        );
     }
 }

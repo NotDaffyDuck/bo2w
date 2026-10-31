@@ -1,31 +1,32 @@
 //! Angle and vector math the scripts use (Quake/IW conventions: angles are
 //! pitch, yaw, roll in degrees; forward = +x at yaw 0, left = +y, up = +z).
 
-pub fn angle_vectors(a: [f32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
-    let (sp, cp) = a[0].to_radians().sin_cos();
-    let (sy, cy) = a[1].to_radians().sin_cos();
-    let (sr, cr) = a[2].to_radians().sin_cos();
-    let forward = [cp * cy, cp * sy, -sp];
-    let right = [-sr * sp * cy + cr * sy, -sr * sp * sy - cr * cy, -sr * cp];
-    let up = [cr * sp * cy + sr * sy, cr * sp * sy - sr * cy, cr * cp];
+type Vec3 = [f32; 3];
+
+pub fn facing_axes(a: Vec3) -> (Vec3, Vec3, Vec3) {
+    let (sin_pitch, cos_pitch) = a[0].to_radians().sin_cos();
+    let (yaw_sin, yaw_cos) = a[1].to_radians().sin_cos();
+    let (sin_roll, cos_roll) = a[2].to_radians().sin_cos();
+    let forward = [cos_pitch * yaw_cos, cos_pitch * yaw_sin, -sin_pitch];
+    let right = [-sin_roll * sin_pitch * yaw_cos + cos_roll * yaw_sin, -sin_roll * sin_pitch * yaw_sin - cos_roll * yaw_cos, -sin_roll * cos_pitch];
+    let up = [cos_roll * sin_pitch * yaw_cos + sin_roll * yaw_sin, cos_roll * sin_pitch * yaw_sin - sin_roll * yaw_cos, cos_roll * cos_pitch];
     (forward, right, up)
 }
 
 pub fn vector_to_angles(d: [f32; 3]) -> [f32; 3] {
-    if d[0] == 0.0 && d[1] == 0.0 {
-        let pitch = if d[2] > 0.0 { 270.0 } else { 90.0 };
-        return [pitch, 0.0, 0.0];
-    }
-    let mut yaw = d[1].atan2(d[0]).to_degrees();
-    if yaw < 0.0 {
-        yaw += 360.0;
-    }
-    let forward = (d[0] * d[0] + d[1] * d[1]).sqrt();
-    let mut pitch = (-d[2]).atan2(forward).to_degrees();
-    if pitch < 0.0 {
-        pitch += 360.0;
-    }
-    [pitch, yaw, 0.0]
+    let [x, y, z] = d;
+    // Straight up or down: no heading, pitch 270 up / 90 down.
+    let (pitch, yaw) = if x == 0.0 && y == 0.0 {
+        (if z > 0.0 { 270.0 } else { 90.0 }, 0.0)
+    } else {
+        // atan2 answers in (-180, 180]; scripts want [0, 360).
+        let wrap = |deg: f32| if deg < 0.0 { deg + 360.0 } else { deg };
+        let ground = (x * x + y * y).sqrt();
+        (wrap((-z).atan2(ground).to_degrees()), wrap(y.atan2(x).to_degrees()))
+    };
+    let mut out = [0.0; 3];
+    (out[0], out[1]) = (pitch, yaw);
+    out
 }
 
 /// An angle in (-180, 180].
@@ -48,33 +49,32 @@ pub fn angle_clamp(a: f32) -> f32 {
 /// `atoi`: leading integer, 0 if none.
 pub fn parse_int(s: &str) -> i32 {
     let s = s.trim();
-    let mut end = 0;
-    for (i, c) in s.char_indices() {
-        if c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+')) {
-            end = i + c.len_utf8();
-        } else {
-            break;
-        }
+    // An optional sign, then digits (all ASCII, so byte counts are char counts).
+    let sign = usize::from(s.starts_with(['-', '+']));
+    let digits = s[sign..].bytes().take_while(u8::is_ascii_digit).count();
+    let lead = &s[..sign + digits];
+    match lead.parse::<i32>() {
+        Ok(n) => n,
+        // No usable integer prefix: try the whole thing as a float, else 0.
+        Err(_) => s.parse::<f32>().map_or(0, |f| f as i32),
     }
-    s[..end]
-        .parse::<i32>()
-        .unwrap_or_else(|_| s.parse::<f32>().map(|f| f as i32).unwrap_or(0))
 }
 
 pub fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    let [x, y, z]: [f32; 3] = core::array::from_fn(|k| a[k] * b[k]);
+    x + y + z
 }
 
 pub fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    core::array::from_fn(|k| a[k] - b[k])
 }
 
 pub fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+    core::array::from_fn(|k| a[k] + b[k])
 }
 
 pub fn scale(a: [f32; 3], k: f32) -> [f32; 3] {
-    [a[0] * k, a[1] * k, a[2] * k]
+    a.map(|c| c * k)
 }
 
 pub fn length(a: [f32; 3]) -> f32 {
@@ -87,9 +87,8 @@ pub fn normalize(a: [f32; 3]) -> [f32; 3] {
 }
 
 pub fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
+    core::array::from_fn(|k| {
+        let (j, l) = ((k + 1) % 3, (k + 2) % 3);
+        a[j] * b[l] - a[l] * b[j]
+    })
 }

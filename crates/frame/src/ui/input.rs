@@ -1,6 +1,6 @@
 //! Key binding requests from the menu UI.
 
-use bevy::prelude::{Message, Resource};
+use bevy::{ecs::message::Message, ecs::resource::Resource};
 
 /// The binding screen is waiting for a key for `command` (none: not waiting).
 #[derive(Resource, Debug, Default)]

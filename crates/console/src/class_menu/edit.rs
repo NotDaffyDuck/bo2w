@@ -2,53 +2,53 @@
 //! put the class back to its default, give it a name.
 
 use ui::classes::display::localized;
-use ui::{ClassEditRow, ClassLoadoutCatalog, ClassSlotState, SessionClassStore};
+use ui::{LoadoutEditorLine, LoadoutRoster, LoadoutSlotStatus, MatchLoadoutVault};
 
 /// The longest a class name can be, in characters.
 const NAME_LIMIT: usize = 20;
 
 /// Only the two gun rows have attachments.
-pub(super) fn takes_attachments(row: ClassEditRow) -> bool {
-    matches!(row, ClassEditRow::Primary | ClassEditRow::Secondary)
+pub(super) fn takes_attachments(line: LoadoutEditorLine) -> bool {
+    matches!(line, LoadoutEditorLine::Primary | LoadoutEditorLine::Secondary)
 }
 
 /// What is on the gun in `row`; nothing for a row that has no attachments.
-pub(super) fn attachments_of(slot: &ClassSlotState, row: ClassEditRow) -> &[String] {
+pub(super) fn attachments_of(slot: &LoadoutSlotStatus, row: LoadoutEditorLine) -> &[String] {
     match row {
-        ClassEditRow::Primary => &slot.primary_attachments,
-        ClassEditRow::Secondary => &slot.secondary_attachments,
+        LoadoutEditorLine::Primary => &slot.primary_attachments,
+        LoadoutEditorLine::Secondary => &slot.secondary_attachments,
         _ => &[],
     }
 }
 
-fn attachments_mut(slot: &mut ClassSlotState, row: ClassEditRow) -> Option<&mut Vec<String>> {
+fn attachments_mut(slot: &mut LoadoutSlotStatus, row: LoadoutEditorLine) -> Option<&mut Vec<String>> {
     match row {
-        ClassEditRow::Primary => Some(&mut slot.primary_attachments),
-        ClassEditRow::Secondary => Some(&mut slot.secondary_attachments),
+        LoadoutEditorLine::Primary => Some(&mut slot.primary_attachments),
+        LoadoutEditorLine::Secondary => Some(&mut slot.secondary_attachments),
         _ => None,
     }
 }
 
-/// The attachments after choosing `value`: none for "none", the others
+/// The attachments after choosing `picked`: none for "none", the others
 /// without it when it is already on, otherwise the others with it added — or
 /// on its own when the gun takes only one.
-fn toggled_list(current: &[String], value: &str, max: usize) -> Vec<String> {
-    if value.is_empty() {
+fn toggled_list(on_gun: &[String], picked: &str, max: usize) -> Vec<String> {
+    if picked.is_empty() {
         return Vec::new();
     }
-    if current.iter().any(|name| name == value) {
-        return current
+    if on_gun.iter().any(|name| name == picked) {
+        return on_gun
             .iter()
-            .filter(|name| *name != value)
+            .filter(|name| *name != picked)
             .cloned()
-            .collect();
+            .collect::<Vec<String>>();
     }
     let mut list = if max == 1 {
         Vec::new()
     } else {
-        current.to_vec()
+        on_gun.to_vec()
     };
-    list.push(value.to_owned());
+    list.push(picked.to_owned());
     list
 }
 
@@ -64,29 +64,29 @@ fn fitted(mut list: Vec<String>, fits: impl Fn(&[String]) -> bool) -> Vec<String
 /// the attachments on its gun. Refuses what the catalog does not allow, and
 /// refuses to lock a class that was usable.
 pub(super) fn pick(
-    catalog: &ClassLoadoutCatalog,
-    slot: &ClassSlotState,
-    row: ClassEditRow,
-    value: &str,
+    catalog: &LoadoutRoster,
+    slot: &LoadoutSlotStatus,
+    row: LoadoutEditorLine,
+    choice: &str,
     attachments: bool,
-) -> Result<ClassSlotState, String> {
+) -> Result<LoadoutSlotStatus, String> {
     let mut candidate = slot.clone();
     if attachments {
         let list =
             attachments_mut(&mut candidate, row).ok_or("This slot does not accept attachments")?;
         let rules = slot.loadout_rules();
-        let chosen = toggled_list(list.as_slice(), value, rules.max_attachments);
+        let chosen = toggled_list(list.as_slice(), choice, rules.max_attachments);
         catalog
-            .check_attachments(slot.row_value(row), &chosen, rules)
+            .check_attachments(slot.value_in(row), &chosen, rules)
             .map_err(|refusal| format!("{refusal:?}"))?;
         *list = chosen;
     } else {
-        candidate.set_row(row, value.to_owned());
+        candidate.put_in(row, choice.to_owned());
         keep_what_fits(catalog, &mut candidate);
     }
     catalog.validate_edit(&candidate, row)?;
-    candidate.lock_reason = catalog.validate_class(&candidate).err();
-    match (&slot.lock_reason, &candidate.lock_reason) {
+    candidate.frozen_because = catalog.validate_class(&candidate).err();
+    match (&slot.frozen_because, &candidate.frozen_because) {
         (None, Some(reason)) => Err(reason.clone()),
         _ => Ok(candidate),
     }
@@ -94,7 +94,7 @@ pub(super) fn pick(
 
 /// A new perk can change how many attachments a gun may carry: drop the
 /// ones that no longer fit.
-fn keep_what_fits(catalog: &ClassLoadoutCatalog, slot: &mut ClassSlotState) {
+fn keep_what_fits(catalog: &LoadoutRoster, slot: &mut LoadoutSlotStatus) {
     let rules = slot.loadout_rules();
     let fits =
         |weapon: &str, list: &[String]| catalog.check_attachments(weapon, list, rules).is_ok();
@@ -107,22 +107,22 @@ fn keep_what_fits(catalog: &ClassLoadoutCatalog, slot: &mut ClassSlotState) {
 /// The class the slot goes back to: its own preset when it is named for one,
 /// else the showcase class in its place, under the slot's name.
 fn default_for(
-    catalog: &ClassLoadoutCatalog,
-    slot: &ClassSlotState,
+    catalog: &LoadoutRoster,
+    slot: &LoadoutSlotStatus,
     at: usize,
-) -> Result<ClassSlotState, String> {
+) -> Result<LoadoutSlotStatus, String> {
     if let Some(preset) = ui::showcase_classes()
         .iter()
         .find(|preset| preset.name == slot.name)
     {
-        return Ok(ClassSlotState::from_preset(preset));
+        return Ok(LoadoutSlotStatus::from_preset(preset));
     }
-    let registry = catalog
+    let book = catalog
         .resolver
         .0
         .as_deref()
         .ok_or("Weapon catalog is not ready")?;
-    let mut class = SessionClassStore::from_showcase(0, registry)
+    let mut class = MatchLoadoutVault::from_showcase(0, book)
         .slots
         .into_iter()
         .nth(at)
@@ -133,10 +133,10 @@ fn default_for(
 
 /// The slot at `at` put back to its default, if the default is usable.
 pub(super) fn reset(
-    catalog: &ClassLoadoutCatalog,
-    slot: &ClassSlotState,
+    catalog: &LoadoutRoster,
+    slot: &LoadoutSlotStatus,
     at: usize,
-) -> Result<ClassSlotState, String> {
+) -> Result<LoadoutSlotStatus, String> {
     let class = default_for(catalog, slot, at)?;
     catalog.validate_class(&class)?;
     Ok(class)
@@ -144,7 +144,7 @@ pub(super) fn reset(
 
 /// The name typed in the menu, trimmed and cut to the limit; an empty one is
 /// refused in the menu's own words.
-pub(super) fn named(typed: &str, loc: &asset_game::LocalizeCatalog) -> Result<String, String> {
+pub(super) fn named(typed: &str, loc: &asset_game::TranslationStringIndex) -> Result<String, String> {
     let name: String = typed.trim().chars().take(NAME_LIMIT).collect();
     let name = name.trim_end();
     if name.is_empty() {
@@ -159,7 +159,7 @@ pub(super) fn named(typed: &str, loc: &asset_game::LocalizeCatalog) -> Result<St
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::class_menu::edit::*;
     use crate::class_menu::fixture::{AK47, catalog, slot};
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -177,28 +177,20 @@ mod tests {
     #[test]
     fn a_new_attachment_joins_the_others_or_replaces_the_one_a_gun_may_take() {
         assert_eq!(toggled_list(&[], "reflex", 2), names(&["reflex"]));
-        assert_eq!(
-            toggled_list(&names(&["reflex"]), "grip", 2),
-            names(&["reflex", "grip"])
-        );
-        assert_eq!(
-            toggled_list(&names(&["reflex"]), "grip", 1),
-            names(&["grip"])
-        );
-        assert_eq!(
-            toggled_list(&names(&["reflex", "grip"]), "silencer", 2),
-            names(&["reflex", "grip", "silencer"]),
-            "the catalog refuses the third, not this"
-        );
+        let actual = toggled_list(&names(&["reflex"]), "grip", 2);
+        assert_eq!(actual, names(&["reflex", "grip"]));
+        let actual = toggled_list(&names(&["reflex"]), "grip", 1);
+        assert_eq!(actual, names(&["grip"]));
+        let third = "silencer";
+        let actual = toggled_list(&names(&["reflex", "grip"]), third, 2);
+        assert_eq!(actual, names(&["reflex", "grip", "silencer"]), "the catalog refuses the third, not this");
     }
 
     #[test]
     fn a_list_loses_its_last_items_until_it_fits() {
         let list = names(&["a", "b", "c"]);
-        assert_eq!(
-            fitted(list.clone(), |list| list.len() <= 2),
-            names(&["a", "b"])
-        );
+        let actual = fitted(list.clone(), |list| list.len() <= 2);
+        assert_eq!(actual, names(&["a", "b"]));
         assert_eq!(fitted(list.clone(), |_| true), list);
         assert_eq!(fitted(list, |list| list.is_empty()), Vec::<String>::new());
         assert_eq!(fitted(Vec::new(), |_| false), Vec::<String>::new());
@@ -209,35 +201,32 @@ mod tests {
         let mut class = slot("one");
         class.primary_attachments = names(&["reflex"]);
         class.secondary_attachments = names(&["extclip"]);
-        for row in ClassEditRow::ALL {
+        for row in LoadoutEditorLine::ALL {
             let expected: &[&str] = match row {
-                ClassEditRow::Primary => &["reflex"],
-                ClassEditRow::Secondary => &["extclip"],
+                LoadoutEditorLine::Primary => &["reflex"],
+                LoadoutEditorLine::Secondary => &["extclip"],
                 _ => &[],
             };
             assert_eq!(attachments_of(&class, row), expected, "{row:?}");
             assert_eq!(takes_attachments(row), !expected.is_empty(), "{row:?}");
-            assert_eq!(
-                attachments_mut(&mut class, row).is_some(),
-                takes_attachments(row),
-                "{row:?}"
-            );
+            let actual = attachments_mut(&mut class, row).is_some();
+            assert_eq!(actual, takes_attachments(row), "{row:?}");
         }
     }
 
     /// A class that is already unusable, so that a pick may leave it so.
-    fn locked(name: &str) -> ClassSlotState {
-        ClassSlotState {
-            lock_reason: Some("no such gun".into()),
+    fn locked(name: &str) -> LoadoutSlotStatus {
+        LoadoutSlotStatus {
+            frozen_because: Some("no such gun".into()),
             ..slot(name)
         }
     }
 
-    fn other_perk(catalog: &ClassLoadoutCatalog, class: &ClassSlotState) -> String {
+    fn other_perk(catalog: &LoadoutRoster, class: &LoadoutSlotStatus) -> String {
         catalog
-            .options(ClassEditRow::Perk2)
+            .options(LoadoutEditorLine::Perk2)
             .into_iter()
-            .find(|perk| perk != &class.perk2)
+            .find(|perk| perk != &class.second_specialty)
             .expect("the roster has more than one perk")
     }
 
@@ -246,10 +235,10 @@ mod tests {
         let catalog = catalog();
         let class = locked("one");
         let perk = other_perk(&catalog, &class);
-        let picked = pick(&catalog, &class, ClassEditRow::Perk2, &perk, false).unwrap();
-        assert_eq!(picked.perk2, perk);
+        let picked = pick(&catalog, &class, LoadoutEditorLine::Perk2, &perk, false).unwrap();
+        assert_eq!(picked.second_specialty, perk);
         assert!(
-            picked.lock_reason.is_some(),
+            picked.frozen_because.is_some(),
             "an empty catalog resolves nothing"
         );
         assert_eq!(picked.primary, class.primary, "nothing else moves");
@@ -261,27 +250,23 @@ mod tests {
         let class = slot("one");
         let perk = other_perk(&catalog, &class);
         let mut expected = class.clone();
-        expected.set_row(ClassEditRow::Perk2, perk.clone());
+        expected.put_in(LoadoutEditorLine::Perk2, perk.clone());
         let reason = catalog.validate_class(&expected).unwrap_err();
-        assert_eq!(
-            pick(&catalog, &class, ClassEditRow::Perk2, &perk, false),
-            Err(reason)
-        );
+        let want = Err(reason);
+        assert_eq!(pick(&catalog, &class, LoadoutEditorLine::Perk2, &perk, false), want);
     }
 
     #[test]
     fn a_perk_the_catalog_does_not_list_is_refused() {
         let catalog = catalog();
-        assert_eq!(
-            pick(
-                &catalog,
-                &locked("one"),
-                ClassEditRow::Perk1,
-                "specialty_none",
-                false
-            ),
-            Err("Perk is unavailable".into())
-        );
+        let want = Err("Perk is unavailable".into());
+        assert_eq!(pick(
+            &catalog,
+            &locked("one"),
+            LoadoutEditorLine::Perk1,
+            "specialty_none",
+            false
+        ), want);
     }
 
     #[test]
@@ -291,7 +276,7 @@ mod tests {
         let refused = pick(
             &catalog,
             &class,
-            ClassEditRow::Primary,
+            LoadoutEditorLine::Primary,
             "t6:weapon/mp7_mp",
             false,
         );
@@ -304,10 +289,8 @@ mod tests {
         catalog.resolver = ui::classes::setup::CatalogResolver::default();
         let class = locked("one");
         let perk = other_perk(&catalog, &class);
-        assert_eq!(
-            pick(&catalog, &class, ClassEditRow::Perk2, &perk, false),
-            Err("Weapon catalog is not ready".into())
-        );
+        let want = Err("Weapon catalog is not ready".into());
+        assert_eq!(pick(&catalog, &class, LoadoutEditorLine::Perk2, &perk, false), want);
     }
 
     #[test]
@@ -318,23 +301,20 @@ mod tests {
             .check_attachments(AK47, &names(&["reflex"]), class.loadout_rules())
             .map_err(|refusal| format!("{refusal:?}"))
             .unwrap_err();
-        assert_eq!(
-            pick(&catalog, &class, ClassEditRow::Primary, "reflex", true),
-            Err(refusal),
-            "an empty catalog has no ak47"
-        );
+        let want = Err(refusal);
+        assert_eq!(pick(&catalog, &class, LoadoutEditorLine::Primary, "reflex", true), want, "an empty catalog has no ak47");
     }
 
     #[test]
     fn a_row_pick_drops_the_attachments_the_catalog_no_longer_accepts() {
         let catalog = catalog();
-        let class = ClassSlotState {
+        let class = LoadoutSlotStatus {
             primary_attachments: names(&["reflex"]),
             secondary_attachments: names(&["extclip"]),
             ..locked("one")
         };
         let perk = other_perk(&catalog, &class);
-        let picked = pick(&catalog, &class, ClassEditRow::Perk2, &perk, false).unwrap();
+        let picked = pick(&catalog, &class, LoadoutEditorLine::Perk2, &perk, false).unwrap();
         assert_eq!(picked.primary_attachments, Vec::<String>::new());
         assert_eq!(picked.secondary_attachments, Vec::<String>::new());
     }
@@ -343,7 +323,7 @@ mod tests {
     fn attachments_for_a_row_that_has_none_are_refused() {
         let catalog = catalog();
         let class = locked("one");
-        let refused = pick(&catalog, &class, ClassEditRow::Perk2, "x", true);
+        let refused = pick(&catalog, &class, LoadoutEditorLine::Perk2, "x", true);
         assert!(refused.is_err(), "{refused:?}");
     }
 
@@ -353,62 +333,46 @@ mod tests {
         let catalog = catalog();
         let preset = &ui::showcase_classes()[0];
         let class = slot(preset.name);
-        assert_eq!(
-            default_for(&catalog, &class, 3),
-            Ok(ClassSlotState::from_preset(preset))
-        );
-        assert_eq!(
-            reset(&catalog, &class, 3),
-            Err(catalog
-                .validate_class(&ClassSlotState::from_preset(preset))
-                .unwrap_err()),
-            "and a default the catalog cannot resolve is not taken"
-        );
+        let want = Ok(LoadoutSlotStatus::from_preset(preset));
+        assert_eq!(default_for(&catalog, &class, 3), want);
+        let actual = reset(&catalog, &class, 3);
+        assert_eq!(actual, Err(catalog
+            .validate_class(&LoadoutSlotStatus::from_preset(preset))
+            .unwrap_err()), "and a default the catalog cannot resolve is not taken");
     }
 
     #[test]
     fn a_class_with_a_name_of_its_own_needs_a_catalog_with_something_to_offer() {
         let mut catalog = catalog();
         let class = slot("mine");
-        assert_eq!(
-            reset(&catalog, &class, 0),
-            Err("No available default class".into())
-        );
+        let want = Err("No available default class".into());
+        assert_eq!(reset(&catalog, &class, 0), want);
         catalog.resolver = ui::classes::setup::CatalogResolver::default();
-        assert_eq!(
-            reset(&catalog, &class, 0),
-            Err("Weapon catalog is not ready".into())
-        );
+        let want = Err("Weapon catalog is not ready".into());
+        assert_eq!(reset(&catalog, &class, 0), want);
     }
 
     #[test]
     fn a_name_is_trimmed_and_cut_to_twenty_characters() {
-        let loc = asset_game::LocalizeCatalog::default();
+        let loc = asset_game::TranslationStringIndex::default();
         assert_eq!(named("  Rusher  ", &loc), Ok("Rusher".into()));
-        assert_eq!(
-            named("abcdefghijklmnopqrstuvwxyz", &loc),
-            Ok("abcdefghijklmnopqrst".into())
-        );
-        assert_eq!(
-            named("abcdefghijklmnopqrs tuv", &loc),
-            Ok("abcdefghijklmnopqrs".into()),
-            "no space is left hanging at the cut"
-        );
-        assert_eq!(
-            named("ééééééééééééééééééééé", &loc)
-                .unwrap()
-                .chars()
-                .count(),
-            20
-        );
+        let want = Ok("abcdefghijklmnopqrst".into());
+        assert_eq!(named("abcdefghijklmnopqrstuvwxyz", &loc), want);
+        let want = Ok("abcdefghijklmnopqrs".into());
+        assert_eq!(named("abcdefghijklmnopqrs tuv", &loc), want, "no space is left hanging at the cut");
+        let want = 20;
+        assert_eq!(named("ééééééééééééééééééééé", &loc)
+            .unwrap()
+            .chars()
+            .count(), want);
     }
 
     #[test]
     fn an_empty_name_is_refused_in_the_menus_words() {
-        let plain = asset_game::LocalizeCatalog::default();
+        let plain = asset_game::TranslationStringIndex::default();
         assert_eq!(named(" \t ", &plain), Err("Enter a class name".into()));
         let loc =
-            asset_game::LocalizeCatalog::from_rows([("MENU_IWNET_CREATE_BADNAME", "Name it")]);
+            asset_game::TranslationStringIndex::from_rows([("MENU_IWNET_CREATE_BADNAME", "Name it")]);
         assert_eq!(named("", &loc), Err("Name it".into()));
     }
 }

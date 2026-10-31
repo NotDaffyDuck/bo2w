@@ -6,101 +6,75 @@
 //! has on top. BO2 keeps its anims in `crate::viewmodel::slot`; this goes when the catalog
 //! stores those.
 
-use crate::anim as a;
-use weap_anim_slot as weap_anim;
+use crate::anim;
 
-/// Slots in the base layout; [`weap_anim_extra`] numbers the ones after it.
-pub const WEAPON_ANIM_COUNT: usize = 37;
-pub const WEAPON_ANIM_SLOTS: usize = WEAPON_ANIM_COUNT + 28;
+/// Declares `pub const` slot indices numbered in the order listed, the first
+/// taking `start`. The order is the catalog layout; never reorder or insert
+/// in the middle.
+macro_rules! numbered_slots {
+    (start = $start:expr; $($(#[$doc:meta])* $name:ident),+ $(,)?) => {
+        numbered_slots!(@next $start; $($(#[$doc])* $name),+);
+    };
+    (@next $at:expr; $(#[$doc:meta])* $name:ident $(, $(#[$rest_doc:meta])* $rest:ident)*) => {
+        $(#[$doc])*
+        pub const $name: usize = $at;
+        numbered_slots!(@next $at + 1; $($(#[$rest_doc])* $rest),*);
+    };
+    (@next $at:expr;) => {};
+}
 
+/// How many slots the base layout has; [`weap_anim_extra`] continues after it.
+pub const GUN_MOTION_TOTAL: usize = 37;
+/// Base slots plus the extra slots for animations added on top.
+pub const WEAPON_ANIM_SLOTS: usize = GUN_MOTION_TOTAL + 28;
+
+/// The base slot layout.
 pub mod weap_anim_slot {
-    pub const ROOT: usize = 0x0;
-    pub const IDLE: usize = 0x1;
-    pub const EMPTY_IDLE: usize = 0x2;
-    pub const FIRE: usize = 0x3;
-    pub const HOLD_FIRE: usize = 0x4;
-    pub const LASTSHOT: usize = 0x5;
-    pub const RECHAMBER: usize = 0x6;
-    pub const MELEE: usize = 0x7;
-    pub const MELEE_CHARGE: usize = 0x8;
-    pub const RELOAD: usize = 0x9;
-    pub const RELOAD_EMPTY: usize = 0xA;
-    pub const RELOAD_START: usize = 0xB;
-    pub const RELOAD_END: usize = 0xC;
-    pub const RAISE: usize = 0xD;
-    pub const FIRST_RAISE: usize = 0xE;
-    pub const BREACH_RAISE: usize = 0xF;
-    pub const DROP: usize = 0x10;
-    pub const ALT_RAISE: usize = 0x11;
-    pub const ALT_DROP: usize = 0x12;
-    pub const QUICK_RAISE: usize = 0x13;
-    pub const QUICK_DROP: usize = 0x14;
-    pub const EMPTY_RAISE: usize = 0x15;
-    pub const EMPTY_DROP: usize = 0x16;
-    pub const SPRINT_IN: usize = 0x17;
-    pub const SPRINT_LOOP: usize = 0x18;
-    pub const SPRINT_OUT: usize = 0x19;
-    pub const STUNNED_START: usize = 0x1A;
-    pub const STUNNED_LOOP: usize = 0x1B;
-    pub const STUNNED_END: usize = 0x1C;
-    pub const DETONATE: usize = 0x1D;
-    pub const NIGHTVISION_WEAR: usize = 0x1E;
-    pub const NIGHTVISION_REMOVE: usize = 0x1F;
-    pub const ADS_FIRE: usize = 0x20;
-    pub const ADS_LASTSHOT: usize = 0x21;
-    pub const ADS_RECHAMBER: usize = 0x22;
-    pub const ADS_UP: usize = 0x23;
-    pub const ADS_DOWN: usize = 0x24;
+    numbered_slots! {
+        start = 0;
+        ROOT, IDLE, DRY_REST_CLIP, TRIGGER_SLOT, HOLD_FIRE, FINAL_SHOT_CLIP, RECHAMBER,
+        CLOSE_COMBAT, MELEE_CHARGE,
+        RELOAD, RELOAD_EMPTY, RELOAD_START, RELOAD_END,
+        RAISE, FIRST_RAISE, BREACHER_LIFT_CLIP, DROP,
+        ATTACHMENT_LIFT_CLIP, ATTACHMENT_LOWER_CLIP,
+        QUICK_RAISE, QUICK_DROP, EMPTY_RAISE, EMPTY_DROP,
+        SPRINT_IN, SPRINT_LOOP, SPRINT_OUT,
+        DAZED_BEGIN_CLIP, DAZED_REPEAT_CLIP, DAZED_FINISH_CLIP,
+        DETONATE, NIGHTVISION_WEAR, NIGHTVISION_REMOVE,
+        SCOPE_SHOT_CLIP, SCOPE_FINAL_SHOT_CLIP, ADS_RECHAMBER, SCOPE_RAISE_CLIP, SCOPE_LOWER_CLIP,
+    }
 }
 
+/// Slots past the base layout.
 pub mod weap_anim_extra {
-    use super::WEAPON_ANIM_COUNT;
-
-    pub const RELOAD_QUICK: usize = WEAPON_ANIM_COUNT;
-    pub const RELOAD_QUICK_EMPTY: usize = WEAPON_ANIM_COUNT + 1;
-    /// bo2zm: Black Ops II's dive-to-prone animations (`d2p_in`, `_loop`,
-    /// `_out`, and their empty-magazine ones).
-    pub const DIVE_IN: usize = WEAPON_ANIM_COUNT + 2;
-    pub const DIVE_LOOP: usize = WEAPON_ANIM_COUNT + 3;
-    pub const DIVE_OUT: usize = WEAPON_ANIM_COUNT + 4;
-    pub const DIVE_IN_EMPTY: usize = WEAPON_ANIM_COUNT + 5;
-    pub const DIVE_LOOP_EMPTY: usize = WEAPON_ANIM_COUNT + 6;
-    pub const DIVE_OUT_EMPTY: usize = WEAPON_ANIM_COUNT + 7;
-    /// bo2zm: Black Ops II's empty-magazine sprint animations.
-    pub const SPRINT_IN_EMPTY: usize = WEAPON_ANIM_COUNT + 8;
-    pub const SPRINT_LOOP_EMPTY: usize = WEAPON_ANIM_COUNT + 9;
-    pub const SPRINT_OUT_EMPTY: usize = WEAPON_ANIM_COUNT + 10;
-    /// bo2zm: Black Ops II's prone crawl animations: in, the four
-    /// directions (looping), out; then their empty-magazine ones.
-    pub const CRAWL_IN: usize = WEAPON_ANIM_COUNT + 11;
-    pub const CRAWL_FORWARD: usize = WEAPON_ANIM_COUNT + 12;
-    pub const CRAWL_BACK: usize = WEAPON_ANIM_COUNT + 13;
-    pub const CRAWL_RIGHT: usize = WEAPON_ANIM_COUNT + 14;
-    pub const CRAWL_LEFT: usize = WEAPON_ANIM_COUNT + 15;
-    pub const CRAWL_OUT: usize = WEAPON_ANIM_COUNT + 16;
-    pub const CRAWL_IN_EMPTY: usize = WEAPON_ANIM_COUNT + 17;
-    pub const CRAWL_FORWARD_EMPTY: usize = WEAPON_ANIM_COUNT + 18;
-    pub const CRAWL_BACK_EMPTY: usize = WEAPON_ANIM_COUNT + 19;
-    pub const CRAWL_RIGHT_EMPTY: usize = WEAPON_ANIM_COUNT + 20;
-    pub const CRAWL_LEFT_EMPTY: usize = WEAPON_ANIM_COUNT + 21;
-    pub const CRAWL_OUT_EMPTY: usize = WEAPON_ANIM_COUNT + 22;
-    /// bo2zm: Black Ops II's climb camera animation: it moves only the
-    /// camera, played over a low climb that keeps the gun in hand.
-    pub const CAMERA_MANTLE: usize = WEAPON_ANIM_COUNT + 23;
-    /// bo2zm: Black Ops II's melee and charged melee with an empty
-    /// magazine (a pistol's slide stays back).
-    pub const MELEE_EMPTY: usize = WEAPON_ANIM_COUNT + 24;
-    pub const MELEE_CHARGE_EMPTY: usize = WEAPON_ANIM_COUNT + 25;
-    /// bo2zm: Black Ops II's first-shots fire, hip and aimed (the HAMR's
-    /// fast start, the AN-94's intro shot).
-    pub const FIRE_INTRO: usize = WEAPON_ANIM_COUNT + 26;
-    pub const ADS_FIRE_INTRO: usize = WEAPON_ANIM_COUNT + 27;
+    numbered_slots! {
+        start = super::GUN_MOTION_TOTAL;
+        RELOAD_QUICK, RELOAD_QUICK_EMPTY,
+        /// Dive-to-prone: in, loop, out, then the same three with an empty magazine.
+        DIVE_IN, DIVE_LOOP, DIVE_OUT, DIVE_IN_EMPTY, DIVE_LOOP_EMPTY, DIVE_OUT_EMPTY,
+        /// Sprint in, loop and out with an empty magazine.
+        SPRINT_IN_EMPTY, SPRINT_LOOP_EMPTY, SPRINT_OUT_EMPTY,
+        /// Prone crawl: in, the four looping directions, out; then the empty-magazine set.
+        CRAWL_IN, CRAWL_FORWARD, CRAWL_BACK, CRAWL_RIGHT, CRAWL_LEFT, CRAWL_OUT,
+        CRAWL_IN_EMPTY, CRAWL_FORWARD_EMPTY, CRAWL_BACK_EMPTY, CRAWL_RIGHT_EMPTY,
+        CRAWL_LEFT_EMPTY, CRAWL_OUT_EMPTY,
+        /// Camera-only climb motion, layered over a low climb with the gun kept in hand.
+        CAMERA_MANTLE,
+        /// Melee and charged melee with an empty magazine (slide locked back).
+        MELEE_EMPTY, MELEE_CHARGE_EMPTY,
+        /// First shots of a trigger pull, hip and aimed.
+        FIRE_INTRO, ADS_FIRE_INTRO,
+    }
 }
 
-pub const ACTION_GOAL_TIME_SECS: f32 = 0.0;
-pub const IDLE_INTERRUPT_GOAL_TIME_SECS: f32 = 0.5;
-pub const ACTIVE_GOAL_WEIGHT: f32 = 1.0;
-pub const INACTIVE_GOAL_WEIGHT: f32 = 0.0;
+// Each list must fill its range exactly.
+const _: () = assert!(weap_anim_slot::SCOPE_LOWER_CLIP + 1 == GUN_MOTION_TOTAL);
+const _: () = assert!(weap_anim_extra::ADS_FIRE_INTRO + 1 == WEAPON_ANIM_SLOTS);
+
+pub const ACTION_BLEND_SECONDS: f32 = 0.0;
+pub const REST_BREAK_BLEND_SECONDS: f32 = 0.5;
+pub const LIVE_BLEND_TARGET: f32 = 1.0;
+pub const DORMANT_BLEND_TARGET: f32 = 0.0;
 
 /// Base slots whose clip is stretched over the gun's own time for the action
 /// (fire, reload, raise, drop and the rest); the others play at the clip's rate.
@@ -108,22 +82,22 @@ const TIMED_SLOTS: [usize; 25] = [
     4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 31,
 ];
 
-/// How fast a clip plays so it lasts the action's `weapon_timer_ms`.
-pub fn playback_rate(clip_length_ms: i32, weapon_timer_ms: i32) -> f32 {
-    if weapon_timer_ms < 0 {
+/// How fast a clip plays so it lasts the action's `gun_action_millis`.
+pub fn play_speed(anim_duration_millis: i32, gun_action_millis: i32) -> f32 {
+    if gun_action_millis < 0 {
         return 1.0;
     }
-    if weapon_timer_ms == 0 {
+    if gun_action_millis == 0 {
         return 0.0;
     }
-    if clip_length_ms <= 0 {
+    if anim_duration_millis <= 0 {
         return 1.0;
     }
-    clip_length_ms as f32 / weapon_timer_ms as f32
+    anim_duration_millis as f32 / gun_action_millis as f32
 }
 
 /// Whether `slot` plays at its clip's own rate rather than over the gun's time.
-pub fn slot_uses_native_rate(slot: usize) -> bool {
+pub fn clip_keeps_authored_rate(slot: usize) -> bool {
     // The dive, crawl and empty-magazine melee animations play over the gun's own times.
     if (weap_anim_extra::DIVE_IN..=weap_anim_extra::DIVE_OUT_EMPTY).contains(&slot)
         || (weap_anim_extra::CRAWL_IN..=weap_anim_extra::CRAWL_OUT_EMPTY).contains(&slot)
@@ -145,60 +119,59 @@ pub enum VmAnim {
 /// The slot BO2 viewmodel anim `anim` plays (its toggle bit ignored). Anims with no slot of
 /// their own (slide, climb, jam, the crawl-in) read as idle.
 pub fn vm_anim(anim: i32) -> VmAnim {
-    use weap_anim_extra as x;
-    let s = match a::number(anim) {
-        a::FORCE_IDLE => return VmAnim::ForceIdle,
-        a::ATTACK | a::ATTACK_LEFT | a::CONT_FIRE_IN | a::CONT_FIRE_LOOP | a::CONT_FIRE_OUT => {
-            weap_anim::FIRE
+    let s = match anim::number(anim) {
+        anim::FORCE_IDLE => return VmAnim::ForceIdle,
+        anim::ATTACK | anim::ATTACK_LEFT | anim::CONT_FIRE_IN | anim::CONT_FIRE_LOOP | anim::CONT_FIRE_OUT => {
+            weap_anim_slot::TRIGGER_SLOT
         }
-        a::ATTACK_LASTSHOT | a::ATTACK_LASTSHOT_LEFT => weap_anim::LASTSHOT,
-        a::RECHAMBER => weap_anim::RECHAMBER,
-        a::ADS_ATTACK => weap_anim::ADS_FIRE,
-        a::ADS_ATTACK_LASTSHOT => weap_anim::ADS_LASTSHOT,
-        a::ADS_RECHAMBER => weap_anim::ADS_RECHAMBER,
-        a::MELEE_ATTACK => weap_anim::MELEE,
-        a::MELEE_CHARGE => weap_anim::MELEE_CHARGE,
-        a::DROP | a::BREAKING_DOWN => weap_anim::DROP,
-        a::RAISE | a::DEPLOYING => weap_anim::RAISE,
-        a::FIRST_RAISE => weap_anim::FIRST_RAISE,
-        a::RELOAD => weap_anim::RELOAD,
-        a::RELOAD_EMPTY => weap_anim::RELOAD_EMPTY,
-        a::RELOAD_START => weap_anim::RELOAD_START,
-        a::RELOAD_END => weap_anim::RELOAD_END,
-        a::ALTSWITCHFROM => weap_anim::ALT_DROP,
-        a::ALTSWITCHTO => weap_anim::ALT_RAISE,
-        a::QUICK_DROP => weap_anim::QUICK_DROP,
-        a::QUICK_RAISE => weap_anim::QUICK_RAISE,
-        a::EMPTY_DROP => weap_anim::EMPTY_DROP,
-        a::EMPTY_RAISE => weap_anim::EMPTY_RAISE,
-        a::SPRINT_IN | a::LOWREADY_IN => weap_anim::SPRINT_IN,
-        a::SPRINT_LOOP | a::LOWREADY_LOOP => weap_anim::SPRINT_LOOP,
-        a::SPRINT_OUT | a::LOWREADY_OUT => weap_anim::SPRINT_OUT,
-        a::HOLD_FIRE => weap_anim::HOLD_FIRE,
-        a::DETONATE => weap_anim::DETONATE,
-        a::NIGHTVISION_WEAR => weap_anim::NIGHTVISION_WEAR,
-        a::NIGHTVISION_REMOVE => weap_anim::NIGHTVISION_REMOVE,
-        a::RELOAD_QUICK => x::RELOAD_QUICK,
-        a::RELOAD_QUICK_EMPTY => x::RELOAD_QUICK_EMPTY,
-        a::DTP_IN | a::DTP_LOOP => x::DIVE_IN,
-        a::DTP_OUT => x::DIVE_OUT,
-        a::DTP_EMPTY_IN | a::DTP_EMPTY_LOOP => x::DIVE_IN_EMPTY,
-        a::DTP_EMPTY_OUT => x::DIVE_OUT_EMPTY,
-        a::SPRINT_EMPTY_IN => x::SPRINT_IN_EMPTY,
-        a::SPRINT_EMPTY_LOOP => x::SPRINT_LOOP_EMPTY,
-        a::SPRINT_EMPTY_OUT => x::SPRINT_OUT_EMPTY,
-        a::CRAWL_FORWARD => x::CRAWL_FORWARD,
-        a::CRAWL_BACK => x::CRAWL_BACK,
-        a::CRAWL_RIGHT => x::CRAWL_RIGHT,
-        a::CRAWL_LEFT => x::CRAWL_LEFT,
-        a::CRAWL_OUT => x::CRAWL_OUT,
-        a::CRAWL_EMPTY_FORWARD => x::CRAWL_FORWARD_EMPTY,
-        a::CRAWL_EMPTY_BACK => x::CRAWL_BACK_EMPTY,
-        a::CRAWL_EMPTY_RIGHT => x::CRAWL_RIGHT_EMPTY,
-        a::CRAWL_EMPTY_LEFT => x::CRAWL_LEFT_EMPTY,
-        a::CRAWL_EMPTY_OUT => x::CRAWL_OUT_EMPTY,
-        a::MELEE_ATTACK_EMPTY => x::MELEE_EMPTY,
-        a::MELEE_CHARGE_EMPTY => x::MELEE_CHARGE_EMPTY,
+        anim::ATTACK_LASTSHOT | anim::ATTACK_LASTSHOT_LEFT => weap_anim_slot::FINAL_SHOT_CLIP,
+        anim::BOLT_CYCLE => weap_anim_slot::RECHAMBER,
+        anim::ADS_ATTACK => weap_anim_slot::SCOPE_SHOT_CLIP,
+        anim::ADS_ATTACK_LASTSHOT => weap_anim_slot::SCOPE_FINAL_SHOT_CLIP,
+        anim::ADS_BOLT_CYCLE => weap_anim_slot::ADS_RECHAMBER,
+        anim::MELEE_ATTACK => weap_anim_slot::CLOSE_COMBAT,
+        anim::MELEE_CHARGE => weap_anim_slot::MELEE_CHARGE,
+        anim::PUT_AWAY | anim::BREAKING_DOWN => weap_anim_slot::DROP,
+        anim::RAISE | anim::DEPLOYING => weap_anim_slot::RAISE,
+        anim::FIRST_TAKE_OUT => weap_anim_slot::FIRST_RAISE,
+        anim::RELOAD => weap_anim_slot::RELOAD,
+        anim::RELOAD_DRY => weap_anim_slot::RELOAD_EMPTY,
+        anim::RELOAD_BEGIN => weap_anim_slot::RELOAD_START,
+        anim::RELOAD_FINISH => weap_anim_slot::RELOAD_END,
+        anim::ALTSWITCHFROM => weap_anim_slot::ATTACHMENT_LOWER_CLIP,
+        anim::ALTSWITCHTO => weap_anim_slot::ATTACHMENT_LIFT_CLIP,
+        anim::FAST_PUT_AWAY => weap_anim_slot::QUICK_DROP,
+        anim::FAST_TAKE_OUT => weap_anim_slot::QUICK_RAISE,
+        anim::EMPTY_PUT_AWAY => weap_anim_slot::EMPTY_DROP,
+        anim::EMPTY_TAKE_OUT => weap_anim_slot::EMPTY_RAISE,
+        anim::SPRINT_ENTER | anim::LOWREADY_IN => weap_anim_slot::SPRINT_IN,
+        anim::SPRINT_HOLD | anim::LOWREADY_LOOP => weap_anim_slot::SPRINT_LOOP,
+        anim::SPRINT_EXIT | anim::LOWREADY_OUT => weap_anim_slot::SPRINT_OUT,
+        anim::FIRE_HELD => weap_anim_slot::HOLD_FIRE,
+        anim::TRIGGER_DETONATOR => weap_anim_slot::DETONATE,
+        anim::NVG_ON => weap_anim_slot::NIGHTVISION_WEAR,
+        anim::NVG_OFF => weap_anim_slot::NIGHTVISION_REMOVE,
+        anim::RELOAD_QUICK => weap_anim_extra::RELOAD_QUICK,
+        anim::RELOAD_QUICK_EMPTY => weap_anim_extra::RELOAD_QUICK_EMPTY,
+        anim::DTP_IN | anim::DTP_LOOP => weap_anim_extra::DIVE_IN,
+        anim::DTP_OUT => weap_anim_extra::DIVE_OUT,
+        anim::DTP_EMPTY_IN | anim::DTP_EMPTY_LOOP => weap_anim_extra::DIVE_IN_EMPTY,
+        anim::DTP_EMPTY_OUT => weap_anim_extra::DIVE_OUT_EMPTY,
+        anim::SPRINT_EMPTY_IN => weap_anim_extra::SPRINT_IN_EMPTY,
+        anim::SPRINT_EMPTY_LOOP => weap_anim_extra::SPRINT_LOOP_EMPTY,
+        anim::SPRINT_EMPTY_OUT => weap_anim_extra::SPRINT_OUT_EMPTY,
+        anim::CRAWL_FORWARD => weap_anim_extra::CRAWL_FORWARD,
+        anim::CRAWL_BACK => weap_anim_extra::CRAWL_BACK,
+        anim::CRAWL_RIGHT => weap_anim_extra::CRAWL_RIGHT,
+        anim::CRAWL_LEFT => weap_anim_extra::CRAWL_LEFT,
+        anim::CRAWL_OUT => weap_anim_extra::CRAWL_OUT,
+        anim::CRAWL_EMPTY_FORWARD => weap_anim_extra::CRAWL_FORWARD_EMPTY,
+        anim::CRAWL_EMPTY_BACK => weap_anim_extra::CRAWL_BACK_EMPTY,
+        anim::CRAWL_EMPTY_RIGHT => weap_anim_extra::CRAWL_RIGHT_EMPTY,
+        anim::CRAWL_EMPTY_LEFT => weap_anim_extra::CRAWL_LEFT_EMPTY,
+        anim::CRAWL_EMPTY_OUT => weap_anim_extra::CRAWL_OUT_EMPTY,
+        anim::MELEE_ATTACK_EMPTY => weap_anim_extra::MELEE_EMPTY,
+        anim::MELEE_CHARGE_EMPTY => weap_anim_extra::MELEE_CHARGE_EMPTY,
         _ => return VmAnim::Idle,
     };
     VmAnim::Slot(s)
@@ -209,7 +182,7 @@ pub fn is_fire_anim(anim: i32) -> bool {
     matches!(
         vm_anim(anim),
         VmAnim::Slot(
-            weap_anim::FIRE | weap_anim::LASTSHOT | weap_anim::ADS_FIRE | weap_anim::ADS_LASTSHOT
+            weap_anim_slot::TRIGGER_SLOT | weap_anim_slot::FINAL_SHOT_CLIP | weap_anim_slot::SCOPE_SHOT_CLIP | weap_anim_slot::SCOPE_FINAL_SHOT_CLIP
         )
     )
 }
@@ -220,21 +193,29 @@ mod tests {
 
     #[test]
     fn anims_pick_their_slots() {
-        assert_eq!(vm_anim(a::IDLE), VmAnim::Idle);
-        assert_eq!(vm_anim(a::SLIDE_IN), VmAnim::Idle);
-        assert_eq!(vm_anim(a::FORCE_IDLE | a::TOGGLE), VmAnim::ForceIdle);
-        assert_eq!(vm_anim(a::RAISE | a::TOGGLE), VmAnim::Slot(weap_anim::RAISE));
-        assert_eq!(vm_anim(a::CONT_FIRE_LOOP), VmAnim::Slot(weap_anim::FIRE));
-        assert_eq!(vm_anim(a::CRAWL_EMPTY_OUT), VmAnim::Slot(weap_anim_extra::CRAWL_OUT_EMPTY));
-        assert!(is_fire_anim(a::ADS_ATTACK_LASTSHOT));
-        assert!(!is_fire_anim(a::RECHAMBER));
+        assert_eq!(vm_anim(anim::REST), VmAnim::Idle);
+        assert_eq!(vm_anim(anim::SLIDE_IN), VmAnim::Idle);
+        assert_eq!(vm_anim(anim::FORCE_IDLE | anim::TOGGLE), VmAnim::ForceIdle);
+        assert_eq!(vm_anim(anim::RAISE | anim::TOGGLE), VmAnim::Slot(weap_anim_slot::RAISE));
+        assert_eq!(vm_anim(anim::CONT_FIRE_LOOP), VmAnim::Slot(weap_anim_slot::TRIGGER_SLOT));
+        assert_eq!(vm_anim(anim::CRAWL_EMPTY_OUT), VmAnim::Slot(weap_anim_extra::CRAWL_OUT_EMPTY));
+        assert!(is_fire_anim(anim::ADS_ATTACK_LASTSHOT));
+        assert!(!is_fire_anim(anim::BOLT_CYCLE));
+    }
+
+    #[test]
+    fn layout_numbers_are_fixed() {
+        assert_eq!([weap_anim_slot::ROOT, weap_anim_slot::RELOAD, weap_anim_slot::DROP], [0, 9, 16]);
+        assert_eq!((weap_anim_slot::ADS_RECHAMBER, weap_anim_slot::SCOPE_LOWER_CLIP), (34, 36));
+        assert_eq!((weap_anim_extra::RELOAD_QUICK, weap_anim_extra::DIVE_IN), (37, 39));
+        assert_eq!((weap_anim_extra::CAMERA_MANTLE, weap_anim_extra::ADS_FIRE_INTRO), (60, 64));
     }
 
     #[test]
     fn timed_slots_follow_the_gun() {
-        assert!(slot_uses_native_rate(weap_anim::IDLE));
-        assert!(!slot_uses_native_rate(weap_anim::RELOAD));
-        assert!(!slot_uses_native_rate(weap_anim_extra::CRAWL_IN));
-        assert!(slot_uses_native_rate(weap_anim_extra::RELOAD_QUICK));
+        assert!(clip_keeps_authored_rate(weap_anim_slot::IDLE));
+        assert!(!clip_keeps_authored_rate(weap_anim_slot::RELOAD));
+        assert!(!clip_keeps_authored_rate(weap_anim_extra::CRAWL_IN));
+        assert!(clip_keeps_authored_rate(weap_anim_extra::RELOAD_QUICK));
     }
 }

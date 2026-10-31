@@ -1,7 +1,7 @@
 //! bo2mp: measure Black Ops II's model vertex (`GfxPackedVertex`), read-only.
 //! `t6vert <zone.ff>...` (default Nuketown) captures each zone's XModels and
 //! reports, over every first-LOD vertex: the row size, the binormal-sign
-//! values, the colour and texcoord bytes, how the normal and tangent words
+//! values, the colour and uv_semantic bytes, how the normal and tangent words
 //! pack (top bits, component range, decoded length per candidate decode),
 //! and per triangle how the packed normal, tangent and binormal sign line up
 //! with the geometry and the texcoords. A few whole rows are printed in hex
@@ -12,70 +12,42 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
-use asset_t6::{WorldRef, WorldSurface, ZoneCapture, capture_zone, half_to_f32, pack_unit_vec};
-use fastfile_t6::layout_gen::GfxPackedVertex as L;
+use glam::Vec3;
 
-const DEFAULT_ZONE: &str =
-    r"C:\Program Files (x86)\Steam\steamapps\common\Call of Duty Black Ops II\zone\all\mp_nuketown_2020.ff";
+use asset_t6::{WorldRef, WorldSurface, ZoneCapture, capture_zone, short_float_to_full, pack_unit_vec};
+use fastfile_t6::layout_gen::GfxPackedVertex;
 
-type V3 = [f32; 3];
+fn default_zone() -> PathBuf {
+    bo2zm_tools::zone_file("mp_nuketown_2020.ff")
+}
 
 fn rd_u32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
-fn sub(a: V3, b: V3) -> V3 {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-fn add(a: V3, b: V3) -> V3 {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-fn scale(a: V3, s: f32) -> V3 {
-    [a[0] * s, a[1] * s, a[2] * s]
-}
-
-fn dot(a: V3, b: V3) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn cross(a: V3, b: V3) -> V3 {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn len(a: V3) -> f32 {
-    dot(a, a).sqrt()
-}
-
 /// Three 10-bit fields, two's complement, over `div`.
-fn signed10(w: u32, div: f32) -> V3 {
+fn signed10(w: u32, div: f32) -> Vec3 {
     let c = |v: u32| {
         let v = (v & 0x3ff) as i32;
         (if v >= 512 { v - 1024 } else { v }) as f32 / div
     };
-    [c(w), c(w >> 10), c(w >> 20)]
+    Vec3::new(c(w), c(w >> 10), c(w >> 20))
 }
 
 /// Three 10-bit fields, unsigned, biased to -1..1.
-fn biased10(w: u32) -> V3 {
+fn biased10(w: u32) -> Vec3 {
     let c = |v: u32| (v & 0x3ff) as f32 / 1023.0 * 2.0 - 1.0;
-    [c(w), c(w >> 10), c(w >> 20)]
+    Vec3::new(c(w), c(w >> 10), c(w >> 20))
 }
 
 /// Four bytes, unsigned, biased to -1..1 (the legacy packing).
-fn biased8(w: u32) -> V3 {
+fn biased8(w: u32) -> Vec3 {
     let c = |v: u32| (v & 0xff) as f32 / 127.5 - 1.0;
-    [c(w), c(w >> 8), c(w >> 16)]
+    Vec3::new(c(w), c(w >> 8), c(w >> 16))
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct Lengths {
     n: u64,
     min: f32,
@@ -85,17 +57,15 @@ struct Lengths {
 }
 
 impl Lengths {
-    fn add(&mut self, l: f32) {
-        if self.n == 0 {
-            (self.min, self.max) = (l, l);
-        }
-        self.n += 1;
-        self.min = self.min.min(l);
-        self.max = self.max.max(l);
-        self.sum += f64::from(l);
-        if (l - 1.0).abs() <= 0.01 {
-            self.near_one += 1;
-        }
+    fn tally(&mut self, l: f32) {
+        let (min, max) = if self.n == 0 { (l, l) } else { (self.min, self.max) };
+        *self = Lengths {
+            n: self.n + 1,
+            min: min.min(l),
+            max: max.max(l),
+            sum: self.sum + f64::from(l),
+            near_one: self.near_one + u64::from((l - 1.0).abs() <= 0.01),
+        };
     }
 
     fn line(&self, what: &str) -> String {
@@ -129,7 +99,7 @@ struct Word {
 }
 
 impl Word {
-    fn add(&mut self, w: u32) {
+    fn tally(&mut self, w: u32) {
         *self.top2.entry(w >> 30).or_default() += 1;
         for k in 0..3 {
             let v = ((w >> (10 * k)) & 0x3ff) as i32;
@@ -137,20 +107,20 @@ impl Word {
             self.comp_min = self.comp_min.min(v);
             self.comp_max = self.comp_max.max(v);
         }
-        self.s511.add(len(signed10(w, 511.0)));
-        self.s512.add(len(signed10(w, 512.0)));
-        self.b1023.add(len(biased10(w)));
-        self.b8.add(len(biased8(w)));
-        self.repack_same += u64::from(pack_unit_vec(signed10(w, 511.0)) == w);
+        self.s511.tally(signed10(w, 511.0).length());
+        self.s512.tally(signed10(w, 512.0).length());
+        self.b1023.tally(biased10(w).length());
+        self.b8.tally(biased8(w).length());
+        self.repack_same += u64::from(pack_unit_vec(signed10(w, 511.0).to_array()) == w);
     }
 
     fn print(&self, what: &str) {
-        println!("  {what} @{}: bits 30..31 values {:?}", if what == "normal" { L::normal } else { L::tangent }, self.top2);
+        println!("  {what} @{}: bits 30..31 values {:?}", if what == "normal" { GfxPackedVertex::normal } else { GfxPackedVertex::tangent }, self.top2);
         println!("    signed 10-bit components: min {} max {}", self.comp_min, self.comp_max);
-        println!("    {}", self.s511.line("signed10 /511"));
-        println!("    {}", self.s512.line("signed10 /512"));
-        println!("    {}", self.b1023.line("unsigned10 biased"));
-        println!("    {}", self.b8.line("bytes biased"));
+        println!("    {line}", line = self.s511.line("signed10 /511"));
+        println!("    {line}", line = self.s512.line("signed10 /512"));
+        println!("    {line}", line = self.b1023.line("unsigned10 biased"));
+        println!("    {line}", line = self.b8.line("bytes biased"));
         println!("    asset_t6::pack_unit_vec(signed10 /511) == word: {}", pct(self.repack_same, self.s511.n - self.repack_same));
     }
 }
@@ -161,7 +131,7 @@ struct Report {
     surfaces: u64,
     short_surfaces: u64,
     stride: BTreeMap<String, u64>,
-    verts: u64,
+    vertex_points: u64,
     sign_bits: BTreeMap<u32, u64>,
     alpha_19_ff: u64,
     alpha_16_ff: u64,
@@ -171,7 +141,7 @@ struct Report {
     normal: Word,
     tangent: Word,
     n_dot_t: Lengths,
-    tris: u64,
+    triangle_list: u64,
     face_with_normal: u64,
     face_against_normal: u64,
     tan_uv_lo: (u64, u64),
@@ -179,8 +149,14 @@ struct Report {
     bin_ntx_dv: (u64, u64),
     bin_tnx_dv: (u64, u64),
     mixed_sign_tris: u64,
-    /// (model, row) samples, keyed by binormal sign bits.
-    samples: BTreeMap<u32, Vec<(String, Vec<u8>)>>,
+    /// Sample rows, keyed by binormal sign bits.
+    samples: BTreeMap<u32, Vec<SampleRow>>,
+}
+
+/// One whole vertex row and the model it came from.
+struct SampleRow {
+    from_model: String,
+    bytes: Vec<u8>,
 }
 
 fn measure(capture: &ZoneCapture, r: &mut Report) {
@@ -188,43 +164,43 @@ fn measure(capture: &ZoneCapture, r: &mut Report) {
     for model in &capture.xmodels {
         for srf in &model.lod0 {
             r.surfaces += 1;
-            let n = usize::from(srf.vert_count);
+            let n = usize::from(srf.vertex_tally);
             if n == 0 {
                 continue;
             }
-            let key = if srf.verts.len() % n == 0 {
-                format!("{}", srf.verts.len() / n)
+            let key = if srf.vertex_points.len() % n == 0 {
+                format!("{per}", per = srf.vertex_points.len() / n)
             } else {
-                format!("{} bytes / {} verts", srf.verts.len(), n)
+                format!("{} bytes / {} verts", srf.vertex_points.len(), n)
             };
             *r.stride.entry(key).or_default() += 1;
-            if srf.verts.len() < n * L::SIZE {
+            if srf.vertex_points.len() < n * GfxPackedVertex::SIZE {
                 r.short_surfaces += 1;
                 continue;
             }
-            let rows: Vec<&[u8]> = srf.verts.chunks_exact(L::SIZE).take(n).collect();
-            let sign = rd_u32(rows[0], L::binormalSign);
+            let rows: Vec<&[u8]> = srf.vertex_points.chunks_exact(GfxPackedVertex::SIZE).take(n).collect();
+            let sign = rd_u32(rows[0], GfxPackedVertex::binormalSign);
             let picked = r.samples.entry(sign).or_default();
-            if picked.len() < 3 && picked.iter().all(|(m, _)| *m != model.name) {
-                picked.push((model.name.clone(), rows[0].to_vec()));
+            if picked.len() < 3 && picked.iter().all(|s| s.from_model != model.name) {
+                picked.push(SampleRow { from_model: model.name.clone(), bytes: rows[0].to_vec() });
             }
             for v in &rows {
-                r.verts += 1;
-                *r.sign_bits.entry(rd_u32(v, L::binormalSign)).or_default() += 1;
-                r.alpha_19_ff += u64::from(v[L::color + 3] == 0xff);
-                r.alpha_16_ff += u64::from(v[L::color] == 0xff);
-                let tex = rd_u32(v, L::texCoord);
-                let (lo, hi) = (half_to_f32(tex as u16), half_to_f32((tex >> 16) as u16));
+                r.vertex_points += 1;
+                *r.sign_bits.entry(rd_u32(v, GfxPackedVertex::binormalSign)).or_default() += 1;
+                r.alpha_19_ff += u64::from(v[GfxPackedVertex::color + 3] == 0xff);
+                r.alpha_16_ff += u64::from(v[GfxPackedVertex::color] == 0xff);
+                let tex = rd_u32(v, GfxPackedVertex::texCoord);
+                let (lo, hi) = (short_float_to_full(tex as u16), short_float_to_full((tex >> 16) as u16));
                 if !lo.is_finite() || !hi.is_finite() {
                     r.uv_nonfinite += 1;
                 } else {
                     r.uv_lo = (r.uv_lo.0.min(lo), r.uv_lo.1.max(lo));
                     r.uv_hi = (r.uv_hi.0.min(hi), r.uv_hi.1.max(hi));
                 }
-                let (nw, tw) = (rd_u32(v, L::normal), rd_u32(v, L::tangent));
-                r.normal.add(nw);
-                r.tangent.add(tw);
-                r.n_dot_t.add(dot(signed10(nw, 511.0), signed10(tw, 511.0)).abs());
+                let (nw, tw) = (rd_u32(v, GfxPackedVertex::normal), rd_u32(v, GfxPackedVertex::tangent));
+                r.normal.tally(nw);
+                r.tangent.tally(tw);
+                r.n_dot_t.tally(signed10(nw, 511.0).dot(signed10(tw, 511.0)).abs());
             }
             for t in srf.indices.chunks_exact(3) {
                 let ids = [usize::from(t[0]), usize::from(t[1]), usize::from(t[2])];
@@ -238,58 +214,56 @@ fn measure(capture: &ZoneCapture, r: &mut Report) {
 }
 
 fn triangle(v: &[&[u8]; 3], r: &mut Report) {
-    let pos = |row: &[u8]| -> V3 {
-        [0, 4, 8].map(|o| f32::from_bits(rd_u32(row, L::xyz + o)))
-    };
+    let pos = |row: &[u8]| Vec3::from_array([0, 4, 8].map(|o| f32::from_bits(rd_u32(row, GfxPackedVertex::xyz + o))));
     let uv = |row: &[u8]| -> [f32; 2] {
-        let tex = rd_u32(row, L::texCoord);
-        [half_to_f32(tex as u16), half_to_f32((tex >> 16) as u16)]
+        let tex = rd_u32(row, GfxPackedVertex::texCoord);
+        [short_float_to_full(tex as u16), short_float_to_full((tex >> 16) as u16)]
     };
     let p = v.map(pos);
-    let face = cross(sub(p[1], p[0]), sub(p[2], p[0]));
-    if len(face) < 1e-6 {
+    let face = (p[1] - p[0]).cross(p[2] - p[0]);
+    if face.length() < 1e-6 {
         return;
     }
-    r.tris += 1;
-    let normal = v.iter().fold([0.0; 3], |a, row| add(a, signed10(rd_u32(row, L::normal), 511.0)));
-    let tangent = v.iter().fold([0.0; 3], |a, row| add(a, signed10(rd_u32(row, L::tangent), 511.0)));
-    if dot(face, normal) >= 0.0 {
+    r.triangle_list += 1;
+    let normal = v.iter().fold(Vec3::ZERO, |a, row| a + signed10(rd_u32(row, GfxPackedVertex::normal), 511.0));
+    let tangent = v.iter().fold(Vec3::ZERO, |a, row| a + signed10(rd_u32(row, GfxPackedVertex::tangent), 511.0));
+    if face.dot(normal) >= 0.0 {
         r.face_with_normal += 1;
     } else {
         r.face_against_normal += 1;
     }
 
     // dP/du and dP/dv over the triangle, with u the low half (lo) or the
-    // high half (hi) of the texcoord word.
+    // high half (hi) of the uv_semantic word.
     let t = v.map(uv);
-    let (e1, e2) = (sub(p[1], p[0]), sub(p[2], p[0]));
-    let grads = |a: usize, b: usize| -> Option<(V3, V3)> {
+    let (e1, e2) = (p[1] - p[0], p[2] - p[0]);
+    let grads = |a: usize, b: usize| -> Option<(Vec3, Vec3)> {
         let (du1, dv1) = (t[1][a] - t[0][a], t[1][b] - t[0][b]);
         let (du2, dv2) = (t[2][a] - t[0][a], t[2][b] - t[0][b]);
         let det = du1 * dv2 - du2 * dv1;
         if !det.is_finite() || det.abs() < 1e-8 {
             return None;
         }
-        let dpdu = scale(sub(scale(e1, dv2), scale(e2, dv1)), 1.0 / det);
-        let dpdv = scale(sub(scale(e2, du1), scale(e1, du2)), 1.0 / det);
+        let dpdu = (e1 * dv2 - e2 * dv1) * (1.0 / det);
+        let dpdv = (e2 * du1 - e1 * du2) * (1.0 / det);
         Some((dpdu, dpdv))
     };
     let count = |pair: &mut (u64, u64), d: f32| {
         if d >= 0.0 { pair.0 += 1 } else { pair.1 += 1 }
     };
     if let Some((dpdu, dpdv)) = grads(0, 1) {
-        count(&mut r.tan_uv_lo, dot(tangent, dpdu));
-        let signs = v.map(|row| f32::from_bits(rd_u32(row, L::binormalSign)));
+        count(&mut r.tan_uv_lo, tangent.dot(dpdu));
+        let signs = v.map(|row| f32::from_bits(rd_u32(row, GfxPackedVertex::binormalSign)));
         if signs.iter().all(|&s| s == signs[0]) && signs[0] != 0.0 {
             let s = signs[0].signum();
-            count(&mut r.bin_ntx_dv, s * dot(cross(normal, tangent), dpdv));
-            count(&mut r.bin_tnx_dv, s * dot(cross(tangent, normal), dpdv));
+            count(&mut r.bin_ntx_dv, s * normal.cross(tangent).dot(dpdv));
+            count(&mut r.bin_tnx_dv, s * tangent.cross(normal).dot(dpdv));
         } else {
             r.mixed_sign_tris += 1;
         }
     }
     if let Some((dpdu, _)) = grads(1, 0) {
-        count(&mut r.tan_uv_hi, dot(tangent, dpdu));
+        count(&mut r.tan_uv_hi, tangent.dot(dpdu));
     }
 }
 
@@ -298,10 +272,10 @@ fn pct(a: u64, b: u64) -> String {
 }
 
 fn print(zone: &str, r: &Report, capture: &ZoneCapture) {
-    println!("{zone}: {} xmodels, {} lod0 surfaces, {} vertices, {} triangles", r.models, r.surfaces, r.verts, r.tris);
+    println!("{zone}: {} xmodels, {} lod0 surfaces, {} vertices, {} triangles", r.models, r.surfaces, r.vertex_points, r.triangle_list);
     println!(
         "  layout GfxPackedVertex SIZE {} xyz @{} binormalSign @{} color @{} texCoord @{} normal @{} tangent @{}",
-        L::SIZE, L::xyz, L::binormalSign, L::color, L::texCoord, L::normal, L::tangent
+        GfxPackedVertex::SIZE, GfxPackedVertex::xyz, GfxPackedVertex::binormalSign, GfxPackedVertex::color, GfxPackedVertex::texCoord, GfxPackedVertex::normal, GfxPackedVertex::tangent
     );
     println!("  bytes per vertex (verts.len() / vertCount), surfaces: {:?}; short: {}", r.stride, r.short_surfaces);
     let mut signs: Vec<_> = r.sign_bits.iter().collect();
@@ -311,16 +285,16 @@ fn print(zone: &str, r: &Report, capture: &ZoneCapture) {
         .take(6)
         .map(|(bits, c)| format!("{bits:#010x} (f32 {}) x{c}", f32::from_bits(**bits)))
         .collect();
-    println!("  binormalSign @{}: {} distinct u32 values; top: {}", L::binormalSign, signs.len(), shown.join(", "));
+    println!("  binormalSign @{}: {} distinct u32 values; top: {}", GfxPackedVertex::binormalSign, signs.len(), shown.join(", "));
     println!(
         "  color @{}: byte 3 is 0xff in {}, byte 0 is 0xff in {}",
-        L::color,
-        pct(r.alpha_19_ff, r.verts - r.alpha_19_ff),
-        pct(r.alpha_16_ff, r.verts - r.alpha_16_ff)
+        GfxPackedVertex::color,
+        pct(r.alpha_19_ff, r.vertex_points - r.alpha_19_ff),
+        pct(r.alpha_16_ff, r.vertex_points - r.alpha_16_ff)
     );
     println!(
         "  texCoord @{}: non-finite half in {} verts; low half {:.3}..{:.3}, high half {:.3}..{:.3}",
-        L::texCoord, r.uv_nonfinite, r.uv_lo.0, r.uv_lo.1, r.uv_hi.0, r.uv_hi.1
+        GfxPackedVertex::texCoord, r.uv_nonfinite, r.uv_lo.0, r.uv_lo.1, r.uv_hi.0, r.uv_hi.1
     );
     r.normal.print("normal");
     r.tangent.print("tangent");
@@ -336,10 +310,10 @@ fn print(zone: &str, r: &Report, capture: &ZoneCapture) {
         pct(r.bin_tnx_dv.0, r.bin_tnx_dv.1),
         r.mixed_sign_tris
     );
-    for (sign, rows) in &r.samples {
-        for (model, row) in rows {
-            let hex: Vec<String> = row.iter().map(|b| format!("{b:02x}")).collect();
-            println!("  row sign {sign:#010x} {model}: {}", hex.join(""));
+    for (sign, table) in &r.samples {
+        for SampleRow { from_model, bytes } in table {
+            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            println!("  row sign {sign:#010x} {from_model}: {}", hex.join(""));
         }
     }
     if let Some(w) = &capture.world {
@@ -360,12 +334,16 @@ struct Slot {
 }
 
 impl Slot {
-    fn add(&mut self, w: u32, lo: f32, hi: f32) {
-        self.n += 1;
-        self.unit += u64::from(w >> 30 == 0 && (len(signed10(w, 511.0)) - 1.0).abs() <= 0.01);
-        self.sign += u64::from(w == 0x3f80_0000 || w == 0xbf80_0000);
-        let f = f32::from_bits(w);
-        self.in_box += u64::from(f.is_finite() && f >= lo && f <= hi);
+    fn tally(&mut self, w: u32, lo: f32, hi: f32) {
+        let is_unit = w >> 30 == 0 && (signed10(w, 511.0).length() - 1.0).abs() <= 0.01;
+        let is_sign = matches!(w, 0x3f80_0000 | 0xbf80_0000);
+        let inside = (lo..=hi).contains(&f32::from_bits(w));
+        *self = Slot {
+            n: self.n + 1,
+            unit: self.unit + u64::from(is_unit),
+            sign: self.sign + u64::from(is_sign),
+            in_box: self.in_box + u64::from(inside),
+        };
     }
 
     fn cell(&self, at: usize) -> String {
@@ -374,21 +352,21 @@ impl Slot {
     }
 }
 
-/// Scores every 4-byte offset of `stride`-byte rows laid from `starts`
+/// Standings every 4-byte offset of `stride`-byte rows laid from `starts`
 /// (byte offset into `data`, row count); rows past the end are counted apart.
-fn sweep(data: &[u8], starts: &[(usize, usize)], stride: usize, lo: f32, hi: f32) -> (Vec<Slot>, u64, u64) {
-    let mut slots = vec![Slot::default(); stride / 4];
+fn sweep(data: &[u8], starts: &[(usize, usize)], stride_bytes: usize, lo: f32, hi: f32) -> (Vec<Slot>, u64, u64) {
+    let mut slots = vec![Slot::default(); stride_bytes / 4];
     let (mut rows, mut past_end) = (0u64, 0u64);
     for &(base, n) in starts {
         for i in 0..n {
-            let at = base + i * stride;
-            let Some(row) = data.get(at..at + stride) else {
+            let at = base + i * stride_bytes;
+            let Some(row) = data.get(at..at + stride_bytes) else {
                 past_end += 1;
                 continue;
             };
             rows += 1;
             for (k, slot) in slots.iter_mut().enumerate() {
-                slot.add(rd_u32(row, k * 4), lo, hi);
+                slot.tally(rd_u32(row, k * 4), lo, hi);
             }
         }
     }
@@ -406,8 +384,8 @@ fn world(w: &WorldRef) {
         per(w.vd1.len()),
         w.surfaces.len()
     );
-    let lo = w.mins.iter().copied().fold(f32::INFINITY, f32::min) - 1.0;
-    let hi = w.maxs.iter().copied().fold(f32::NEG_INFINITY, f32::max) + 1.0;
+    let lo = w.lo_corner.iter().copied().fold(f32::INFINITY, f32::min) - 1.0;
+    let hi = w.hi_corner.iter().copied().fold(f32::NEG_INFINITY, f32::max) + 1.0;
 
     // Each distinct vertex range once: (vertexDataOffset, firstVertex, vertexCount).
     let ranges = |offset: fn(&WorldSurface) -> i32| -> Vec<(usize, usize, usize)> {
@@ -449,7 +427,7 @@ fn world(w: &WorldRef) {
         for pair in ranges.windows(2) {
             let ((a, _, n), (b, _, _)) = (pair[0], pair[1]);
             if b > a {
-                let key = if (b - a) % n == 0 { format!("{}", (b - a) / n) } else { "not whole".to_string() };
+                let key = if (b - a) % n == 0 { format!("{per}", per = (b - a) / n) } else { "not whole".to_string() };
                 *gap.entry(key).or_default() += 1;
             }
         }
@@ -471,26 +449,36 @@ fn world(w: &WorldRef) {
     println!("  (u = unit 10:10:10 word, s = f32 +-1, b = f32 inside the world box; percent of rows)");
 }
 
-fn main() -> ExitCode {
-    let mut paths: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
-    if paths.is_empty() {
-        paths.push(PathBuf::from(DEFAULT_ZONE));
+/// The zones named on the command line, or the default one.
+fn zones_to_read(named: impl Iterator<Item = String>) -> Vec<PathBuf> {
+    let zones: Vec<PathBuf> = named.map(PathBuf::from).collect();
+    match zones.as_slice() {
+        [] => vec![default_zone()],
+        _ => zones,
     }
-    let mut ok = true;
-    for path in &paths {
-        match capture_zone(path) {
-            Ok(capture) => {
-                let mut r = Report::default();
-                measure(&capture, &mut r);
-                print(&path.display().to_string(), &r, &capture);
-            }
-            Err(e) => {
-                eprintln!("t6vert: {}: {e}", path.display());
-                ok = false;
-            }
+}
+
+/// Reads one zone and prints its report; false when the zone would not load.
+fn report_zone(path: &PathBuf) -> bool {
+    let capture = match capture_zone(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("t6vert: {}: {e}", path.to_string_lossy());
+            return false;
         }
-    }
-    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    };
+    let mut r = Report::default();
+    measure(&capture, &mut r);
+    print(&path.display().to_string(), &r, &capture);
+    true
+}
+
+fn main() {
+    let loaded: Vec<bool> = zones_to_read(std::env::args().skip(1))
+        .iter()
+        .map(report_zone)
+        .collect();
+    std::process::exit(if loaded.contains(&false) { 1 } else { 0 });
 }
 
 #[cfg(test)]
@@ -498,8 +486,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decodes_give_vec3_per_field() {
+        assert_eq!(signed10(0x0010_0401 | (1023 << 20), 1.0).to_array(), [1.0, 1.0, -1.0]);
+        assert_eq!(biased8(0x00ff_0000).to_array(), [-1.0, -1.0, 1.0]);
+    }
+
+    #[test]
+    fn lengths_track_extremes_and_near_one() {
+        let mut l = Lengths::default();
+        assert_eq!(l.line("n"), "n: none");
+        for v in [0.5, 1.005, 2.0] {
+            l.tally(v);
+        }
+        assert_eq!((l.n, l.min, l.max, l.near_one), (3, 0.5, 2.0, 1));
+        assert!((l.sum - 3.505).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_zone_named_means_the_default() {
+        assert_eq!(zones_to_read(std::iter::empty()), vec![default_zone()]);
+        assert_eq!(zones_to_read(["a.ff".to_owned()].into_iter()), vec![PathBuf::from("a.ff")]);
+    }
+
+    #[test]
     fn the_sweep_finds_each_slot_at_its_offset() {
-        // Two ranges of 36-byte rows: x y z, sign, colour, uv, normal, tangent, lmap.
+        // Two ranges of 36-byte rows: x y z, sign, colour, uv, normal, tangent, baked_light_slot.
         let row = |x: f32| {
             let mut r = Vec::new();
             for f in [x, 2.0, 3.0, -1.0] {

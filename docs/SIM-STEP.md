@@ -1,52 +1,58 @@
-# `sim::step` — the one funnel
+# `sim::step`: the single entry into the world
 
-```rust
-pub fn step(
-    world: &mut SimWorld,
-    tick: Tick,
-    input: &TickInput,
-    msec: i32,
-    reason: StepReason,
-) -> Snapshot
-```
+It takes the world (mutable), the tick number, that tick's input, the frame length
+in msec and the reason for the step, and it hands back the snapshot.
 
-`crates/sim/src/carrier.rs`. Everything able to change the authoritative world
-enters through `TickInput` and leaves through `Snapshot`. There is no second
-door. `try_step` exposes the same path as a `Result<Snapshot, script::Fault>`;
-`step` panics on script failure. Authority/replay require a loaded, started GSC
-program.
+Defined in `crates/sim/src/carrier/mod.rs` and re-exported from the `sim`
+crate root. Whatever can alter the authoritative world has to come in through
+a `TickInput`, and the only thing that comes out is a `Snapshot`. There is no
+other path in.
 
-## One function, three callers
+`try_step` takes the same arguments and the same route but returns
+`Result<Snapshot, script::Fault>`. `step` is `try_step` that panics when a
+script fails. Authority and replay steps need a script program that is loaded
+and started.
 
-Server authority, client prediction and replay all call this same `step`. They
-differ only in `StepReason`:
+## Who calls it
 
-| reason | meaning |
+The server's authority, a client's prediction, and replay all call this one
+function. Only the `StepReason` differs:
+
+| reason | when it is used |
 |---|---|
-| `AuthorityFrame` | the authoritative advance — the only reason `advances_authority_world()` holds |
-| `PredictNew` | the local client running ahead of the server |
-| `Replay` | a recorded input stream played back |
+| `AuthorityFrame` | the server's own frame; the sole reason for which `advances_authority_world()` is true |
+| `PredictNew` | a client running a tick it has not run before, ahead of the server |
+| `Replay` | a client re-running a tick it already ran, after the server corrected it |
 
-A human at a keyboard and a bot both arrive as entries in `TickInput.cmds`.
-`sim` cannot tell them apart, and nothing downstream needs to.
+People at keyboards and bots look identical to `sim`: both show up as entries
+in `TickInput.cmds`, and nothing further down needs to distinguish them.
 
-## Why it is shaped this way
+## Design reasons
 
-* **State is explicit.** `&mut SimWorld` owns the `bevy_ecs` world, so two of
-  them step side by side without touching each other: one in
-  `net::authority::runtime`, one in `net::client::predict`.
-* **Time is an argument.** `tick` and `msec` arrive per call instead of living
-  in the world, so re-running a tick means passing it again.
-* **Input is canonical.** `TickInput::canonicalize()` sorts commands and
-  actions by `ClientId`, so the same set of inputs is the same input whatever
-  order the network delivered it in.
-* **The snapshot is the return value**, not a later pass over the world. What
-  is absent from `Snapshot` cannot reach a client.
+* **Explicit state.** A `SimWorld` owns its own `bevy_ecs` world. Two can be
+  stepped side by side with no shared state: one in `net::authority::runtime`
+  and one in `net::client::predict`.
+* **Time passed in.** `tick` and `msec` are arguments rather than stored in
+  the world. To run a tick again, pass it again.
+* **Canonical input.** `TickInput::canonicalize()` orders commands by
+  `ClientId`, and actions by `ClientId` and then request id (a stable sort).
+  The same inputs therefore make the same step whatever order the network
+  delivered them in.
+* **Output is the return value.** The snapshot is what `step` returns, not
+  something read from the world afterward. Anything missing from `Snapshot`
+  cannot reach a client.
 
-## Coming back the other way
+## The way back in
 
-`adopt_snapshot` installs an authoritative snapshot; `adopt_prediction_snapshot`
-reconciles the local client against one. Both live in `crates/sim/src/adopt.rs`
-and answer with an `AdoptReport`.
+Two methods on `SimWorld` (in `crates/sim/src/carrier/checkpoint.rs`) bring
+authoritative state back:
 
-See [`ENTITIES.md`](ENTITIES.md) for snapshots and [`GSC-RUNTIME.md`](GSC-RUNTIME.md) for script execution.
+* `adopt_snapshot` installs an authoritative snapshot. It is only for worlds
+  that run no script program, since a snapshot carries no script state; a
+  world with scripts must be restored from a full `SimWorld` copy.
+* `adopt_prediction_snapshot` reconciles the local client with a snapshot.
+
+Both report a tally as an `AdoptReport` (`crates/sim/src/adopt.rs`).
+
+Related pages: [`ENTITIES.md`](ENTITIES.md) for snapshots and
+[`GSC-RUNTIME.md`](GSC-RUNTIME.md) for how scripts run.

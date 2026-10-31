@@ -8,14 +8,14 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// The folder bo2mp writes its own output under (logs, caches, runs,
 /// screenshots, demos), relative to where it runs.
 pub const ARTIFACTS_DIR: &str = "bo2mp-artifacts";
 
 /// The name beside each new log that always opens the newest one.
-const LATEST_LOG_NAME: &str = "latest.log";
+const NEWEST_LOG_FILE: &str = "latest.log";
 
 const WRITER_NAME: &str = "diag-writer";
 
@@ -29,29 +29,22 @@ pub enum Channel {
     Launch,
     Zone,
     World,
-    Fpv,
+    ViewModelPerspective,
     Input,
     Sim,
-    Net,
+    WireLink,
     Ui,
     Audio,
     Console,
 }
 
+/// The word each channel writes, in declaration order.
+const CHANNEL_WORDS: [&str; 10] =
+    ["launch", "zone", "world", "fpv", "input", "sim", "net", "ui", "audio", "console"];
+
 impl Channel {
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Launch => "launch",
-            Self::Zone => "zone",
-            Self::World => "world",
-            Self::Fpv => "fpv",
-            Self::Input => "input",
-            Self::Sim => "sim",
-            Self::Net => "net",
-            Self::Ui => "ui",
-            Self::Audio => "audio",
-            Self::Console => "console",
-        }
+        CHANNEL_WORDS[self as usize]
     }
 }
 
@@ -65,35 +58,38 @@ pub enum Level {
     Debug,
 }
 
+/// Every level with its word, most important first.
+const LEVELS: [(Level, &str); 4] = [
+    (Level::Error, "error"),
+    (Level::Warn, "warn"),
+    (Level::Info, "info"),
+    (Level::Debug, "debug"),
+];
+
 impl Level {
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Error => "error",
-            Self::Warn => "warn",
-            Self::Info => "info",
-            Self::Debug => "debug",
-        }
+        LEVELS[self as usize].1
     }
 
+    /// A level from its word, any case and padding; `warning` means warn.
     fn parse(text: &str) -> Option<Self> {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "error" => Some(Self::Error),
-            "warn" | "warning" => Some(Self::Warn),
-            "info" => Some(Self::Info),
-            "debug" => Some(Self::Debug),
-            _ => None,
-        }
+        let word = text.trim().to_ascii_lowercase();
+        let word = if word == "warning" { "warn" } else { word.as_str() };
+        LEVELS.iter().find(|(_, name)| *name == word).map(|(level, _)| *level)
     }
+}
+
+/// Where one log line goes, and whether it must reach the disk right away.
+#[derive(Clone, Copy)]
+struct Route {
+    stderr: bool,
+    file: bool,
+    at_once: bool,
 }
 
 /// What the writer thread is asked to do, in the order asked.
 enum Job {
-    Log {
-        text: String,
-        stderr: bool,
-        file: bool,
-        at_once: bool,
-    },
+    Log(String, Route),
     OpenLog(File),
     OpenLines(usize, File),
     Line(usize, String),
@@ -121,68 +117,98 @@ fn writer() -> Option<&'static mpsc::Sender<Job>> {
     JOBS.get().and_then(Option::as_ref)
 }
 
-fn run_writer(inbox: mpsc::Receiver<Job>) {
-    let mut log: Option<BufWriter<File>> = None;
-    let mut line_files: Vec<Option<BufWriter<File>>> = Vec::new();
-    let mut on_disk = Instant::now();
-    loop {
-        let job = inbox.recv_timeout(BATCH);
-        let at_once = match job {
-            Ok(Job::Log {
-                text,
-                stderr,
-                file,
-                at_once,
-            }) => {
-                // A failed write is dropped: the writer must outlive it.
-                if stderr {
-                    let _ = writeln!(std::io::stderr(), "{text}");
-                }
-                if file && let Some(log) = log.as_mut() {
-                    let _ = writeln!(log, "{text}");
-                }
-                at_once
+/// Write buffer each open file gets.
+const FILE_BUFFER: usize = 64 * 1024;
+
+/// The files the writer thread owns, and when it last put them on the disk.
+/// Write failures are dropped on purpose: the writer must outlive them.
+struct Sinks {
+    log: Option<BufWriter<File>>,
+    /// `LineFile`s by slot; a slot is empty until its file opens.
+    lines: Vec<Option<BufWriter<File>>>,
+    last_sync: Instant,
+}
+
+impl Sinks {
+    fn every_file(&mut self) -> impl Iterator<Item = &mut BufWriter<File>> {
+        self.log.iter_mut().chain(self.lines.iter_mut().flatten())
+    }
+
+    fn sync(&mut self) {
+        for open in self.every_file() {
+            open.flush().ok();
+        }
+        self.last_sync = Instant::now();
+    }
+
+    fn log_line(&mut self, text: &str, route: Route) {
+        if route.stderr {
+            writeln!(std::io::stderr(), "{text}").ok();
+        }
+        match self.log.as_mut() {
+            Some(log) if route.file => {
+                writeln!(log, "{text}").ok();
             }
-            Ok(Job::OpenLog(file)) => {
-                log = Some(BufWriter::with_capacity(1 << 16, file));
+            _ => {}
+        }
+    }
+
+    fn open_lines(&mut self, at: usize, file: File) {
+        let needed = at + 1;
+        if self.lines.len() < needed {
+            self.lines.resize_with(needed, || None);
+        }
+        self.lines[at] = Some(BufWriter::with_capacity(FILE_BUFFER, file));
+    }
+
+    fn add_line(&mut self, line_slot: usize, line_text: &str) {
+        if let Some(target) = self.lines.get_mut(line_slot).and_then(Option::as_mut) {
+            writeln!(target, "{line_text}").ok();
+        }
+    }
+
+    /// Does one job; true when it wants the files on the disk now.
+    fn run_job(&mut self, job: Job) -> bool {
+        match job {
+            Job::Log(text, route) => {
+                self.log_line(&text, route);
+                route.at_once
+            }
+            Job::OpenLog(file) => {
+                self.log = Some(BufWriter::with_capacity(FILE_BUFFER, file));
                 false
             }
-            Ok(Job::OpenLines(slot, file)) => {
-                if line_files.len() <= slot {
-                    line_files.resize_with(slot + 1, || None);
-                }
-                line_files[slot] = Some(BufWriter::with_capacity(1 << 16, file));
+            Job::OpenLines(slot, file) => {
+                self.open_lines(slot, file);
                 false
             }
-            Ok(Job::Line(slot, text)) => {
-                if let Some(Some(file)) = line_files.get_mut(slot) {
-                    let _ = writeln!(file, "{text}");
-                }
+            Job::Line(slot, text) => {
+                self.add_line(slot, &text);
                 false
             }
-            Ok(Job::Flush(answer)) => {
-                put_on_disk(&mut log, &mut line_files);
-                on_disk = Instant::now();
-                let _ = answer.send(());
-                continue;
+            Job::Flush(answer) => {
+                self.sync();
+                answer.send(()).ok();
+                false
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => true,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                put_on_disk(&mut log, &mut line_files);
-                return;
-            }
-        };
-        if at_once || on_disk.elapsed() >= BATCH {
-            put_on_disk(&mut log, &mut line_files);
-            on_disk = Instant::now();
         }
     }
 }
 
-fn put_on_disk(log: &mut Option<BufWriter<File>>, line_files: &mut [Option<BufWriter<File>>]) {
-    for file in log.iter_mut().chain(line_files.iter_mut().flatten()) {
-        let _ = file.flush();
+fn run_writer(inbox: mpsc::Receiver<Job>) {
+    let mut sinks = Sinks { log: None, lines: Vec::new(), last_sync: Instant::now() };
+    loop {
+        let urgent = match inbox.recv_timeout(BATCH) {
+            Ok(job) => sinks.run_job(job),
+            // A quiet stretch: whatever waits goes out.
+            Err(mpsc::RecvTimeoutError::Timeout) => true,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if urgent || sinks.last_sync.elapsed() >= BATCH {
+            sinks.sync();
+        }
     }
+    sinks.sync();
 }
 
 /// Waits, at most `limit`, until every line handed over so far is on the
@@ -204,7 +230,7 @@ pub(crate) fn wait_for_disk(limit: Duration) {
 struct Output {
     path: PathBuf,
     open: bool,
-    latest: Option<PathBuf>,
+    newest_alias: Option<PathBuf>,
     stderr_up_to: Level,
     file_up_to: Level,
 }
@@ -214,27 +240,29 @@ impl Output {
         level <= self.stderr_up_to || (self.open && level <= self.file_up_to)
     }
 
-    fn send(&self, level: Level, text: String) {
-        let stderr = level <= self.stderr_up_to;
-        let file = self.open && level <= self.file_up_to;
-        match writer() {
-            Some(jobs) => {
-                let _ = jobs.send(Job::Log {
-                    text,
-                    stderr,
-                    file,
-                    at_once: level <= Level::Warn,
-                });
-            }
-            None if stderr => eprintln!("{text}"),
-            None => {}
-        }
+    fn deliver(&self, level: Level, line_text: String) {
+        let route = Route {
+            stderr: level <= self.stderr_up_to,
+            file: self.open && level <= self.file_up_to,
+            at_once: level <= Level::Warn,
+        };
+        hand_over(line_text, route);
+    }
+}
+
+/// Gives a line to the writer thread; with no writer running, only its
+/// stderr part happens, straight away.
+fn hand_over(text: String, route: Route) {
+    if let Some(jobs) = writer() {
+        jobs.send(Job::Log(text, route)).ok();
+    } else if route.stderr {
+        writeln!(std::io::stderr(), "{text}").ok();
     }
 }
 
 static OUTPUT: OnceLock<Output> = OnceLock::new();
 static STARTED: OnceLock<Instant> = OnceLock::new();
-static REPEATS: Mutex<Repeats> = Mutex::new(Repeats::new());
+static REPEATS: Mutex<Repeats> = Mutex::new(Repeats::NONE);
 
 /// Holds back a line that only repeats the one written before it, and
 /// counts it. The count goes out as one note when a different line comes,
@@ -245,12 +273,8 @@ struct Repeats {
 }
 
 impl Repeats {
-    const fn new() -> Self {
-        Self {
-            last: None,
-            more: 0,
-        }
-    }
+    /// Nothing written yet, so nothing to repeat.
+    const NONE: Self = Self { last: None, more: 0 };
 
     /// Counts `line` when it repeats the last line written; true if it did.
     fn count(&mut self, line: &str) -> bool {
@@ -273,12 +297,12 @@ impl Repeats {
     }
 }
 
-/// Opens the log: `BO2MP_LOG`, or `<artifacts_root>/logs/<unix seconds>.log`,
+/// Opens the log: `BO2MP_LOG`, or `<output_store_dir>/logs/<unix seconds>.log`,
 /// and points `latest.log` beside it at it. `BO2MP_LOG_LEVEL` (error, warn,
 /// info, debug) sets what both stderr and the file take; without it stderr
 /// takes errors and the file takes up to info. From here on a crash leaves
 /// its reason in the log. Returns the log's path.
-pub fn init_log(artifacts_root: &Path) -> PathBuf {
+pub fn init_log(output_store_dir: &Path) -> PathBuf {
     if let Some(output) = OUTPUT.get() {
         return output.path.clone();
     }
@@ -286,10 +310,8 @@ pub fn init_log(artifacts_root: &Path) -> PathBuf {
     let path = std::env::var_os("BO2MP_LOG")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_secs());
-            artifacts_root.join("logs").join(format!("{secs}.log"))
+            let secs = UNIX_EPOCH.elapsed().map_or(0, |since| since.as_secs());
+            output_store_dir.join("logs").join(format!("{secs}.log"))
         });
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -302,13 +324,12 @@ pub fn init_log(artifacts_root: &Path) -> PathBuf {
     let chosen = std::env::var("BO2MP_LOG_LEVEL")
         .ok()
         .and_then(|text| Level::parse(&text));
-    let output = Output {
-        latest: link_latest(&path),
-        path,
-        open,
-        stderr_up_to: chosen.unwrap_or(Level::Error),
-        file_up_to: chosen.unwrap_or(Level::Info),
+    let (stderr_up_to, file_up_to) = match chosen {
+        Some(both) => (both, both),
+        None => (Level::Error, Level::Info),
     };
+    let latest = point_newest_alias(&path);
+    let output = Output { path, open, newest_alias: latest, stderr_up_to, file_up_to };
     let path = OUTPUT.get_or_init(|| output).path.clone();
     crate::crash::install(&path);
     path
@@ -316,47 +337,50 @@ pub fn init_log(artifacts_root: &Path) -> PathBuf {
 
 /// Points `latest.log` beside `log` at it. Returns the link, or None when
 /// none was made.
-fn link_latest(log: &Path) -> Option<PathBuf> {
-    let name = log.file_name()?;
-    if name == LATEST_LOG_NAME {
-        return None;
-    }
-    let link = log.with_file_name(LATEST_LOG_NAME);
-    #[cfg(unix)]
-    {
-        // Only a link is replaced; a real file of that name is left alone.
-        if let Ok(meta) = std::fs::symlink_metadata(&link) {
-            if !meta.is_symlink() {
-                return None;
-            }
-            std::fs::remove_file(&link).ok()?;
-        }
-        std::os::unix::fs::symlink(name, &link).ok()?;
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows: a symbolic link needs a privilege most accounts do not
-        // have, and a hard link does not.
-        if let Err(error) = std::fs::remove_file(&link)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            return None;
-        }
-        std::fs::hard_link(log, &link).ok()?;
-    }
-    Some(link)
+fn point_newest_alias(log: &Path) -> Option<PathBuf> {
+    // A log that is itself called latest.log gets no link to itself.
+    log.file_name().filter(|name| *name != NEWEST_LOG_FILE)?;
+    let link = log.with_file_name(NEWEST_LOG_FILE);
+    replace_link(log, &link).then_some(link)
+}
+
+/// Unix: a relative symbolic link. Only a link is replaced; a real file of
+/// that name is left alone.
+#[cfg(unix)]
+fn replace_link(log: &Path, link: &Path) -> bool {
+    let Some(target) = log.file_name() else {
+        return false;
+    };
+    let in_the_way = std::fs::symlink_metadata(link).map(|meta| meta.is_symlink());
+    let cleared = match in_the_way {
+        Ok(true) => std::fs::remove_file(link).is_ok(),
+        Ok(false) => false,
+        Err(_) => true,
+    };
+    cleared && std::os::unix::fs::symlink(target, link).is_ok()
+}
+
+/// Windows: a symbolic link needs a privilege most accounts do not have, and
+/// a hard link does not.
+#[cfg(not(unix))]
+fn replace_link(log: &Path, link: &Path) -> bool {
+    let cleared = match std::fs::remove_file(link) {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    };
+    cleared && std::fs::hard_link(log, link).is_ok()
 }
 
 /// The `latest.log` link `init_log` made, if it made one.
-pub fn latest_log_path() -> Option<PathBuf> {
-    OUTPUT.get()?.latest.clone()
+pub fn newest_log_location() -> Option<PathBuf> {
+    OUTPUT.get()?.newest_alias.clone()
 }
 
 /// Writes one line, `<channel>  <level>  <message>`. The `error!`, `warn!`,
 /// `info!` and `event!` macros call it. Before `init_log` every line goes
 /// to stderr.
 #[doc(hidden)]
-pub fn write_event(channel: Channel, level: Level, message: fmt::Arguments<'_>) {
+pub fn put_event(channel: Channel, level: Level, message: fmt::Arguments<'_>) {
     let Some(output) = OUTPUT.get() else {
         eprintln!("{}  {}  {message}", channel.as_str(), level.as_str());
         return;
@@ -374,9 +398,9 @@ pub fn write_event(channel: Channel, level: Level, message: fmt::Arguments<'_>) 
         return;
     }
     if let Some((level, note)) = repeats.note() {
-        output.send(level, note);
+        output.deliver(level, note);
     }
-    output.send(level, line.clone());
+    output.deliver(level, line.clone());
     repeats.wrote(level, line);
 }
 
@@ -387,7 +411,7 @@ pub fn flush() {
         && let Ok(mut repeats) = REPEATS.lock()
         && let Some((level, note)) = repeats.note()
     {
-        output.send(level, note);
+        output.deliver(level, note);
     }
     wait_for_disk(Duration::from_secs(2));
 }
@@ -395,8 +419,8 @@ pub fn flush() {
 /// Ends the process on an error found while starting up: logs it, says
 /// where the log is, and exits with code 2. On Windows a console window
 /// waits for Enter first, so the message can be read before it closes.
-pub fn exit_launch_error(message: &str) -> ! {
-    write_event(Channel::Launch, Level::Error, format_args!("{message}"));
+pub fn abort_on_startup_fault(message: &str) -> ! {
+    put_event(Channel::Launch, Level::Error, format_args!("{message}"));
     flush();
     if let Some(output) = OUTPUT.get() {
         let state = if output.open {
@@ -407,21 +431,30 @@ pub fn exit_launch_error(message: &str) -> ! {
         eprintln!("{state}: {}", output.path.display());
     }
     #[cfg(windows)]
-    {
-        use std::io::IsTerminal as _;
-        if std::io::stdin().is_terminal() {
-            eprintln!("\nPress Enter to close.");
-            let _ = std::io::stdin().read_line(&mut String::new());
-        }
-    }
+    hold_console_open();
     std::process::exit(2);
 }
 
+/// A console window opened just for this process closes with it; wait for
+/// Enter so its last words can be read.
+#[cfg(windows)]
+fn hold_console_open() {
+    use std::io::IsTerminal as _;
+    let input = std::io::stdin();
+    if !input.is_terminal() {
+        return;
+    }
+    eprintln!("\nPress Enter to close.");
+    let mut ignored = String::new();
+    input.read_line(&mut ignored).ok();
+}
+
 /// Prints where the log is on stdout, for whoever started the process.
-pub fn announce_log_stdout(path: &Path, latest: Option<&Path>) {
-    match latest {
-        Some(latest) => to_stdout(&format!("log: {} ({})", path.display(), latest.display())),
-        None => to_stdout(&format!("log: {}", path.display())),
+pub fn print_log_location(path: &Path, newest_link: Option<&Path>) {
+    let shown = path.to_string_lossy();
+    match newest_link {
+        Some(latest) => to_stdout(&format!("log: {shown} ({})", latest.to_string_lossy())),
+        None => to_stdout(&format!("log: {shown}")),
     }
 }
 
@@ -443,23 +476,21 @@ pub fn process_elapsed_ns() -> u128 {
 /// A step in the process's life (started, quitting, exiting), as
 /// `lifecycle: <name> pid=<pid> ns=<ns><detail>` in the log and on stdout,
 /// where a test runner watches for it.
-pub fn lifecycle_boundary(name: &str, detail: &str) {
-    boundary("lifecycle", name, detail);
+pub fn lifecycle_boundary(name: &str, note: &str) {
+    boundary("lifecycle", name, note);
 }
 
 /// A step in the match scripts' life, as `gsc: <name> pid=<pid>
 /// ns=<ns><detail>` in the log and on stdout.
-pub fn script_boundary(name: &str, detail: &str) {
-    boundary("gsc", name, detail);
+pub fn script_boundary(name: &str, note: &str) {
+    boundary("gsc", name, note);
 }
 
-fn boundary(kind: &str, name: &str, detail: &str) {
-    let line = format!(
-        "{kind}: {name} pid={} ns={}{detail}",
-        std::process::id(),
-        process_elapsed_ns()
-    );
-    write_event(Channel::Launch, Level::Info, format_args!("{line}"));
+fn boundary(kind: &str, name: &str, note: &str) {
+    let pid = std::process::id();
+    let ns = process_elapsed_ns();
+    let line = format!("{kind}: {name} pid={pid} ns={ns}{note}");
+    put_event(Channel::Launch, Level::Info, format_args!("{line}"));
     to_stdout(&line);
 }
 
@@ -487,23 +518,11 @@ impl Write for StderrLine {
 
 impl Drop for StderrLine {
     fn drop(&mut self) {
-        let text = String::from_utf8_lossy(&self.0);
-        let text = text.trim_end_matches(['\r', '\n']);
-        if text.is_empty() {
-            return;
-        }
-        match writer() {
-            Some(jobs) => {
-                let _ = jobs.send(Job::Log {
-                    text: text.to_owned(),
-                    stderr: true,
-                    file: false,
-                    at_once: false,
-                });
-            }
-            None => {
-                let _ = writeln!(std::io::stderr(), "{text}");
-            }
+        let shown = String::from_utf8_lossy(&self.0);
+        let body = shown.trim_end_matches(['\r', '\n']);
+        if !body.is_empty() {
+            let stderr_only = Route { stderr: true, file: false, at_once: false };
+            hand_over(body.to_owned(), stderr_only);
         }
     }
 }
@@ -547,7 +566,7 @@ mod tests {
 
     #[test]
     fn a_repeated_line_is_counted_and_noted_once() {
-        let mut repeats = Repeats::new();
+        let mut repeats = Repeats::NONE;
         assert!(!repeats.count("sim  warn  stall"));
         repeats.wrote(Level::Warn, "sim  warn  stall".into());
         assert_eq!(repeats.note(), None);
@@ -569,7 +588,7 @@ mod tests {
         file.line("second".into());
         flush();
         let text = std::fs::read_to_string(&path).expect("written");
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).ok();
         assert_eq!(text, "first\nsecond\n");
     }
 

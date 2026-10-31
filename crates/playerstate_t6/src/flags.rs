@@ -2,20 +2,20 @@
 //! sets and tests them. Bits with no setter or reader in BO2's code are
 //! left out.
 
-/// `playerState_s::pm_flags`.
-pub mod pm_flags {
-    /// The stance bits (`PM_CheckDuck`): 0 stand, `PRONE` or `CROUCH`.
+/// `playerState_s::movement_state_bits`.
+pub mod movement_state_bits {
+    /// The stance bits (`PM_CheckDuck`): 0 stand, `LYING_FLAT` or `DUCK_BUTTON_BIT`.
     pub const STANCE_MASK: i32 = 0x3;
-    pub const PRONE: i32 = 0x1;
-    pub const CROUCH: i32 = 0x2;
+    pub const LYING_FLAT: i32 = 0x1;
+    pub const DUCK_BUTTON_BIT: i32 = 0x2;
     /// Mantling (`Mantle_Start` sets it, `Mantle_Move` clears it): blocks
     /// aim (`PM_IsAdsAllowed`).
     pub const MANTLE: i32 = 0x4;
     /// On a ladder (`PM_CheckLadderMove`; `PM_ClearLadderFlag` clears it).
     pub const LADDER: i32 = 0x8;
     /// Aiming down sights (`PM_UpdateAimDownSightFlag`).
-    pub const ADS: i32 = 0x10;
-    /// Moving backwards: `PmoveSingle` sets it on negative forwardmove.
+    pub const AIM_BIT: i32 = 0x10;
+    /// Moving backwards: `PmoveSingle` sets it on negative thrust_ahead.
     pub const BACKWARDS_MOVEMENT: i32 = 0x20;
     /// Walking (`PM_UpdatePlayerWalkingFlag`).
     pub const WALKING: i32 = 0x40;
@@ -42,7 +42,7 @@ pub mod pm_flags {
     pub const SPRINT: i32 = 0x8000;
     /// Shell shocked (`GScr_ShellShock`).
     pub const SHELLSHOCK: i32 = 0x1_0000;
-    /// Knife lunge running (`PM_MeleeChargeStart`): forwardmove is held at
+    /// Knife lunge running (`PM_MeleeChargeStart`): thrust_ahead is held at
     /// 127.
     pub const MELEE_CHARGE: i32 = 0x2_0000;
     /// The `AllowX(0)` script calls set these.
@@ -71,7 +71,7 @@ pub mod pm_flags {
 /// `BG_PlayerStateToEntityState`.
 pub mod e_flags {
     pub const CROUCHING: i32 = 0x4;
-    pub const PRONE: i32 = 0x8;
+    pub const LYING_FLAT: i32 = 0x8;
     /// Firing this frame (`PmoveSingle`).
     pub const FIRING: i32 = 0x40;
     /// No user command for over a second (`ClientEndFrame`, entity only).
@@ -89,10 +89,10 @@ pub mod e_flags {
     pub const MANTLE: i32 = 0x8000;
     /// In a vehicle's gunner seat (`VEH_UpdateGunnerWeapon`).
     pub const VEHICLE_GUNNER: i32 = 0x1_0000;
-    /// Dead: `BG_PlayerStateToEntityState` sets it when `pm_type` is dead.
+    /// Dead: `BG_PlayerStateToEntityState` sets it when `movement_mode` is dead.
     pub const DEAD: i32 = 0x4_0000;
-    /// Aiming down sights, copied from `pm_flags::ADS`.
-    pub const ADS: i32 = 0x8_0000;
+    /// Aiming down sights, copied from `movement_state_bits::ADS`.
+    pub const AIM_BIT: i32 = 0x8_0000;
     pub const VOTED: i32 = 0x10_0000;
     /// Shows on the enemy's minimap (`PlayerCmd_pingPlayer`).
     pub const PING: i32 = 0x40_0000;
@@ -108,7 +108,7 @@ pub mod e_flags2 {
     pub const STOWED_WEAPON: i32 = 0x800;
     pub const GPS_JAMMER: i32 = 0x1000;
     pub const GUIDED_MISSILE_CAMERA: i32 = 0x4_0000;
-    /// Set with `other_flags::EMP_JAMMED` (`GScr_SetEMPJammed`).
+    /// Set with `secondary_state_bits::EMP_JAMMED` (`GScr_SetEMPJammed`).
     pub const EMP_JAMMED: i32 = 0x8_0000;
     pub const BURNING: i32 = 0x20_0000;
     pub const TURRET_SPINNING: i32 = 0x40_0000;
@@ -117,8 +117,8 @@ pub mod e_flags2 {
     pub const DRAW_INFRARED: i32 = 0x2000_0000;
 }
 
-/// `playerState_s::other_flags`.
-pub mod other_flags {
+/// `playerState_s::secondary_state_bits`.
+pub mod secondary_state_bits {
     pub const INVULNERABLE: i32 = 0x1;
     pub const SPECTATING: i32 = 0x2;
     /// In the game, not spectating (`ClientEndFrame`): `PM_IsAdsAllowed`
@@ -138,15 +138,15 @@ pub mod other_flags {
     pub const CAMERA_LINKED: i32 = 0x2000;
 }
 
-/// `playerState_s::weap_flags` (64 bits; BO2 only uses the low 32).
-pub mod weap_flags {
+/// `playerState_s::weapon_state_bits` (64 bits; BO2 only uses the low 32).
+pub mod weapon_state_bits {
     /// An offhand is held for use (`PM_Weapon_OffHand_HoldUse`).
     pub const OFFHAND_HOLDUSE: u64 = 0x2;
     pub const HOLD_BREATH: u64 = 0x4;
     pub const AIM_AT_FRIENDLY: u64 = 0x8;
     pub const AIM_AT_ENEMY: u64 = 0x10;
     /// `PlayerCmd_AllowADS(0)`: blocks aim (`PM_IsAdsAllowed`).
-    pub const NO_ADS: u64 = 0x20;
+    pub const AIM_DISABLED_BIT: u64 = 0x20;
     pub const NIGHTVISION: u64 = 0x40;
     pub const WEAPONS_DISABLED: u64 = 0x80;
     pub const OFFHAND_DISABLED: u64 = 0x100;
@@ -160,8 +160,8 @@ pub mod weap_flags {
     pub const CHARGING_SHOT: u64 = 0x400_0000;
 }
 
-/// `playerState_s::link_flags`.
-pub mod link_flags {
+/// `playerState_s::attach_bits`.
+pub mod attach_bits {
     pub const OFFSET: i32 = 0x2;
     /// Linked to `tag_player`: the player may still aim
     /// (`PlayerLinkTo_Internal`, `PM_IsAdsAllowed`).
@@ -173,20 +173,20 @@ pub mod link_flags {
 /// `playerState_s::move_type` when sliding (`BG_IsSliding`).
 pub const MOVE_TYPE_SLIDE: i32 = 0x1a;
 
-/// The `view_height_target` values `PM_GetEffectiveStance` tells apart.
-pub mod view_height {
-    pub const PRONE: i32 = 0xb;
+/// The `eye_height_goal` values `PM_GetEffectiveStance` tells apart.
+pub mod eye_height {
+    pub const LYING_FLAT: i32 = 0xb;
     /// 22 units: no stance name in BO2's code. It reads as prone on dry
     /// land, crouch in shallow water, stand in deep water.
     pub const LOW: i32 = 0x16;
-    pub const CROUCH: i32 = 0x28;
+    pub const DUCK_BUTTON_BIT: i32 = 0x28;
 }
 
 /// BO2's `PmStanceFrontBack`, what `PM_GetEffectiveStance` returns.
 pub mod stance {
-    pub const STAND: i32 = 0;
-    pub const PRONE: i32 = 1;
-    pub const CROUCH: i32 = 2;
+    pub const UPRIGHT: i32 = 0;
+    pub const LYING_FLAT: i32 = 1;
+    pub const DUCK_BUTTON_BIT: i32 = 2;
     pub const BACKWARD_RUN: i32 = 3;
     pub const BACKWARD_PRONE: i32 = 4;
     pub const BACKWARD_CROUCH: i32 = 5;

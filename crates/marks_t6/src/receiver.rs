@@ -8,17 +8,17 @@ const NO_MARKS_FLAG: u8 = 0x4;
 
 /// What the mark test reads from the material of the surface that was hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MarkReceiver {
-    pub sort_key: u8,
+pub struct DecalSurfaceGate {
+    pub draw_rank: u8,
     /// The low byte of the material's game flags.
     pub game_flags: u8,
     /// The surface kinds the material counts as (metal, wood, ...), `None` when unknown.
-    pub surface_type_bits: Option<u32>,
+    pub facet_type_bits: Option<u32>,
 }
 
 /// The answer of [`mark_allow`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FxMarkAllow {
+pub enum DecalAdmit {
     Keep,
     Reject,
     /// Something the test needs was not known.
@@ -28,36 +28,36 @@ pub enum FxMarkAllow {
 /// A decal or a no-marks material refuses the mark. Otherwise the surface takes it when its
 /// material counts as every surface kind the mark's material names.
 pub fn mark_allow(
-    receiver: Option<MarkReceiver>,
-    mark_surface_type_bits: Option<u32>,
-) -> FxMarkAllow {
+    receiver: Option<DecalSurfaceGate>,
+    wanted_kinds: Option<u32>,
+) -> DecalAdmit {
     let Some(receiver) = receiver else {
-        return FxMarkAllow::Unknown;
+        return DecalAdmit::Unknown;
     };
-    if receiver.sort_key == DECAL_SORT_KEY || receiver.game_flags & NO_MARKS_FLAG != 0 {
-        return FxMarkAllow::Reject;
+    if receiver.draw_rank == DECAL_SORT_KEY || receiver.game_flags & NO_MARKS_FLAG != 0 {
+        return DecalAdmit::Reject;
     }
-    match (receiver.surface_type_bits, mark_surface_type_bits) {
-        (Some(has), Some(wants)) if has & wants == wants => FxMarkAllow::Keep,
-        (Some(_), Some(_)) => FxMarkAllow::Reject,
-        _ => FxMarkAllow::Unknown,
+    match (receiver.facet_type_bits, wanted_kinds) {
+        (Some(has), Some(wants)) if has & wants == wants => DecalAdmit::Keep,
+        (Some(_), Some(_)) => DecalAdmit::Reject,
+        _ => DecalAdmit::Unknown,
     }
 }
 
 /// Only a surface that surely takes the mark is cut for it.
-pub fn mark_include_in_world_clip(allow: FxMarkAllow) -> bool {
-    allow == FxMarkAllow::Keep
+pub fn mark_include_in_world_clip(allow: DecalAdmit) -> bool {
+    allow == DecalAdmit::Keep
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn wall(bits: Option<u32>) -> MarkReceiver {
-        MarkReceiver {
-            sort_key: 2,
+    fn wall(bits: Option<u32>) -> DecalSurfaceGate {
+        DecalSurfaceGate {
+            draw_rank: 2,
             game_flags: 0,
-            surface_type_bits: bits,
+            facet_type_bits: bits,
         }
     }
 
@@ -65,36 +65,36 @@ mod tests {
     fn surface_kinds_must_cover_the_mark() {
         assert_eq!(
             mark_allow(Some(wall(Some(0b1110))), Some(0b0110)),
-            FxMarkAllow::Keep
+            DecalAdmit::Keep
         );
         assert_eq!(
             mark_allow(Some(wall(Some(0b1110))), Some(0b0001)),
-            FxMarkAllow::Reject
+            DecalAdmit::Reject
         );
-        assert_eq!(mark_allow(Some(wall(Some(0))), Some(0)), FxMarkAllow::Keep);
+        assert_eq!(mark_allow(Some(wall(Some(0))), Some(0)), DecalAdmit::Keep);
     }
 
     #[test]
     fn decals_and_no_marks_refuse_even_when_kinds_are_unknown() {
-        let decal = MarkReceiver {
-            sort_key: DECAL_SORT_KEY,
+        let decal = DecalSurfaceGate {
+            draw_rank: DECAL_SORT_KEY,
             ..wall(None)
         };
-        let no_marks = MarkReceiver {
+        let no_marks = DecalSurfaceGate {
             game_flags: NO_MARKS_FLAG | 1,
             ..wall(Some(!0))
         };
-        assert_eq!(mark_allow(Some(decal), None), FxMarkAllow::Reject);
-        assert_eq!(mark_allow(Some(no_marks), Some(1)), FxMarkAllow::Reject);
+        assert_eq!(mark_allow(Some(decal), None), DecalAdmit::Reject);
+        assert_eq!(mark_allow(Some(no_marks), Some(1)), DecalAdmit::Reject);
     }
 
     #[test]
     fn missing_facts_are_unknown_and_not_cut() {
-        assert_eq!(mark_allow(None, Some(1)), FxMarkAllow::Unknown);
-        assert_eq!(mark_allow(Some(wall(None)), Some(1)), FxMarkAllow::Unknown);
-        assert_eq!(mark_allow(Some(wall(Some(1))), None), FxMarkAllow::Unknown);
-        assert!(mark_include_in_world_clip(FxMarkAllow::Keep));
-        assert!(!mark_include_in_world_clip(FxMarkAllow::Reject));
-        assert!(!mark_include_in_world_clip(FxMarkAllow::Unknown));
+        assert_eq!(mark_allow(None, Some(1)), DecalAdmit::Unknown);
+        assert_eq!(mark_allow(Some(wall(None)), Some(1)), DecalAdmit::Unknown);
+        assert_eq!(mark_allow(Some(wall(Some(1))), None), DecalAdmit::Unknown);
+        assert!(mark_include_in_world_clip(DecalAdmit::Keep));
+        assert!(!mark_include_in_world_clip(DecalAdmit::Reject));
+        assert!(!mark_include_in_world_clip(DecalAdmit::Unknown));
     }
 }

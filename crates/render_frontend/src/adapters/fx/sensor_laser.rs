@@ -8,10 +8,10 @@ use std::collections::HashMap;
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use fx_t6::{FX_BEAM_ADD_CAP, FxBeamKind, FxBeamTess};
-use render_fx::{HostFxSystem, QueuedBeam, TracerWorld};
+use fx_t6::{RAY_QUEUE_LIMIT, FxBeamKind, EffectBeamStitch};
+use render_fx::{EffectsSystemHandle, PendingTracerBeam, StreakLevel};
 
-use crate::assemble::drawsurf::MaterialGeneration;
+use crate::assemble::draw_items::MaterialEpoch;
 
 /// How long one laser event keeps its beam up: a server tick and a bit.
 const HOLD_MS: i32 = 90;
@@ -22,9 +22,37 @@ const FLARE_PCT: f32 = 0.25;
 
 #[derive(Clone, Copy)]
 struct Laser {
-    begin: [f32; 3],
+    open_at: [f32; 3],
     end: [f32; 3],
-    until_ms: i32,
+    deadline_millis: i32,
+}
+
+impl Laser {
+    fn is_up(&self, clock_millis: i32) -> bool {
+        self.deadline_millis.wrapping_sub(clock_millis) > 0
+    }
+
+    /// The beam as seen from `view`: wider at the far end the farther it is.
+    fn beam(&self, view: [f32; 3], material: Option<usize>) -> PendingTracerBeam {
+        let far = Vec3::from_array(view).distance(Vec3::from_array(self.end));
+        let white = [255, 255, 255, 255];
+        PendingTracerBeam {
+            tess: EffectBeamStitch {
+                kind: FxBeamKind::Laser {
+                    finish_reach: (far * FLARE_PCT * 0.01 + 1.0) * RADIUS,
+                },
+                near_layer_draw: false,
+                draw_surf_override: 0,
+                begin: self.open_at,
+                end: self.end,
+                // A laser reads two keys, begin and end: white, fading out.
+                colors: [white, [255, 255, 255, 0], [0; 4], [0; 4], [0; 4]],
+                radius: RADIUS,
+                piece_tally: 1,
+            },
+            mat_ref: material,
+        }
+    }
 }
 
 /// The beams up now, by grenade.
@@ -34,65 +62,46 @@ pub(crate) struct SensorLasers {
 }
 
 pub(crate) fn note(
-    play: On<net::EntityPlayFx>,
-    host: Res<HostFxSystem>,
+    fx_play: On<net::EffectAt>,
+    host: Res<EffectsSystemHandle>,
     mut lasers: ResMut<SensorLasers>,
 ) {
-    if play.event.event.0 != entity_t6::event::ours::SENSOR_LASER {
+    let heard = &fx_play.event;
+    if heard.event.0 != entity_t6::event::ours::SENSOR_LASER {
         return;
     }
-    let payload = play.event.payload;
-    lasers.by_grenade.insert(
-        payload.correlation,
-        Laser {
-            begin: payload.origin,
-            end: payload.origin2,
-            until_ms: host.0.msec_now.wrapping_add(HOLD_MS),
-        },
-    );
+    let payload = heard.payload;
+    let deadline_millis = host.0.clock_ms_now.wrapping_add(HOLD_MS);
+    let laser = Laser {
+        open_at: payload.origin,
+        end: payload.origin2,
+        deadline_millis,
+    };
+    lasers.by_grenade.insert(payload.correlation, laser);
 }
 
 #[derive(SystemParam)]
 pub(crate) struct SensorLaserQueue<'w> {
     lasers: ResMut<'w, SensorLasers>,
-    runtime: Option<Res<'w, MaterialGeneration>>,
+    runtime: Option<Res<'w, MaterialEpoch>>,
 }
 
 impl SensorLaserQueue<'_> {
     /// Drops the beams whose time is up and queues the rest.
-    pub(crate) fn queue(&mut self, tracers: &mut TracerWorld, now_ms: i32, view: [f32; 3]) {
-        self.lasers
-            .by_grenade
-            .retain(|_, l| l.until_ms.wrapping_sub(now_ms) > 0);
+    pub(crate) fn queue(&mut self, tracers: &mut StreakLevel, clock_millis: i32, view: [f32; 3]) {
+        self.lasers.by_grenade.retain(|_, laser| laser.is_up(clock_millis));
         if self.lasers.by_grenade.is_empty() {
             return;
         }
-        let material = self.runtime.as_ref().and_then(|r| {
-            r.catalog
-                .material_for_name(asset_game::material_bind_name("gfx_laser"))
-                .map(|m| usize::from(m.asset_id.0))
+        let laser_material = self.runtime.as_ref().and_then(|runtime| {
+            let found = runtime
+                .catalog
+                .material_by_name(asset_game::material_bind_name("gfx_laser"))?;
+            Some(usize::from(found.asset_id.0))
         });
-        for laser in self.lasers.by_grenade.values() {
-            if tracers.queued.len() >= FX_BEAM_ADD_CAP {
-                break;
-            }
-            let far = Vec3::from_array(view).distance(Vec3::from_array(laser.end));
-            tracers.queued.push(QueuedBeam {
-                tess: FxBeamTess {
-                    kind: FxBeamKind::Laser {
-                        end_radius: (far * FLARE_PCT * 0.01 + 1.0) * RADIUS,
-                    },
-                    depth_hack: false,
-                    draw_surf_override: 0,
-                    begin: laser.begin,
-                    end: laser.end,
-                    // A laser reads two keys, begin and end: white, fading out.
-                    colors: [[255, 255, 255, 255], [255, 255, 255, 0], [0; 4], [0; 4], [0; 4]],
-                    radius: RADIUS,
-                    segment_count: 1,
-                },
-                material,
-            });
-        }
+        let room = RAY_QUEUE_LIMIT.saturating_sub(tracers.pending_list.len());
+        let beams = self.lasers.by_grenade.values().take(room);
+        let drawn = beams.map(|laser| laser.beam(view, laser_material));
+        tracers.pending_list.extend(drawn);
     }
 }

@@ -10,7 +10,7 @@
 //!          51           Lua 5.1
 //!          0D           HavokScript's format
 //!          01           little-endian
-//!          04 04 04 04  int, size_t, instruction, number: 4 bytes
+//!          04 04 04 04  int, size_t, opcode, number: 4 bytes
 //!          00           numbers are floats (32-bit)
 //!          00 00        two flag bytes (0 in every file)
 //! types    u32 count, then {u32 id, u32 length, name with NUL}:
@@ -43,7 +43,7 @@ pub mod vm;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Const {
     Nil,
-    Bool(bool),
+    Boolean(bool),
     Number(f32),
     /// The bytes, without the trailing NUL.
     String(Vec<u8>),
@@ -53,7 +53,7 @@ impl fmt::Display for Const {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Const::Nil => f.write_str("nil"),
-            Const::Bool(b) => write!(f, "{b}"),
+            Const::Boolean(b) => write!(f, "{b}"),
             Const::Number(n) => write!(f, "{n}"),
             Const::String(s) => write!(f, "{:?}", String::from_utf8_lossy(s)),
         }
@@ -70,7 +70,7 @@ pub struct Proto {
     pub code: Vec<u32>,
     pub consts: Vec<Const>,
     /// The script's hash (every function in a script shares it).
-    pub name_hash: u32,
+    pub label_digest: u32,
     /// This function's number in its script, depth first (the main chunk
     /// is 0): with the hash, what an error trace names (`hash/index:pc`).
     pub index: u32,
@@ -125,70 +125,70 @@ impl std::error::Error for Error {}
 
 const HEADER: [u8; 12] = [0x1B, b'L', b'u', b'a', 0x51, 0x0D, 0x01, 4, 4, 4, 4, 0];
 
-struct Reader<'a> {
+struct ByteCursor<'a> {
     b: &'a [u8],
     o: usize,
     /// The next function's number in the script (depth first).
     next: u32,
 }
 
-impl Reader<'_> {
-    fn bytes(&mut self, n: usize) -> Result<&[u8], Error> {
+impl ByteCursor<'_> {
+    fn take_bytes(&mut self, n: usize) -> Result<&[u8], Error> {
         let s = self.b.get(self.o..self.o + n).ok_or(Error::Short(self.o))?;
         self.o += n;
         Ok(s)
     }
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.bytes(1)?[0])
+    fn read_u8(&mut self) -> Result<u8, Error> {
+        Ok(self.take_bytes(1)?[0])
     }
-    fn u32(&mut self) -> Result<u32, Error> {
-        let s = self.bytes(4)?;
+    fn read_u32(&mut self) -> Result<u32, Error> {
+        let s = self.take_bytes(4)?;
         Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
     fn f32(&mut self) -> Result<f32, Error> {
-        Ok(f32::from_bits(self.u32()?))
+        Ok(f32::from_bits(self.read_u32()?))
     }
     fn proto(&mut self) -> Result<Proto, Error> {
         let index = self.next;
         self.next += 1;
-        let upvalues = self.u32()?;
-        let params = self.u32()?;
-        let vararg = self.u8()?;
-        let stack = self.u32()?;
-        let ncode = self.u32()? as usize;
+        let upvalues = self.read_u32()?;
+        let params = self.read_u32()?;
+        let vararg = self.read_u8()?;
+        let stack = self.read_u32()?;
+        let ncode = self.read_u32()? as usize;
         while !self.o.is_multiple_of(4) {
             let at = self.o;
-            if self.u8()? != 0x5F {
+            if self.read_u8()? != 0x5F {
                 return Err(Error::Padding(at));
             }
         }
         let mut code = Vec::with_capacity(ncode.min(1 << 16));
         for _ in 0..ncode {
-            code.push(self.u32()?);
+            code.push(self.read_u32()?);
         }
-        let nk = self.u32()? as usize;
+        let nk = self.read_u32()? as usize;
         let mut consts = Vec::with_capacity(nk.min(1 << 16));
         for _ in 0..nk {
             let at = self.o;
-            consts.push(match self.u8()? {
+            consts.push(match self.read_u8()? {
                 0 => Const::Nil,
-                1 => Const::Bool(self.u8()? != 0),
+                1 => Const::Boolean(self.read_u8()? != 0),
                 3 => Const::Number(self.f32()?),
                 4 => {
-                    let n = self.u32()? as usize;
-                    let s = self.bytes(n)?;
+                    let n = self.read_u32()? as usize;
+                    let s = self.take_bytes(n)?;
                     Const::String(s.strip_suffix(&[0]).unwrap_or(s).to_vec())
                 }
                 t => return Err(Error::ConstType(t, at)),
             });
         }
         let at = self.o;
-        let debug = self.u32()?;
+        let debug = self.read_u32()?;
         if debug != 1 {
             return Err(Error::Debug(debug, at));
         }
-        let name_hash = self.u32()?;
-        let nchild = self.u32()? as usize;
+        let label_digest = self.read_u32()?;
+        let nchild = self.read_u32()? as usize;
         let mut protos = Vec::with_capacity(nchild.min(1 << 12));
         for _ in 0..nchild {
             protos.push(std::rc::Rc::new(self.proto()?));
@@ -200,7 +200,7 @@ impl Reader<'_> {
             stack,
             code,
             consts,
-            name_hash,
+            label_digest,
             index,
             protos,
         })
@@ -212,13 +212,17 @@ pub fn parse(bytes: &[u8]) -> Result<Chunk, Error> {
     if bytes.get(..12) != Some(&HEADER[..]) {
         return Err(Error::Header);
     }
-    let mut r = Reader { b: bytes, o: 14, next: 0 };
-    let n = r.u32()? as usize;
+    let mut r = ByteCursor {
+        b: bytes,
+        o: 14,
+        next: 0,
+    };
+    let n = r.read_u32()? as usize;
     let mut types = Vec::with_capacity(n.min(64));
     for _ in 0..n {
-        let id = r.u32()?;
-        let len = r.u32()? as usize;
-        let name = r.bytes(len)?;
+        let id = r.read_u32()?;
+        let len = r.read_u32()? as usize;
+        let name = r.take_bytes(len)?;
         let name = name.strip_suffix(&[0]).unwrap_or(name);
         types.push((id, String::from_utf8_lossy(name).into_owned()));
     }
@@ -350,12 +354,12 @@ pub fn disassemble(p: &Proto, out: &mut String) {
 }
 
 /// One function's listing, without the functions inside it.
-pub fn disassemble_one(p: &Proto, out: &mut String) {
+pub fn disassemble_one(p: &Proto, listing: &mut String) {
     use fmt::Write;
     let _ = writeln!(
-        out,
+        listing,
         "function {:#010x}/{}: {} params, {} upvalues, vararg {}, stack {}, {} constants",
-        p.name_hash,
+        p.label_digest,
         p.index,
         p.params,
         p.upvalues,
@@ -363,7 +367,11 @@ pub fn disassemble_one(p: &Proto, out: &mut String) {
         p.stack,
         p.consts.len()
     );
-    let k = |i: usize| p.consts.get(i).map_or_else(|| "?".to_owned(), ToString::to_string);
+    let k = |i: usize| {
+        p.consts
+            .get(i)
+            .map_or_else(|| "?".to_owned(), ToString::to_string)
+    };
     let rk = |i: u16| {
         if i >= 256 {
             k(usize::from(i - 256))
@@ -381,18 +389,47 @@ pub fn disassemble_one(p: &Proto, out: &mut String) {
             "SELF" => format!("r{a} = r{b}:{}", rk(c)),
             "GETTABLE" | "GETTABLE_S" | "GETTABLE_N" => format!("r{a} = r{b}[{}]", rk(c)),
             "SETTABLE" | "SETTABLE_S" | "SETTABLE_N" => format!("r{a}[r{b}] = {}", rk(c)),
-            "SETTABLE_BK" | "SETTABLE_S_BK" | "SETTABLE_N_BK" => format!("r{a}[{}] = {}", k(usize::from(b)), rk(c)),
+            "SETTABLE_BK" | "SETTABLE_S_BK" | "SETTABLE_N_BK" => {
+                format!("r{a}[{}] = {}", k(usize::from(b)), rk(c))
+            }
             "EQ" | "LT" | "LE" => format!("r{b} vs {}", rk(c)),
             "EQ_BK" | "LT_BK" | "LE_BK" => format!("{} vs {}", k(usize::from(b)), rk(c)),
             "JMP" | "FORPREP" | "FORLOOP" => format!("-> {}", i as i64 + 1 + i64::from(d.sbx)),
-            "CALL" | "CALL_I" | "CALL_C" | "CALL_M" | "CALL_I_R1" => format!("r{a}({} args) -> {}", i32::from(b) - 1, i32::from(c) - 1),
+            // R(A) := B op RK(C); B a register, or a constant in the _BK forms.
+            name @ ("ADD" | "SUB" | "MUL" | "DIV" | "MOD" | "POW" | "ADD_BK" | "SUB_BK"
+            | "MUL_BK" | "DIV_BK" | "MOD_BK" | "POW_BK") => {
+                let left = if name.ends_with("_BK") {
+                    k(usize::from(b))
+                } else {
+                    format!("r{b}")
+                };
+                let sign = match &name[..3] {
+                    "ADD" => "+",
+                    "SUB" => "-",
+                    "MUL" => "*",
+                    "DIV" => "/",
+                    "MOD" => "%",
+                    _ => "^",
+                };
+                format!("r{a} = {left} {sign} {}", rk(c))
+            }
+            "CALL" | "CALL_I" | "CALL_C" | "CALL_M" | "CALL_I_R1" => {
+                format!("r{a}({} args) -> {}", i32::from(b) - 1, i32::from(c) - 1)
+            }
             _ => String::new(),
         };
-        let _ = write!(out, "  {i:4} {:<14} {:3} {:3} {:3}", op_name(d.op), d.a, d.b, d.c);
+        let _ = write!(
+            listing,
+            "  {i:4} {:<14} {:3} {:3} {:3}",
+            op_name(d.op),
+            d.a,
+            d.b,
+            d.c
+        );
         if !note.is_empty() {
-            let _ = write!(out, "  ; {note}");
+            write!(listing, "  ; {note}").ok();
         }
-        out.push('\n');
+        listing.push('\n');
     }
 }
 

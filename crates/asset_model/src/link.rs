@@ -1,95 +1,152 @@
-//! Where a model's material slots stand against the material definitions.
+//! How a model's material slots line up with the loaded material definitions.
 
-use asset_core::{AssetEdge, AssetEdgeReason, MaterialKey, MaterialSpace, WalkLocalMaterialIndex};
+use asset_core::AssetDependencyLink;
+use asset_core::DependencyCause;
+use asset_core::MaterialKey;
+use asset_core::SurfaceShaderSpace;
+use asset_core::TraversalMaterialSlot;
 use asset_material::MaterialDefinitions;
 
-/// A slot is in use when the model's own data points at a material for it, or
-/// a material name has been put there.
-fn slot_in_use(
-    authored: &[Option<WalkLocalMaterialIndex>],
-    keys: &[Option<MaterialKey>],
-    slot: usize,
-) -> bool {
-    let pointed_at = authored.get(slot).is_some_and(Option::is_some);
-    let named = keys
-        .get(slot)
-        .and_then(Option::as_ref)
-        .is_some_and(|key| !key.name.is_empty());
-    pointed_at || named
+/// True when the model's data points the slot at a material, or a non-empty
+/// material name has been put in it.
+fn slot_is_used(pointer: Option<&Option<TraversalMaterialSlot>>, key: Option<&Option<MaterialKey>>) -> bool {
+    if pointer.is_some_and(Option::is_some) {
+        return true;
+    }
+    matches!(key, Some(Some(named)) if !named.name.is_empty())
 }
 
-/// The material key of each slot the model points at, read from the
-/// definitions it was walked with, and an edge for each slot: absent when the
-/// slot is unused, otherwise not yet resolved. Slots stay unnamed when there
-/// are no definitions to read.
-pub fn capture_xmodel_material_slots(
-    authored: &[Option<WalkLocalMaterialIndex>],
-    materials: Option<&MaterialDefinitions>,
-) -> (Vec<Option<MaterialKey>>, Vec<AssetEdge<MaterialSpace>>) {
-    let keys: Vec<Option<MaterialKey>> = authored
+/// An unused slot links to nothing; a used one links to what `lookup` finds,
+/// or stays unbound when it finds nothing.
+fn link_for(used: bool, lookup: impl FnOnce() -> Option<AssetDependencyLink<SurfaceShaderSpace>>) -> AssetDependencyLink<SurfaceShaderSpace> {
+    match used.then(lookup) {
+        None => AssetDependencyLink::NothingThere,
+        Some(found) => found.unwrap_or(AssetDependencyLink::Unresolved(DependencyCause::IndexLookupFailure)),
+    }
+}
+
+/// Reads each slot's material key from `defs` (slots stay unnamed without
+/// them) and gives every slot a link: nothing for an unused slot, unbound
+/// for a used one.
+pub fn read_slot_keys(pointers: &[Option<TraversalMaterialSlot>], defs: Option<&MaterialDefinitions>) -> (Vec<Option<MaterialKey>>, Vec<AssetDependencyLink<SurfaceShaderSpace>>) {
+    let mut keys = Vec::with_capacity(pointers.len());
+    for pointer in pointers {
+        let row = defs.zip(pointer.as_ref()).and_then(|(table, at)| table.materials.get(at.get()));
+        keys.push(row.map(|found| MaterialKey { namespace: found.namespace, name: found.name.to_string() }));
+    }
+    let links = pointers
         .iter()
-        .map(|slot| {
-            let material = materials?.materials.get(slot.as_ref()?.get())?;
-            Some(MaterialKey {
-                namespace: material.namespace,
-                name: material.name.to_string(),
-            })
-        })
+        .zip(&keys)
+        .map(|(pointer, key)| link_for(slot_is_used(Some(pointer), Some(key)), || None))
         .collect();
-    let edges = (0..authored.len())
-        .map(|slot| {
-            if slot_in_use(authored, &keys, slot) {
-                AssetEdge::Unresolved(AssetEdgeReason::CatalogMiss)
-            } else {
-                AssetEdge::Absent
-            }
-        })
-        .collect();
-    (keys, edges)
+    (keys, links)
 }
 
-/// Finds the definition row of every slot's key. A slot that is unused gets
-/// no edge; a used one whose key matches no real definition stays unresolved.
-pub fn stamp_xmodel_material_edges(
-    keys: &[Option<MaterialKey>],
-    authored: &[Option<WalkLocalMaterialIndex>],
-    materials: &MaterialDefinitions,
-) -> Vec<AssetEdge<MaterialSpace>> {
-    (0..keys.len().max(authored.len()))
-        .map(|slot| {
-            if !slot_in_use(authored, keys, slot) {
-                return AssetEdge::Absent;
-            }
-            let row = keys
-                .get(slot)
-                .and_then(Option::as_ref)
-                .and_then(|key| materials.material_index_by_key(key));
-            match row {
-                Some(row) => AssetEdge::bind(row, materials.zone_of(row.order())),
-                None => AssetEdge::Unresolved(AssetEdgeReason::CatalogMiss),
-            }
-        })
-        .collect()
+/// Looks up the definition row of every slot's key. Unused slots link to
+/// nothing; a used slot whose key names no definition stays unbound.
+pub fn bind_slot_keys(keys: &[Option<MaterialKey>], pointers: &[Option<TraversalMaterialSlot>], defs: &MaterialDefinitions) -> Vec<AssetDependencyLink<SurfaceShaderSpace>> {
+    let slots = pointers.len().max(keys.len());
+    let mut links = Vec::with_capacity(slots);
+    for at in 0..slots {
+        let key = keys.get(at);
+        let lookup = || {
+            let row = defs.material_index_by_key(key?.as_ref()?)?;
+            Some(AssetDependencyLink::bind(row, defs.owning_zone(row.order())))
+        };
+        links.push(link_for(slot_is_used(pointers.get(at), key), lookup));
+    }
+    links
+}
+
+/// Older spellings other crates still call; the rename sweep moves them over.
+pub fn snapshot_mesh_surface_slots(
+    pointers: &[Option<TraversalMaterialSlot>],
+    defs: Option<&MaterialDefinitions>,
+) -> (Vec<Option<MaterialKey>>, Vec<AssetDependencyLink<SurfaceShaderSpace>>) {
+    read_slot_keys(pointers, defs)
+}
+
+/// Older spellings other crates still call; the rename sweep moves them over.
+pub fn write_mesh_surface_links(keys: &[Option<MaterialKey>], pointers: &[Option<TraversalMaterialSlot>], defs: &MaterialDefinitions) -> Vec<AssetDependencyLink<SurfaceShaderSpace>> {
+    bind_slot_keys(keys, pointers, defs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asset_core::AssetCategoryScope;
 
-    #[test]
-    fn with_no_definitions_slots_are_unnamed_and_unresolved() {
-        let authored = [Some(WalkLocalMaterialIndex::from_walk(0)), None];
-        let (keys, edges) = capture_xmodel_material_slots(&authored, None);
-        assert!(keys.iter().all(Option::is_none));
-        assert_eq!(edges.len(), 2);
-        assert!(matches!(edges[0], AssetEdge::Unresolved(AssetEdgeReason::CatalogMiss)));
-        assert!(matches!(edges[1], AssetEdge::Absent));
+    fn blank<T: Default>() -> T {
+        T::default()
+    }
+
+    fn walked(at: usize) -> Option<TraversalMaterialSlot> {
+        Some(TraversalMaterialSlot::from_walk(at))
+    }
+
+    fn named(text: &str) -> Option<MaterialKey> {
+        Some(MaterialKey { namespace: AssetCategoryScope::T6, name: text.into() })
+    }
+
+    fn one_material(label: &str) -> MaterialDefinitions {
+        let row = asset_material::DesignerMaterial {
+            name: label.into(),
+            namespace: AssetCategoryScope::T6,
+            method_set: blank(),
+            draw_order: blank(),
+            game_flag_info: blank(),
+            condition_bits: blank(),
+            camera_zone: blank(),
+            facet_type_bits: blank(),
+            raster_bits: blank(),
+            raster_slot: blank(),
+            method_table: blank(),
+            route: blank(),
+            textures: blank(),
+            constants: blank(),
+            zone: asset_core::ZoneCustodian::TEST,
+            t6_draw: blank(),
+        };
+        MaterialDefinitions { materials: vec![row], ..blank() }
     }
 
     #[test]
-    fn a_slot_that_nothing_names_or_points_at_has_no_edge() {
-        let edges = stamp_xmodel_material_edges(&[None, None], &[None], &MaterialDefinitions::default());
-        assert_eq!(edges.len(), 2);
-        assert!(edges.iter().all(|edge| matches!(edge, AssetEdge::Absent)));
+    fn without_definitions_used_slots_wait_and_empty_ones_link_nowhere() {
+        let (keys, links) = read_slot_keys(&[walked(0), None], None);
+        assert!(keys.iter().all(Option::is_none));
+        assert_eq!(links.len(), 2);
+        assert!(matches!(links[0], AssetDependencyLink::Unresolved(DependencyCause::IndexLookupFailure)));
+        assert!(matches!(links[1], AssetDependencyLink::NothingThere));
+    }
+
+    #[test]
+    fn a_used_slot_binds_only_when_its_key_names_a_definition() {
+        let defs = one_material("wall");
+        let keys = [named("wall"), named("floor"), None, named("")];
+        let pointers = [None, None, walked(0), None];
+        let links = bind_slot_keys(&keys, &pointers, &defs);
+        let shape: Vec<(bool, bool)> = links
+            .iter()
+            .map(|link| (link.is_attached(), matches!(link, AssetDependencyLink::NothingThere)))
+            .collect();
+        assert_eq!(shape, [(true, false), (false, false), (false, false), (false, true)]);
+        assert_eq!(links[0].bound().map(|row| row.order()), Some(0));
+    }
+
+    #[test]
+    fn read_slots_carry_their_material_name_and_stay_unbound() {
+        let defs = one_material("wall");
+        let (keys, links) = read_slot_keys(&[walked(0), walked(5), None], Some(&defs));
+        assert_eq!(keys[0].as_ref().map(|key| key.name.as_str()), Some("wall"));
+        assert!(keys[1].is_none() && keys[2].is_none());
+        let waiting: Vec<bool> = links.iter().map(|link| matches!(link, AssetDependencyLink::Unresolved(_))).collect();
+        assert_eq!(waiting, [true, true, false]);
+    }
+
+    #[test]
+    fn a_slot_nothing_names_or_points_at_links_nowhere() {
+        let links = bind_slot_keys(&[None, None], &[None], &MaterialDefinitions::default());
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().all(|link| matches!(link, AssetDependencyLink::NothingThere)));
     }
 }

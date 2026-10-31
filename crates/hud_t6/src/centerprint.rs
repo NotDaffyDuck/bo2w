@@ -7,32 +7,33 @@ extern crate alloc;
 
 use alloc::string::String;
 
+/// Where the player's name goes in a template.
+const NAME_SLOT: &str = "&&1";
+
 /// The alpha of a message started at `start` that lasts `duration` ms: full until its last
-/// `fade_tail` ms, then down to 0. None once it is over, or when it never started.
+/// `dim_trailing` ms, then down to 0. None once it is over, or when it never started.
 #[must_use]
-pub fn fade_color(now: i32, start: i32, duration: i32, fade_tail: i32) -> Option<f32> {
-    if start == 0 {
+pub fn fade_color(at_ms: i32, began_ms: i32, lasts_ms: i32, dim_trailing: i32) -> Option<f32> {
+    if began_ms == 0 {
         return None;
     }
-    let elapsed = now - start;
-    if elapsed >= duration {
+    let gone = at_ms - began_ms;
+    if gone >= lasts_ms {
         return None;
     }
-    let remaining = duration - elapsed;
-    if fade_tail < 1 || remaining >= fade_tail {
+    let left = lasts_ms - gone;
+    if dim_trailing < 1 || left >= dim_trailing {
         Some(1.0)
     } else {
-        Some(remaining as f32 / fade_tail as f32)
+        Some(left as f32 / dim_trailing as f32)
     }
 }
 
-/// A template with "&&1" gets the name in its place; any other template is kept.
+/// A template with "&&1" gets the name in its place; any other template comes back as it was
+/// (replacing finds nothing to swap in those).
 #[must_use]
-pub fn centerprint_replace_name(template: &str, name: &str) -> String {
-    if !template.contains("&&") {
-        return String::from(template);
-    }
-    template.replace("&&1", name)
+pub fn banner_swap_player_tag(template: &str, who: &str) -> String {
+    template.replace(NAME_SLOT, who)
 }
 
 #[cfg(test)]
@@ -49,7 +50,7 @@ mod tests {
 
     #[test]
     fn the_name_goes_in_place_of_and_and_one() {
-        assert_eq!(centerprint_replace_name("&&1 joined", "Ann"), "Ann joined");
-        assert_eq!(centerprint_replace_name("joined", "Ann"), "joined");
+        assert_eq!(banner_swap_player_tag("&&1 joined", "Ann"), "Ann joined");
+        assert_eq!(banner_swap_player_tag("joined", "Ann"), "joined");
     }
 }

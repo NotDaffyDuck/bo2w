@@ -7,7 +7,7 @@ pub const FX_EFFECT_HANDLE_MASK: u32 = 0x3ff;
 /// The effect ring starts warning about priority at this many live effects.
 pub const FX_EFFECT_PRIORITY_WARNING_AT: u32 = 1014;
 
-pub const FX_EFFECT_SLOT_SIZE: usize = 0x110;
+pub const EMITTER_SLOT_BYTES: usize = 0x110;
 
 pub const FX_ELEM_LIMIT: u32 = 2048;
 
@@ -41,7 +41,7 @@ pub const FX_DEFERRED_RING: usize = 128;
 pub const FX_DEFERRED_QUEUED_LIMIT: usize = 511;
 
 /// Only one spot-light effect may be active at a time.
-pub const FX_SPOT_LIGHT_LIMIT: u32 = 1;
+pub const CONE_GLOW_LIMIT: u32 = 1;
 
 pub const FX_MAX_VISUALS: usize = 32;
 

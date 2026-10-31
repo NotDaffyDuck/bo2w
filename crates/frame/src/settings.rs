@@ -6,12 +6,12 @@ use std::fmt;
 use bevy::prelude::Resource;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DisplayResolution {
+pub struct ScreenPixelSize {
     pub width: u32,
     pub height: u32,
 }
 
-impl DisplayResolution {
+impl ScreenPixelSize {
     pub const HD: Self = Self::new(1280, 720);
 
     pub const fn new(width: u32, height: u32) -> Self {
@@ -19,7 +19,7 @@ impl DisplayResolution {
     }
 }
 
-impl fmt::Display for DisplayResolution {
+impl fmt::Display for ScreenPixelSize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}x{}", self.width, self.height)
     }
@@ -35,14 +35,14 @@ fn clamp_or(value: f32, lo: f32, hi: f32, fallback: f32) -> f32 {
 }
 
 #[derive(Resource, Clone, Debug, PartialEq)]
-pub struct GameSettings {
-    pub resolution: DisplayResolution,
-    pub fullscreen: bool,
-    pub vsync: bool,
-    pub fov: f32,
-    pub master_volume: f32,
+pub struct PlayerPrefsBundle {
+    pub resolution: ScreenPixelSize,
+    pub full_screen: bool,
+    pub sync_frames: bool,
+    pub view_angle: f32,
+    pub main_level: f32,
     /// The other volume sliders each scale one menu sound category, under the
-    /// master volume.
+    /// master volume (music, effects, voices, cinematics; 0..1).
     pub voice_volume: f32,
     pub music_volume: f32,
     pub sfx_volume: f32,
@@ -55,8 +55,8 @@ pub struct GameSettings {
     pub depth_of_field: bool,
     pub bloom: bool,
     pub sensitivity: f32,
-    pub invert_mouse: bool,
-    pub player_name: String,
+    pub flip_look: bool,
+    pub shown_name: String,
 
     pub pad_layout: u8,
     pub pad_stick_layout: u8,
@@ -76,30 +76,44 @@ pub struct GameSettings {
     /// Sprint in any direction rather than forward only.
     pub omni_movement: bool,
 
+    /// bo2zm: more of Black Ops II's Settings rows: mature content (heads
+    /// and limbs come off), how many corpses stay (3, 5, 10, 16), the fps
+    /// counter, the frame cap (0 = none; only without sync), FXAA, the
+    /// anti-aliasing row (1 = off), texture filtering (0 low .. 2 high) and
+    /// texture quality (-1 automatic, 3 low .. 0 extra; low = `bo2_fast`).
+    pub mature: bool,
+    pub corpses: u8,
+    pub draw_fps: bool,
+    pub max_fps: u16,
+    pub fxaa: bool,
+    pub aa_samples: u8,
+    pub tex_filter: u8,
+    pub tex_quality: i8,
+
     /// Bumped by [`touch`](Self::touch) so readers can notice a change.
     pub revision: u64,
 }
 
-impl Default for GameSettings {
+impl Default for PlayerPrefsBundle {
     fn default() -> Self {
         Self {
-            resolution: DisplayResolution::HD,
-            fullscreen: false,
-            vsync: true,
-            fov: Self::FOV_DEFAULT,
-            master_volume: 1.0,
+            resolution: ScreenPixelSize::HD,
+            full_screen: Self::FULLSCREEN_DEFAULT,
+            sync_frames: Self::VSYNC_DEFAULT,
+            view_angle: Self::FOV_DEFAULT,
+            main_level: Self::VOLUME_FULL,
             voice_volume: 1.0,
             music_volume: 1.0,
             sfx_volume: 1.0,
             cinematic_volume: 1.0,
             audio_preset: 0,
-            brightness: 0.0,
+            brightness: Self::BRIGHTNESS_DEFAULT,
             shadows: true,
             depth_of_field: true,
             bloom: true,
-            sensitivity: 5.0,
-            invert_mouse: false,
-            player_name: Self::NAME_DEFAULT.to_owned(),
+            sensitivity: Self::SENSITIVITY_DEFAULT,
+            flip_look: Self::INVERT_DEFAULT,
+            shown_name: Self::NAME_DEFAULT.to_owned(),
             pad_layout: 0,
             pad_stick_layout: 0,
             pad_sensitivity: Self::PAD_SENSITIVITY_DEFAULT,
@@ -112,13 +126,21 @@ impl Default for GameSettings {
             pad_deadzone_left: Self::DEADZONE_DEFAULT,
             pad_deadzone_right: Self::DEADZONE_DEFAULT,
             bo2_fast: false,
+            mature: true,
+            corpses: 16,
+            draw_fps: false,
+            max_fps: 0,
+            fxaa: false,
+            aa_samples: 1,
+            tex_filter: 2,
+            tex_quality: -1,
             omni_movement: false,
-            revision: 0,
+            revision: u64::MIN,
         }
     }
 }
 
-impl GameSettings {
+impl PlayerPrefsBundle {
     pub const FOV_DEFAULT: f32 = 65.0;
     pub const FOV_MIN: f32 = 65.0;
     pub const FOV_MAX: f32 = 120.0;
@@ -130,6 +152,12 @@ impl GameSettings {
     const NAME_LEN_MAX: usize = 16;
     const DEADZONE_DEFAULT: f32 = 0.12;
     const BRIGHTNESS_LIMIT: f32 = 0.2;
+    const BRIGHTNESS_DEFAULT: f32 = 0.0;
+    const SENSITIVITY_DEFAULT: f32 = 5.0;
+    const VOLUME_FULL: f32 = 1.0;
+    const FULLSCREEN_DEFAULT: bool = false;
+    const VSYNC_DEFAULT: bool = true;
+    const INVERT_DEFAULT: bool = false;
 
     /// The gain a menu sound category takes from its slider: the slider
     /// squared. Categories are 0 effects, 1 music, 2 voice, 3 interface and
@@ -148,26 +176,26 @@ impl GameSettings {
 
     /// The gain every sound takes from the master slider: the slider squared.
     pub fn master_gain(&self) -> f32 {
-        self.master_volume * self.master_volume
+        self.main_level * self.main_level
     }
 
     pub fn touch(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+        self.revision = u64::wrapping_add(self.revision, 1);
     }
 
     /// Pulls every value back inside its limits. Anything that is not a
     /// finite number takes its default.
-    pub fn sanitize(&mut self) {
-        self.resolution.width = self.resolution.width.clamp(640, 7680);
-        self.resolution.height = self.resolution.height.clamp(480, 4320);
-        self.fov = clamp_or(self.fov, Self::FOV_MIN, Self::FOV_MAX, Self::FOV_DEFAULT);
+    pub fn pull_into_limits(&mut self) {
+        self.resolution.width = u32::clamp(self.resolution.width, 640, 7680);
+        self.resolution.height = u32::clamp(self.resolution.height, 480, 4320);
+        self.view_angle = clamp_or(self.view_angle, Self::FOV_MIN, Self::FOV_MAX, Self::FOV_DEFAULT);
         self.brightness = clamp_or(
             self.brightness,
             -Self::BRIGHTNESS_LIMIT,
             Self::BRIGHTNESS_LIMIT,
             0.0,
         );
-        self.master_volume = self.master_volume.clamp(0.0, 1.0);
+        self.main_level = f32::clamp(self.main_level, 0.0, 1.0);
         for slider in [
             &mut self.voice_volume,
             &mut self.music_volume,
@@ -177,7 +205,7 @@ impl GameSettings {
             *slider = clamp_or(*slider, 0.0, 1.0, 1.0);
         }
         self.audio_preset = self.audio_preset.min(4);
-        self.sensitivity = self.sensitivity.clamp(0.1, 30.0);
+        self.sensitivity = f32::clamp(self.sensitivity, 0.1, 30.0);
 
         if self.pad_layout != Self::PAD_LAYOUT_CUSTOM {
             self.pad_layout = self.pad_layout.min(4);
@@ -193,12 +221,21 @@ impl GameSettings {
             Self::PAD_SENSITIVITY_DEFAULT,
         );
         self.pad_ads_sensitivity = clamp_or(self.pad_ads_sensitivity, 0.5, 1.5, 1.0);
+        if ![3, 5, 10, 16].contains(&self.corpses) {
+            self.corpses = 16;
+        }
+        self.max_fps = self.max_fps.min(1000);
+        if ![1, 2, 4, 8, 16, 17, 18].contains(&self.aa_samples) {
+            self.aa_samples = 1;
+        }
+        self.tex_filter = self.tex_filter.min(2);
+        self.tex_quality = self.tex_quality.clamp(-1, 3);
         self.pad_deadzone_left = clamp_or(self.pad_deadzone_left, 0.0, 0.4, Self::DEADZONE_DEFAULT);
         self.pad_deadzone_right =
             clamp_or(self.pad_deadzone_right, 0.0, 0.4, Self::DEADZONE_DEFAULT);
 
-        let trimmed = self.player_name.trim();
-        self.player_name = if trimmed.is_empty() {
+        let trimmed = self.shown_name.trim();
+        self.shown_name = if trimmed.is_empty() {
             Self::NAME_DEFAULT.to_owned()
         } else {
             trimmed.chars().take(Self::NAME_LEN_MAX).collect()
@@ -210,47 +247,47 @@ impl GameSettings {
 mod tests {
     use super::*;
 
-    fn sanitized(edit: impl FnOnce(&mut GameSettings)) -> GameSettings {
-        let mut settings = GameSettings::default();
-        edit(&mut settings);
-        settings.sanitize();
-        settings
+    fn sanitized(edit: impl FnOnce(&mut PlayerPrefsBundle)) -> PlayerPrefsBundle {
+        let mut prefs = PlayerPrefsBundle::default();
+        edit(&mut prefs);
+        prefs.pull_into_limits();
+        prefs
     }
 
     #[test]
     fn resolution_prints_as_width_x_height() {
-        assert_eq!(DisplayResolution::HD.to_string(), "1280x720");
-        assert_eq!(DisplayResolution::new(1920, 1080).to_string(), "1920x1080");
+        assert_eq!(ScreenPixelSize::HD.to_string(), "1280x720");
+        assert_eq!(ScreenPixelSize::new(1920, 1080).to_string(), "1920x1080");
     }
 
     #[test]
     fn defaults_are_already_inside_every_limit() {
-        let defaults = GameSettings::default();
+        let defaults = PlayerPrefsBundle::default();
         let mut cleaned = defaults.clone();
-        cleaned.sanitize();
+        cleaned.pull_into_limits();
         assert_eq!(cleaned, defaults);
     }
 
     #[test]
     fn touching_counts_up_and_wraps() {
-        let mut settings = GameSettings::default();
-        settings.touch();
-        settings.touch();
-        assert_eq!(settings.revision, 2);
-        settings.revision = u64::MAX;
-        settings.touch();
-        assert_eq!(settings.revision, 0);
+        let mut prefs = PlayerPrefsBundle::default();
+        prefs.touch();
+        prefs.touch();
+        assert_eq!(prefs.revision, 2);
+        prefs.revision = u64::MAX;
+        prefs.touch();
+        assert_eq!(prefs.revision, 0);
     }
 
     #[test]
     fn sliders_give_their_square() {
-        let settings = GameSettings {
-            master_volume: 0.5,
+        let settings = PlayerPrefsBundle {
+            main_level: 0.5,
             sfx_volume: 0.5,
             music_volume: 0.25,
             voice_volume: 1.0,
             cinematic_volume: 0.0,
-            ..GameSettings::default()
+            ..PlayerPrefsBundle::default()
         };
         assert_eq!(settings.master_gain(), 0.25);
         assert_eq!(settings.menu_volume(Some(0)), 0.25);
@@ -261,19 +298,19 @@ mod tests {
 
     #[test]
     fn interface_sounds_follow_the_effects_slider() {
-        let settings = GameSettings {
+        let settings = PlayerPrefsBundle {
             sfx_volume: 0.5,
-            ..GameSettings::default()
+            ..PlayerPrefsBundle::default()
         };
         assert_eq!(settings.menu_volume(Some(3)), settings.menu_volume(Some(0)));
     }
 
     #[test]
     fn uncategorised_sounds_are_not_scaled() {
-        let settings = GameSettings {
+        let settings = PlayerPrefsBundle {
             sfx_volume: 0.1,
             music_volume: 0.1,
-            ..GameSettings::default()
+            ..PlayerPrefsBundle::default()
         };
         assert_eq!(settings.menu_volume(None), 1.0);
         assert_eq!(settings.menu_volume(Some(5)), 1.0);
@@ -282,19 +319,19 @@ mod tests {
 
     #[test]
     fn resolution_is_held_between_the_smallest_and_largest_supported() {
-        let small = sanitized(|s| s.resolution = DisplayResolution::new(10, 10));
-        assert_eq!(small.resolution, DisplayResolution::new(640, 480));
-        let huge = sanitized(|s| s.resolution = DisplayResolution::new(100_000, 100_000));
-        assert_eq!(huge.resolution, DisplayResolution::new(7680, 4320));
+        let small = sanitized(|s| s.resolution = ScreenPixelSize::new(10, 10));
+        assert_eq!(small.resolution, ScreenPixelSize::new(640, 480));
+        let huge = sanitized(|s| s.resolution = ScreenPixelSize::new(100_000, 100_000));
+        assert_eq!(huge.resolution, ScreenPixelSize::new(7680, 4320));
     }
 
     #[test]
     fn fov_and_brightness_are_clamped_and_nan_takes_the_default() {
-        assert_eq!(sanitized(|s| s.fov = 10.0).fov, GameSettings::FOV_MIN);
-        assert_eq!(sanitized(|s| s.fov = 500.0).fov, GameSettings::FOV_MAX);
+        assert_eq!(sanitized(|s| s.view_angle = 10.0).view_angle, PlayerPrefsBundle::FOV_MIN);
+        assert_eq!(sanitized(|s| s.view_angle = 500.0).view_angle, PlayerPrefsBundle::FOV_MAX);
         assert_eq!(
-            sanitized(|s| s.fov = f32::NAN).fov,
-            GameSettings::FOV_DEFAULT
+            sanitized(|s| s.view_angle = f32::NAN).view_angle,
+            PlayerPrefsBundle::FOV_DEFAULT
         );
         assert_eq!(sanitized(|s| s.brightness = 3.0).brightness, 0.2);
         assert_eq!(sanitized(|s| s.brightness = -3.0).brightness, -0.2);
@@ -304,13 +341,13 @@ mod tests {
     #[test]
     fn volumes_stay_between_silent_and_full() {
         let loud = sanitized(|s| {
-            s.master_volume = 4.0;
+            s.main_level = 4.0;
             s.voice_volume = 9.0;
             s.music_volume = -1.0;
             s.sfx_volume = f32::NAN;
             s.cinematic_volume = f32::NEG_INFINITY;
         });
-        assert_eq!(loud.master_volume, 1.0);
+        assert_eq!(loud.main_level, 1.0);
         assert_eq!(loud.voice_volume, 1.0);
         assert_eq!(loud.music_volume, 0.0);
         assert_eq!(loud.sfx_volume, 1.0);
@@ -335,8 +372,8 @@ mod tests {
 
     #[test]
     fn the_custom_pad_layout_marker_survives() {
-        let custom = sanitized(|s| s.pad_layout = GameSettings::PAD_LAYOUT_CUSTOM);
-        assert_eq!(custom.pad_layout, GameSettings::PAD_LAYOUT_CUSTOM);
+        let custom = sanitized(|s| s.pad_layout = PlayerPrefsBundle::PAD_LAYOUT_CUSTOM);
+        assert_eq!(custom.pad_layout, PlayerPrefsBundle::PAD_LAYOUT_CUSTOM);
     }
 
     #[test]
@@ -363,7 +400,7 @@ mod tests {
         });
         assert_eq!(
             broken.pad_sensitivity,
-            GameSettings::PAD_SENSITIVITY_DEFAULT
+            PlayerPrefsBundle::PAD_SENSITIVITY_DEFAULT
         );
         assert_eq!(broken.pad_ads_sensitivity, 1.0);
     }
@@ -377,25 +414,71 @@ mod tests {
     #[test]
     fn names_are_trimmed_cut_to_sixteen_characters_and_never_empty() {
         assert_eq!(
-            sanitized(|s| s.player_name = "  Ada  ".into()).player_name,
+            sanitized(|s| s.shown_name = "  Ada  ".into()).shown_name,
             "Ada"
         );
         assert_eq!(
-            sanitized(|s| s.player_name = "   ".into()).player_name,
+            sanitized(|s| s.shown_name = "   ".into()).shown_name,
             "Player"
         );
         assert_eq!(
-            sanitized(|s| s.player_name = String::new()).player_name,
+            sanitized(|s| s.shown_name = String::new()).shown_name,
             "Player"
         );
-        let long = sanitized(|s| s.player_name = "abcdefghijklmnopqrstuvwxyz".into());
-        assert_eq!(long.player_name, "abcdefghijklmnop");
+        let long = sanitized(|s| s.shown_name = "abcdefghijklmnopqrstuvwxyz".into());
+        assert_eq!(long.shown_name, "abcdefghijklmnop");
     }
 
     #[test]
     fn the_name_limit_counts_characters_not_bytes() {
         let wide = "é".repeat(20);
-        let cut = sanitized(|s| s.player_name = wide);
-        assert_eq!(cut.player_name.chars().count(), 16);
+        let cut = sanitized(|s| s.shown_name = wide);
+        assert_eq!(cut.shown_name.chars().count(), 16);
     }
+}
+
+impl PlayerPrefsBundle {
+    /// The name he plays under (lobby, scoreboard, the game's own
+    /// messages): a name his settings give (the family launcher's
+    /// profile), else the Steam account this PC signs into.
+    pub fn shown_name(&self) -> String {
+        if self.shown_name == "Player" {
+            steam_name().unwrap_or_else(|| self.shown_name.clone())
+        } else {
+            self.shown_name.clone()
+        }
+    }
+}
+
+/// The Steam name of the account Steam signs into on this PC (its
+/// `config/loginusers.vdf`: the auto-login one, else the newest), as BO2
+/// shows the player's Steam name; read once.
+pub fn steam_name() -> Option<String> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let root = std::env::var_os("ProgramFiles(x86)")?;
+        let path = std::path::Path::new(&root).join("Steam/config/loginusers.vdf");
+        let text = std::fs::read_to_string(path).ok()?;
+        // Each account is a { } block of "key" "value" lines.
+        let mut chosen: Option<(bool, u64, String)> = None;
+        for entry in text.split('{').skip(2) {
+            let entry = entry.split('}').next().unwrap_or("");
+            let value_of = |wanted: &str| {
+                entry.lines().find_map(|l| {
+                    let mut parts = l.split('"').filter(|p| !p.trim().is_empty());
+                    (parts.next()? == wanted).then(|| parts.next().map(str::to_owned)).flatten()
+                })
+            };
+            let Some(name) = value_of("PersonaName").filter(|n| !n.trim().is_empty()) else {
+                continue;
+            };
+            let auto = value_of("AutoLogin").as_deref() == Some("1");
+            let time = value_of("Timestamp").and_then(|t| t.parse().ok()).unwrap_or(0);
+            if chosen.as_ref().is_none_or(|b| (auto, time) > (b.0, b.1)) {
+                chosen = Some((auto, time, name));
+            }
+        }
+        chosen.map(|(_, _, n)| n.trim().chars().take(16).collect())
+    })
+    .clone()
 }

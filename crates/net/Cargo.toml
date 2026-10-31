@@ -1,35 +1,36 @@
-[package]
-name = "net"
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-description = "Our wire: frames, deltas, prediction, interpolation. Not retail's netcode."
+package.name = "net"
+package.version = "0.1.0"
+package.edition.workspace = true
+package.publish.workspace = true
+package.description = "Our netcode: frames, deltas, prediction and interpolation, written for this engine."
+lints.workspace = true
 
 [dependencies]
-diag.workspace = true
-game_math.workspace = true
-frame.workspace = true
-playerstate_t6.workspace = true
-entity_t6.workspace = true
-xmodel_runtime.workspace = true
-movement_t6.workspace = true
-input_t6.workspace = true
-weapon_t6.workspace = true
-gamemode_t6.workspace = true
-killcam_t6.workspace = true
-sim.workspace = true
-glass_t6.workspace = true # bo2mp: BO2 glass in the snapshot
-hud_t6.workspace = true
-perf.workspace = true
-bevy.workspace = true
-master_protocol.workspace = true
-quinn = { version = "0.11.11", default-features = false, features = ["platform-verifier", "runtime-tokio", "rustls-ring"] }
-rustls = { version = "0.23.31", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2.2.0"
-rustls-platform-verifier = "0.7.0"
-tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
-zstd = { version = "0.13", default-features = false }
+# Game crates.
+diag = { workspace = true }
+frame = { workspace = true }
+game_math = { workspace = true }
+glass_t6 = { workspace = true } # bo2mp: BO2 glass in the snapshot
+gamemode_t6 = { workspace = true }
+hud_t6 = { workspace = true }
+input_t6 = { workspace = true }
+killcam_t6 = { workspace = true }
+bo2mp-master = { workspace = true } # a LAN host runs the lobby service itself
+master_protocol = { workspace = true }
+movement_t6 = { workspace = true }
+perf = { workspace = true }
+playerstate_t6 = { workspace = true }
+entity_t6 = { workspace = true }
+sim = { workspace = true }
+weapon_t6 = { workspace = true }
+xmodel_runtime = { workspace = true }
 
-[lints]
-workspace = true
+# Engine and transport.
+bevy = { workspace = true }
+quinn = { default-features = false, features = ["rustls-ring", "runtime-tokio", "platform-verifier"], version = "0.11.11" }
+rustls = { default-features = false, features = ["std", "ring"], version = "0.23.31" }
+rustls-pemfile = { version = "2.2.0" }
+rustls-platform-verifier = { version = "0.7.0" }
+tokio = { features = ["sync", "time", "net", "macros", "rt-multi-thread"], version = "1.47" }
+tokio-util = { default-features = false, features = ["rt"], version = "0.7" }
+zstd = { default-features = false, version = "0.13" }

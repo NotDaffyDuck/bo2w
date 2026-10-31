@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use asset_core::AssetNamespace;
+use asset_core::AssetCategoryScope;
 use bevy::prelude::Resource;
 
 /// Team music lines, each named under a team's voice prefix.
@@ -68,20 +68,20 @@ const T5_LINES: &[(&str, &str)] = &[
 ];
 
 /// Names of every Black Ops II alias in the catalog.
-fn t6_alias_names(bank: &asset_audio::SoundCatalog) -> impl Iterator<Item = &str> {
+fn t6_alias_names(bank: &asset_audio::AudioRoster) -> impl Iterator<Item = &str> {
     (0..bank.sounds.len())
-        .filter(|&index| bank.namespace_of_alias(index) == AssetNamespace::T6)
-        .filter_map(|index| bank.name_at(index))
+        .filter(|&index| bank.space_of_slot(index) == AssetCategoryScope::T6)
+        .filter_map(|index| bank.label_at(index))
 }
 
 /// The aliases to have ready for a match: everything under the teams'
 /// voice prefixes or the generic death prefix, plus each team's music lines.
 pub(crate) fn team_voice_aliases(
-    bank: &asset_audio::SoundCatalog,
+    bank: &asset_audio::AudioRoster,
     allies: Option<&str>,
-    axis: Option<&str>,
+    along: Option<&str>,
 ) -> Vec<String> {
-    let teams: Vec<&str> = [allies, axis].into_iter().flatten().collect();
+    let teams: Vec<&str> = [allies, along].into_iter().flatten().collect();
 
     let mut aliases: Vec<String> = t6_alias_names(bank)
         .filter(|name| {
@@ -113,13 +113,13 @@ pub(crate) fn team_voice_aliases(
 /// prefixes belongs to them. They are in neither the weapon nor the map sets;
 /// without preparing them here they would first be decoded when the script
 /// plays them and would miss the start deadline (a late line is dropped).
-pub(crate) fn t6_announcer_aliases(bank: &asset_audio::SoundCatalog) -> Vec<String> {
+pub(crate) fn t6_announcer_aliases(bank: &asset_audio::AudioRoster) -> Vec<String> {
     t6_alias_names(bank)
         .filter(|name| {
-            let lower = name.to_ascii_lowercase();
+            let lowered = name.to_ascii_lowercase();
             T6_ANNOUNCER_PREFIXES
                 .iter()
-                .any(|prefix| lower.starts_with(prefix))
+                .any(|prefix| lowered.starts_with(prefix))
         })
         .map(str::to_owned)
         .collect()
@@ -127,10 +127,7 @@ pub(crate) fn t6_announcer_aliases(bank: &asset_audio::SoundCatalog) -> Vec<Stri
 
 /// Where each announcer alias of the match is actually played from.
 #[derive(Resource, Default)]
-pub(crate) struct AnnouncerRoutes(HashMap<String, (AssetNamespace, String)>);
-
-/// One team's voice prefix, voice name and music names.
-type Team<'a> = (&'a str, Option<&'a str>, &'a asset_game::TeamMusic);
+pub(crate) struct AnnouncerRoutes(HashMap<String, (AssetCategoryScope, String)>);
 
 /// The alias a team's `line` is played from, when it has one.
 fn routed_line(
@@ -158,10 +155,10 @@ fn routed_line(
 
 impl AnnouncerRoutes {
     /// Where to play `alias` from; aliases without a route play as themselves.
-    pub(crate) fn route<'a>(&'a self, alias: &'a str) -> (AssetNamespace, &'a str) {
-        match self.0.get(alias) {
-            Some((namespace, routed)) => (*namespace, routed),
-            None => (AssetNamespace::T6, alias),
+    pub(crate) fn route<'a>(&'a self, cue_id: &'a str) -> (AssetCategoryScope, &'a str) {
+        match self.0.get(cue_id) {
+            Some((cue_ns, routed)) => (*cue_ns, routed),
+            None => (AssetCategoryScope::T6, cue_id),
         }
     }
 
@@ -170,8 +167,8 @@ impl AnnouncerRoutes {
     }
 
     pub(crate) fn build(
-        bank: &asset_audio::SoundCatalog,
-        namespace: AssetNamespace,
+        bank: &asset_audio::AudioRoster,
+        namespace: AssetCategoryScope,
         team_prefixes: [Option<&str>; 2],
         native: Option<&asset_game::MapTeamSettings>,
         aliases: &[String],
@@ -180,13 +177,13 @@ impl AnnouncerRoutes {
             return Self::default();
         };
         let renames: &[(&str, &str)] = match namespace {
-            AssetNamespace::T5 => T5_LINES,
+            AssetCategoryScope::T5 => T5_LINES,
             // Black Ops II announcer lines are not renamed.
-            AssetNamespace::T6 => &[],
+            AssetCategoryScope::T6 => &[],
         };
 
         let [allies, axis] = team_prefixes;
-        let teams: Vec<Team> = [
+        let teams: Vec<(&str, Option<&str>, &asset_game::TeamMusic)> = [
             (allies, native.allies_voice.as_deref(), &native.allies_music),
             (axis, native.axis_voice.as_deref(), &native.axis_music),
         ]
@@ -200,7 +197,7 @@ impl AnnouncerRoutes {
                 teams.iter().find_map(|&(prefix, voice, music)| {
                     let line = alias.strip_prefix(prefix)?;
                     let routed = routed_line(line, voice, music, renames)?;
-                    bank.index_in(namespace, &routed)?;
+                    bank.slot_in(namespace, &routed)?;
                     Some((alias.clone(), (namespace, routed)))
                 })
             })

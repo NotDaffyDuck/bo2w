@@ -4,15 +4,15 @@
 mod bmodel;
 mod build;
 mod dpvs;
-mod models;
+mod model_set;
 mod scene;
-mod sun;
+mod daylight;
 
-pub use build::world_scene_from_draw;
-pub use dpvs::{WorldCull, WorldDpvs, WorldDrawItem, WorldDrawItemKind, WorldPortal};
-pub use models::*;
-pub use render_frame::{LightAttenuationBind, T5LightFalloffPack};
-pub use render_scene::WorldCameraPose;
-pub use scene::{MapDirPrimaryLight, SMODEL_LIGHTING_MAX_CLIENT_VIEWS, WorldScene};
+pub use build::level_stage_from_draw;
+pub use dpvs::{LevelHide, LevelSight, LevelDrawItem, LevelDrawItemKind, SelfContainedVisibilityPortal};
+pub use model_set::*;
+pub use render_frame::{LightFalloffBind, LegacyFalloffParams};
+pub use render_scene::WorldEyePlacement;
+pub use scene::{MapDirKeyLight, PROP_ILLUM_MAX_CLIENT_VIEWS, LevelStage};
 
-pub(crate) use bmodel::{posed_brush_bounds, transform_from_gfx_placement};
+pub(crate) use bmodel::{posed_solid_bounds, unit_rotation};

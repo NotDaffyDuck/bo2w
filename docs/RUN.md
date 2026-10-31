@@ -1,72 +1,123 @@
-# Run and poke the live game
+# Driving the live game from the console
 
-How to touch the live process. Observation is [`PERF.md`](PERF.md).
-Two players through the master: [`make duo`](DUO.md).
+This page covers poking a running process: loading a map, scripting a player,
+grabbing dumps. For observing it, see [`PERF.md`](PERF.md). For two players
+through the master, see [`make duo`](DUO.md).
+
+## Starting a run
 
 ```bash
-set -a; . ./.env; set +a          # BO2MP_GAMES; DISPLAY=:0 if the session has none
-make map mp_boneyard CMDS='spawn 0; wait 2s; quit'
-cargo run --profile play -p launcher -- map iw5:mp_overwatch --cmds '…'
+set -a; . ./.env; set +a          # loads BO2MP_GAMES; add DISPLAY=:0 if the session has none
+make map mp_raid CMDS='spawn 0; wait 2s; quit'
+cargo run --profile play -p launcher -- map t6:mp_raid --cmds '...'
 ```
 
-`make` passes no foreign flags through: in the `Makefile` it is `CMDS`, on the
-binary `--cmds`. The colon is a GNU make pattern, so `make map iw5:…` fails —
-write `make map ZONE=iw5:mp_overwatch` or use `cargo run`. Recipes: `make
-scenario`, `chaos`, `bench` ([`BENCH.md`](BENCH.md)), `bench-live`, `lifecycle-*`
-(`*_CMDS` in the `Makefile`). Live recipes use `[profile.play]`; LTO is `PROFILE=release`.
+* `make` forwards no foreign flags. The script string is `CMDS` on the
+  `Makefile` and `--cmds` on the binary.
+* A colon cannot be a make goal (GNU make reads it as a pattern rule), so
+  `make map t6:mp_raid` fails. Write `make map ZONE=t6:mp_raid`, or call
+  `cargo run` directly.
+* `Makefile` goals today: `map`, `export-gltf`, `play`, `menu`, `menu-shots`,
+  plus the ship targets (`launcher`, `build-windows`, `setup-windows`,
+  the provisioning goal, `release`, `publish`, `deploy`, `logs`) and `clean`. Run
+  `make help` for the list.
+* Live goals use `[profile.play]`. For an LTO build pass `PROFILE=release`.
+* Targets that older copies of this page named (`scenario`, `chaos`, `bench`,
+  `bench-live`, `lifecycle-*`) are not in this `Makefile`. See
+  [`BENCH.md`](BENCH.md) for the timing tools that are.
 
-**GSC controls the start freeze.** `freezecontrols` constrains authority movement;
-snapshots carry the same constraints into client prediction and command replay.
-Wait for the loaded mode's countdown, or use the debug command:
-`wait world; spawn 0; force_match_start; wait 1s; …`.
-Firing, hit and decal probes must start after the countdown releases the player.
+## Start-of-match freeze
 
-**Sync by default.** Ritual `wait`s are unnecessary: a command holds the FIFO
-until its own fact — `map`/`demo`/`play` until the swap plus GPU-ready
-`WorldScene::spawned`, `spawn` until `AppScreen::InGame`, `move`/`look`/`tp`
-until a matching presented pose, `force_match_start` until `Playing`,
-`disconnect` until the hold is torn down. `wait Ns` remains, for pacing and
-observation windows. The `&` suffix is a loud refusal to wait (`map mp_rust &`),
-`!` jumps the queue (in bash write `disconnect !`, or history expansion bites).
-The 120 s gate timeout aborts the rest with an echo; parsing is
-`crates/console/src/`. Hand-typed `dump`/`clip`/`screenshot` pass through any
-wait while preserving the queue, which inside `--cmds` takes an explicit `!`.
-A hand-typed `quit`/`exit`/`disconnect` goes further: it jumps **every** hold,
-`wait 60s` included, and releases it. A `quit` written into `--cmds` does not —
-it is part of the script and waits its turn.
+The loaded game script owns the freeze. `freezecontrols` limits movement on
+the authority, and snapshots carry the same limits into client prediction and
+command replay. Either wait for the mode's countdown to end, or use the debug
+command `force_match_start` in `--cmds`, for example after `wait world` and `spawn 0`.
 
-## Verbs and traps
+**Real keys in a hidden run.** `keydown <key>` presses a keyboard key (or mouse
+button) through the binds, as the window would, and holds it until `keyup <key>`;
+`key <key> 0.5` is the timed form. `BO2MP_INPUT_SCRIPT=<file>` appends a file of
+these commands (one a line, `#` comments) to `--cmds`. A scripted run takes input
+with the window hidden or unfocused, and keeps a held key down through a focus
+loss. Example: `docs/gun/ingame/keys/` (Shift sprints, never prone; Ctrl tap
+crouches; Ctrl hold goes prone).
 
-`map spawn class give attach name kill damage move tp look nudge press hold
-release bind bot wait mark record stoprecord clip demo dump screenshot ui disconnect quit
-finish_run`
-plus the debug `force_match_start` / `showpos`. `quit` leaves now and abandons
-whatever screenshot was queued or half-written; `finish_run` is the scripted
-ending that waits for those files first. `disconnect` leaves the session, not
-just the world — it also leaves the room, or closes it when hosting, and works
-with no map installed. `bot` is
-`add | dummy | hold | tp | give | fire`; `dump [name]` writes the current snapshot into
-`dumps/`. `clip` writes the last available 45 s into `clips/<ULID>/` (demo + dump)
-on host and clients — the host records authority, a client the snapshots it
-received plus its own presented state; `demo LATEST` plays it back.
+Firing, hit and decal probes must begin only after the countdown has released
+the player.
 
-* ADS is `hold +speed_throw`, not `+speed`;
-* Aim binding: `bind MOUSE2 +speed_throw` aims only while held;
-  `bind MOUSE2 +toggleads_throw` toggles aim on each press. Both are available
-  under Options → Controls → Actions, and the chosen bind is saved in settings.
-* bolt action (`fire_type=1`): `hold +attack` is **one** shot, and a full
-  magazine will not reload itself (`press +attack` ×N, then `press +reload`);
-* `look` without `LookState` only writes `ps.viewangles` — no aiming;
-* Use (`+activate` or `+usereload`) retrieves your settled C4, claymores and
-  deployable gadgets when there is room in their equipment ammo slot.
-* `give` takes a namespace: `give t5:weapon/psg1_acog`, `give iw5:weapon/msr`.
-* custom classes live in `iw4l-artifacts/profile/classes.txt` (one tab-separated
-  row per class); `spawn 0` selects the first slot. Delete the file to generate
-  five available classes again.
+## Commands wait for their own fact
 
-Video settings include brightness (50–150%, neutral 100%) and FOV (65–120°)
-sliders. Drag with the mouse or use Left/Right on the focused slider; the value
-appears to its right. Multiplayer settings contain the player-name field
-(Enter to edit and accept, Escape to cancel). These settings persist across
-launches in `$XDG_CONFIG_HOME/iw4l/settings.cfg` or `~/.config/iw4l/settings.cfg`
-on Linux; `BO2MP_SETTINGS_PATH` selects a separate profile for probes.
+No ritual `wait` is needed. A command holds the queue (a FIFO) until the fact
+it depends on is true:
+
+| command | holds until |
+|---|---|
+| `map` / `demo` / `play` | the swap is done and `WorldScene::spawned` is GPU-ready |
+| `spawn` | `AppScreen::InGame` |
+| `move` / `look` / `tp` | a matching pose has been presented |
+| `force_match_start` | the match is `Playing` |
+| `disconnect` | the hold has been torn down |
+
+* `wait Ns` stays for pacing and observation windows.
+* A trailing `&` refuses to wait, loudly (`map mp_rust &`).
+* A trailing `!` jumps the queue. In bash write `disconnect !`, or
+  history expansion bites.
+* The gate times out after 120 s and aborts the rest of the script with an echo.
+  Parsing lives in `crates/console/src/`.
+* Hand-typed `dump`, `clip` and `screenshot` pass through any wait and leave
+  the queue intact. Inside `--cmds` that takes an explicit `!`.
+* Hand-typed `quit`, `exit` and `disconnect` go further: they jump every hold,
+  `wait 60s` included, and release it. A `quit` written into `--cmds` does not;
+  it is part of the script and takes its turn.
+
+## Verbs
+
+```text
+map spawn class give attach name kill damage move tp look nudge press hold
+release bind bot wait mark record stoprecord clip demo dump screenshot ui
+disconnect quit finish_run
+```
+
+plus the debug commands `force_match_start` and `showpos`.
+
+* `quit` leaves at once and abandons any screenshot that was queued or
+  half-written. `finish_run` is the scripted ending: it waits for those files
+  first.
+* `disconnect` leaves the session, not just the world. It also leaves the room
+  (or closes it when hosting), and works with no map installed.
+* `bot` takes `add | dummy | hold | tp | give | fire`.
+* `dump [name]` writes the current snapshot under `dumps/`.
+* `clip` writes the last 45 s available into `clips/<ULID>/` (a demo plus a
+  dump), on the host and on clients. The host records the authority; a client
+  records the snapshots it received plus its own presented state.
+  `demo LATEST` plays the newest one back.
+
+## Traps
+
+* Aim down sights with `hold +speed_throw`, not `+speed`.
+* The aim binding can be `bind MOUSE2 +speed_throw` (aims only while held) or
+  `bind MOUSE2 +toggleads_throw` (each press toggles). Both are under
+  Options, Controls, Actions, and the choice is saved in settings.
+* Bolt action (`fire_type=1`): `hold +attack` fires **one** shot, and a full
+  magazine does not reload by itself. Use `press +attack` N times, then
+  `press +reload`.
+* `look` without `LookState` only writes `ps.viewangles`; it does not aim.
+* Use (`+activate` or `+usereload`) picks up your settled C4, claymores and
+  deployable gadgets when their equipment ammo slot has room.
+* `give` takes a namespaced asset key, for example `give t6:weapon/an94_mp`
+  (keys look like `t6:weapon/<name>`).
+* Custom classes live in `bo2mp-artifacts/profile/classes.txt`, one
+  tab-separated row per class, and `spawn 0` picks the first slot. Delete the
+  file to get five freshly generated classes.
+
+## Settings
+
+* Video has a brightness slider (50 to 150 percent, neutral 100) and an FOV
+  slider (65 to 120 degrees). Drag with the mouse, or press Left/Right on the
+  focused slider; the value shows at its right.
+* Multiplayer settings hold the player-name field: Enter edits and accepts,
+  Escape cancels.
+* Settings persist between launches. On Windows the file is
+  `settings.cfg` inside the artifacts folder. Elsewhere it is
+  `$XDG_CONFIG_HOME/bo2mp/settings.cfg`, falling back to
+  `~/.config/bo2mp/settings.cfg`. `BO2MP_SETTINGS_PATH` selects a separate
+  profile, which is handy for probes.

@@ -63,10 +63,10 @@ mod tests {
 
     #[test]
     fn no_map_is_listed_twice() {
-        let mut seen = std::collections::HashSet::new();
+        let mut met_names = std::collections::HashSet::new();
         for (_, maps) in SAMPLE_SIZE_NEAR {
             for map in *maps {
-                assert!(seen.insert(*map), "{map} is listed twice");
+                assert!(met_names.insert(*map), "{map} is listed twice");
             }
         }
     }

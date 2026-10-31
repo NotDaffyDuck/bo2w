@@ -1,9 +1,10 @@
 //! Where a first-person gun's attachments and rocket hang on it.
 
-use asset_core::FpvMeshIndex;
-use bevy::math::Quat;
+use asset_core::FpvMeshSlot;
+use bevy::math::f32::Quat;
 
-use crate::{FpvMeshCatalog, FpvMeshEntry};
+use crate::FirstPersonMeshRecord;
+use crate::FirstPersonMeshRoster;
 
 /// `FpvMount::parent_model` of a model that hangs on the arms.
 const PARENT_ARMS: usize = 0;
@@ -27,9 +28,9 @@ const SIGHT_TAGS: [&str; 8] = [
 /// One model hung on another.
 #[derive(Clone, Debug)]
 pub struct FpvMount {
-    pub model: FpvMeshIndex,
+    pub model: FpvMeshSlot,
     /// 0 the arms, 1 the gun, or 2 plus the slot of an earlier attachment.
-    pub parent_model: usize,
+    pub host_mesh: usize,
     pub tag: String,
     /// Where the model's root sits on the tag (rotation x y z w, then
     /// translation); `None` puts it on the tag itself.
@@ -53,62 +54,65 @@ pub struct FpvMountOffset {
 /// Pitch, yaw, roll in degrees as a rotation x y z w: yaw about z, then
 /// pitch about y, then roll about x.
 pub fn angles_quat(angles: [f32; 3]) -> [f32; 4] {
-    let [pitch, yaw, roll] = angles.map(f32::to_radians);
-    (Quat::from_rotation_z(yaw) * Quat::from_rotation_y(pitch) * Quat::from_rotation_x(roll))
-        .to_array()
+    let turn = |degrees: f32| degrees.to_radians();
+    let about_z = Quat::from_rotation_z(turn(angles[1]));
+    let about_y = Quat::from_rotation_y(turn(angles[0]));
+    let about_x = Quat::from_rotation_x(turn(angles[2]));
+    (about_z * about_y * about_x).to_array()
 }
 
 #[derive(Clone, Debug)]
 pub struct FpvMountPlan {
-    pub gun: FpvMeshIndex,
+    pub gun: FpvMeshSlot,
     pub attachments: Vec<FpvMount>,
     pub rocket: Option<FpvMount>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FpvMountError {
-    pub model: String,
+    pub subject: String,
     pub detail: &'static str,
 }
 
 impl core::fmt::Display for FpvMountError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FPV model `{}`: {}", self.model, self.detail)
+        write!(f, "FPV model `{}`: {}", self.subject, self.detail)
     }
 }
 
 /// What a missing or unposed model of one kind is reported as.
 struct Role {
-    missing: &'static str,
+    absent: &'static str,
     unposed: &'static str,
 }
 
 const GUN: Role = Role {
-    missing: "gun missing from FPV catalog",
+    absent: "gun missing from FPV catalog",
     unposed: "gun has no pose source",
 };
 const ATTACHMENT: Role = Role {
-    missing: "attachment missing from FPV catalog",
+    absent: "attachment missing from FPV catalog",
     unposed: "attachment has no pose source",
 };
 const ROCKET: Role = Role {
-    missing: "rocket missing from FPV catalog",
+    absent: "rocket missing from FPV catalog",
     unposed: "rocket has no pose source",
 };
 
 /// The catalog's row for a model, which must have a pose to be mounted.
 fn posed<'a>(
-    catalog: &'a FpvMeshCatalog,
-    index: FpvMeshIndex,
+    catalog: &'a FirstPersonMeshRoster,
+    index: FpvMeshSlot,
     role: &Role,
-) -> Result<&'a FpvMeshEntry, FpvMountError> {
-    let entry = catalog.get_at(index.order()).ok_or_else(|| FpvMountError {
-        model: format!("#{}", index.order()),
-        detail: role.missing,
+) -> Result<&'a FirstPersonMeshRecord, FpvMountError> {
+    let row = index.order();
+    let entry = catalog.at_row(row).ok_or_else(|| FpvMountError {
+        subject: format!("#{row}"),
+        detail: role.absent,
     })?;
-    if entry.skel.pose.is_none() {
+    if entry.bone_rig.pose.is_none() {
         return Err(FpvMountError {
-            model: entry.skel.name.clone(),
+            subject: entry.bone_rig.name.clone(),
             detail: role.unposed,
         });
     }
@@ -141,7 +145,7 @@ fn sight_tag<'a>(gun_bones: &'a [String], sight_bones: &[String]) -> Option<&'a 
 /// namesake on the gun, else on the latest earlier attachment holding that
 /// bone, else a sight tag on the gun.
 fn derived_joint<'a>(
-    catalog: &'a FpvMeshCatalog,
+    catalog: &'a FirstPersonMeshRoster,
     gun_bones: &'a [String],
     earlier: &'a [FpvMount],
     bones: &[String],
@@ -152,7 +156,7 @@ fn derived_joint<'a>(
     }
     let on_earlier = root.and_then(|root| {
         earlier.iter().enumerate().rev().find_map(|(slot, mount)| {
-            let held = &catalog.get_at(mount.model.order())?.skel.bone_names;
+            let held = &catalog.at_row(mount.model.order())?.bone_rig.joint_labels;
             Some((FIRST_ATTACHMENT_PARENT + slot, bone_named(held, root)?))
         })
     });
@@ -163,50 +167,50 @@ fn derived_joint<'a>(
 /// alongside `attachments`; a missing or `None` entry means the weapon
 /// authors no placement for it.
 pub fn plan_fpv_mounts(
-    catalog: &FpvMeshCatalog,
-    gun: FpvMeshIndex,
-    attachments: &[FpvMeshIndex],
+    catalog: &FirstPersonMeshRoster,
+    gun: FpvMeshSlot,
+    attachments: &[FpvMeshSlot],
     offsets: &[Option<FpvMountOffset>],
-    rocket: Option<FpvMeshIndex>,
+    rocket: Option<FpvMeshSlot>,
 ) -> Result<FpvMountPlan, FpvMountError> {
-    let gun_skel = &posed(catalog, gun, &GUN)?.skel;
+    let gun_skel = &posed(catalog, gun, &GUN)?.bone_rig;
     let mut mounts: Vec<FpvMount> = Vec::with_capacity(attachments.len());
     for (slot, &model) in attachments.iter().enumerate() {
-        let skel = &posed(catalog, model, &ATTACHMENT)?.skel;
+        let bone_rig = &posed(catalog, model, &ATTACHMENT)?.bone_rig;
         let mount = match offsets.get(slot).and_then(Option::as_ref) {
             Some(at) if at.on_arms => FpvMount {
                 model,
-                parent_model: PARENT_ARMS,
+                host_mesh: PARENT_ARMS,
                 tag: at.tag.clone(),
                 root_bind: None,
             },
             Some(at) => {
                 let named = (!at.tag.is_empty())
-                    .then(|| bone_named(&gun_skel.bone_names, &at.tag))
+                    .then(|| bone_named(&gun_skel.joint_labels, &at.tag))
                     .flatten();
                 let tag = named
-                    .or_else(|| gun_skel.bone_names.first().map(String::as_str))
+                    .or_else(|| gun_skel.joint_labels.first().map(String::as_str))
                     .ok_or_else(|| FpvMountError {
-                        model: skel.name.clone(),
+                        subject: bone_rig.name.clone(),
                         detail: "gun has no bones to mount on",
                     })?;
                 FpvMount {
                     model,
-                    parent_model: PARENT_GUN,
+                    host_mesh: PARENT_GUN,
                     tag: tag.to_owned(),
                     root_bind: Some((angles_quat(at.rotation), at.offset)),
                 }
             }
             None => {
                 let (parent_model, tag) =
-                    derived_joint(catalog, &gun_skel.bone_names, &mounts, &skel.bone_names)
+                    derived_joint(catalog, &gun_skel.joint_labels, &mounts, &bone_rig.joint_labels)
                         .ok_or_else(|| FpvMountError {
-                            model: skel.name.clone(),
+                            subject: bone_rig.name.clone(),
                             detail: "no compatible mount on gun or earlier attachment",
                         })?;
                 FpvMount {
                     model,
-                    parent_model,
+                    host_mesh: parent_model,
                     tag: tag.to_owned(),
                     root_bind: None,
                 }
@@ -214,45 +218,44 @@ pub fn plan_fpv_mounts(
         };
         mounts.push(mount);
     }
-    let rocket = rocket
-        .map(|model| {
-            let skel = &posed(catalog, model, &ROCKET)?.skel;
-            let tag = bone_named(&gun_skel.bone_names, "tag_clip").ok_or_else(|| FpvMountError {
-                model: skel.name.clone(),
-                detail: "gun has no tag_clip rocket mount",
-            })?;
-            Ok::<_, FpvMountError>(FpvMount {
-                model,
-                parent_model: PARENT_GUN,
-                tag: tag.to_owned(),
-                root_bind: None,
-            })
-        })
-        .transpose()?;
+    let mut rocket_mounted = None;
+    if let Some(model) = rocket {
+        rocket_mounted = Some(rocket_mount(catalog, &gun_skel.joint_labels, model)?);
+    }
     Ok(FpvMountPlan {
         gun,
         attachments: mounts,
-        rocket,
+        rocket: rocket_mounted,
     })
+}
+
+/// The rocket's mount on the gun's `tag_clip`.
+fn rocket_mount(catalog: &FirstPersonMeshRoster, gun_bones: &[String], model: FpvMeshSlot) -> Result<FpvMount, FpvMountError> {
+    let bone_rig = &posed(catalog, model, &ROCKET)?.bone_rig;
+    let tag = bone_named(gun_bones, "tag_clip").ok_or_else(|| FpvMountError {
+        subject: bone_rig.name.clone(),
+        detail: "gun has no tag_clip rocket mount",
+    })?;
+    Ok(FpvMount { model, host_mesh: PARENT_GUN, tag: tag.to_owned(), root_bind: None })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::FpvMeshBuild;
-    use crate::fpv_mesh_catalog::test_support::skel;
-    use asset_core::AssetNamespace;
+    use crate::fpv_mesh_catalog::test_support::bone_rig;
+    use asset_core::AssetCategoryScope;
 
-    fn catalog_of(models: &[(&str, &[&str], bool)]) -> FpvMeshCatalog {
+    fn catalog_of(models: &[(&str, &[&str], bool)]) -> FirstPersonMeshRoster {
         let mut build = FpvMeshBuild::default();
         for &(name, bones, posed) in models {
-            build.insert_in(AssetNamespace::T6, skel(name, bones, posed), None);
+            build.put_into_namespace(AssetCategoryScope::T6, bone_rig(name, bones, posed), None);
         }
         build.publish()
     }
 
-    fn at(order: usize) -> FpvMeshIndex {
-        FpvMeshIndex::from_order(order)
+    fn at(order: usize) -> FpvMeshSlot {
+        FpvMeshSlot::from_sequence(order)
     }
 
     #[test]
@@ -263,7 +266,7 @@ mod tests {
         ]);
         let plan = plan_fpv_mounts(&catalog, at(0), &[at(1)], &[], None).unwrap();
         let mount = &plan.attachments[0];
-        assert_eq!((mount.parent_model, mount.tag.as_str()), (PARENT_GUN, "tag_acog"));
+        assert_eq!((mount.host_mesh, mount.tag.as_str()), (PARENT_GUN, "tag_acog"));
         assert!(mount.root_bind.is_none());
     }
 
@@ -286,7 +289,7 @@ mod tests {
         ]);
         let plan = plan_fpv_mounts(&catalog, at(0), &[at(1), at(2)], &[], None);
         let err = plan.unwrap_err();
-        assert_eq!(err.model, "grip");
+        assert_eq!(err.subject, "grip");
         assert_eq!(err.detail, "no compatible mount on gun or earlier attachment");
 
         let catalog = catalog_of(&[
@@ -296,7 +299,7 @@ mod tests {
         ]);
         let plan = plan_fpv_mounts(&catalog, at(0), &[at(1), at(2)], &[], None).unwrap();
         let light = &plan.attachments[1];
-        assert_eq!((light.parent_model, light.tag.as_str()), (FIRST_ATTACHMENT_PARENT, "tag_light"));
+        assert_eq!((light.host_mesh, light.tag.as_str()), (FIRST_ATTACHMENT_PARENT, "tag_light"));
     }
 
     #[test]
@@ -336,7 +339,7 @@ mod tests {
             on_arms: true,
         })];
         let plan = plan_fpv_mounts(&catalog, at(0), &[at(1)], &offsets, None).unwrap();
-        assert_eq!(plan.attachments[0].parent_model, PARENT_ARMS);
+        assert_eq!(plan.attachments[0].host_mesh, PARENT_ARMS);
         assert_eq!(plan.attachments[0].tag, "tag_weapon1");
     }
 
@@ -348,7 +351,7 @@ mod tests {
         ]);
         let plan = plan_fpv_mounts(&catalog, at(0), &[], &[], Some(at(1))).unwrap();
         let rocket = plan.rocket.unwrap();
-        assert_eq!((rocket.parent_model, rocket.tag.as_str()), (PARENT_GUN, "tag_clip"));
+        assert_eq!((rocket.host_mesh, rocket.tag.as_str()), (PARENT_GUN, "tag_clip"));
 
         let bare = catalog_of(&[("gun", &["tag_origin"], true), ("rocket", &["r"], true)]);
         let err = plan_fpv_mounts(&bare, at(0), &[], &[], Some(at(1))).unwrap_err();

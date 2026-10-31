@@ -1,7 +1,7 @@
 //! bo2zm M4: read Black Ops II's UI scripts (HavokScript bytecode),
 //! read-only.
 //!
-//! `t6lua [dir]` (default raw\patch_zm, the rawfile dump) reads
+//! `t6lua [dir]` (default `raw/patch_zm` here, the rawfile dump) reads
 //! every `.lua` there and reports how many read exactly, their functions,
 //! instructions and constants, and how often each opcode occurs.
 //! `T6LUA_DIS=<name part>` lists the first matching script's functions;
@@ -9,21 +9,57 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    let dir = std::env::args()
-        .nth(1)
-        .map_or_else(|| PathBuf::from(r"raw\patch_zm"), PathBuf::from);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("cannot read {}", dir.display());
-        return ExitCode::FAILURE;
-    };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
+/// The `.lua` paths among `candidates`, in name order.
+fn lua_files(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = candidates
+        .into_iter()
         .filter(|p| p.extension().is_some_and(|x| x == "lua"))
         .collect();
     files.sort();
+    files
+}
+
+/// How many runs failed with each (first 90 characters of) message, and
+/// whether a failure deserves its line in the output.
+#[derive(Default)]
+struct ErrorLog {
+    counts: BTreeMap<String, usize>,
+    failures: usize,
+}
+
+impl ErrorLog {
+    /// Note one failure; true when it should be printed: any of the first
+    /// fifteen, and every kind of error once so a rare one is not hidden.
+    fn admit(&mut self, msg: &str) -> bool {
+        self.failures += 1;
+        let seen = self.counts.entry(msg.chars().take(90).collect()).or_insert(0);
+        *seen += 1;
+        self.failures <= 15 || *seen == 1
+    }
+}
+
+/// The "require found no script" line, when there is anything to say.
+fn missing_line(missing: &[String]) -> Option<String> {
+    (!missing.is_empty())
+        .then(|| format!("require found no script for ({}): {}", missing.len(), missing.join(" ")))
+}
+
+fn main() {
+    std::process::exit(run());
+}
+
+fn run() -> i32 {
+    let dir = std::env::args()
+        .nth(1)
+        .map_or_else(|| PathBuf::from("raw/patch_zm"), PathBuf::from);
+    let files = match std::fs::read_dir(&dir) {
+        Ok(entries) => lua_files(entries.filter_map(|e| e.ok().map(|e| e.path()))),
+        Err(_) => {
+            eprintln!("cannot read {}", dir.to_string_lossy());
+            return 1;
+        }
+    };
     let dis = std::env::var("T6LUA_DIS").ok();
     // T6LUA_FN=<hash>[/<index>] (as an error trace prints it).
     let fn_hash = std::env::var("T6LUA_FN").ok().and_then(|h| {
@@ -37,9 +73,7 @@ fn main() -> ExitCode {
     let mut shown_dis = false;
     let mut shown_strings = false;
     for path in &files {
-        let name = path
-            .file_name()
-            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let name = file_label(path);
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
@@ -60,7 +94,7 @@ fn main() -> ExitCode {
                 if let Some((want, index)) = fn_hash {
                     let mut stack = vec![&chunk.main];
                     while let Some(p) = stack.pop() {
-                        if p.name_hash == want && index.is_none_or(|i| i == p.index) {
+                        if p.label_digest == want && index.is_none_or(|i| i == p.index) {
                             let mut out = String::new();
                             hks_t6::disassemble_one(p, &mut out);
                             println!("== {name}
@@ -77,16 +111,7 @@ fn main() -> ExitCode {
                 }
                 if !shown_strings && strings.as_deref().is_some_and(|d| name.contains(d)) {
                     shown_strings = true;
-                    let mut stack = vec![&chunk.main];
-                    let mut all = Vec::new();
-                    while let Some(p) = stack.pop() {
-                        for k in &p.consts {
-                            if let hks_t6::Const::String(s) = k {
-                                all.push(String::from_utf8_lossy(s).into_owned());
-                            }
-                        }
-                        stack.extend(p.protos.iter().map(|c| &**c));
-                    }
+                    let all = proto_strings(&chunk.main);
                     println!("== {name} strings: {}", all.join(" | "));
                 }
             }
@@ -103,7 +128,7 @@ fn main() -> ExitCode {
     // T6LUA_METHODS=1: method names the scripts call (`obj:name()`) that no
     // script assigns anywhere: the engine's element natives.
     if std::env::var_os("T6LUA_METHODS").is_some() {
-        let mut called: BTreeMap<String, usize> = BTreeMap::new();
+        let mut called: BTreeMap<String, usize> = BTreeMap::default();
         let mut assigned = std::collections::BTreeSet::new();
         for path in &files {
             let Ok(bytes) = std::fs::read(path) else { continue };
@@ -141,7 +166,7 @@ fn main() -> ExitCode {
             .filter(|(n, _)| !assigned.contains(*n) && !natives.contains(n))
             .map(|(n, c)| format!("{n} {c}"))
             .collect();
-        println!("element natives called, not bound ({}): {}", need.len(), need.join(", "));
+        println!("element natives called, not bound ({count}): {list}", count = need.len(), list = need.join(", "));
     }
     // T6LUA_RUN=1: run every script's top level in one VM (require loads
     // the others by module name), with stand-ins for the engine's tables.
@@ -153,11 +178,7 @@ fn main() -> ExitCode {
         .map(|(op, n)| format!("{} {n}", hks_t6::op_name(*op)))
         .collect();
     println!("opcodes: {}", line.join(", "));
-    if bad == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    i32::from(bad != 0)
 }
 
 /// Nuketown Zombies' engine values: survival mode, standard rules, the HUD
@@ -202,13 +223,9 @@ fn is_mp(dir: &std::path::Path) -> bool {
 /// His multiplayer zones' string tables, English text and config files
 /// (T6LUA_GAME = the game's `zone` folder): (localized text, tables as
 /// rows, `.cfg` raw files as (name, text)).
-type ZoneData = (Vec<(String, String)>, Vec<(String, Vec<Vec<String>>)>, Vec<(String, String)>);
-
-fn mp_zone_data() -> ZoneData {
-    let game = PathBuf::from(std::env::var("T6LUA_GAME").unwrap_or_else(|_| {
-        r"C:\Program Files (x86)\Steam\steamapps\common\Call of Duty Black Ops II\zone".to_owned()
-    }));
-    let (mut text, mut tables, mut configs) = (Vec::new(), Vec::new(), Vec::new());
+fn mp_zone_data() -> (Vec<(String, String)>, Vec<(String, Vec<Vec<String>>)>, Vec<(String, String)>) {
+    let game = std::env::var_os("T6LUA_GAME").map_or_else(|| bo2zm_tools::game_dir().join("zone"), PathBuf::from);
+    let (mut text, mut tables, mut configs) = (vec![], vec![], vec![]);
     for z in ["code_post_gfx_mp", "common_mp", "patch_mp", "patch_ui_mp"] {
         let Ok(cap) = asset_t6::capture_zone(&game.join("all").join(format!("{z}.ff"))) else {
             println!("zone {z}: not read");
@@ -256,7 +273,7 @@ fn mp_zone_data() -> ZoneData {
 
 /// A host for the scripts: zombies' Nuketown values, or (bo2mp) the
 /// multiplayer front end's.
-fn new_host(dir: &std::path::Path, files: &[PathBuf], mp: Option<&ZoneData>) -> hks_t6::host::Host {
+fn new_host(dir: &std::path::Path, files: &[PathBuf], mp: Option<&(Vec<(String, String)>, Vec<(String, Vec<Vec<String>>)>, Vec<(String, String)>)>) -> hks_t6::host::Host {
     // Text width: half the height per character (the harness has no fonts).
     let measure = Box::new(|t: &str, _: &str, h: f32| t.chars().count() as f32 * h * 0.5);
     let mut host = hks_t6::host::Host::new(scripts_of(dir, files), measure);
@@ -334,12 +351,10 @@ fn run_all(dir: &std::path::Path, files: &[PathBuf]) {
     let zone_data = is_mp(dir).then(mp_zone_data);
     let mut host = new_host(dir, files, zone_data.as_ref());
     host.step_budget = 50_000_000;
-    let (mut ran, mut failed) = (0usize, 0usize);
-    let mut errors: BTreeMap<String, usize> = BTreeMap::new();
+    let mut ran = 0usize;
+    let mut errors = ErrorLog::default();
     for path in files {
-        let name = path
-            .file_name()
-            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let name = file_label(path);
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
@@ -359,32 +374,25 @@ fn run_all(dir: &std::path::Path, files: &[PathBuf]) {
         match r {
             Ok(_) => ran += 1,
             Err(e) => {
-                failed += 1;
-                let short: String = e.msg.chars().take(90).collect();
-                let seen = errors.entry(short.clone()).or_insert(0);
-                *seen += 1;
-                // Every kind of error once, so a rare one is not hidden.
-                if failed <= 15 || *seen == 1 {
+                if errors.admit(&e.msg) {
                     println!("run {name}: {e}");
                 }
             }
         }
     }
-    println!("ran {ran} top levels, {failed} failed");
+    println!("ran {ran} top levels, {} failed", errors.failures);
     let missing = host.missing.borrow().clone();
-    if !missing.is_empty() {
-        println!("require found no script for ({}): {}", missing.len(), missing.join(" "));
-    }
+    missing_line(&missing).iter().for_each(|text| println!("{text}"));
     // The menus the scripts registered (LUI.createMenu.<name>).
     if let Value::Table(t) = host.field("LUI", "createMenu") {
-        let mut names = Vec::new();
-        let mut k = Value::Nil;
-        while let Some((key, _)) = t.borrow().next(&k) {
-            names.push(key.to_string());
-            k = key;
+        let mut listed: Vec<String> = Vec::new();
+        let mut cursor = Value::Nil;
+        while let Some((key, _)) = t.borrow().next(&cursor) {
+            listed.push(key.to_string());
+            cursor = key;
         }
-        names.sort();
-        println!("menus ({}): {}", names.len(), names.join(" "));
+        listed.sort_unstable();
+        println!("menus ({}): {}", listed.len(), listed.join(" "));
     }
     if let Ok(spec) = std::env::var("T6LUA_MENU") {
         // A fresh VM loaded as the engine loads a game: the base, then the
@@ -414,7 +422,7 @@ fn run_all(dir: &std::path::Path, files: &[PathBuf]) {
         let top: Vec<String> = v.into_iter().take(60).map(|(k, n)| format!("{k} {n}")).collect();
         println!("game engine fields asked, unanswered: {}", top.join(", "));
     }
-    for (e, n) in errors.iter().take(20) {
+    for (e, n) in errors.counts.iter().take(20) {
         println!("  {n} x {e}");
     }
     for e in host.errors.iter().take(20) {
@@ -458,7 +466,7 @@ fn build_menu(host: &mut hks_t6::host::Host, spec: &str) {
                 if i + 1 == fields.len() {
                     let _ = host.vm.set_index(&t, key(f), lua_value(val));
                 } else {
-                    t = host.vm.index(&t, &key(f)).unwrap_or(Value::Nil);
+                    t = host.vm.lookup_index(&t, &key(f)).unwrap_or(Value::Nil);
                 }
             }
         }
@@ -472,7 +480,7 @@ fn build_menu(host: &mut hks_t6::host::Host, spec: &str) {
             let mut fields = path.split('.');
             let mut f = host.vm.global(fields.next().unwrap_or_default());
             for field in fields {
-                f = host.vm.index(&f, &Value::str(field)).unwrap_or(Value::Nil);
+                f = host.vm.lookup_index(&f, &Value::str(field)).unwrap_or(Value::Nil);
             }
             let args = args.trim_end_matches(')').split(',').filter(|a| !a.trim().is_empty());
             let args = args.map(|a| lua_value(a.trim())).collect();
@@ -484,11 +492,12 @@ fn build_menu(host: &mut hks_t6::host::Host, spec: &str) {
     host.open_menu(name);
     // Events split on top-level ',' (braces nest); within one, '/' splits
     // the fields. `@<ms>:` in front sends it at that time.
+    const AT_ONCE: f64 = 0.0;
     let mut timed: Vec<(f64, String)> = split_top(events, ',')
         .into_iter()
         .map(|ev| match ev.strip_prefix('@').and_then(|r| r.split_once(':')) {
-            Some((ms, rest)) => (ms.parse::<f64>().unwrap_or(0.0), rest.to_owned()),
-            None => (0.0, ev),
+            Some((ms, rest)) => (ms.parse::<f64>().unwrap_or(AT_ONCE), rest.to_owned()),
+            None => (AT_ONCE, ev),
         })
         .collect();
     timed.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -501,7 +510,7 @@ fn build_menu(host: &mut hks_t6::host::Host, spec: &str) {
             let (k, v) = f.split_once('=').unwrap_or((f.as_str(), "1"));
             fields.push((k.to_owned(), lua_value(v)));
         }
-        let refs: Vec<(&str, Value)> = fields.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let refs: Vec<(&str, Value)> = fields.iter().map(|(field, value)| (field.as_str(), value.clone())).collect();
         host.root_event(ev, &refs);
     };
     let run_ms = std::env::var("T6LUA_MS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(2000.0);
@@ -524,7 +533,7 @@ fn build_menu(host: &mut hks_t6::host::Host, spec: &str) {
         if let Some(id) = watch
             && let Some(d) = host.drawn().into_iter().find(|d| d.id == id)
         {
-            println!("  t {t:>6.0} #{id} alpha {:.2}", d.alpha);
+            println!("  t {t:>6.0} #{id} alpha {:.2}", d.opacity);
         }
         t += 16.0;
     }
@@ -541,13 +550,13 @@ fn build_menu(host: &mut hks_t6::host::Host, spec: &str) {
             (host.element_by_id(id).unwrap_or(Value::Nil), format!("#{id}"))
         };
         for f in parts {
-            v = host.vm.index(&v, &Value::str(f)).unwrap_or(Value::Nil);
+            v = host.vm.lookup_index(&v, &Value::str(f)).unwrap_or(Value::Nil);
             path.push('.');
             path.push_str(f);
             println!("  probe {path} = {v}");
         }
         let g = host.field("LUI", "UIElement");
-        let gb = host.vm.index(&g, &Value::str("GamepadButton")).unwrap_or(Value::Nil);
+        let gb = host.vm.lookup_index(&g, &Value::str("GamepadButton")).unwrap_or(Value::Nil);
         println!("  probe LUI.UIElement.GamepadButton = {gb}");
     }
     if std::env::var_os("T6LUA_TREE").is_some() {
@@ -556,19 +565,19 @@ fn build_menu(host: &mut hks_t6::host::Host, spec: &str) {
         }
     }
     let drawn = host.drawn();
-    let shown = drawn.iter().filter(|d| d.alpha > 0.01).count();
+    let shown = drawn.iter().filter(|d| d.opacity > 0.01).count();
     println!("menu {name}: {} elements, {shown} visible", drawn.len());
     let all = std::env::var_os("T6LUA_ALL").is_some();
-    for d in drawn.iter().filter(|d| all || (d.alpha > 0.01 && (d.material.is_some() || d.text.is_some()))).take(if all { 2000 } else { 80 }) {
+    for d in drawn.iter().filter(|d| all || (d.opacity > 0.01 && (d.material.is_some() || d.text.is_some()))).take(if all { 2000 } else { 80 }) {
         println!(
             "  #{:<4} {:<6} ({:.0} {:.0} {:.0} {:.0}) a {:.2} rgb ({:.2} {:.2} {:.2}) {}{}",
             d.id,
-            d.kind,
+            d.element_kind,
             d.rect[0],
             d.rect[1],
             d.rect[2],
             d.rect[3],
-            d.alpha,
+            d.opacity,
             d.rgb[0],
             d.rgb[1],
             d.rgb[2],
@@ -580,54 +589,107 @@ fn build_menu(host: &mut hks_t6::host::Host, spec: &str) {
 
 /// `s` split on `sep` outside braces.
 fn split_top(s: &str, sep: char) -> Vec<String> {
-    let mut out = Vec::new();
-    let (mut depth, mut cur) = (0i32, String::new());
-    for c in s.chars() {
-        match c {
-            '{' => depth += 1,
-            '}' => depth -= 1,
-            _ => {}
+    // Grow the last piece; a separator outside every brace pair starts the next.
+    let mut nest = 0i32;
+    let mut pieces = vec![String::new()];
+    s.chars().for_each(|c| {
+        nest += i32::from(c == '{') - i32::from(c == '}');
+        match pieces.last_mut() {
+            Some(_) if c == sep && nest == 0 => pieces.push(String::new()),
+            Some(last) => last.push(c),
+            None => {}
         }
-        if c == sep && depth == 0 {
-            if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-            }
-        } else {
-            cur.push(c);
-        }
+    });
+    pieces.retain(|p| !p.is_empty());
+    pieces
+}
+
+/// Every string constant of a function and the ones nested in it, the
+/// last-declared nested function first.
+fn proto_strings(root: &hks_t6::Proto) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![root];
+    while let Some(p) = pending.pop() {
+        found.extend(p.consts.iter().filter_map(|k| match k {
+            hks_t6::Const::String(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+            _ => None,
+        }));
+        pending.extend(p.protos.iter().map(|c| &**c));
     }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
+    found
+}
+
+/// The file's name as text, empty when it has none.
+fn file_label(path: &std::path::Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// A value: `true`, `false`, a number, `{a;k=v;...}` (a table: positional
 /// items and named fields, `;` between) or else a string.
 fn lua_value(v: &str) -> hks_t6::value::Value {
-    use hks_t6::value::{Table, Value};
+    use hks_t6::value::{LuaTable, Value};
     let v = v.trim();
     if let Some(inner) = v.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         let mut n = 0;
         for item in split_top(inner, ';') {
             match item.split_once('=') {
                 Some((k, x)) if !k.contains('{') => {
                     // A number key is a number (`4={...}`).
                     let key = k.trim().parse::<f32>().map_or_else(|_| Value::str(k.trim()), Value::Num);
-                    t.borrow_mut().set(key, lua_value(x));
+                    t.borrow_mut().store(key, lua_value(x));
                 }
                 _ => {
                     n += 1;
-                    t.borrow_mut().set(Value::Num(n as f32), lua_value(&item));
+                    t.borrow_mut().store(Value::Num(n as f32), lua_value(&item));
                 }
             }
         }
         return Value::Table(t);
     }
     match v {
-        "true" => Value::Bool(true),
-        "false" => Value::Bool(false),
+        "true" => Value::Boolean(true),
+        "false" => Value::Boolean(false),
         _ => v.parse::<f32>().map_or_else(|_| Value::str(v), Value::Num),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_lua_files_survive_and_come_sorted() {
+        let all = ["b.lua", "a.lua", "c.txt", "lua", "d.luac"].map(PathBuf::from);
+        assert_eq!(lua_files(all), [PathBuf::from("a.lua"), PathBuf::from("b.lua")]);
+    }
+
+    #[test]
+    fn errors_print_for_the_first_fifteen_and_each_new_kind() {
+        let mut log = ErrorLog::default();
+        assert!((0..15).all(|_| log.admit("same")));
+        assert!(!log.admit("same"));
+        assert!(log.admit("a different one"));
+        assert!(!log.admit("a different one"));
+        assert_eq!(log.failures, 18);
+        // Messages that agree for 90 characters count as one kind.
+        let long = "x".repeat(100);
+        assert!(log.admit(&long));
+        assert!(!log.admit(&format!("{}y", &long[..95])));
+    }
+
+    #[test]
+    fn missing_scripts_are_listed_only_when_there_are_some() {
+        assert_eq!(missing_line(&[]), None);
+        let two = ["a".to_owned(), "b".to_owned()];
+        assert_eq!(missing_line(&two).as_deref(), Some("require found no script for (2): a b"));
+    }
+
+    #[test]
+    fn splits_outside_braces_only() {
+        assert_eq!(split_top("a,{b,c},d", ','), ["a", "{b,c}", "d"]);
+        assert_eq!(split_top(",,x,,y,", ','), ["x", "y"]);
+        assert_eq!(split_top("", ','), Vec::<String>::new());
+        assert_eq!(split_top("{a;b};c", ';'), ["{a;b}", "c"]);
     }
 }

@@ -1,7 +1,7 @@
 //! Decoding the images materials sample, on a pool the loader names, and
 //! putting the results on their rows.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use bevy::tasks::TaskPool;
@@ -10,13 +10,14 @@ use crate::image_texels::{self, Texels};
 use crate::image_wrap::{Wrap, build_image};
 use asset_transport::StageHandle;
 use crate::{
-    AssetNamespace, AssetRef, AuthoredImage, ColorMapTransform, MaterialDefinitions, MaterialKey,
-    TS_2D, TS_COLOR_MAP, TS_FUNCTION, TS_NORMAL_MAP, TS_WATER_MAP,
+    AssetCategoryScope, AssetPointer, HandBuiltTexture, DesignerMaterial, TintMapRemap, MaterialDefinitions, MaterialKey,
+    SurfaceImageAttachment,
+    TS_2D, SEMANTIC_COLOR, SEMANTIC_FUNCTION, SEMANTIC_NORMAL, SEMANTIC_LIQUID,
 };
 
 /// How a decode stage went.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct MaterialImageStats {
+pub struct ShaderTextureMetrics {
     pub requested: usize,
     pub decoded: usize,
     /// Rows with no body in the zone, or a decode cut short by a retarget.
@@ -25,107 +26,110 @@ pub struct MaterialImageStats {
     pub unsupported: usize,
 }
 
+/// What an asker wants out of the image beyond a plain read.
+#[derive(Clone, Copy, Default)]
+struct Wants(u8);
+
+impl Wants {
+    const NORMAL: u8 = 1;
+    const SHARP: u8 = 2;
+    const LINEAR: u8 = 4;
+
+    fn has(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
+
+    fn with(self, bit: u8, on: bool) -> Self {
+        Self(self.0 | if on { bit } else { 0 })
+    }
+}
+
 /// One image to decode and how its asker will sample it.
 #[derive(Clone, Copy)]
 struct Ask {
     image: usize,
-    sampler_state: u8,
-    is_normal: bool,
-    sharp: bool,
-    linear: bool,
+    texture_sampling_mode: u8,
+    wants: Wants,
 }
 
 impl Ask {
-    fn plain(image: usize, sampler_state: u8) -> Self {
-        Self {
-            image,
-            sampler_state,
-            is_normal: false,
-            sharp: false,
-            linear: false,
-        }
+    fn plain(image: usize, texture_sampling_mode: u8) -> Self {
+        Self { image, texture_sampling_mode, wants: Wants::default() }
+    }
+
+    fn read_linear(mut self) -> Self {
+        self.wants = self.wants.with(Wants::LINEAR, true);
+        self
     }
 
     /// Another asker for the same image: it keeps this one's sampler state
     /// and wants everything either of them wanted.
-    fn absorb(&mut self, other: Ask) {
-        self.is_normal |= other.is_normal;
-        self.sharp |= other.sharp;
-        self.linear |= other.linear;
+    fn merge_in(&mut self, other: Ask) {
+        self.wants = Wants(self.wants.0 | other.wants.0);
     }
 }
 
-enum Answer {
-    Ready {
-        image: usize,
-        texels: Texels,
-        wrap: Wrap,
-    },
+/// An image that came out of the pool without pixels.
+#[derive(Clone, Copy)]
+enum Shortfall {
     Missing,
-    Unsupported,
+    UnknownFormat,
 }
 
-fn decode_ask(images: &[AuthoredImage], ask: Ask) -> Answer {
-    let Some(row) = images.get(ask.image) else {
-        return Answer::Missing;
-    };
+struct Decoded {
+    image: usize,
+    texels: Texels,
+    wrap: Wrap,
+}
+
+fn decode_ask(images: &[HandBuiltTexture], ask: Ask) -> Result<Decoded, Shortfall> {
     // Black Ops II ships no loose image files: a row without a body in the
     // zone has nothing to read.
-    if row.payload.is_empty() {
-        return Answer::Missing;
-    }
-    match image_texels::decode(&row.payload, u32::from(row.width), u32::from(row.height), row.format)
-    {
-        Ok(texels) => Answer::Ready {
-            image: ask.image,
-            texels,
-            wrap: Wrap {
-                sampler_state: ask.sampler_state,
-                is_normal: ask.is_normal,
-                sharp: ask.sharp,
-                force_linear: ask.linear,
-                srgb_reads: row.use_srgb_reads,
-            },
-        },
-        Err(_) => Answer::Unsupported,
-    }
+    let row = images
+        .get(ask.image)
+        .filter(|row| !row.payload.is_empty())
+        .ok_or(Shortfall::Missing)?;
+    let texels = image_texels::decode(&row.payload, row.width.into(), row.height.into(), row.format)
+        .map_err(|_| Shortfall::UnknownFormat)?;
+    let wrap = Wrap {
+        texture_sampling_mode: ask.texture_sampling_mode,
+        is_normal: ask.wants.has(Wants::NORMAL),
+        sharp: ask.wants.has(Wants::SHARP),
+        force_linear: ask.wants.has(Wants::LINEAR),
+        srgb_reads: row.srgb_sampled,
+    };
+    Ok(Decoded { image: ask.image, texels, wrap })
 }
 
 /// Decodes `asks` on `pool`. The pool is the caller's because the loader's is
 /// not the frame's, and this crate sits below the loader.
 fn decode_all(
-    images: &[AuthoredImage],
-    asks: &[Ask],
+    sources: &[HandBuiltTexture],
+    requests: &[Ask],
     stage: &StageHandle,
     pool: &TaskPool,
-) -> Vec<Answer> {
-    if asks.is_empty() {
-        return Vec::new();
-    }
-    let per_task = asks.len().div_ceil(pool.thread_num().max(1)).clamp(1, 64);
-    pool.scope(|scope| {
-        for part in asks.chunks(per_task) {
-            scope.spawn(async move {
-                let mut answers = Vec::with_capacity(part.len());
-                for &ask in part {
-                    if stage.is_canceled() {
-                        answers.push(Answer::Missing);
-                        continue;
-                    }
-                    let answer = decode_ask(images, ask);
-                    if let Answer::Ready { texels, .. } = &answer {
-                        stage.add_bytes(texels.bytes.len() as u64);
-                    }
-                    answers.push(answer);
-                    stage.advance(1);
-                }
-                answers
-            });
+) -> Vec<Result<Decoded, Shortfall>> {
+    // Spread the asks evenly over the workers, in batches of 1 to 64.
+    let workers = pool.thread_num().max(1);
+    let batch_len = requests.len().div_ceil(workers).clamp(1, 64);
+    let decode_one = |ask: &Ask| -> Result<Decoded, Shortfall> {
+        // A cancelled load stops decoding; what is left counts as missing.
+        let answer = if stage.was_aborted() { Err(Shortfall::Missing) } else { decode_ask(sources, *ask) };
+        if let Ok(done) = &answer {
+            stage.add_bytes(done.texels.bytes.len() as u64);
         }
-    })
-    .into_iter()
-    .flatten()
-    .collect()
+        if !stage.was_aborted() {
+            stage.advance(1);
+        }
+        answer
+    };
+    let decode_one = &decode_one;
+    let batches = pool.scope(|scope| {
+        requests
+            .chunks(batch_len)
+            .for_each(|batch| scope.spawn(async move { batch.iter().map(decode_one).collect::<Vec<_>>() }));
+    });
+    batches.into_iter().flatten().collect()
 }
 
 /// Decodes `asks` and puts each result on its row. `reclaim` also takes the
@@ -136,76 +140,110 @@ fn run(
     reclaim: bool,
     stage: &StageHandle,
     pool: &TaskPool,
-) -> MaterialImageStats {
+) -> ShaderTextureMetrics {
     stage.set_total(asks.len() as u64);
     let answers = decode_all(&defs.images, asks, stage, pool);
-    let mut stats = MaterialImageStats {
-        requested: asks.len(),
-        ..MaterialImageStats::default()
-    };
-    for answer in answers {
-        match answer {
-            Answer::Ready {
-                image,
-                texels,
-                wrap,
-            } => {
-                let row = &mut defs.images[image];
-                row.decoded = Some(Arc::new(build_image(texels, wrap)));
-                if reclaim {
-                    row.common_owned = false;
-                }
-                stats.decoded += 1;
-            }
-            Answer::Missing => stats.missing += 1,
-            Answer::Unsupported => stats.unsupported += 1,
-        }
-    }
+    let mut stats = ShaderTextureMetrics::default();
+    stats.requested = asks.len();
+    stats.decoded = answers
+        .into_iter()
+        .filter_map(|answer| answer.map_err(|short| stats.note_shortfall(short)).ok())
+        .map(|done| install_decoded(&mut defs.images, done, reclaim))
+        .count();
     stats
+}
+
+impl ShaderTextureMetrics {
+    fn note_shortfall(&mut self, short: Shortfall) {
+        let tally = match short {
+            Shortfall::Missing => &mut self.missing,
+            Shortfall::UnknownFormat => &mut self.unsupported,
+        };
+        *tally = tally.saturating_add(1);
+    }
+}
+
+fn install_decoded(images: &mut [HandBuiltTexture], done: Decoded, reclaim: bool) {
+    let Decoded { image, texels, wrap } = done;
+    let row = &mut images[image];
+    row.decoded = Some(Arc::new(build_image(texels, wrap)));
+    row.common_owned &= !reclaim;
 }
 
 /// Whether a texture of this semantic holds a normal map; `None` for the
 /// ones that are not decoded as colour or normal at all.
 fn decodes_as_normal(semantic: u8) -> Option<bool> {
-    match semantic {
-        TS_FUNCTION | TS_WATER_MAP => None,
-        TS_NORMAL_MAP => Some(true),
-        _ => Some(false),
+    let decoded = !matches!(semantic, SEMANTIC_FUNCTION | SEMANTIC_LIQUID);
+    decoded.then_some(semantic == SEMANTIC_NORMAL)
+}
+
+/// The row exists and holds no pixels yet.
+fn awaiting(images: &[HandBuiltTexture], image: usize) -> bool {
+    images.get(image).is_some_and(|row| row.decoded.is_none())
+}
+
+/// The row already holds pixels.
+fn has_pixels(images: &[HandBuiltTexture], image: usize) -> bool {
+    images.get(image).is_some_and(|row| row.decoded.is_some())
+}
+
+/// Asks in the order offered, one per image.
+#[derive(Default)]
+struct Queue {
+    seen: HashSet<usize>,
+    asks: Vec<Ask>,
+}
+
+impl Queue {
+    fn offer(&mut self, ask: Ask) {
+        if self.seen.insert(ask.image) {
+            self.asks.push(ask);
+        }
+    }
+
+    /// Runs what was offered; nothing offered means no stage work at all.
+    fn decode(
+        &self,
+        defs: &mut MaterialDefinitions,
+        reclaim: bool,
+        stage: &StageHandle,
+        pool: &TaskPool,
+    ) -> usize {
+        match self.asks.as_slice() {
+            [] => 0,
+            asks => run(defs, asks, reclaim, stage, pool).decoded,
+        }
     }
 }
 
 /// Decodes every image some material samples that is not decoded yet.
-pub fn decode_material_color_maps(
+pub fn unpack_surface_tint_maps(
     defs: &mut MaterialDefinitions,
     stage: &StageHandle,
     pool: &TaskPool,
-) -> MaterialImageStats {
-    let mut asks: Vec<Option<Ask>> = vec![None; defs.images.len()];
+) -> ShaderTextureMetrics {
+    let mut merged: BTreeMap<usize, Ask> = BTreeMap::new();
     for material in &defs.materials {
-        let alpha_tested = defs
-            .agreed_alpha_test_cutoff(material)
-            .is_some_and(|cutoff| cutoff.is_some());
-        let squared = defs.color_map_transform(material) == ColorMapTransform::Square;
-        for texture in &material.textures {
-            let (Some(is_normal), Some(image)) =
-                (decodes_as_normal(texture.semantic), texture.image)
-            else {
-                continue;
-            };
-            if defs.images.get(image).is_none_or(|row| row.decoded.is_some()) {
-                continue;
-            }
-            let ask = Ask {
-                image,
-                sampler_state: texture.sampler_state,
-                is_normal,
-                sharp: alpha_tested && !is_normal,
-                linear: squared && !is_normal,
-            };
-            asks[image].get_or_insert(ask).absorb(ask);
+        let alpha_tested = matches!(defs.shared_alpha_cutoff(material), Some(Some(_)));
+        let squared = defs.tint_map_remap(material) == TintMapRemap::Square;
+        let wanted = material.textures.iter().filter_map(|texture| {
+            let image = texture.image?;
+            let is_normal = decodes_as_normal(texture.semantic)?;
+            awaiting(&defs.images, image).then_some((image, texture.texture_sampling_mode, is_normal))
+        });
+        for (image, texture_sampling_mode, is_normal) in wanted {
+            let wants = Wants::default()
+                .with(Wants::NORMAL, is_normal)
+                .with(Wants::SHARP, alpha_tested && !is_normal)
+                .with(Wants::LINEAR, squared && !is_normal);
+            let ask = Ask { image, texture_sampling_mode, wants };
+            merged
+                .entry(image)
+                .and_modify(|first| first.merge_in(ask))
+                .or_insert(ask);
         }
     }
-    let asks: Vec<Ask> = asks.into_iter().flatten().collect();
+    let asks: Vec<Ask> = merged.into_values().collect();
     run(defs, &asks, true, stage, pool)
 }
 
@@ -217,106 +255,74 @@ pub fn decode_color_or_2d_for_keys(
     stage: &StageHandle,
     pool: &TaskPool,
 ) -> usize {
-    let mut wanted: HashMap<AssetNamespace, HashSet<String>> = HashMap::new();
-    for key in keys {
-        let name = AssetRef::bare_name(&key.name);
-        if !name.is_empty() {
-            wanted.entry(key.namespace).or_default().insert(name.to_owned());
+    let mut named: HashMap<AssetCategoryScope, HashSet<String>> = HashMap::new();
+    keys.into_iter().for_each(|key| {
+        let bare = AssetPointer::bare_name(&key.name);
+        if !bare.is_empty() {
+            named.entry(key.namespace).or_default().insert(bare.to_owned());
         }
-    }
-    if wanted.is_empty() {
-        return 0;
-    }
-    let mut seen = HashSet::new();
-    let mut asks = Vec::new();
-    for material in &defs.materials {
-        let name = material.name.as_str();
-        let named = material.name.is_real()
-            && !name.is_empty()
-            && wanted
-                .get(&material.namespace)
-                .is_some_and(|names| names.contains(name));
-        if !named {
-            continue;
-        }
-        let picture = |semantic: u8| {
-            material
-                .textures
-                .iter()
-                .find(|texture| texture.semantic == semantic && texture.image.is_some())
+    });
+    let is_listed = |material: &&DesignerMaterial| {
+        let label = material.name.as_str();
+        let known = named.get(&material.namespace).is_some_and(|names| names.contains(label));
+        known && material.name.is_genuine() && !label.is_empty()
+    };
+    let picture_of = |material: &DesignerMaterial| {
+        let pick = |semantic: u8| {
+            let texture_of = |t: &&SurfaceImageAttachment| t.semantic == semantic && t.image.is_some();
+            material.textures.iter().find(texture_of)
         };
-        let Some(texture) = picture(TS_COLOR_MAP).or_else(|| picture(TS_2D)) else {
-            continue;
-        };
-        let Some(image) = texture.image else {
-            continue;
-        };
-        let decoded = defs.images.get(image).is_some_and(|row| row.decoded.is_some());
-        if !decoded && seen.insert(image) {
-            asks.push(Ask::plain(image, texture.sampler_state));
-        }
+        let texture = pick(SEMANTIC_COLOR).or_else(|| pick(TS_2D))?;
+        Some((texture.image?, texture.texture_sampling_mode))
+    };
+    let mut queue = Queue::default();
+    let pictures = defs.materials.iter().filter(is_listed).filter_map(picture_of);
+    for (image, texture_sampling_mode) in pictures.filter(|&(image, _)| !has_pixels(&defs.images, image)) {
+        queue.offer(Ask::plain(image, texture_sampling_mode));
     }
-    if asks.is_empty() {
-        return 0;
-    }
-    run(defs, &asks, true, stage, pool).decoded
+    queue.decode(defs, true, stage, pool)
 }
 
 /// Decodes the listed images (row, sampler state) that are not decoded yet,
 /// read without the sRGB curve.
 pub fn decode_catalog_images(
     defs: &mut MaterialDefinitions,
-    images: impl IntoIterator<Item = (usize, u8)>,
+    gpu_images: impl IntoIterator<Item = (usize, u8)>,
     stage: &StageHandle,
     pool: &TaskPool,
 ) -> usize {
-    let mut seen = HashSet::new();
-    let mut asks = Vec::new();
-    for (image, sampler_state) in images {
-        let decoded = defs.images.get(image).is_some_and(|row| row.decoded.is_some());
-        if !decoded && seen.insert(image) {
-            asks.push(Ask {
-                linear: true,
-                ..Ask::plain(image, sampler_state)
-            });
-        }
-    }
-    if asks.is_empty() {
-        return 0;
-    }
-    run(defs, &asks, false, stage, pool).decoded
+    let mut queue = Queue::default();
+    let missing = gpu_images.into_iter().filter(|&(image, _)| !has_pixels(&defs.images, image));
+    missing.for_each(|(image, texture_sampling_mode)| queue.offer(Ask::plain(image, texture_sampling_mode).read_linear()));
+    queue.decode(defs, false, stage, pool)
 }
 
 /// Decodes the zone's own `$`-named images that carry a body, on this thread.
 pub fn decode_in_zone_builtin_images(defs: &mut MaterialDefinitions) -> usize {
-    let mut decoded = 0;
-    for row in &mut defs.images {
-        let name = row.name.as_str();
-        let builtin = row.decoded.is_none()
+    let builtin = |row: &&mut HandBuiltTexture| {
+        row.decoded.is_none()
+            && row.texture_kind == 3
             && !row.payload.is_empty()
-            && row.map_type == 3
-            && row.name.is_real()
-            && name.starts_with('$');
-        if !builtin {
-            continue;
-        }
-        let Ok(texels) = image_texels::decode(
-            &row.payload,
-            u32::from(row.width),
-            u32::from(row.height),
-            row.format,
-        ) else {
-            continue;
-        };
-        let wrap = Wrap {
-            sampler_state: 0,
-            is_normal: name.contains("normal"),
-            sharp: false,
-            force_linear: false,
-            srgb_reads: row.use_srgb_reads,
-        };
-        row.decoded = Some(Arc::new(build_image(texels, wrap)));
-        decoded += 1;
-    }
-    decoded
+            && row.name.is_genuine()
+            && row.name.as_str().starts_with('$')
+    };
+    defs.images
+        .iter_mut()
+        .filter(builtin)
+        .filter_map(decode_builtin_row)
+        .count()
+}
+
+/// Decodes one builtin image's embedded payload in place; `None` when it will not decode.
+fn decode_builtin_row(row: &mut HandBuiltTexture) -> Option<()> {
+    let texels = image_texels::decode(&row.payload, row.width.into(), row.height.into(), row.format).ok()?;
+    let wrap = Wrap {
+        texture_sampling_mode: 0,
+        is_normal: row.name.as_str().contains("normal"),
+        sharp: false,
+        force_linear: false,
+        srgb_reads: row.srgb_sampled,
+    };
+    row.decoded = Some(Arc::new(build_image(texels, wrap)));
+    Some(())
 }

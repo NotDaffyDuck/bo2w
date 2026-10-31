@@ -58,14 +58,14 @@ pub const BUSY_MS: i32 = 50;
 pub const RESTART_BIT: u16 = 0x400;
 
 /// Anim value without the restart bit.
-pub const fn anim_index(value: u16) -> u16 {
+pub const fn clip_ordinal(value: u16) -> u16 {
     value & !RESTART_BIT
 }
 
 /// Flags BO2 marks on each script anim when the script loads.
 pub mod anim_flags {
     /// Fire anims (they also get a 30 ms blend-in).
-    pub const FIRE: u32 = 0x8;
+    pub const TRIGGER_SLOT: u32 = 0x8;
     /// Death anims (no move speed).
     pub const DEATH: u32 = 0x100;
     /// A looping anim: a `continue` call refreshes its timer.
@@ -195,7 +195,7 @@ impl AnimCall {
 
     /// A shot starts, a riot shield is planted, or an offhand is let go (StartFiring,
     /// RiotshieldStart, OffHandStart).
-    pub const FIRE: Self = Self::new(AnimEvent::FireWeapon, false, true);
+    pub const TRIGGER_SLOT: Self = Self::new(AnimEvent::FireWeapon, false, true);
     /// A weapon switch starts.
     pub const DROP: Self = Self::new(AnimEvent::DropWeapon, false, false);
     /// A held offhand is quick-dropped (OffHand_HoldUse).
@@ -246,7 +246,7 @@ impl AnimCall {
             AnimScript::PrimeGear => Self::prime(true),
             AnimScript::Reload => Self::RELOAD,
             AnimScript::FireWeapon | AnimScript::RiotshieldStart | AnimScript::OffHandStart => {
-                Self::FIRE
+                Self::TRIGGER_SLOT
             }
             AnimScript::DtpTakeoff => Self::DTP_TAKEOFF,
             AnimScript::DtpLand => Self::DTP_LAND,
@@ -260,14 +260,14 @@ impl AnimCall {
 }
 
 /// Which melee event a swing fires (MeleeInit's choice), checked in BO2's order.
-pub fn melee_event(riotshield: bool, lunge: bool, left_hand: bool, knife_model: bool) -> AnimEvent {
+pub fn melee_event(riotshield: bool, lunge: bool, left_hand: bool, blade_mesh: bool) -> AnimEvent {
     if riotshield {
         AnimEvent::MeleeAttack
-    } else if lunge && knife_model {
+    } else if lunge && blade_mesh {
         AnimEvent::KnifeMeleeCharge
     } else if left_hand {
         AnimEvent::MeleeLeft
-    } else if knife_model {
+    } else if blade_mesh {
         AnimEvent::KnifeMelee
     } else {
         AnimEvent::MeleeAttack
@@ -285,40 +285,40 @@ pub fn dual_reload_shows(
     state_right: i32,
     state_left: i32,
     time_right: i32,
-    time_left: i32,
+    countdown_rest: i32,
     reload_right: i32,
     reload_left: i32,
 ) -> bool {
     state_right == state::RELOADING
         && state_left == state::RELOADING
         && time_right > reload_right >> 1
-        && time_left > reload_left >> 1
+        && countdown_rest > reload_left >> 1
 }
 
 /// [`dual_reload_shows`] on the player state: the held (right) gun and its left partner, each
 /// hand's state and timer, and each gun's own reload time. False when the held gun is not dual.
 pub fn dual_reload_shows_ps(
-    ps: &crate::player::T6WeaponPs,
+    wps: &crate::player::T6WeaponPs,
     facts: &crate::facts::FactsTable,
 ) -> bool {
     use crate::pm::dual;
-    if !dual::is_dual_wield(facts, ps.weapon) {
+    if !dual::is_dual_wield(facts, wps.weapon) {
         return false;
     }
-    let left = dual::dual_wield_weapon(facts, ps.weapon);
+    let left = dual::dual_wield_weapon(facts, wps.weapon);
     dual_reload_shows(
-        ps.weaponstate,
-        ps.weaponstate_left,
-        ps.weapon_time,
-        ps.weapon_time_left,
-        facts.get(ps.weapon).reload.reload,
+        wps.gun_phase,
+        wps.weaponstate_left,
+        wps.gun_timer_ms,
+        wps.weapon_time_left,
+        facts.get(wps.weapon).reload.reload,
         facts.get(left).reload.reload,
     )
 }
 
 /// First raise when he never had this weapon, except in pm types 7 and 9.
-pub fn first_raise(ever_had: bool, pm_type: i32) -> bool {
-    !ever_had && pm_type != 7 && pm_type != 9
+pub fn first_raise(ever_had: bool, movement_mode: i32) -> bool {
+    !ever_had && movement_mode != 7 && movement_mode != 9
 }
 
 /// The conditions the script blocks test, by BO2's condition numbers (section 2 of the spec).
@@ -536,8 +536,8 @@ pub fn move_type(m: &MoveIn) -> (MoveType, bool) {
 }
 
 /// Hurt recently enough to stumble.
-pub fn hurt(damage_timer: i32, damage_duration: i32) -> bool {
-    (damage_duration - dvars::STUMBLE_MS).max(0) < damage_timer
+pub fn hurt(hurt_clock: i32, hurt_length: i32) -> bool {
+    (hurt_length - dvars::STUMBLE_MS).max(0) < hurt_clock
 }
 
 /// He stopped from a run: no move keys, no dive, and still at least at run speed.
@@ -559,14 +559,14 @@ pub enum Part {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Command {
     pub parts: [Option<(Part, u16)>; 2],
-    pub duration_ms: i32,
+    pub span_ms: i32,
 }
 
 impl Command {
-    pub fn one(part: Part, anim: u16, duration_ms: i32) -> Self {
+    pub fn one(part: Part, anim: u16, hold_ms: i32) -> Self {
         Self {
             parts: [Some((part, anim)), None],
-            duration_ms,
+            span_ms: hold_ms,
         }
     }
 }
@@ -630,10 +630,10 @@ pub struct Body {
     /// Anim index plus [`RESTART_BIT`].
     pub legs_anim: u16,
     /// How long the legs stay busy (ms).
-    pub legs_timer: i32,
+    pub lower_body_clock: i32,
     pub legs_duration: i32,
     pub torso_anim: u16,
-    pub torso_timer: i32,
+    pub upper_body_clock: i32,
     pub torso_duration: i32,
 }
 
@@ -642,10 +642,10 @@ pub struct Body {
 pub struct Play {
     pub anim: u16,
     /// Plays for this long (ms) at rate 1.
-    pub duration_ms: i32,
+    pub span_ms: i32,
     pub rate: f32,
     /// An event sets the part's timer; a movement anim does not.
-    pub set_timer: bool,
+    pub arm_countdown: bool,
     pub cont: bool,
     pub force: bool,
 }
@@ -653,7 +653,7 @@ pub struct Play {
 impl Body {
     /// Run the timers down by one frame.
     pub fn tick(&mut self, msec: i32) {
-        for timer in [&mut self.legs_timer, &mut self.torso_timer] {
+        for timer in [&mut self.lower_body_clock, &mut self.upper_body_clock] {
             if *timer > 0 {
                 *timer = (*timer - msec).max(0);
             }
@@ -663,32 +663,32 @@ impl Body {
     /// Start an anim on a part by BO2's rules. Returns the duration when the legs started it.
     pub fn play(&mut self, part: Part, p: &Play, table: &impl AnimTable) -> Option<i32> {
         let rate = if p.rate > 0.0 { p.rate } else { 1.0 };
-        let duration = (p.duration_ms as f32 / rate) as i32;
+        let duration = (p.span_ms as f32 / rate) as i32;
         let new = table.info(p.anim);
         let mut legs_started = false;
         let mut torso_anim = p.anim;
         if matches!(part, Part::Legs | Part::Both) {
             let mut force = p.force;
-            let cur = anim_index(self.legs_anim);
-            if !force && cur != p.anim && (!dvars::FORCE_TIMER_CHECK || self.legs_timer < BUSY_MS) {
+            let cur = clip_ordinal(self.legs_anim);
+            if !force && cur != p.anim && (!dvars::FORCE_TIMER_CHECK || self.lower_body_clock < BUSY_MS) {
                 // A stance anim gives way to a moving anim once it has played long enough.
                 if table.info(cur).flags & anim_flags::STANCE != 0 && new.moves {
                     let wait = dvars::STANCE_MOVE_INTERRUPT_MS;
-                    if wait == 0 || self.legs_timer < (self.legs_duration - wait).max(BUSY_MS) {
+                    if wait == 0 || self.lower_body_clock < (self.legs_duration - wait).max(BUSY_MS) {
                         force = true;
                     }
                 }
             }
-            if self.legs_timer < BUSY_MS || force {
+            if self.lower_body_clock < BUSY_MS || force {
                 if !p.cont || cur != p.anim {
                     self.legs_duration = duration;
                     self.legs_anim = (!self.legs_anim & RESTART_BIT) | p.anim;
-                    if p.set_timer {
-                        self.legs_timer = duration;
+                    if p.arm_countdown {
+                        self.lower_body_clock = duration;
                     }
                     legs_started = true;
-                } else if p.set_timer && new.flags & anim_flags::LOOPED != 0 {
-                    self.legs_timer = duration;
+                } else if p.arm_countdown && new.flags & anim_flags::LOOPED != 0 {
+                    self.lower_body_clock = duration;
                 }
             }
             if part == Part::Legs {
@@ -697,68 +697,69 @@ impl Body {
             torso_anim = 0;
         }
         let mut force = p.force;
-        let cur = anim_index(self.torso_anim);
+        let cur = clip_ordinal(self.torso_anim);
         if !force
             && cur != torso_anim
-            && (!dvars::FORCE_TIMER_CHECK || self.torso_timer < BUSY_MS)
+            && (!dvars::FORCE_TIMER_CHECK || self.upper_body_clock < BUSY_MS)
             && part == Part::Torso
             && table.info(cur).flags & anim_flags::RELOAD != 0
             && table.info(torso_anim).flags & anim_flags::CUTS_RELOAD != 0
         {
             force = true;
         }
-        if self.torso_timer < BUSY_MS || force {
+        if self.upper_body_clock < BUSY_MS || force {
             if !p.cont || cur != torso_anim {
                 self.torso_anim = (!self.torso_anim & RESTART_BIT) | torso_anim;
-                if p.set_timer {
-                    self.torso_timer = duration;
+                if p.arm_countdown {
+                    self.upper_body_clock = duration;
                 }
                 self.torso_duration = duration;
-            } else if p.set_timer && table.info(torso_anim).flags & anim_flags::LOOPED != 0 {
-                self.torso_timer = duration;
+            } else if p.arm_countdown && table.info(torso_anim).flags & anim_flags::LOOPED != 0 {
+                self.upper_body_clock = duration;
             }
         }
         legs_started.then_some(duration)
     }
 
-    /// Run one command: each of its parts, all for the command's duration + 50 ms. Returns the
-    /// duration when the legs started.
+    /// Plays every part of `cmd`, each lasting the command's length plus the busy margin.
+    /// When the command's first part drives the legs, the result says whether the last part
+    /// played started the legs: `Some(span)` if so.
     pub fn execute(
         &mut self,
         cmd: &Command,
         rates: [f32; 2],
-        set_timer: bool,
-        cont: bool,
-        force: bool,
+        arm_timer: bool,
+        keep_running: bool,
+        override_busy: bool,
         table: &impl AnimTable,
     ) -> Option<i32> {
-        let duration_ms = cmd.duration_ms + BUSY_MS;
-        let leads = matches!(cmd.parts[0], Some((Part::Legs | Part::Both, _)));
-        let mut out = None;
-        for (slot, entry) in cmd.parts.iter().enumerate() {
-            let Some((part, anim)) = *entry else { continue };
-            let play = Play {
+        let span = cmd.span_ms + BUSY_MS;
+        let legs_lead = matches!(cmd.parts[0], Some((Part::Legs | Part::Both, _)));
+        let mut reported = None;
+        let present = cmd.parts.iter().zip(rates).filter_map(|(entry, rate)| entry.map(|pair| (pair, rate)));
+        for ((part, anim), rate) in present {
+            let request = Play {
                 anim,
-                duration_ms,
-                rate: rates[slot],
-                set_timer,
-                cont,
-                force,
+                span_ms: span,
+                rate,
+                arm_countdown: arm_timer,
+                cont: keep_running,
+                force: override_busy,
             };
-            let r = self.play(part, &play, table);
-            if leads {
-                out = r;
+            let started = self.play(part, &request, table);
+            if legs_lead {
+                reported = started;
             }
         }
-        out.map(|_| duration_ms)
+        reported.map(|_| span)
     }
 }
 
 /// The gun's two times a weapon-timed anim may follow (ms).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GunTimes {
-    pub weapon_time: i32,
-    pub weapon_delay: i32,
+    pub gun_timer_ms: i32,
+    pub weapon_ready_wait: i32,
 }
 
 /// Fire an anim event: pick the matching block, a variant by BO2's random, scale weapon-timed
@@ -770,22 +771,22 @@ pub fn script_event<T: AnimTable>(
     conds: &T::Conds,
     table: &T,
     gun: GunTimes,
-    seed: &mut u32,
-    pm_type: i32,
+    hold_seed: &mut u32,
+    movement_mode: i32,
 ) -> Option<(Command, Option<i32>)> {
-    if call.event != AnimEvent::Death && pm_type >= 10 {
+    if call.event != AnimEvent::Death && movement_mode >= 10 {
         return None;
     }
-    let mut pick = |n: usize| bg_rand(seed) as usize % n;
+    let mut pick = |n: usize| bg_rand(hold_seed) as usize % n;
     let cmd = table.event_command(call.event, conds, &mut pick)?;
     let mut rates = [1.0; 2];
     for (slot, entry) in cmd.parts.iter().enumerate() {
-        let Some((_, anim)) = *entry else { continue };
+        let Some(&(_, anim)) = entry.as_ref() else { continue };
         let info = table.info(anim);
         if info.flags & anim_flags::WEAPON_TIME_SCALE != 0 {
-            rates[slot] = weapon_rate(info.len_ms, gun.weapon_time);
+            rates[slot] = weapon_rate(info.len_ms, gun.gun_timer_ms);
         } else if info.flags & anim_flags::WEAPON_DELAY_SCALE != 0 {
-            rates[slot] = weapon_rate(info.len_ms, gun.weapon_delay);
+            rates[slot] = weapon_rate(info.len_ms, gun.weapon_ready_wait);
         }
     }
     let started = body.execute(&cmd, rates, true, call.cont, call.force, table);
@@ -798,15 +799,15 @@ pub fn script_event<T: AnimTable>(
 pub fn script_move<T: AnimTable>(
     body: &mut Body,
     mt: MoveType,
-    force: bool,
+    forced: bool,
     conds: &T::Conds,
     table: &T,
-    client_num: u32,
+    client_index: u32,
 ) -> Result<bool, ()> {
-    let mut pick = |n: usize| client_num as usize % n;
+    let mut pick = |n: usize| client_index as usize % n;
     let cmd = table.move_command(mt, conds, &mut pick).ok_or(())?;
     Ok(body
-        .execute(&cmd, [1.0; 2], false, true, force, table)
+        .execute(&cmd, [1.0; 2], false, true, forced, table)
         .is_some())
 }
 
@@ -816,11 +817,11 @@ pub fn apply_movement<T: AnimTable>(
     m: &MoveIn,
     conds: &T::Conds,
     table: &T,
-    client_num: u32,
+    client_index: u32,
 ) -> MoveType {
     let (mt, force) = move_type(m);
-    if script_move(body, mt, force, conds, table, client_num).is_err() {
-        let _ = script_move(body, MoveType::Idle, false, conds, table, client_num);
+    if script_move(body, mt, force, conds, table, client_index).is_err() {
+        let _ = script_move(body, MoveType::Idle, false, conds, table, client_index);
         return MoveType::Idle;
     }
     mt
@@ -834,15 +835,15 @@ pub fn apply_still<T: AnimTable>(
     water_level: i32,
     conds: &T::Conds,
     table: &T,
-    client_num: u32,
+    client_index: u32,
 ) -> MoveType {
     if water_level > 3 {
-        let _ = script_move(body, MoveType::Swim, false, conds, table, client_num);
+        let _ = script_move(body, MoveType::Swim, false, conds, table, client_index);
         return MoveType::Swim;
     }
     let mt = STILL_MOVES[turn.min(2)];
-    if script_move(body, mt, false, conds, table, client_num).is_err() {
-        let _ = script_move(body, MoveType::Idle, false, conds, table, client_num);
+    if script_move(body, mt, false, conds, table, client_index).is_err() {
+        let _ = script_move(body, MoveType::Idle, false, conds, table, client_index);
         return MoveType::Idle;
     }
     mt
@@ -858,37 +859,37 @@ mod tests {
 
     const IDLE: [Command; 1] = [Command {
         parts: [Some((Part::Legs, 1)), None],
-        duration_ms: 1000,
+        span_ms: 1000,
     }];
     const RUN: [Command; 2] = [
         Command {
             parts: [Some((Part::Legs, 2)), None],
-            duration_ms: 700,
+            span_ms: 700,
         },
         Command {
             parts: [Some((Part::Legs, 8)), None],
-            duration_ms: 700,
+            span_ms: 700,
         },
     ];
-    const FIRE: [Command; 1] = [Command {
+    const TRIGGER_SLOT: [Command; 1] = [Command {
         parts: [Some((Part::Torso, 3)), None],
-        duration_ms: 150,
+        span_ms: 150,
     }];
     const RELOAD: [Command; 1] = [Command {
         parts: [Some((Part::Torso, 4)), None],
-        duration_ms: 2500,
+        span_ms: 2500,
     }];
     const DROP: [Command; 1] = [Command {
         parts: [Some((Part::Torso, 5)), None],
-        duration_ms: 400,
+        span_ms: 400,
     }];
-    const CROUCH: [Command; 1] = [Command {
+    const DUCK_BUTTON_BIT: [Command; 1] = [Command {
         parts: [Some((Part::Legs, 6)), None],
-        duration_ms: 600,
+        span_ms: 600,
     }];
     const DIVE: [Command; 1] = [Command {
         parts: [Some((Part::Both, 7)), None],
-        duration_ms: 800,
+        span_ms: 800,
     }];
 
     fn choose(cmds: &[Command], pick: &mut dyn FnMut(usize) -> usize) -> Option<Command> {
@@ -904,10 +905,10 @@ mod tests {
             pick: &mut dyn FnMut(usize) -> usize,
         ) -> Option<Command> {
             let cmds: &[Command] = match event {
-                AnimEvent::FireWeapon => &FIRE,
+                AnimEvent::FireWeapon => &TRIGGER_SLOT,
                 AnimEvent::Reload => &RELOAD,
                 AnimEvent::DropWeapon => &DROP,
-                AnimEvent::StandToCrouch => &CROUCH,
+                AnimEvent::StandToCrouch => &DUCK_BUTTON_BIT,
                 AnimEvent::DtpTakeoff => &DIVE,
                 _ => return None,
             };
@@ -929,7 +930,7 @@ mod tests {
         fn info(&self, anim: u16) -> AnimInfo {
             let (len_ms, flags, moves) = match anim {
                 2 | 8 => (700, anim_flags::RUN, true),
-                3 => (150, anim_flags::FIRE, false),
+                3 => (150, anim_flags::TRIGGER_SLOT, false),
                 4 => (2500, anim_flags::RELOAD, false),
                 5 => (
                     400,
@@ -949,8 +950,8 @@ mod tests {
 
     fn fire(body: &mut Body, call: AnimCall, seed: &mut u32) -> Option<(Command, Option<i32>)> {
         let gun = GunTimes {
-            weapon_time: 400,
-            weapon_delay: 0,
+            gun_timer_ms: 400,
+            weapon_ready_wait: 0,
         };
         script_event(body, call, &Conds::default(), &Table, gun, seed, 0)
     }
@@ -966,12 +967,12 @@ mod tests {
     fn event_sets_timer_duration_plus_50_and_flips_restart() {
         let mut body = Body::default();
         let mut seed = 0;
-        fire(&mut body, AnimCall::FIRE, &mut seed);
-        assert_eq!(anim_index(body.torso_anim), 3);
-        assert_eq!(body.torso_timer, 200);
+        fire(&mut body, AnimCall::TRIGGER_SLOT, &mut seed);
+        assert_eq!(clip_ordinal(body.torso_anim), 3);
+        assert_eq!(body.upper_body_clock, 200);
         let bit = body.torso_anim & RESTART_BIT;
         body.tick(200);
-        fire(&mut body, AnimCall::FIRE, &mut seed);
+        fire(&mut body, AnimCall::TRIGGER_SLOT, &mut seed);
         assert_ne!(
             body.torso_anim & RESTART_BIT,
             bit,
@@ -987,10 +988,10 @@ mod tests {
         // Unforced, not a cut: the reload holds.
         let call = AnimCall::new(AnimEvent::FireWeapon, false, false);
         fire(&mut body, call, &mut seed);
-        assert_eq!(anim_index(body.torso_anim), 4);
+        assert_eq!(clip_ordinal(body.torso_anim), 4);
         // A forced shot takes it.
-        fire(&mut body, AnimCall::FIRE, &mut seed);
-        assert_eq!(anim_index(body.torso_anim), 3);
+        fire(&mut body, AnimCall::TRIGGER_SLOT, &mut seed);
+        assert_eq!(clip_ordinal(body.torso_anim), 3);
     }
 
     #[test]
@@ -998,9 +999,9 @@ mod tests {
         let mut body = Body::default();
         let mut seed = 0;
         fire(&mut body, AnimCall::RELOAD, &mut seed);
-        assert_eq!(body.torso_timer, 2550);
+        assert_eq!(body.upper_body_clock, 2550);
         fire(&mut body, AnimCall::DROP, &mut seed);
-        assert_eq!(anim_index(body.torso_anim), 5);
+        assert_eq!(clip_ordinal(body.torso_anim), 5);
     }
 
     #[test]
@@ -1009,7 +1010,7 @@ mod tests {
         let mut body = Body::default();
         let mut seed = 0;
         fire(&mut body, AnimCall::DROP, &mut seed);
-        assert_eq!(body.torso_timer, 450);
+        assert_eq!(body.upper_body_clock, 450);
         assert!((weapon_rate(400, 100) - 1.66).abs() < 1e-6);
         assert!((weapon_rate(400, 10_000) - 0.34).abs() < 1e-6);
         assert!((weapon_rate(400, 0) - 1.66).abs() < 1e-6);
@@ -1026,8 +1027,8 @@ mod tests {
             apply_movement(&mut body, &m, &Conds::default(), &Table, 0),
             MoveType::Run
         );
-        assert_eq!(anim_index(body.legs_anim), 2);
-        assert_eq!(body.legs_timer, 0, "movement never sets the timer");
+        assert_eq!(clip_ordinal(body.legs_anim), 2);
+        assert_eq!(body.lower_body_clock, 0, "movement never sets the timer");
         let bit = body.legs_anim & RESTART_BIT;
         apply_movement(&mut body, &m, &Conds::default(), &Table, 0);
         assert_eq!(body.legs_anim & RESTART_BIT, bit, "same anim continues");
@@ -1041,7 +1042,7 @@ mod tests {
             ..MoveIn::default()
         };
         apply_movement(&mut body, &m, &Conds::default(), &Table, 3);
-        assert_eq!(anim_index(body.legs_anim), 8);
+        assert_eq!(clip_ordinal(body.legs_anim), 8);
     }
 
     #[test]
@@ -1050,28 +1051,28 @@ mod tests {
         let mut seed = 0;
         let call = AnimCall::new(AnimEvent::StandToCrouch, false, true);
         fire(&mut body, call, &mut seed);
-        assert_eq!(body.legs_timer, 650);
+        assert_eq!(body.lower_body_clock, 650);
         let m = MoveIn {
             xy_speed: 190.0,
             ..MoveIn::default()
         };
         body.tick(100);
         apply_movement(&mut body, &m, &Conds::default(), &Table, 0);
-        assert_eq!(anim_index(body.legs_anim), 6, "too early");
+        assert_eq!(clip_ordinal(body.legs_anim), 6, "too early");
         body.tick(150);
         apply_movement(&mut body, &m, &Conds::default(), &Table, 0);
-        assert_eq!(anim_index(body.legs_anim), 2);
+        assert_eq!(clip_ordinal(body.legs_anim), 2);
     }
 
     #[test]
     fn both_drives_the_body_and_clears_the_torso() {
         let mut body = Body::default();
         let mut seed = 0;
-        fire(&mut body, AnimCall::FIRE, &mut seed);
+        fire(&mut body, AnimCall::TRIGGER_SLOT, &mut seed);
         body.tick(500);
         fire(&mut body, AnimCall::DTP_TAKEOFF, &mut seed);
-        assert_eq!(anim_index(body.legs_anim), 7);
-        assert_eq!(anim_index(body.torso_anim), 0);
+        assert_eq!(clip_ordinal(body.legs_anim), 7);
+        assert_eq!(clip_ordinal(body.torso_anim), 0);
     }
 
     #[test]
@@ -1086,7 +1087,7 @@ mod tests {
             apply_movement(&mut body, &m, &Conds::default(), &Table, 0),
             MoveType::Idle
         );
-        assert_eq!(anim_index(body.legs_anim), 1);
+        assert_eq!(clip_ordinal(body.legs_anim), 1);
     }
 
     #[test]
@@ -1205,27 +1206,27 @@ mod tests {
 
     #[test]
     fn gun_code_calls_carry_bo2s_flags() {
-        use crate::events::AnimScript as S;
+        use crate::events::AnimScript;
         let call = |s| {
             let c = AnimCall::from_script(s);
             (c.event, c.cont, c.force)
         };
-        assert_eq!(call(S::FireWeapon), (AnimEvent::FireWeapon, false, true));
+        assert_eq!(call(AnimScript::FireWeapon), (AnimEvent::FireWeapon, false, true));
         assert_eq!(
-            call(S::RiotshieldStart),
+            call(AnimScript::RiotshieldStart),
             (AnimEvent::FireWeapon, false, true)
         );
-        assert_eq!(call(S::OffHandStart), (AnimEvent::FireWeapon, false, true));
-        assert_eq!(call(S::PrimeGrenade), (AnimEvent::PrimeGrenade, true, true));
-        assert_eq!(call(S::PrimeGear), (AnimEvent::RaiseWeapon, true, true));
-        assert_eq!(call(S::Reload), (AnimEvent::Reload, false, true));
-        assert_eq!(call(S::DropWeapon), (AnimEvent::DropWeapon, false, false));
-        assert_eq!(call(S::RaiseWeapon), (AnimEvent::RaiseWeapon, false, false));
-        assert_eq!(call(S::DtpTakeoff), (AnimEvent::DtpTakeoff, false, true));
-        assert_eq!(call(S::DtpLand), (AnimEvent::DtpLand, true, true));
-        assert_eq!(call(S::RunToIdle), (AnimEvent::RunToIdle, false, false));
+        assert_eq!(call(AnimScript::OffHandStart), (AnimEvent::FireWeapon, false, true));
+        assert_eq!(call(AnimScript::PrimeGrenade), (AnimEvent::PrimeGrenade, true, true));
+        assert_eq!(call(AnimScript::PrimeGear), (AnimEvent::RaiseWeapon, true, true));
+        assert_eq!(call(AnimScript::Reload), (AnimEvent::Reload, false, true));
+        assert_eq!(call(AnimScript::DropWeapon), (AnimEvent::DropWeapon, false, false));
+        assert_eq!(call(AnimScript::RaiseWeapon), (AnimEvent::RaiseWeapon, false, false));
+        assert_eq!(call(AnimScript::DtpTakeoff), (AnimEvent::DtpTakeoff, false, true));
+        assert_eq!(call(AnimScript::DtpLand), (AnimEvent::DtpLand, true, true));
+        assert_eq!(call(AnimScript::RunToIdle), (AnimEvent::RunToIdle, false, false));
         assert_eq!(
-            call(S::KnifeMeleeCharge),
+            call(AnimScript::KnifeMeleeCharge),
             (AnimEvent::KnifeMeleeCharge, false, true)
         );
     }
@@ -1238,7 +1239,7 @@ mod tests {
         assert!(
             script_event(
                 &mut body,
-                AnimCall::FIRE,
+                AnimCall::TRIGGER_SLOT,
                 &Conds::default(),
                 &Table,
                 gun,

@@ -11,12 +11,12 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
-use fx::PlayResult;
-use net::LastAdoptedSnapshot;
-use render_fx::FxCameraOrigin;
-use sim::ScriptEffect;
+use fx::PlaybackResult;
+use net::NewestTakenSnapshot;
+use render_fx::EffectsEyePosition;
+use sim::PlacedEffect;
 
-use super::stage::FxStage;
+use super::stage::{FxStage, Pose};
 
 /// What the client remembers of one scripted effect between frames.
 #[derive(Default)]
@@ -31,23 +31,11 @@ pub(super) struct ScriptFxRow {
     next_ms: i32,
 }
 
-/// The orientation a script gives an effect: forward and up, with the left
-/// the two make.
-fn axis(forward: [f32; 3], up: [f32; 3]) -> [[f32; 3]; 3] {
-    let forward = Vec3::from_array(forward);
-    let up = Vec3::from_array(up);
-    [
-        forward.to_array(),
-        up.cross(forward).to_array(),
-        up.to_array(),
-    ]
-}
-
 /// Whether a far-away effect is left out. A cull distance of zero or less
 /// means never.
-fn out_of_range(eye: Option<Vec3>, origin: [f32; 3], cull_distance: f32) -> bool {
+fn out_of_range(eye: Option<Vec3>, pos: [f32; 3], cull_distance: f32) -> bool {
     cull_distance > 0.0
-        && eye.is_some_and(|eye| eye.distance(Vec3::from_array(origin)) > cull_distance)
+        && eye.is_some_and(|eye| eye.distance(Vec3::from_array(pos)) > cull_distance)
 }
 
 #[derive(Debug, PartialEq)]
@@ -59,7 +47,7 @@ enum Plan {
     Bursts(Vec<i32>),
 }
 
-fn plan(row: &mut ScriptFxRow, fx: &ScriptEffect, server_now: i32, eye: Option<Vec3>) -> Plan {
+fn plan(row: &mut ScriptFxRow, fx: &PlacedEffect, server_now: i32, eye: Option<Vec3>) -> Plan {
     let restarted = row.start != fx.start_ms;
     row.start = fx.start_ms;
     let Some(start) = fx.start_ms else {
@@ -82,26 +70,26 @@ fn plan(row: &mut ScriptFxRow, fx: &ScriptEffect, server_now: i32, eye: Option<V
         row.next_ms = server_now - behind % fx.repeat_ms;
     }
     let silent = out_of_range(eye, fx.origin, fx.cull_distance);
-    let mut due = Vec::new();
+    let mut due_at_ms = Vec::new();
     while row.next_ms <= server_now {
         if !silent {
-            due.push(row.next_ms);
+            due_at_ms.push(row.next_ms);
         }
         row.next_ms = row.next_ms.saturating_add(fx.repeat_ms);
     }
-    Plan::Bursts(due)
+    Plan::Bursts(due_at_ms)
 }
 
-fn held_handle(result: PlayResult) -> Option<u16> {
+fn held_handle(result: PlaybackResult) -> Option<u16> {
     match result {
-        PlayResult::Held { handle } => Some(handle),
+        PlaybackResult::Kept { handle } => Some(handle),
         _ => None,
     }
 }
 
 pub(super) fn sync_script_fx(
-    adopted: Option<Res<LastAdoptedSnapshot>>,
-    camera: Option<Res<FxCameraOrigin>>,
+    adopted: Option<Res<NewestTakenSnapshot>>,
+    camera: Option<Res<EffectsEyePosition>>,
     mut stage: FxStage,
     mut rows: Local<HashMap<u32, ScriptFxRow>>,
 ) {
@@ -139,11 +127,15 @@ pub(super) fn sync_script_fx(
             effect: fx.effect,
             ..Default::default()
         });
-        let Some(authored) = adopted.effect_name(fx.effect) else {
+        let Some(authored) = adopted.effect_label(fx.effect) else {
             continue;
         };
         let name = play.defs().map_fx_name(authored);
-        let orientation = axis(fx.forward, fx.up);
+        let at = Pose {
+            anchor: fx.origin,
+            // A script gives an effect its forward and up.
+            turn: Pose::axes_from(Vec3::from_array(fx.forward), Vec3::from_array(fx.up_dir)),
+        };
         match plan(row, fx, server_now, eye) {
             Plan::Nothing => {}
             Plan::Respawn { start_ms } => {
@@ -151,12 +143,12 @@ pub(super) fn sync_script_fx(
                     play.host().stop_owned(handle);
                 }
                 row.held = play
-                    .spawned(name, fx.origin, orientation, start_ms.wrapping_add(offset))
+                    .spawned(name, at, start_ms.wrapping_add(offset))
                     .and_then(held_handle);
             }
             Plan::Bursts(times) => {
-                for at in times {
-                    play.oriented_at(name, fx.origin, orientation, at.wrapping_add(offset));
+                for when in times {
+                    play.oriented_at(name, at, when.wrapping_add(offset));
                 }
             }
         }
@@ -167,8 +159,8 @@ pub(super) fn sync_script_fx(
 mod tests {
     use super::*;
 
-    fn repeating(start: Option<i32>, repeat_ms: i32) -> ScriptEffect {
-        ScriptEffect {
+    fn repeating(start: Option<i32>, repeat_ms: i32) -> PlacedEffect {
+        PlacedEffect {
             id: 1,
             effect: 2,
             start_ms: start,
@@ -180,12 +172,12 @@ mod tests {
     #[test]
     fn forward_and_up_make_a_right_handed_frame() {
         assert_eq!(
-            axis([1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+            Pose::axes_from(Vec3::X, Vec3::Z),
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
         );
         // Turned a quarter: forward along y puts left along -x.
         assert_eq!(
-            axis([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            Pose::axes_from(Vec3::Y, Vec3::Z),
             [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
         );
     }
@@ -280,7 +272,7 @@ mod tests {
     #[test]
     fn a_culled_effect_keeps_its_schedule_but_plays_nothing() {
         let mut row = ScriptFxRow::default();
-        let fx = ScriptEffect {
+        let fx = PlacedEffect {
             cull_distance: 500.0,
             ..repeating(Some(0), 100)
         };
@@ -294,6 +286,6 @@ mod tests {
 
     #[test]
     fn only_a_held_result_gives_a_handle() {
-        assert_eq!(held_handle(PlayResult::Held { handle: 9 }), Some(9));
+        assert_eq!(held_handle(PlaybackResult::Kept { handle: 9 }), Some(9));
     }
 }

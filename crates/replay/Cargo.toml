@@ -1,19 +1,19 @@
 [package]
 name = "replay"
 version = "0.1.0"
+description = "Saves a match as the stream of server frames, plays it back to the client as if it were live, and keeps the last 45 seconds ready to cut as a clip."
 edition.workspace = true
-license.workspace = true
-description = "Records a match as the frames the server sends and plays one back through the client (theater mode); also keeps the last 45 seconds for `clip`."
-
-[dependencies]
-bevy.workspace = true
-diag.workspace = true
-frame.workspace = true
-net.workspace = true
-perf.workspace = true
-playerstate_t6.workspace = true
-sim.workspace = true
-getrandom = "0.3"
+publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+bevy.workspace = true
+playerstate_t6.workspace = true
+getrandom = "0.3"
+diag = { path = "../diag" }
+frame = { path = "../frame" }
+net = { path = "../net", version = "0.1" }
+perf = { path = "../perf" }
+sim = { path = "../sim", version = "0.1" }

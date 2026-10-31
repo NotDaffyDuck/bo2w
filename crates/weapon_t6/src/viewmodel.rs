@@ -11,23 +11,23 @@
 //! Spec and the per-request table: `docs/gun/ANIMS.md`.
 
 use crate::anim;
-use crate::env::{T6Dvars, perk, pm_type};
+use crate::env::{T6Dvars, perk, movement_mode};
 use crate::facts::{inventory, offhand_slot, unhex};
 use crate::state;
-use fastfile_t6::layout::{WeaponAttachment as A, WeaponDef as D, WeaponVariantDef as V};
+use fastfile_t6::layout::{WeaponAttachment, WeaponDef, WeaponVariantDef};
 
 /// BO2's 88 viewmodel anim slots, by BO2's numbers.
 pub mod slot {
     pub const ROOT: usize = 0;
     pub const IDLE: usize = 1;
-    pub const EMPTY_IDLE: usize = 2;
+    pub const DRY_REST_CLIP: usize = 2;
     pub const FIRE_INTRO: usize = 3;
-    pub const FIRE: usize = 4;
+    pub const TRIGGER_SLOT: usize = 4;
     pub const HOLD_FIRE: usize = 5;
-    pub const LASTSHOT: usize = 6;
+    pub const FINAL_SHOT_CLIP: usize = 6;
     pub const FINALSHOT: usize = 7;
     pub const RECHAMBER: usize = 8;
-    pub const MELEE: usize = 9;
+    pub const CLOSE_COMBAT: usize = 9;
     pub const MELEE1: usize = 10;
     pub const MELEE2: usize = 11;
     pub const MELEE3: usize = 12;
@@ -44,8 +44,8 @@ pub mod slot {
     pub const RAISE: usize = 23;
     pub const FIRST_RAISE: usize = 24;
     pub const DROP: usize = 25;
-    pub const ALT_RAISE: usize = 26;
-    pub const ALT_DROP: usize = 27;
+    pub const ATTACHMENT_LIFT_CLIP: usize = 26;
+    pub const ATTACHMENT_LOWER_CLIP: usize = 27;
     pub const QUICK_RAISE: usize = 28;
     pub const QUICK_DROP: usize = 29;
     pub const EMPTY_RAISE: usize = 30;
@@ -79,8 +79,8 @@ pub mod slot {
     pub const DETONATE: usize = 58;
     pub const NIGHTVISION_WEAR: usize = 59;
     pub const NIGHTVISION_REMOVE: usize = 60;
-    pub const ADS_FIRE: usize = 61;
-    pub const ADS_LASTSHOT: usize = 62;
+    pub const SCOPE_SHOT_CLIP: usize = 61;
+    pub const SCOPE_FINAL_SHOT_CLIP: usize = 62;
     pub const ADS_FIRE_INTRO: usize = 63;
     pub const ADS_RECHAMBER: usize = 64;
     pub const DTP_IN: usize = 65;
@@ -103,8 +103,8 @@ pub mod slot {
     pub const EMPTY_IDLE_LEFT: usize = 82;
     pub const RELOAD_EMPTY_LEFT: usize = 83;
     pub const RELOAD_LEFT: usize = 84;
-    pub const ADS_UP: usize = 85;
-    pub const ADS_DOWN: usize = 86;
+    pub const SCOPE_RAISE_CLIP: usize = 85;
+    pub const SCOPE_LOWER_CLIP: usize = 86;
     pub const ADS_UP_OTHER_SCOPE: usize = 87;
 
     /// Number of slots (NUM_WEAP_ANIMS).
@@ -154,7 +154,7 @@ pub const PERK_FASTSPRINTRECOVERY: u32 = 57;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VmDvars {
     pub perk_weap_switch_multiplier: f32,
-    pub perk_weap_reload_multiplier: f32,
+    pub quick_hands_factor: f32,
     pub perk_weap_rate_multiplier: f32,
     pub perk_weap_melee_multiplier: f32,
     pub perk_weap_toss_multiplier: f32,
@@ -178,7 +178,7 @@ impl VmDvars {
     pub fn from_t6(d: &T6Dvars) -> Self {
         Self {
             perk_weap_switch_multiplier: d.perk_weap_switch_multiplier,
-            perk_weap_reload_multiplier: d.perk_weap_reload_multiplier,
+            quick_hands_factor: d.quick_hands_factor,
             perk_weap_rate_multiplier: d.perk_weap_rate_multiplier,
             perk_weap_melee_multiplier: d.perk_weap_melee_multiplier,
             perk_weap_toss_multiplier: d.perk_weap_toss_multiplier,
@@ -202,50 +202,50 @@ enum TimeSrc {
 fn time_src(s: usize) -> TimeSrc {
     use TimeSrc::{Def, None, Var};
     match s {
-        5 => Def(D::iHoldFireTime),
-        7 | 80 => Def(D::iFlourishTime),
-        8 => Def(D::iRechamberTime),
-        9..=13 => Def(D::iMeleeTime),
-        14 | 15 => Def(D::meleeChargeTime),
-        16 | 84 => Var(V::iReloadTime),
-        17 => Def(D::iReloadTimeRight),
-        18 | 83 => Var(V::iReloadEmptyTime),
-        19 => Def(D::iReloadStartTime),
-        20 => Def(D::iReloadEndTime),
-        21 => Var(V::iReloadQuickTime),
-        22 => Var(V::iReloadQuickEmptyTime),
-        23 => Def(D::iRaiseTime),
-        24 => Def(D::iFirstRaiseTime),
-        25 => Def(D::iDropTime),
-        26 => Var(V::iAltRaiseTime),
-        27 => Def(D::iAltDropTime),
-        28 => Def(D::quickRaiseTime),
-        29 => Def(D::quickDropTime),
-        30 => Def(D::iEmptyRaiseTime),
-        31 => Def(D::iEmptyDropTime),
-        32 | 35 => Def(D::sprintInTime),
-        33 | 36 | 73 => Def(D::sprintLoopTime),
-        34 | 37 => Def(D::sprintOutTime),
-        38 => Def(D::lowReadyInTime),
-        39 => Def(D::lowReadyLoopTime),
-        40 => Def(D::lowReadyOutTime),
-        41 => Def(D::contFireInTime),
-        42 => Def(D::contFireLoopTime),
-        43 => Def(D::contFireOutTime),
-        44 | 50 => Def(D::crawlInTime),
-        45 | 51 => Def(D::crawlForwardTime),
-        46 | 52 => Def(D::crawlBackTime),
-        47 | 53 => Def(D::crawlRightTime),
-        48 | 54 => Def(D::crawlLeftTime),
-        49 | 55 => Def(D::crawlOutTime),
-        56 => Def(D::deployTime),
-        57 => Def(D::breakdownTime),
-        59 => Def(D::nightVisionWearTime),
-        60 => Def(D::nightVisionRemoveTime),
-        65 | 68 | 74 => Def(D::dtpInTime),
-        66 | 69 | 75 => Def(D::dtpLoopTime),
-        67 | 70 | 76 => Def(D::dtpOutTime),
-        71 => Def(D::slideInTime),
+        5 => Def(WeaponDef::iHoldFireTime),
+        7 | 80 => Def(WeaponDef::iFlourishTime),
+        8 => Def(WeaponDef::iRechamberTime),
+        9..=13 => Def(WeaponDef::iMeleeTime),
+        14 | 15 => Def(WeaponDef::meleeChargeTime),
+        16 | 84 => Var(WeaponVariantDef::iReloadTime),
+        17 => Def(WeaponDef::iReloadTimeRight),
+        18 | 83 => Var(WeaponVariantDef::iReloadEmptyTime),
+        19 => Def(WeaponDef::iReloadStartTime),
+        20 => Def(WeaponDef::iReloadEndTime),
+        21 => Var(WeaponVariantDef::iReloadQuickTime),
+        22 => Var(WeaponVariantDef::iReloadQuickEmptyTime),
+        23 => Def(WeaponDef::iRaiseTime),
+        24 => Def(WeaponDef::iFirstRaiseTime),
+        25 => Def(WeaponDef::iDropTime),
+        26 => Var(WeaponVariantDef::iAltRaiseTime),
+        27 => Def(WeaponDef::iAltDropTime),
+        28 => Def(WeaponDef::quickRaiseTime),
+        29 => Def(WeaponDef::quickDropTime),
+        30 => Def(WeaponDef::iEmptyRaiseTime),
+        31 => Def(WeaponDef::iEmptyDropTime),
+        32 | 35 => Def(WeaponDef::sprintInTime),
+        33 | 36 | 73 => Def(WeaponDef::sprintLoopTime),
+        34 | 37 => Def(WeaponDef::sprintOutTime),
+        38 => Def(WeaponDef::lowReadyInTime),
+        39 => Def(WeaponDef::lowReadyLoopTime),
+        40 => Def(WeaponDef::lowReadyOutTime),
+        41 => Def(WeaponDef::contFireInTime),
+        42 => Def(WeaponDef::contFireLoopTime),
+        43 => Def(WeaponDef::contFireOutTime),
+        44 | 50 => Def(WeaponDef::crawlInTime),
+        45 | 51 => Def(WeaponDef::crawlForwardTime),
+        46 | 52 => Def(WeaponDef::crawlBackTime),
+        47 | 53 => Def(WeaponDef::crawlRightTime),
+        48 | 54 => Def(WeaponDef::crawlLeftTime),
+        49 | 55 => Def(WeaponDef::crawlOutTime),
+        56 => Def(WeaponDef::deployTime),
+        57 => Def(WeaponDef::breakdownTime),
+        59 => Def(WeaponDef::nightVisionWearTime),
+        60 => Def(WeaponDef::nightVisionRemoveTime),
+        65 | 68 | 74 => Def(WeaponDef::dtpInTime),
+        66 | 69 | 75 => Def(WeaponDef::dtpLoopTime),
+        67 | 70 | 76 => Def(WeaponDef::dtpOutTime),
+        71 => Def(WeaponDef::slideInTime),
         _ => None,
     }
 }
@@ -274,9 +274,9 @@ pub struct VmFacts {
     /// Play time (ms) per slot; 0 = play at the clip's own speed.
     pub times: [i32; slot::COUNT],
     pub sprint_cycle_scale: f32,
-    pub move_speed_scale: f32,
-    pub aim_down_sight: bool,
-    pub inventory_type: u8,
+    pub walk_factor: f32,
+    pub scoped_aiming: bool,
+    pub carry_slot_kind: u8,
     /// `bAltWeaponAdsOnly` as stored.
     pub alt_weapon_ads_only: bool,
     pub dual_wield: bool,
@@ -294,9 +294,9 @@ impl Default for VmFacts {
         Self {
             times: [0; slot::COUNT],
             sprint_cycle_scale: 0.0,
-            move_speed_scale: 0.0,
-            aim_down_sight: false,
-            inventory_type: 0,
+            walk_factor: 0.0,
+            scoped_aiming: false,
+            carry_slot_kind: 0,
             alt_weapon_ads_only: false,
             dual_wield: false,
             offhand_slot: 0,
@@ -319,22 +319,22 @@ impl VmFacts {
         }
         Self {
             times,
-            sprint_cycle_scale: rd_f32(def, D::fSprintCycleScale),
-            move_speed_scale: rd_f32(def, D::moveSpeedScale),
-            aim_down_sight: rd_u8(def, D::aimDownSight) != 0,
-            inventory_type: rd_u8(def, D::inventoryType),
-            alt_weapon_ads_only: rd_u8(def, D::bAltWeaponAdsOnly) != 0,
-            dual_wield: rd_u8(def, D::bDualWield) != 0,
-            offhand_slot: rd_u8(def, D::offhandSlot),
-            intro_fire_length: rd_i32(def, D::iIntroFireLength),
-            unlimited_ammo: rd_u8(def, D::unlimitedAmmo) != 0,
-            perks: rd_u64(variant, V::perks),
+            sprint_cycle_scale: rd_f32(def, WeaponDef::fSprintCycleScale),
+            walk_factor: rd_f32(def, WeaponDef::moveSpeedScale),
+            scoped_aiming: rd_u8(def, WeaponDef::aimDownSight) != 0,
+            carry_slot_kind: rd_u8(def, WeaponDef::inventoryType),
+            alt_weapon_ads_only: rd_u8(def, WeaponDef::bAltWeaponAdsOnly) != 0,
+            dual_wield: rd_u8(def, WeaponDef::bDualWield) != 0,
+            offhand_slot: rd_u8(def, WeaponDef::offhandSlot),
+            intro_fire_length: rd_i32(def, WeaponDef::iIntroFireLength),
+            unlimited_ammo: rd_u8(def, WeaponDef::unlimitedAmmo) != 0,
+            perks: rd_u64(variant, WeaponVariantDef::perks),
         }
     }
 
     /// An alt-mode weapon that only exists while aiming (the PlayADSAnim test).
     pub fn alt_ads_only(&self) -> bool {
-        self.inventory_type == inventory::ALTMODE && self.alt_weapon_ads_only
+        self.carry_slot_kind == inventory::ALTMODE && self.alt_weapon_ads_only
     }
 }
 
@@ -346,24 +346,24 @@ pub struct VmTable {
 }
 
 impl VmTable {
-    pub fn set(&mut self, weapon: u32, facts: VmFacts) {
-        let i = weapon as usize;
+    pub fn set(&mut self, gun: u32, facts: VmFacts) {
+        let i = gun as usize;
         if self.rows.len() <= i {
             self.rows.resize(i + 1, None);
         }
         self.rows[i] = Some(facts);
     }
 
-    pub fn get(&self, weapon: u32) -> Option<&VmFacts> {
-        self.rows.get(weapon as usize).and_then(Option::as_ref)
+    pub fn fetch(&self, weapon: u32) -> Option<&VmFacts> {
+        self.rows.get(weapon as usize)?.as_ref()
     }
 
     /// `name<TAB>variant hex<TAB>def hex` per line; line N (from 1) is weapon N.
     pub fn from_dump(text: &str) -> Self {
         let mut t = Self::default();
-        for (i, line) in text.lines().enumerate() {
-            let mut parts = line.split('\t');
-            let (Some(_), Some(v), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
+        for (i, row) in text.lines().enumerate() {
+            let mut fields = row.split('\t');
+            let (Some(_label), Some(v), Some(d)) = (fields.next(), fields.next(), fields.next()) else {
                 continue;
             };
             let (Some(v), Some(d)) = (unhex(v), unhex(d)) else {
@@ -384,16 +384,16 @@ impl VmTable {
         let mut by_name: Vec<(&str, VmFacts)> = Vec::new();
         // `#att` lines carry attachments, not weapons: only their perks matter here.
         let mut att_perks: Vec<(&str, u64)> = Vec::new();
-        for line in text.lines() {
-            if let Some((n, h)) = line.strip_prefix("#att\t").and_then(|r| r.split_once('\t')) {
+        for row in text.lines() {
+            if let Some((n, h)) = row.strip_prefix("#att\t").and_then(|r| r.split_once('\t')) {
                 if let Some(b) = unhex(h) {
-                    att_perks.push((n, rd_u64(&b, A::perks)));
+                    att_perks.push((n, rd_u64(&b, WeaponAttachment::perks)));
                 }
             }
         }
-        for line in text.lines().filter(|l| !l.starts_with('#')) {
-            let mut parts = line.split('\t');
-            let (Some(n), Some(v), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
+        for row in text.lines().filter(|l| !l.starts_with('#')) {
+            let mut fields = row.split('\t');
+            let (Some(n), Some(v), Some(d)) = (fields.next(), fields.next(), fields.next()) else {
                 continue;
             };
             let (Some(v), Some(d)) = (unhex(v), unhex(d)) else {
@@ -408,7 +408,7 @@ impl VmTable {
         for (i, name) in rows {
             if let Some(mut f) = find(name).or_else(|| name.split_once('+').and_then(|(b, _)| find(b))) {
                 // BG_GetPerks: the variant's perks and up to three attachments'.
-                if let Some((_, atts)) = name.split_once('+') {
+                if let Some((_base, atts)) = name.split_once('+') {
                     for att in atts.split('+').take(3) {
                         f.perks |= att_perks.iter().find(|(n, _)| *n == att).map_or(0, |(_, p)| *p);
                     }
@@ -478,14 +478,14 @@ impl AnimSet {
 /// One running anim on the tree (BO2's XAnimInfo state).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AnimInfo {
-    pub weight: f32,
+    pub mix_w: f32,
     pub goal: f32,
     /// Seconds left to reach `goal`.
-    pub goal_time: f32,
-    pub rate: f32,
+    pub target_t: f32,
+    pub speed_k: f32,
     /// Normalized play position, 0..=1.
     pub time: f32,
-    pub old_time: f32,
+    pub prev_t: f32,
     pub cycle: i32,
     pub old_cycle: i32,
 }
@@ -510,59 +510,59 @@ impl Default for VmTree {
 /// Move `info` toward `goal` over `blend` seconds (the weight half of XAnimSetGoalWeight).
 fn blend_to(info: &mut AnimInfo, goal: f32, blend: f32) {
     if blend == 0.0 {
-        info.weight = goal;
-        info.goal_time = 0.0;
+        info.mix_w = goal;
+        info.target_t = Default::default();
         return;
     }
-    if info.weight == 0.0 {
-        info.weight = goal * 0.001;
+    if info.mix_w == 0.0 {
+        info.mix_w = goal * 0.001;
     }
-    let d = info.weight - goal;
+    let d = info.mix_w - goal;
     if d == 0.0 || (info.goal - goal) * d > 0.0 {
-        info.goal_time = blend;
+        info.target_t = blend;
     } else {
-        info.goal_time = info.goal_time.min(blend);
+        info.target_t = info.target_t.min(blend);
     }
     if goal != 0.0 {
-        let frac = if goal < info.weight {
-            d / info.weight
+        let frac = if goal < info.mix_w {
+            d / info.mix_w
         } else {
-            (goal - info.weight) / goal
+            (goal - info.mix_w) / goal
         };
-        info.goal_time = info.goal_time.max(frac * blend);
+        info.target_t = info.target_t.max(frac * blend);
     }
 }
 
 /// One frame of weight and time for one info. False = the info is gone.
-fn advance(info: &mut AnimInfo, dt: f32, clip: Clip) -> bool {
-    if info.goal_time <= dt {
-        info.weight = info.goal;
-        info.goal_time = 0.0;
+fn advance(info: &mut AnimInfo, dt: f32, played: Clip) -> bool {
+    if info.target_t <= dt {
+        info.mix_w = info.goal;
+        info.target_t = Default::default();
         if info.goal == 0.0 {
             return false;
         }
     } else {
-        info.weight += (info.goal - info.weight) * dt / info.goal_time;
-        info.goal_time -= dt;
-        if info.weight < 1e-6 {
-            info.weight = info.goal * 0.001;
+        info.mix_w += (info.goal - info.mix_w) * dt / info.target_t;
+        info.target_t -= dt;
+        if info.mix_w < 1e-6 {
+            info.mix_w = info.goal * 0.001;
             if info.goal == 0.0 {
                 return false;
             }
         }
     }
-    info.old_time = info.time;
+    info.prev_t = info.time;
     info.old_cycle = info.cycle;
-    if clip.length_ms > 0.0 {
-        info.time += info.rate * dt * 1000.0 / clip.length_ms;
+    if played.length_ms > 0.0 {
+        info.time += info.speed_k * dt * 1000.0 / played.length_ms;
     }
-    if clip.looping {
+    if played.looping {
         while info.time >= 1.0 {
             info.time -= 1.0;
             info.cycle += 1;
         }
     } else if info.time >= 1.0 {
-        info.time = if info.old_time >= 0.9999999 { 1.0 } else { 0.9999999 };
+        info.time = if info.prev_t >= 0.9999999 { 1.0 } else { 0.9999999 };
     }
     true
 }
@@ -570,7 +570,7 @@ fn advance(info: &mut AnimInfo, dt: f32, clip: Clip) -> bool {
 impl VmTree {
     /// XAnimSetGoalWeight: aim `s` at `goal` over `blend` seconds at `rate`. `restart`
     /// starts the clip again; a clip that is visibly playing crossfades from a fading copy.
-    pub fn set_goal_weight(&mut self, s: usize, goal: f32, blend: f32, rate: f32, restart: bool) {
+    pub fn assign_target_blend(&mut self, s: usize, goal: f32, blend: f32, rate: f32, restart: bool) {
         let goal = if goal < 0.001 { 0.0 } else { goal };
         if self.infos[s].is_none() {
             if goal == 0.0 {
@@ -582,7 +582,7 @@ impl VmTree {
             return;
         };
         if restart && (info.time != 0.0 || info.cycle != 0) && info.cycle == info.old_cycle {
-            if blend != 0.0 && info.weight != 0.0 {
+            if blend != 0.0 && info.mix_w != 0.0 {
                 let mut ghost = *info;
                 blend_to(&mut ghost, 0.0, blend);
                 ghost.goal = 0.0;
@@ -590,20 +590,20 @@ impl VmTree {
                 *info = AnimInfo::default();
             } else {
                 info.time = 0.0;
-                info.old_time = 0.0;
+                info.prev_t = 0.0;
                 info.cycle = 0;
                 info.old_cycle = 0;
             }
         }
         blend_to(info, goal, blend);
         info.goal = goal;
-        info.rate = rate;
+        info.speed_k = rate;
     }
 
     /// XAnimClearTreeGoalWeights at blend 0: every slot off at once.
     pub fn clear(&mut self) {
         for s in 0..slot::COUNT {
-            self.set_goal_weight(s, 0.0, 0.0, 1.0, false);
+            self.assign_target_blend(s, 0.0, 0.0, 1.0, false);
         }
         self.ghosts.clear();
     }
@@ -613,7 +613,7 @@ impl VmTree {
     pub fn has_finished(&self, s: usize) -> bool {
         match &self.infos[s] {
             None => true,
-            Some(i) => !(i.old_time <= i.time && i.time != 1.0 && i.cycle <= i.old_cycle),
+            Some(i) => !(i.prev_t <= i.time && i.time != 1.0 && i.cycle <= i.old_cycle),
         }
     }
 
@@ -621,42 +621,42 @@ impl VmTree {
         self.infos.get(s).and_then(Option::as_ref)
     }
 
-    pub fn weight(&self, s: usize) -> f32 {
-        self.info(s).map_or(0.0, |i| i.weight)
+    pub fn blend_of(&self, s: usize) -> f32 {
+        self.info(s).map_or(0.0, |i| i.mix_w)
     }
 
-    pub fn set_time(&mut self, s: usize, time: f32) {
+    pub fn put_time(&mut self, s: usize, time: f32) {
         if let Some(i) = self.infos[s].as_mut() {
             i.time = time;
         }
     }
 
-    pub fn set_rate(&mut self, s: usize, rate: f32) {
+    pub fn put_rate(&mut self, s: usize, rate: f32) {
         if let Some(i) = self.infos[s].as_mut() {
-            i.rate = rate;
+            i.speed_k = rate;
         }
     }
 
     /// One frame (`dt` seconds): weights, then play positions.
-    pub fn update(&mut self, dt: f32, set: &AnimSet) {
+    pub fn step_on(&mut self, secs: f32, set: &AnimSet) {
         for s in 1..slot::COUNT {
             if let Some(i) = self.infos[s].as_mut()
-                && !advance(i, dt, set.clips[s])
+                && !advance(i, secs, set.clips[s])
             {
                 self.infos[s] = None;
             }
         }
         self.ghosts
-            .retain_mut(|(s, g)| advance(g, dt, set.clips[*s]));
+            .retain_mut(|(s, g)| advance(g, secs, set.clips[*s]));
     }
 
     /// Every slot with weight: (slot, weight, play position), fading copies included.
     pub fn pose(&self) -> Vec<(usize, f32, f32)> {
         let mut out: Vec<_> = (1..slot::COUNT)
-            .filter_map(|s| self.infos[s].map(|i| (s, i.weight, i.time)))
+            .filter_map(|s| self.infos[s].map(|i| (s, i.mix_w, i.time)))
             .filter(|p| p.1 > 0.0)
             .collect();
-        out.extend(self.ghosts.iter().map(|(s, g)| (*s, g.weight, g.time)));
+        out.extend(self.ghosts.iter().map(|(s, g)| (*s, g.mix_w, g.time)));
         out
     }
 }
@@ -683,17 +683,17 @@ pub struct VmFrame {
     pub weapon: u32,
     /// The viewmodel model in use. A new model rebuilds the tree.
     pub model: u32,
-    pub weap_anim: i32,
+    pub gun_clip: i32,
     pub weap_anim_left: i32,
-    pub weaponstate: i32,
+    pub gun_phase: i32,
     pub weaponstate_left: i32,
-    pub weapon_time: i32,
+    pub gun_timer_ms: i32,
     pub weapon_time_left: i32,
     pub ammo_in_clip: i32,
     /// The dual-wield partner's clip (left hand).
     pub ammo_in_clip_left: i32,
     pub intro_shots_fired: i32,
-    pub weapon_pos_frac: f32,
+    pub gun_raise_share: f32,
     /// Player perks plus the weapon's own.
     pub perks: u64,
     pub off_hand_weapon: u32,
@@ -703,10 +703,10 @@ pub struct VmFrame {
     /// BO2's Mantle_DoAnim: the climb is higher than `mantle_weapon_anim_height`, so a kept gun plays its climb anim.
     pub mantle_do_anim: bool,
     /// The player's current move speed and their max (`ps.speed`), for the crawl rate.
-    pub move_speed: f32,
+    pub stride_velocity: f32,
     pub ps_speed: f32,
-    pub pm_type: i32,
-    pub frametime_ms: i32,
+    pub movement_mode: i32,
+    pub step_duration_ms: i32,
     /// Replay every request from scratch (BO2's forced pass).
     pub forced: bool,
     /// A cg flag the swap-time ADS pose reads for alt-ADS-only weapons.
@@ -719,26 +719,26 @@ impl Default for VmFrame {
         Self {
             weapon: 0,
             model: 0,
-            weap_anim: 0,
+            gun_clip: Default::default(),
             weap_anim_left: anim::LEFT_NONE,
-            weaponstate: 0,
+            gun_phase: 0,
             weaponstate_left: 0,
-            weapon_time: 0,
+            gun_timer_ms: Default::default(),
             weapon_time_left: 0,
             ammo_in_clip: 0,
             ammo_in_clip_left: 0,
             intro_shots_fired: 0,
-            weapon_pos_frac: 0.0,
+            gun_raise_share: 0.0,
             perks: 0,
             off_hand_weapon: 0,
             zombies: false,
             mantle_weapon_equipped: false,
             mantle_duration_ms: 0,
             mantle_do_anim: false,
-            move_speed: 0.0,
+            stride_velocity: 0.0,
             ps_speed: 0.0,
-            pm_type: pm_type::NORMAL,
-            frametime_ms: 16,
+            movement_mode: movement_mode::NORMAL,
+            step_duration_ms: 16,
             forced: false,
             alt_ads_pose_flag: false,
             dvars: VmDvars::default(),
@@ -796,9 +796,9 @@ impl Ctx<'_> {
         }
         // In the offhand states the anims playing are the offhand's own (its pin
         // pull, throw, etc.), so their times come from the offhand.
-        let offhand = (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&self.f.weaponstate);
+        let offhand = (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&self.f.gun_phase);
         let w = if offhand {
-            self.table.get(self.f.off_hand_weapon).unwrap_or(self.w)
+            self.table.fetch(self.f.off_hand_weapon).unwrap_or(self.w)
         } else {
             self.w
         };
@@ -807,7 +807,7 @@ impl Ctx<'_> {
             return 1.0;
         }
         if s == slot::SPRINT_LOOP {
-            t = t * self.w.sprint_cycle_scale * 0.5 * self.w.move_speed_scale
+            t = t * self.w.sprint_cycle_scale * 0.5 * self.w.walk_factor
                 / self.f.dvars.player_sprint_camera_bob;
             if t == 0.0 {
                 return 1.0;
@@ -819,7 +819,7 @@ impl Ctx<'_> {
     /// GetWeaponAnimTimeFrac: where a forced restart of `s` picks up.
     fn time_frac(&self, s: usize) -> f32 {
         let weapon_time = match s {
-            8 | 16..=31 | 64 => self.f.weapon_time,
+            8 | 16..=31 | 64 => self.f.gun_timer_ms,
             83 | 84 => self.f.weapon_time_left,
             _ => return 0.0,
         };
@@ -835,13 +835,13 @@ impl Ctx<'_> {
     fn perk_divisor(&self) -> f32 {
         let f = self.f;
         let d = &f.dvars;
-        let st = f.weaponstate;
+        let st = f.gun_phase;
         let or_1000 = |m: f32| if m == 0.0 { 1000.0 } else { m };
         let reloading = |s: i32| (state::RELOADING..=state::RELOAD_QUICK_EMPTY).contains(&s);
         let offhand = (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&st);
-        let off_slot = self.table.get(f.off_hand_weapon).map(|o| o.offhand_slot);
+        let off_slot = self.table.fetch(f.off_hand_weapon).map(|o| o.offhand_slot);
         if (reloading(st) || reloading(f.weaponstate_left)) && self.has_perk(perk::FASTRELOAD) {
-            or_1000(d.perk_weap_reload_multiplier)
+            or_1000(d.quick_hands_factor)
         } else if (st == state::RECHAMBER_START || st == state::RECHAMBERING)
             && self.has_perk(perk::RATEOFFIRE)
         {
@@ -897,16 +897,16 @@ impl Viewmodel {
     /// playing on a dual-wield gun.
     fn start(&mut self, c: &Ctx, s: usize, blend: f32) {
         let rate = c.anim_rate(s) / c.perk_divisor();
-        self.tree.set_goal_weight(s, 1.0, blend, rate, true);
+        self.tree.assign_target_blend(s, 1.0, blend, rate, true);
         if c.f.forced {
-            self.tree.set_time(s, c.time_frac(s));
+            self.tree.put_time(s, c.time_frac(s));
         }
         for o in 1..=slot::RELOAD_LEFT {
             if o == s {
                 continue;
             }
             if !c.w.dual_wield || (o != self.hands[0].slot && o != self.hands[1].slot) {
-                self.tree.set_goal_weight(o, 0.0, blend, 1.0, false);
+                self.tree.assign_target_blend(o, 0.0, blend, 1.0, false);
             }
         }
     }
@@ -918,23 +918,23 @@ impl Viewmodel {
 
     fn start_camera(&mut self, c: &Ctx, s: usize) {
         let rate = c.anim_rate(s);
-        self.tree.set_goal_weight(s, 1.0, 0.0, rate, true);
+        self.tree.assign_target_blend(s, 1.0, 0.0, rate, true);
         for o in slot::CAMERA_SPRINT_LOOP..=slot::CAMERA_MANTLE {
             if o != s {
-                self.tree.set_goal_weight(o, 0.0, 0.0, 1.0, false);
+                self.tree.assign_target_blend(o, 0.0, 0.0, 1.0, false);
             }
         }
     }
 
     fn stop_camera(&mut self) {
         for o in slot::CAMERA_SPRINT_LOOP..=slot::CAMERA_MANTLE {
-            self.tree.set_goal_weight(o, 0.0, 0.0, 1.0, false);
+            self.tree.assign_target_blend(o, 0.0, 0.0, 1.0, false);
         }
     }
 
     fn play_idle(&mut self, c: &Ctx, blend: f32) {
         let s = if c.clip_empty() {
-            slot::EMPTY_IDLE
+            slot::DRY_REST_CLIP
         } else {
             slot::IDLE
         };
@@ -953,68 +953,68 @@ impl Viewmodel {
 
     /// The ADS up/down pose, every frame: held at the weapon's aim position.
     fn play_ads(&mut self, c: &Ctx) {
-        let (alt_only, frac) = if c.w.aim_down_sight {
-            (c.w.alt_ads_only(), c.f.weapon_pos_frac)
-        } else if c.named(slot::ADS_DOWN) {
+        let (alt_only, frac) = if c.w.scoped_aiming {
+            (c.w.alt_ads_only(), c.f.gun_raise_share)
+        } else if c.named(slot::SCOPE_LOWER_CLIP) {
             (false, 0.0)
         } else {
             return;
         };
         let t = &mut self.tree;
-        if c.w.aim_down_sight {
-            t.set_goal_weight(slot::ADS_UP, if alt_only { 0.0 } else { 1.0 }, 0.1, 0.0, !alt_only);
-            t.set_goal_weight(slot::ADS_UP_OTHER_SCOPE, if alt_only { 1.0 } else { 0.0 }, 0.1, 0.0, alt_only);
-            t.set_goal_weight(slot::ADS_DOWN, 0.0, 0.1, 0.0, false);
+        if c.w.scoped_aiming {
+            t.assign_target_blend(slot::SCOPE_RAISE_CLIP, if alt_only { 0.0 } else { 1.0 }, 0.1, 0.0, !alt_only);
+            t.assign_target_blend(slot::ADS_UP_OTHER_SCOPE, if alt_only { 1.0 } else { 0.0 }, 0.1, 0.0, alt_only);
+            t.assign_target_blend(slot::SCOPE_LOWER_CLIP, 0.0, 0.1, 0.0, false);
         } else {
-            t.set_goal_weight(slot::ADS_UP_OTHER_SCOPE, 0.0, 0.1, 0.0, false);
-            t.set_goal_weight(slot::ADS_UP, 0.0, 0.1, 0.0, false);
-            t.set_goal_weight(slot::ADS_DOWN, 1.0, 0.1, 0.0, false);
+            t.assign_target_blend(slot::ADS_UP_OTHER_SCOPE, 0.0, 0.1, 0.0, false);
+            t.assign_target_blend(slot::SCOPE_RAISE_CLIP, 0.0, 0.1, 0.0, false);
+            t.assign_target_blend(slot::SCOPE_LOWER_CLIP, 1.0, 0.1, 0.0, false);
         }
-        t.set_time(slot::ADS_UP_OTHER_SCOPE, frac);
-        t.set_time(slot::ADS_UP, frac);
-        t.set_time(slot::ADS_DOWN, 1.0 - frac);
+        t.put_time(slot::ADS_UP_OTHER_SCOPE, frac);
+        t.put_time(slot::SCOPE_RAISE_CLIP, frac);
+        t.put_time(slot::SCOPE_LOWER_CLIP, 1.0 - frac);
     }
 
     /// Hold one ADS slot at its end (the swap-time pose).
     fn hold_ads_pose(&mut self, c: &Ctx, s: usize) {
         if s == slot::IDLE || c.named(s) {
-            self.tree.set_goal_weight(s, 1.0, 0.0, 0.0, true);
-            self.tree.set_time(s, 1.0);
+            self.tree.assign_target_blend(s, 1.0, 0.0, 0.0, true);
+            self.tree.put_time(s, 1.0);
         }
     }
 
     /// ChangeViewmodelDobj: a new viewmodel starts clean on its idle and its ADS pose.
-    fn rebuild(&mut self, c: &Ctx) {
+    fn refresh(&mut self, c: &Ctx) {
         self.hands[0].prev_anim = -1;
         self.hands[1].prev_anim = -1;
         self.tree.clear();
-        self.tree.set_goal_weight(slot::ROOT, 1.0, 0.0, 1.0, false);
+        self.tree.assign_target_blend(slot::ROOT, 1.0, 0.0, 1.0, false);
         let idle = if c.clip_empty() {
-            slot::EMPTY_IDLE
+            slot::DRY_REST_CLIP
         } else {
             slot::IDLE
         };
-        self.tree.set_goal_weight(idle, 1.0, 0.0, 1.0, true);
+        self.tree.assign_target_blend(idle, 1.0, 0.0, 1.0, true);
         if c.f.alt_ads_pose_flag && c.w.alt_weapon_ads_only {
-            let s = if c.f.weaponstate != state::RAISING_ALTSWITCH
-                && c.f.weaponstate != state::DROPPING_ALTSWITCH
+            let s = if c.f.gun_phase != state::RAISING_ALTSWITCH
+                && c.f.gun_phase != state::DROPPING_ALTSWITCH
             {
-                slot::ADS_DOWN
-            } else if c.w.inventory_type == inventory::ALTMODE {
-                slot::ADS_UP
+                slot::SCOPE_LOWER_CLIP
+            } else if c.w.carry_slot_kind == inventory::ALTMODE {
+                slot::SCOPE_RAISE_CLIP
             } else {
                 slot::ADS_UP_OTHER_SCOPE
             };
             self.hold_ads_pose(c, s);
-        } else if c.named(slot::ADS_DOWN) {
-            self.hold_ads_pose(c, slot::ADS_DOWN);
+        } else if c.named(slot::SCOPE_LOWER_CLIP) {
+            self.hold_ads_pose(c, slot::SCOPE_LOWER_CLIP);
         }
     }
 
     /// CG_ResetWeaponAnimTrees: everything off, idle on (dead players).
     fn reset_trees(&mut self, c: &Ctx) {
         self.tree.clear();
-        self.tree.set_goal_weight(slot::ROOT, 1.0, 0.0, 1.0, false);
+        self.tree.assign_target_blend(slot::ROOT, 1.0, 0.0, 1.0, false);
         if c.f.weapon != 0 {
             self.start(c, slot::IDLE, 0.0);
         }
@@ -1023,31 +1023,31 @@ impl Viewmodel {
     /// One client frame (CG_UpdateViewWeaponAnim).
     pub fn frame(&mut self, f: &VmFrame, table: &VmTable, set: &AnimSet) {
         let none = VmFacts::default();
-        let w = table.get(f.weapon).unwrap_or(&none);
+        let w = table.fetch(f.weapon).unwrap_or(&none);
         let c = Ctx { f, w, table, set };
-        if f.pm_type > pm_type::LASTSTAND_TRANSITION {
+        if f.movement_mode > movement_mode::LASTSTAND_TRANSITION {
             self.reset_trees(&c);
             return;
         }
         if self.built_model != Some(f.model) {
             self.built_model = Some(f.model);
-            self.rebuild(&c);
+            self.refresh(&c);
         }
-        self.run(&c);
-        self.tree.update(f.frametime_ms as f32 * 0.001, set);
-        if (state::CRAWL_FORWARD..=state::CRAWL_LEFT).contains(&f.weaponstate) {
-            let k = (f.weaponstate - state::CRAWL_FORWARD) as usize;
+        self.step(&c);
+        self.tree.step_on(f.step_duration_ms as f32 * 0.001, set);
+        if (state::CRAWL_FORWARD..=state::CRAWL_LEFT).contains(&f.gun_phase) {
+            let k = (f.gun_phase - state::CRAWL_FORWARD) as usize;
             let s = slot::CRAWL_FORWARD + k;
             let t = w.times[s] as f32;
             if t != 0.0 && f.ps_speed != 0.0 {
-                let rate = (f.move_speed / (f.ps_speed * 0.15)) / t * 1000.0;
-                self.tree.set_rate(s, rate.abs());
+                let rate = (f.stride_velocity / (f.ps_speed * 0.15)) / t * 1000.0;
+                self.tree.put_rate(s, rate.abs());
             }
         }
     }
 
     /// WeaponRunXModelAnims.
-    fn run(&mut self, c: &Ctx) {
+    fn step(&mut self, c: &Ctx) {
         let f = c.f;
         self.play_ads(c);
         if c.w.dual_wield
@@ -1055,9 +1055,9 @@ impl Viewmodel {
         {
             self.run_left(c);
         }
-        if f.forced || f.weapon != self.last_weapon || f.weap_anim != self.hands[0].prev_anim {
+        if f.forced || f.weapon != self.last_weapon || f.gun_clip != self.hands[0].prev_anim {
             if self.run_right(c) {
-                self.hands[0].prev_anim = f.weap_anim;
+                self.hands[0].prev_anim = f.gun_clip;
             }
             self.last_weapon = f.weapon;
         }
@@ -1070,12 +1070,12 @@ impl Viewmodel {
         let f = c.f;
         let req = anim::number(f.weap_anim_left);
         match req {
-            anim::IDLE | anim::FORCE_IDLE => {
+            anim::REST | anim::FORCE_IDLE => {
                 let mut blend = 0.0;
                 for s in slot::FIRE_LEFT..=slot::RELOAD_LEFT {
                     if !self.tree.has_finished(s) {
                         self.hands[1].prev_anim = -1;
-                        if req == anim::IDLE {
+                        if req == anim::REST {
                             return;
                         }
                         if !f.forced {
@@ -1088,7 +1088,7 @@ impl Viewmodel {
             anim::ATTACK => self.start_left(c, slot::FIRE_LEFT),
             anim::ATTACK_LASTSHOT => self.start_left(c, slot::LASTSHOT_LEFT),
             anim::RELOAD => self.start_left(c, slot::RELOAD_LEFT),
-            anim::RELOAD_EMPTY => self.start_left(c, slot::RELOAD_EMPTY_LEFT),
+            anim::RELOAD_DRY => self.start_left(c, slot::RELOAD_EMPTY_LEFT),
             _ => self.hands[1].slot = slot::NONE,
         }
         self.hands[1].prev_anim = f.weap_anim_left;
@@ -1103,15 +1103,15 @@ impl Viewmodel {
     /// (the request is not marked as taken, so it is checked again next frame).
     fn run_right(&mut self, c: &Ctx) -> bool {
         let f = c.f;
-        let req = anim::number(f.weap_anim);
+        let req = anim::number(f.gun_clip);
         let named = |s| c.named(s);
         match req {
-            anim::IDLE | anim::FORCE_IDLE => {
+            anim::REST | anim::FORCE_IDLE => {
                 let mut blend = 0.0;
                 for s in 1..=slot::RELOAD_LEFT {
                     if !self.tree.has_finished(s) && s != self.hands[1].slot {
                         self.hands[0].prev_anim = -1;
-                        if req == anim::IDLE {
+                        if req == anim::REST {
                             return false;
                         }
                         blend = if f.forced { 0.0 } else { 0.5 };
@@ -1124,20 +1124,20 @@ impl Viewmodel {
             }
             anim::ATTACK => {
                 let intro = c.w.intro_fire_length != 0 && f.intro_shots_fired < c.w.intro_fire_length;
-                self.start_right(c, if intro { slot::FIRE_INTRO } else { slot::FIRE }, 0.0);
+                self.start_right(c, if intro { slot::FIRE_INTRO } else { slot::TRIGGER_SLOT }, 0.0);
             }
-            anim::ATTACK_LASTSHOT => self.start_right(c, slot::LASTSHOT, 0.0),
+            anim::ATTACK_LASTSHOT => self.start_right(c, slot::FINAL_SHOT_CLIP, 0.0),
             anim::ATTACK_LASTSHOT_LEFT => {
                 self.hands[1].slot = slot::LASTSHOT_LEFT;
                 self.start(c, slot::LASTSHOT_LEFT, 0.0);
             }
-            anim::RECHAMBER => self.start_right(c, slot::RECHAMBER, 0.0),
+            anim::BOLT_CYCLE => self.start_right(c, slot::RECHAMBER, 0.0),
             anim::ADS_ATTACK => {
                 let intro = c.w.intro_fire_length != 0 && f.intro_shots_fired < c.w.intro_fire_length;
-                self.start_right(c, if intro { slot::ADS_FIRE_INTRO } else { slot::ADS_FIRE }, 0.0);
+                self.start_right(c, if intro { slot::ADS_FIRE_INTRO } else { slot::SCOPE_SHOT_CLIP }, 0.0);
             }
-            anim::ADS_ATTACK_LASTSHOT => self.start_right(c, slot::ADS_LASTSHOT, 0.0),
-            anim::ADS_RECHAMBER => self.start_right(c, slot::ADS_RECHAMBER, 0.0),
+            anim::ADS_ATTACK_LASTSHOT => self.start_right(c, slot::SCOPE_FINAL_SHOT_CLIP, 0.0),
+            anim::ADS_BOLT_CYCLE => self.start_right(c, slot::ADS_RECHAMBER, 0.0),
             anim::MELEE_ATTACK => self.melee(c),
             anim::MELEE_ATTACK_EMPTY => {
                 if named(slot::MELEE_EMPTY) {
@@ -1155,26 +1155,26 @@ impl Viewmodel {
                 };
                 self.start_right(c, s, 0.0);
             }
-            anim::DROP => self.start_right(c, slot::DROP, 0.0),
+            anim::PUT_AWAY => self.start_right(c, slot::DROP, 0.0),
             anim::RAISE => self.start_right(c, slot::RAISE, 0.0),
-            anim::FIRST_RAISE => self.start_right(c, slot::FIRST_RAISE, 0.0),
+            anim::FIRST_TAKE_OUT => self.start_right(c, slot::FIRST_RAISE, 0.0),
             anim::RELOAD => self.start_right(c, slot::RELOAD, 0.0),
-            anim::RELOAD_EMPTY => self.start_right(c, slot::RELOAD_EMPTY, 0.0),
-            anim::RELOAD_START..=anim::RELOAD_QUICK_EMPTY => {
+            anim::RELOAD_DRY => self.start_right(c, slot::RELOAD_EMPTY, 0.0),
+            anim::RELOAD_BEGIN..=anim::RELOAD_QUICK_EMPTY => {
                 self.start_right(c, req as usize, 0.0);
             }
-            anim::ALTSWITCHFROM => self.start_right(c, slot::ALT_DROP, 0.0),
-            anim::ALTSWITCHTO => self.start_right(c, slot::ALT_RAISE, 0.0),
-            anim::QUICK_DROP => self.start_right(c, slot::QUICK_DROP, 0.0),
-            anim::QUICK_RAISE => self.start_right(c, slot::QUICK_RAISE, 0.0),
-            anim::EMPTY_DROP => self.start_right(c, slot::EMPTY_DROP, 0.0),
-            anim::EMPTY_RAISE => self.start_right(c, slot::EMPTY_RAISE, 0.0),
-            anim::SPRINT_IN => {
+            anim::ALTSWITCHFROM => self.start_right(c, slot::ATTACHMENT_LOWER_CLIP, 0.0),
+            anim::ALTSWITCHTO => self.start_right(c, slot::ATTACHMENT_LIFT_CLIP, 0.0),
+            anim::FAST_PUT_AWAY => self.start_right(c, slot::QUICK_DROP, 0.0),
+            anim::FAST_TAKE_OUT => self.start_right(c, slot::QUICK_RAISE, 0.0),
+            anim::EMPTY_PUT_AWAY => self.start_right(c, slot::EMPTY_DROP, 0.0),
+            anim::EMPTY_TAKE_OUT => self.start_right(c, slot::EMPTY_RAISE, 0.0),
+            anim::SPRINT_ENTER => {
                 if named(slot::SPRINT_IN) {
                     self.start_right(c, slot::SPRINT_IN, 0.0);
                 }
             }
-            anim::SPRINT_LOOP => {
+            anim::SPRINT_HOLD => {
                 if named(slot::SPRINT_IN) {
                     self.start_right(c, slot::SPRINT_LOOP, 0.0);
                 } else {
@@ -1182,7 +1182,7 @@ impl Viewmodel {
                 }
                 self.camera_if_named(c, slot::CAMERA_SPRINT_LOOP);
             }
-            anim::SPRINT_OUT => {
+            anim::SPRINT_EXIT => {
                 if named(slot::SPRINT_OUT) {
                     self.start_right(c, slot::SPRINT_OUT, 0.0);
                 }
@@ -1230,10 +1230,10 @@ impl Viewmodel {
                 let s = slot::CONT_FIRE_IN + (req - anim::CONT_FIRE_IN) as usize;
                 self.start_right(c, s, 0.0);
             }
-            anim::HOLD_FIRE => self.start_right(c, slot::HOLD_FIRE, 0.0),
-            anim::DETONATE => self.start_right(c, slot::DETONATE, 0.0),
-            anim::NIGHTVISION_WEAR => self.start_right(c, slot::NIGHTVISION_WEAR, 0.0),
-            anim::NIGHTVISION_REMOVE => self.start_right(c, slot::NIGHTVISION_REMOVE, 0.0),
+            anim::FIRE_HELD => self.start_right(c, slot::HOLD_FIRE, 0.0),
+            anim::TRIGGER_DETONATOR => self.start_right(c, slot::DETONATE, 0.0),
+            anim::NVG_ON => self.start_right(c, slot::NIGHTVISION_WEAR, 0.0),
+            anim::NVG_OFF => self.start_right(c, slot::NIGHTVISION_REMOVE, 0.0),
             anim::DEPLOYING => self.start_right(c, slot::DEPLOY, 0.0),
             anim::BREAKING_DOWN => self.start_right(c, slot::BREAKDOWN, 0.0),
             anim::DTP_IN | anim::DTP_LOOP | anim::DTP_OUT => {
@@ -1327,7 +1327,7 @@ impl Viewmodel {
                 }
             }
         }
-        let s = slot::MELEE + self.irand(n) as usize;
+        let s = slot::CLOSE_COMBAT + self.irand(n) as usize;
         self.start_right(c, s, 0.0);
     }
 
@@ -1335,7 +1335,7 @@ impl Viewmodel {
     /// the left puts the left gun back on its idle.
     fn ensure_left(&mut self, c: &Ctx) {
         let right_ok = matches!(self.hands[0].slot, 1 | 2 | 4 | 6 | 7 | 16 | 18);
-        let left_empty = (slot::FIRE_LEFT..=slot::RELOAD_LEFT).all(|s| self.tree.weight(s) == 0.0);
+        let left_empty = (slot::FIRE_LEFT..=slot::RELOAD_LEFT).all(|s| self.tree.blend_of(s) == 0.0);
         if right_ok && left_empty {
             self.hands[1].slot = slot::IDLE_LEFT;
             self.start(c, slot::IDLE_LEFT, 0.0);
@@ -1357,7 +1357,7 @@ mod tests {
         v.times[slot::SPRINT_IN] = 300;
         v.times[slot::SPRINT_LOOP] = 1000;
         v.sprint_cycle_scale = 1.0;
-        v.move_speed_scale = 1.0;
+        v.walk_factor = 1.0;
         f(&mut v);
         let mut t = VmTable::default();
         t.set(W, v);
@@ -1377,9 +1377,9 @@ mod tests {
         VmFrame {
             weapon: W,
             model: W,
-            weap_anim: anim,
+            gun_clip: anim,
             ammo_in_clip: 30,
-            frametime_ms: 50,
+            step_duration_ms: 50,
             ..VmFrame::default()
         }
     }
@@ -1393,19 +1393,19 @@ mod tests {
 
     #[test]
     fn unlimited_ammo_at_clip_zero_idles_full() {
-        let set = set_with(&[slot::EMPTY_IDLE]);
-        let mut f = frame(anim::start(0, anim::IDLE));
+        let set = set_with(&[slot::DRY_REST_CLIP]);
+        let mut f = frame(anim::start(0, anim::REST));
         f.ammo_in_clip = 0;
         for (unlimited, want, other) in
-            [(false, slot::EMPTY_IDLE, slot::IDLE), (true, slot::IDLE, slot::EMPTY_IDLE)]
+            [(false, slot::DRY_REST_CLIP, slot::IDLE), (true, slot::IDLE, slot::DRY_REST_CLIP)]
         {
             let t = table(|v| v.unlimited_ammo = unlimited);
             let mut vm = Viewmodel::new();
             for _ in 0..40 {
                 vm.frame(&f, &t, &set);
             }
-            assert_eq!(vm.tree.weight(want), 1.0, "unlimited {unlimited}");
-            assert_eq!(vm.tree.weight(other), 0.0, "unlimited {unlimited}");
+            assert_eq!(vm.tree.blend_of(want), 1.0, "unlimited {unlimited}");
+            assert_eq!(vm.tree.blend_of(other), 0.0, "unlimited {unlimited}");
         }
     }
 
@@ -1418,9 +1418,9 @@ mod tests {
         vm.frame(&frame(a), &t, &set);
         assert_eq!(vm.hands[0].slot, slot::RAISE);
         let r = vm.tree.info(slot::RAISE).unwrap();
-        assert!((r.rate - 1000.0 / 600.0).abs() < 1e-4);
+        assert!((r.speed_k - 1000.0 / 600.0).abs() < 1e-4);
         // The gun asks for idle right away; idle waits for the raise to end.
-        let idle = anim::start(a, anim::IDLE);
+        let idle = anim::start(a, anim::REST);
         let mut frames = 1;
         while vm.hands[0].slot != slot::IDLE {
             vm.frame(&frame(idle), &t, &set);
@@ -1429,8 +1429,8 @@ mod tests {
         }
         // 600 ms at 50 ms frames: the raise ends on frame 12, idle starts on frame 13.
         assert_eq!(frames, 14);
-        assert_eq!(vm.tree.weight(slot::IDLE), 1.0);
-        assert_eq!(vm.tree.weight(slot::RAISE), 0.0);
+        assert_eq!(vm.tree.blend_of(slot::IDLE), 1.0);
+        assert_eq!(vm.tree.blend_of(slot::RAISE), 0.0);
     }
 
     #[test]
@@ -1444,14 +1444,14 @@ mod tests {
         vm.frame(&frame(b), &t, &set);
         let i = *vm.tree.info(slot::IDLE).unwrap();
         assert_eq!(i.goal, 1.0);
-        assert!(i.weight < 0.2);
+        assert!(i.mix_w < 0.2);
         let mut perk = frame(anim::start(b, anim::RELOAD));
         vm.frame(&perk, &t, &set);
-        perk.weap_anim = anim::start(perk.weap_anim, anim::FORCE_IDLE);
+        perk.gun_clip = anim::start(perk.gun_clip, anim::FORCE_IDLE);
         perk.perks = 1 << perk::FASTSWITCH;
         vm.frame(&perk, &t, &set);
         // Fast hands halves the blend: weight after one 50 ms frame is about twice as far.
-        assert!(vm.tree.weight(slot::IDLE) > i.weight * 1.5);
+        assert!(vm.tree.blend_of(slot::IDLE) > i.mix_w * 1.5);
     }
 
     #[test]
@@ -1460,10 +1460,10 @@ mod tests {
         let set = set_with(&[slot::RELOAD]);
         let mut vm = Viewmodel::new();
         let mut f = frame(anim::start(0, anim::RELOAD));
-        f.weaponstate = state::RELOADING;
+        f.gun_phase = state::RELOADING;
         f.perks = 1 << perk::FASTRELOAD;
         vm.frame(&f, &t, &set);
-        let r = vm.tree.info(slot::RELOAD).unwrap().rate;
+        let r = vm.tree.info(slot::RELOAD).unwrap().speed_k;
         assert!((r - (1000.0 / 2000.0) / 0.5).abs() < 1e-4);
     }
 
@@ -1473,81 +1473,81 @@ mod tests {
         let bare = set_with(&[]);
         let mut vm = Viewmodel::new();
         // No sprint_in anim: the request does nothing; the idle the new viewmodel started keeps playing.
-        vm.frame(&frame(anim::start(0, anim::SPRINT_IN)), &t, &bare);
+        vm.frame(&frame(anim::start(0, anim::SPRINT_ENTER)), &t, &bare);
         assert_eq!(vm.hands[0].slot, slot::NONE);
-        assert_eq!(vm.tree.weight(slot::IDLE), 1.0);
+        assert_eq!(vm.tree.blend_of(slot::IDLE), 1.0);
         let set = set_with(&[slot::SPRINT_IN, slot::SPRINT_LOOP, slot::CAMERA_SPRINT_LOOP]);
         let mut vm = Viewmodel::new();
-        let a = anim::start(0, anim::SPRINT_IN);
+        let a = anim::start(0, anim::SPRINT_ENTER);
         vm.frame(&frame(a), &t, &set);
         assert_eq!(vm.hands[0].slot, slot::SPRINT_IN);
-        vm.frame(&frame(anim::start(a, anim::SPRINT_LOOP)), &t, &set);
+        vm.frame(&frame(anim::start(a, anim::SPRINT_HOLD)), &t, &set);
         assert_eq!(vm.hands[0].slot, slot::SPRINT_LOOP);
-        assert_eq!(vm.tree.weight(slot::CAMERA_SPRINT_LOOP), 1.0);
+        assert_eq!(vm.tree.blend_of(slot::CAMERA_SPRINT_LOOP), 1.0);
     }
 
     #[test]
     fn restart_while_playing_crossfades_from_a_copy() {
         let mut tree = VmTree::default();
-        let set = set_with(&[slot::FIRE]);
-        tree.set_goal_weight(slot::FIRE, 1.0, 0.0, 1.0, true);
-        tree.update(0.05, &set);
-        tree.set_goal_weight(slot::FIRE, 1.0, 0.2, 1.0, true);
+        let set = set_with(&[slot::TRIGGER_SLOT]);
+        tree.assign_target_blend(slot::TRIGGER_SLOT, 1.0, 0.0, 1.0, true);
+        tree.step_on(0.05, &set);
+        tree.assign_target_blend(slot::TRIGGER_SLOT, 1.0, 0.2, 1.0, true);
         assert_eq!(tree.ghosts.len(), 1);
-        assert_eq!(tree.info(slot::FIRE).unwrap().time, 0.0);
+        assert_eq!(tree.info(slot::TRIGGER_SLOT).unwrap().time, 0.0);
         for _ in 0..5 {
-            tree.update(0.05, &set);
+            tree.step_on(0.05, &set);
         }
         assert!(tree.ghosts.is_empty());
-        assert_eq!(tree.weight(slot::FIRE), 1.0);
+        assert_eq!(tree.blend_of(slot::TRIGGER_SLOT), 1.0);
     }
 
     #[test]
     fn non_looping_clip_holds_its_last_frame_then_finishes() {
         let mut tree = VmTree::default();
-        let set = set_with(&[slot::FIRE]);
-        tree.set_goal_weight(slot::FIRE, 1.0, 0.0, 1.0, true);
-        tree.update(1.5, &set);
-        assert_eq!(tree.info(slot::FIRE).unwrap().time, 0.9999999);
-        assert!(!tree.has_finished(slot::FIRE));
-        tree.update(0.05, &set);
-        assert_eq!(tree.info(slot::FIRE).unwrap().time, 1.0);
-        assert!(tree.has_finished(slot::FIRE));
+        let set = set_with(&[slot::TRIGGER_SLOT]);
+        tree.assign_target_blend(slot::TRIGGER_SLOT, 1.0, 0.0, 1.0, true);
+        tree.step_on(1.5, &set);
+        assert_eq!(tree.info(slot::TRIGGER_SLOT).unwrap().time, 0.9999999);
+        assert!(!tree.has_finished(slot::TRIGGER_SLOT));
+        tree.step_on(0.05, &set);
+        assert_eq!(tree.info(slot::TRIGGER_SLOT).unwrap().time, 1.0);
+        assert!(tree.has_finished(slot::TRIGGER_SLOT));
     }
 
     #[test]
     fn ads_pose_follows_the_aim_fraction() {
-        let t = table(|v| v.aim_down_sight = true);
-        let set = set_with(&[slot::ADS_UP, slot::ADS_DOWN]);
+        let t = table(|v| v.scoped_aiming = true);
+        let set = set_with(&[slot::SCOPE_RAISE_CLIP, slot::SCOPE_LOWER_CLIP]);
         let mut vm = Viewmodel::new();
         let mut f = frame(0);
-        f.weapon_pos_frac = 0.25;
+        f.gun_raise_share = 0.25;
         vm.frame(&f, &t, &set);
-        let up = vm.tree.info(slot::ADS_UP).unwrap();
-        assert_eq!(up.rate, 0.0);
+        let up = vm.tree.info(slot::SCOPE_RAISE_CLIP).unwrap();
+        assert_eq!(up.speed_k, 0.0);
         assert_eq!(up.goal, 1.0);
     }
 
     #[test]
     fn dual_wield_left_hand_fires_on_its_own() {
         let t = table(|v| v.dual_wield = true);
-        let set = set_with(&[slot::FIRE]);
+        let set = set_with(&[slot::TRIGGER_SLOT]);
         let mut vm = Viewmodel::new();
         let mut f = frame(0);
         f.ammo_in_clip_left = 12;
-        f.weap_anim_left = anim::start(0, anim::IDLE);
+        f.weap_anim_left = anim::start(0, anim::REST);
         vm.frame(&f, &t, &set);
         assert_eq!(vm.hands[1].slot, slot::IDLE_LEFT);
         f.weap_anim_left = anim::start(f.weap_anim_left, anim::ATTACK);
         vm.frame(&f, &t, &set);
         assert_eq!(vm.hands[1].slot, slot::FIRE_LEFT);
-        assert_eq!(vm.tree.weight(slot::FIRE_LEFT), 1.0);
+        assert_eq!(vm.tree.blend_of(slot::FIRE_LEFT), 1.0);
         // The right idle waits one frame for the faded left idle to clear, then starts
         // without touching the left hand's fire.
         vm.frame(&f, &t, &set);
         assert_eq!(vm.hands[0].slot, slot::IDLE);
-        assert_eq!(vm.tree.weight(slot::IDLE), 1.0);
-        assert_eq!(vm.tree.weight(slot::FIRE_LEFT), 1.0);
+        assert_eq!(vm.tree.blend_of(slot::IDLE), 1.0);
+        assert_eq!(vm.tree.blend_of(slot::FIRE_LEFT), 1.0);
     }
 
     #[test]
@@ -1557,42 +1557,42 @@ mod tests {
         let mut vm = Viewmodel::new();
         vm.frame(&frame(anim::start(0, anim::RELOAD)), &t, &set);
         let mut f = frame(anim::start(0, anim::RELOAD));
-        f.pm_type = pm_type::DEAD;
+        f.movement_mode = movement_mode::DEAD;
         vm.frame(&f, &t, &set);
-        assert_eq!(vm.tree.weight(slot::IDLE), 1.0);
-        assert_eq!(vm.tree.weight(slot::RELOAD), 0.0);
+        assert_eq!(vm.tree.blend_of(slot::IDLE), 1.0);
+        assert_eq!(vm.tree.blend_of(slot::RELOAD), 0.0);
     }
 
     #[test]
     fn a_reindexed_table_finds_each_gun_by_name_then_base_name() {
-        let mut def = vec![0u8; D::aimDownSight + 1];
-        def[D::aimDownSight] = 1;
+        let mut def = vec![0u8; WeaponDef::aimDownSight + 1];
+        def[WeaponDef::aimDownSight] = 1;
         let hex: String = def.iter().map(|b| format!("{b:02x}")).collect();
         let dump = format!("fiveseven_mp\t00\t00\nmp7_mp\t00\t{hex}\n");
         let t = VmTable::from_dump_reindexed(
             &dump,
             [(4, "mp7_mp"), (9, "mp7_mp+reflex"), (2, "fiveseven_mp"), (3, "nothing_mp")],
         );
-        assert!(t.get(4).is_some_and(|f| f.aim_down_sight));
-        assert!(t.get(9).is_some_and(|f| f.aim_down_sight));
-        assert!(t.get(2).is_some_and(|f| !f.aim_down_sight));
-        assert!(t.get(3).is_none());
-        assert!(t.get(1).is_none());
+        assert!(t.fetch(4).is_some_and(|f| f.scoped_aiming));
+        assert!(t.fetch(9).is_some_and(|f| f.scoped_aiming));
+        assert!(t.fetch(2).is_some_and(|f| !f.scoped_aiming));
+        assert!(t.fetch(3).is_none());
+        assert!(t.fetch(1).is_none());
     }
 
     #[test]
     fn a_reindexed_gun_takes_its_attachments_perks() {
         // BG_GetPerks: the variant's perks plus up to three attachments'.
-        let mut var = vec![0u8; V::perks + 8];
-        var[V::perks..V::perks + 8].copy_from_slice(&(1u64 << 3).to_le_bytes());
-        let mut rf = vec![0u8; A::perks + 8];
-        rf[A::perks..A::perks + 8].copy_from_slice(&(1u64 << perk::RATEOFFIRE).to_le_bytes());
+        let mut var = vec![0u8; WeaponVariantDef::perks + 8];
+        var[WeaponVariantDef::perks..WeaponVariantDef::perks + 8].copy_from_slice(&(1u64 << 3).to_le_bytes());
+        let mut rf = vec![0u8; WeaponAttachment::perks + 8];
+        rf[WeaponAttachment::perks..WeaponAttachment::perks + 8].copy_from_slice(&(1u64 << perk::RATEOFFIRE).to_le_bytes());
         let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let dump = format!("smg_mp\t{}\t00\n#att\trf\t{}\n", hex(&var), hex(&rf));
         let t = VmTable::from_dump_reindexed(&dump, [(1, "smg_mp"), (2, "smg_mp+rf"), (3, "smg_mp+reflex")]);
-        assert_eq!(t.get(1).map(|f| f.perks), Some(1 << 3));
-        assert_eq!(t.get(2).map(|f| f.perks), Some(1 << 3 | 1 << perk::RATEOFFIRE));
-        assert_eq!(t.get(3).map(|f| f.perks), Some(1 << 3));
+        assert_eq!(t.fetch(1).map(|f| f.perks), Some(1 << 3));
+        assert_eq!(t.fetch(2).map(|f| f.perks), Some(1 << 3 | 1 << perk::RATEOFFIRE));
+        assert_eq!(t.fetch(3).map(|f| f.perks), Some(1 << 3));
     }
 
     #[test]
@@ -1613,7 +1613,7 @@ mod tests {
             assert_eq!(cam, if do_anim { 1.0 } else { 0.0 }, "do_anim {do_anim}");
             if do_anim {
                 let r = vm.tree.info(slot::MANTLE).unwrap();
-                assert!((r.rate - 1000.0 / 800.0).abs() < 1e-4);
+                assert!((r.speed_k - 1000.0 / 800.0).abs() < 1e-4);
             }
         }
     }

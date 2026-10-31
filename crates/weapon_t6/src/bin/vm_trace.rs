@@ -19,17 +19,15 @@ use std::process::ExitCode;
 use weapon_t6::anim;
 use weapon_t6::facts::FactsTable;
 use weapon_t6::state;
-use weapon_t6::trace::Runner;
+use weapon_t6::trace::ScenarioDriver;
 use weapon_t6::viewmodel::{AnimSet, Clip, Viewmodel, VmDvars, VmFrame, VmTable, slot};
 
-type Clips = [Option<Clip>; slot::COUNT];
-
-fn read_anims(text: &str) -> Vec<Clips> {
+fn read_anims(text: &str) -> Vec<[Option<Clip>; slot::COUNT]> {
     let mut out = vec![[None; slot::COUNT]];
-    for line in text.lines() {
+    for row in text.lines() {
         let mut clips = [None; slot::COUNT];
-        if let Some((_, list)) = line.split_once('\t') {
-            for item in list.split(';').filter(|s| !s.is_empty()) {
+        if let Some((_slot, names)) = row.split_once('\t') {
+            for item in names.split(';').filter(|s| !s.is_empty()) {
                 let mut p = item.split(':');
                 let (Some(s), Some(ms), Some(lp)) = (p.next(), p.next(), p.next()) else {
                     continue;
@@ -51,14 +49,14 @@ fn read_anims(text: &str) -> Vec<Clips> {
 }
 
 struct Vm<'f> {
-    r: Runner<'f>,
+    r: ScenarioDriver<'f>,
     vm: Viewmodel,
     table: &'f VmTable,
-    clips: &'f [Clips],
+    clips: &'f [[Option<Clip>; slot::COUNT]],
     left_of: HashMap<u32, u32>,
     sets: HashMap<u32, AnimSet>,
     dvars: VmDvars,
-    lines: Vec<String>,
+    log: Vec<String>,
     failures: usize,
 }
 
@@ -88,7 +86,7 @@ impl Vm<'_> {
 
     fn give(&mut self, w: u32) {
         if self.r.ps.give(w) {
-            let clip = self.r.facts.get(w).core.clip_size;
+            let clip = self.r.facts.get(w).core.magazine_capacity;
             self.r.ps.set_ammo_in_clip(self.r.facts, w, clip);
         }
     }
@@ -97,25 +95,25 @@ impl Vm<'_> {
         self.r.step();
         let w = self.r.ps.weapon;
         let set = self.set_for(w);
-        let ps = &self.r.ps;
+        let player = &self.r.ps;
         let left_gun = self.left_of.get(&w).copied().unwrap_or(0);
         let f = VmFrame {
             weapon: w,
             model: w,
-            weap_anim: ps.weap_anim,
-            weap_anim_left: ps.weap_anim_left,
-            weaponstate: ps.weaponstate,
-            weaponstate_left: ps.weaponstate_left,
-            weapon_time: ps.weapon_time,
-            weapon_time_left: ps.weapon_time_left,
-            ammo_in_clip: ps.ammo_in_clip(self.r.facts, w),
-            ammo_in_clip_left: ps.ammo_in_clip(self.r.facts, left_gun),
-            intro_shots_fired: ps.intro_shots_fired,
-            weapon_pos_frac: ps.f_weapon_pos_frac,
+            gun_clip: player.gun_clip,
+            weap_anim_left: player.weap_anim_left,
+            gun_phase: player.gun_phase,
+            weaponstate_left: player.weaponstate_left,
+            gun_timer_ms: player.gun_timer_ms,
+            weapon_time_left: player.weapon_time_left,
+            ammo_in_clip: player.ammo_in_clip(self.r.facts, w),
+            ammo_in_clip_left: player.ammo_in_clip(self.r.facts, left_gun),
+            intro_shots_fired: player.intro_shots_fired,
+            gun_raise_share: player.weapon_raise_fraction,
             perks: self.r.env.perks,
-            off_hand_weapon: ps.off_hand_weapon,
-            pm_type: self.r.env.pm_type,
-            frametime_ms: self.r.cmd.msec,
+            off_hand_weapon: player.off_hand_weapon,
+            movement_mode: self.r.env.movement_mode,
+            step_duration_ms: self.r.cmd.frame_ms,
             dvars: self.dvars,
             ..VmFrame::default()
         };
@@ -127,12 +125,12 @@ impl Vm<'_> {
             .filter(|p| p.1 >= 0.005)
             .map(|(s, wt, t)| format!("{} {:.2}@{:.2}", slot::name(*s), wt, t))
             .collect();
-        self.lines.push(format!(
+        self.log.push(format!(
             "{:>6} {:<14} {:<16} {:<14} | R {:<14} L {:<12} | {}",
             self.r.now,
             self.r.facts.name(w),
-            state::name(ps.weaponstate),
-            anim::name(ps.weap_anim),
+            state::name(player.gun_phase),
+            anim::name(player.gun_clip),
             slot::name(self.vm.hands[0].slot),
             slot::name(self.vm.hands[1].slot),
             slots.join("  "),
@@ -146,15 +144,15 @@ impl Vm<'_> {
             s.parse::<i64>().map_err(|e| format!("{s}: {e}"))
         };
         match words[0] {
-            "msec" => self.r.cmd.msec = num(1)? as i32,
+            "msec" => self.r.cmd.frame_ms = num(1)? as i32,
             "spawn" => {
                 let w = self.id(arg(1)?)?;
                 self.give(w);
                 self.r.ps.weapon = w;
                 self.r.cmd.weapon = w;
-                self.r.ps.weaponstate = state::READY;
+                self.r.ps.gun_phase = state::READY;
                 self.r.ps.weaponstate_left = state::READY;
-                self.r.ps.set_ever_had_all(true);
+                self.r.ps.mark_all_owned(true);
             }
             "give" => {
                 let w = self.id(arg(1)?)?;
@@ -194,8 +192,8 @@ impl Vm<'_> {
                     self.r.env.perks &= !(1u64 << p);
                 }
             }
-            "pmtype" => self.r.env.pm_type = num(1)? as i32,
-            "stick" => self.r.cmd.forwardmove = num(1)?.clamp(-127, 127) as i8,
+            "pmtype" => self.r.env.movement_mode = num(1)? as i32,
+            "stick" => self.r.cmd.thrust_ahead = num(1)?.clamp(-127, 127) as i8,
             "lefthand" => {
                 let (w, l) = (self.id(arg(1)?)?, self.id(arg(2)?)?);
                 self.left_of.insert(w, l);
@@ -203,14 +201,14 @@ impl Vm<'_> {
             }
             "anim" => {
                 let a = anim_number(arg(1)?).ok_or_else(|| format!("no anim {}", words[1]))?;
-                self.r.ps.weap_anim = anim::start(self.r.ps.weap_anim, a);
+                self.r.ps.gun_clip = anim::start(self.r.ps.gun_clip, a);
                 if let Ok(s) = arg(2) {
-                    self.r.ps.weaponstate =
+                    self.r.ps.gun_phase =
                         state_number(s).ok_or_else(|| format!("no state {s}"))?;
                     // The state runs for the gun's own time for that move, as BO2 sets it.
                     let w = self.r.ps.weapon;
-                    if let (Some(sl), Some(vf)) = (slot::find(words[1]), self.table.get(w)) {
-                        self.r.ps.weapon_time = vf.times[sl];
+                    if let (Some(sl), Some(vf)) = (slot::find(words[1]), self.table.fetch(w)) {
+                        self.r.ps.gun_timer_ms = vf.times[sl];
                     }
                 }
             }
@@ -225,16 +223,16 @@ impl Vm<'_> {
                 let got = match what {
                     "slot" => slot::name(self.vm.hands[0].slot),
                     "lslot" => slot::name(self.vm.hands[1].slot),
-                    "state" => state::name(self.r.ps.weaponstate),
-                    "anim" => anim::name(self.r.ps.weap_anim),
+                    "state" => state::name(self.r.ps.gun_phase),
+                    "anim" => anim::name(self.r.ps.gun_clip),
                     "weapon" => self.r.facts.name(self.r.ps.weapon),
                     _ => return Err(format!("expect what? {what}")),
                 };
                 if got.eq_ignore_ascii_case(want) {
-                    self.lines.push(format!("ok   line {n}: {what} {want}"));
+                    self.log.push(format!("ok   line {n}: {what} {want}"));
                 } else {
                     self.failures += 1;
-                    self.lines.push(format!("FAIL line {n}: {what} is {got}, want {want}"));
+                    self.log.push(format!("FAIL line {n}: {what} is {got}, want {want}"));
                 }
             }
             other => return Err(format!("unknown command {other}")),
@@ -246,17 +244,17 @@ impl Vm<'_> {
 fn button(name: &str) -> Option<u32> {
     use weapon_t6::cmd::button;
     Some(match name {
-        "attack" | "fire" => button::ATTACK,
-        "ads" => button::ADS,
-        "melee" => button::MELEE,
-        "reload" => button::RELOAD,
-        "use" => button::USE,
+        "attack" | "fire" => button::FIRE_BIT,
+        "ads" => button::AIM_BIT,
+        "melee" => button::CLOSE_COMBAT,
+        "reload" => button::REFILL_BIT,
+        "use" => button::INTERACT_KEY,
         "sprint" => button::SPRINT,
-        "frag" => button::FRAG,
-        "smoke" => button::SMOKE,
-        "prone" => button::PRONE,
-        "crouch" => button::CROUCH,
-        "jump" => button::JUMP,
+        "frag" => button::SAMPLE_FRAG_ASSET,
+        "smoke" => button::OBSCURANT,
+        "prone" => button::LYING_FLAT,
+        "crouch" => button::DUCK_BUTTON_BIT,
+        "jump" => button::LEAP,
         _ => return None,
     })
 }
@@ -270,13 +268,13 @@ fn state_number(name: &str) -> Option<i32> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.len() < 3 {
         eprintln!("usage: vm_trace SCRIPT FACTS_DUMP ANIMS_DUMP");
         return ExitCode::from(2);
     }
     let read = |p: &str| std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"));
-    let (script, facts_text, anims_text) = match (read(&args[0]), read(&args[1]), read(&args[2])) {
+    let (script_text, facts_text, anims_text) = match (read(&args[0]), read(&args[1]), read(&args[2])) {
         (Ok(a), Ok(b), Ok(c)) => (a, b, c),
         (a, b, c) => {
             for e in [a.err(), b.err(), c.err()].into_iter().flatten() {
@@ -288,7 +286,7 @@ fn main() -> ExitCode {
     let facts = FactsTable::from_dump(&facts_text);
     let table = VmTable::from_dump(&facts_text);
     let clips = read_anims(&anims_text);
-    let r = Runner::new(&facts);
+    let r = ScenarioDriver::new(&facts);
     let dvars = VmDvars::from_t6(&r.env.dvars);
     let mut vm = Vm {
         r,
@@ -298,22 +296,22 @@ fn main() -> ExitCode {
         left_of: HashMap::new(),
         sets: HashMap::new(),
         dvars,
-        lines: Vec::new(),
+        log: Vec::new(),
         failures: 0,
     };
-    for (i, raw) in script.lines().enumerate() {
-        let text = raw.split('#').next().unwrap_or("").trim();
-        if text.is_empty() {
+    for (i, raw) in script_text.lines().enumerate() {
+        let cmd = raw.split('#').next().unwrap_or("").trim();
+        if cmd.is_empty() {
             continue;
         }
-        vm.lines.push(format!("> {text}"));
-        let words: Vec<&str> = text.split_whitespace().collect();
+        vm.log.push(format!("> {cmd}"));
+        let words: Vec<&str> = cmd.split_whitespace().collect();
         if let Err(e) = vm.command(i + 1, &words) {
             eprintln!("line {}: {e}", i + 1);
             return ExitCode::from(2);
         }
     }
-    for l in &vm.lines {
+    for l in &vm.log {
         println!("{l}");
     }
     println!("{} expect failure(s)", vm.failures);

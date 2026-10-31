@@ -1,6 +1,5 @@
 use core::ops::{Deref, DerefMut};
-
-use crate::PartBits;
+use crate::PartSet;
 
 /// `DObjSetControlTagAngles` only takes a part under this index.
 pub const CONTROL_TAG_LIMIT: usize = 0xFE;
@@ -34,14 +33,14 @@ impl PartPose {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LocalPose {
     parts: Vec<PartPose>,
-    pub control: PartBits,
+    pub control: PartSet,
 }
 
 impl LocalPose {
     pub fn new(parts: Vec<PartPose>) -> Self {
         Self {
             parts,
-            control: PartBits::NONE,
+            control: PartSet::NONE,
         }
     }
 
@@ -59,13 +58,13 @@ impl LocalPose {
         self.control.set(part);
     }
 
-    /// Copies part `source` (its pose and control bit) onto part `dest`.
-    pub fn copy_part(&mut self, dest: usize, source: usize) {
-        self.parts[dest] = self.parts[source];
+    /// Copies part `source` (its pose and control bit) onto part `write_target`.
+    pub fn copy_part(&mut self, write_target: usize, source: usize) {
+        self.parts[write_target] = self.parts[source];
         if self.control.get(source) {
-            self.control.set(dest);
+            self.control.set(write_target);
         } else {
-            self.control.clear(dest);
+            self.control.clear(write_target);
         }
     }
 }

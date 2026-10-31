@@ -3,54 +3,54 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::{fpv_mesh_catalog::TagViewBind, skel_model::ModelSkel};
+use crate::fpv_mesh_catalog::AttachPointBinding;
+use crate::skel_model::MeshRig;
 
-pub use xmodel_runtime::BoneCollision;
+pub use xmodel_runtime::BoneHitShape;
 
 /// A bone's place in the model's bind pose, relative to its parent.
 #[derive(Clone, Copy, Debug)]
-pub struct BoneBind {
-    pub quat: [f32; 4],
-    pub trans: [f32; 3],
+pub struct JointAttachment {
+    pub spin: [f32; 4],
+    pub shift_offset: [f32; 3],
 }
 
-impl From<BoneBind> for TagViewBind {
-    fn from(bind: BoneBind) -> Self {
-        Self {
-            quat: bind.quat,
-            trans: bind.trans,
-        }
+impl From<JointAttachment> for AttachPointBinding {
+    fn from(rest: JointAttachment) -> Self {
+        let JointAttachment { spin: quat, shift_offset } = rest;
+        Self { turn: quat, at: shift_offset }
     }
 }
 
 /// How one vertex is skinned: up to four bones and the share each one has.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct VertSkin {
-    pub bones: [u16; 4],
+pub struct CornerWeights {
+    pub joints: [u16; 4],
     pub weights: [f32; 4],
     /// The same shares as fixed-point numbers, 0 to 65535.
-    pub weight_u16: [u16; 4],
+    pub pull_u16: [u16; 4],
 }
 
-/// A first-person arm or weapon rig is a model like any other.
-pub type FpvSkel = ModelSkel;
+/// Older spelling FpvSkel still calls; the rename sweep moves it over.
+/// (A first-person arm or weapon rig is a model like any other.)
+pub use crate::skel_model::MeshRig as FpvSkel;
 
 /// Skeletons shared between callers, by model name, each with the number of
 /// callers that hold it.
 #[derive(Clone, Debug, Default)]
-pub struct SharedXModelSurfaces(pub BTreeMap<String, (Arc<ModelSkel>, usize)>);
+pub struct PooledMeshSkins(pub BTreeMap<String, (Arc<MeshRig>, usize)>);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_bind_carries_over_to_a_tag_bind_unchanged() {
-        let bind = BoneBind {
-            quat: [0.0, 0.0, 0.7, 0.7],
-            trans: [1.0, 2.0, 3.0],
+    fn a_rest_pose_moves_to_an_attach_point_as_is() {
+        let rest = JointAttachment {
+            spin: [0.0, 0.0, 0.7, 0.7],
+            shift_offset: [1.0, 2.0, 3.0],
         };
-        let tag = TagViewBind::from(bind);
-        assert_eq!((tag.quat, tag.trans), (bind.quat, bind.trans));
+        let tag = AttachPointBinding::from(rest);
+        assert_eq!((tag.turn, tag.at), (rest.spin, rest.shift_offset));
     }
 }

@@ -1,29 +1,30 @@
-//! Declaration usages: the meaning an element carries into the shader.
+//! Usage codes: which shader input an element is bound to.
 
-pub const D3DDECLUSAGE_POSITION: u8 = 0;
-pub const D3DDECLUSAGE_NORMAL: u8 = 3;
-pub const D3DDECLUSAGE_TEXCOORD: u8 = 5;
-pub const D3DDECLUSAGE_COLOR: u8 = 10;
-pub const D3DDECLUSAGE_DEPTH: u8 = 12;
+pub const VERTEX_ROLE_POSITION: u8 = 0;
+pub const VERTEX_ROLE_NORMAL: u8 = 3;
+pub const VERTEX_ROLE_UV: u8 = 5;
+pub const VERTEX_USAGE_TINT: u8 = 10;
+pub const VERTEX_ROLE_DEPTH: u8 = 12;
 
-/// A usage plus its index: `texcoord(2)` is the third texture coordinate.
+/// A usage code together with its index; `uv_semantic(2)` is the third set of
+/// texture coordinates. Ordered by usage first, then index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Semantic {
+pub struct VertexInputRole {
     pub usage: u8,
-    pub usage_index: u8,
+    pub semantic_ordinal: u8,
 }
 
-impl Semantic {
-    pub const fn new(usage: u8, usage_index: u8) -> Self {
-        Self { usage, usage_index }
+impl VertexInputRole {
+    pub const fn new(usage: u8, semantic_ordinal: u8) -> Self {
+        Self { usage, semantic_ordinal }
     }
 
-    pub const fn position(usage_index: u8) -> Self {
-        Self::new(D3DDECLUSAGE_POSITION, usage_index)
+    pub const fn position(semantic_ordinal: u8) -> Self {
+        Self::new(VERTEX_ROLE_POSITION, semantic_ordinal)
     }
 
-    pub const fn texcoord(usage_index: u8) -> Self {
-        Self::new(D3DDECLUSAGE_TEXCOORD, usage_index)
+    pub const fn uv_semantic(semantic_ordinal: u8) -> Self {
+        Self::new(VERTEX_ROLE_UV, semantic_ordinal)
     }
 }
 
@@ -32,14 +33,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn constructors_fill_the_usage() {
-        assert_eq!(Semantic::position(1), Semantic::new(D3DDECLUSAGE_POSITION, 1));
-        assert_eq!(Semantic::texcoord(3), Semantic::new(D3DDECLUSAGE_TEXCOORD, 3));
+    fn shorthands_match_new() {
+        assert_eq!(VertexInputRole::position(1), VertexInputRole::new(VERTEX_ROLE_POSITION, 1));
+        assert_eq!(VertexInputRole::uv_semantic(3), VertexInputRole::new(VERTEX_ROLE_UV, 3));
     }
 
     #[test]
-    fn semantics_sort_by_usage_then_index() {
-        assert!(Semantic::position(7) < Semantic::texcoord(0));
-        assert!(Semantic::texcoord(0) < Semantic::texcoord(1));
+    fn order_is_usage_then_index() {
+        assert!(VertexInputRole::position(7) < VertexInputRole::uv_semantic(0));
+        assert!(VertexInputRole::uv_semantic(0) < VertexInputRole::uv_semantic(1));
     }
 }

@@ -5,32 +5,32 @@ use std::collections::BTreeSet;
 /// Adds every double-quoted string in `text` to `names`, skipping the ones
 /// inside `//` and `/* */` comments. A backslash inside a string keeps the
 /// next byte from ending it. Strings that are not UTF-8 are passed over.
-pub(crate) fn collect_quoted(text: &[u8], names: &mut BTreeSet<String>) {
+pub(crate) fn collect_quoted(words: &[u8], names: &mut BTreeSet<String>) {
     let mut at = 0;
-    while at < text.len() {
-        let next = text.get(at + 1).copied();
-        match (text[at], next) {
+    while at < words.len() {
+        let next = words.get(at + 1).copied();
+        match (words[at], next) {
             (b'/', Some(b'/')) => {
-                at = text[at..]
+                at = words[at..]
                     .iter()
                     .position(|&b| b == b'\n')
-                    .map_or(text.len(), |len| at + len);
+                    .map_or(words.len(), |len| at + len);
             }
             (b'/', Some(b'*')) => {
-                let body = &text[at + 2..];
+                let body = &words[at + 2..];
                 at = body
                     .windows(2)
                     .position(|pair| pair == b"*/")
-                    .map_or(text.len(), |len| at + 2 + len + 2);
+                    .map_or(words.len(), |len| at + 2 + len + 2);
             }
             (b'"', _) => {
                 let start = at + 1;
                 let mut end = start;
-                while end < text.len() && text[end] != b'"' {
-                    end += if text[end] == b'\\' { 2 } else { 1 };
+                while end < words.len() && words[end] != b'"' {
+                    end += if words[end] == b'\\' { 2 } else { 1 };
                 }
-                let end = end.min(text.len());
-                if let Ok(name) = std::str::from_utf8(&text[start..end]) {
+                let end = end.min(words.len());
+                if let Ok(name) = std::str::from_utf8(&words[start..end]) {
                     names.insert(name.to_owned());
                 }
                 at = end + 1;
@@ -44,10 +44,10 @@ pub(crate) fn collect_quoted(text: &[u8], names: &mut BTreeSet<String>) {
 mod tests {
     use super::*;
 
-    fn names_in(text: &str) -> Vec<String> {
-        let mut names = BTreeSet::new();
-        collect_quoted(text.as_bytes(), &mut names);
-        names.into_iter().collect()
+    fn names_in(words: &str) -> Vec<String> {
+        let mut found = BTreeSet::new();
+        collect_quoted(words.as_bytes(), &mut found);
+        Vec::from_iter(found)
     }
 
     #[test]

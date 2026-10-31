@@ -1,95 +1,95 @@
 //! One argument of a pass: where a shader register or sampler gets its value.
 
-use crate::RuntimeShaderStage;
+use crate::LiveShaderStage;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum RuntimeArgumentBinding {
-    MaterialTexture {
+pub enum LiveArgumentBinding {
+    ShaderSamplerImage {
         destination: u16,
-        name_hash: u32,
+        label_digest: u32,
     },
-    CodeTexture {
+    EngineSuppliedTexture {
         destination: u16,
         index: u32,
     },
-    MaterialConstant {
-        stage: RuntimeShaderStage,
+    ShaderParameterValue {
+        stage: LiveShaderStage,
         destination: u16,
-        name_hash: u32,
+        label_digest: u32,
     },
-    LiteralConstant {
-        stage: RuntimeShaderStage,
+    InlineConstant {
+        stage: LiveShaderStage,
         destination: u16,
         words: Option<[u32; 4]>,
     },
-    CodeConstant {
-        stage: RuntimeShaderStage,
+    EngineConstant {
+        stage: LiveShaderStage,
         destination: u16,
         index: u16,
-        first_row: u8,
-        row_count: u8,
+        row_base: u8,
+        line_total: u8,
     },
     Unknown {
-        argument_type: u16,
+        kind_code: u16,
         raw: [u8; 8],
     },
 }
 
 /// Argument kind numbers; a pass lists its arguments in this order.
-pub mod mtl_arg {
-    pub const MATERIAL_VERTEX_CONST: u16 = 0;
-    pub const LITERAL_VERTEX_CONST: u16 = 1;
-    pub const MATERIAL_PIXEL_SAMPLER: u16 = 2;
-    pub const CODE_VERTEX_CONST: u16 = 3;
-    pub const CODE_PIXEL_SAMPLER: u16 = 4;
-    pub const CODE_PIXEL_CONST: u16 = 5;
-    pub const MATERIAL_PIXEL_CONST: u16 = 6;
-    pub const LITERAL_PIXEL_CONST: u16 = 7;
+pub mod arg_kind {
+    pub const SURFACE_VERTEX_CONSTANT: u16 = 0;
+    pub const INLINE_VERTEX_CONSTANT: u16 = 1;
+    pub const SURFACE_FRAGMENT_SAMPLER: u16 = 2;
+    pub const ENGINE_VERTEX_CONSTANT: u16 = 3;
+    pub const ENGINE_FRAGMENT_SAMPLER: u16 = 4;
+    pub const ENGINE_FRAGMENT_CONSTANT: u16 = 5;
+    pub const SURFACE_FRAGMENT_CONSTANT: u16 = 6;
+    pub const INLINE_FRAGMENT_CONSTANT: u16 = 7;
 }
 
-impl RuntimeArgumentBinding {
+impl LiveArgumentBinding {
     /// The kind number this argument sorts under.
-    pub fn mtl_arg_type(&self) -> u16 {
-        use RuntimeShaderStage::{Pixel, Vertex};
+    pub fn material_argument_kind(&self) -> u16 {
+        use LiveShaderStage::{Pixel, Vertex};
         match self {
-            Self::MaterialTexture { .. } => mtl_arg::MATERIAL_PIXEL_SAMPLER,
-            Self::CodeTexture { .. } => mtl_arg::CODE_PIXEL_SAMPLER,
-            Self::MaterialConstant { stage, .. } => match stage {
-                Vertex => mtl_arg::MATERIAL_VERTEX_CONST,
-                Pixel => mtl_arg::MATERIAL_PIXEL_CONST,
+            Self::ShaderSamplerImage { .. } => arg_kind::SURFACE_FRAGMENT_SAMPLER,
+            Self::EngineSuppliedTexture { .. } => arg_kind::ENGINE_FRAGMENT_SAMPLER,
+            Self::ShaderParameterValue { stage, .. } => match stage {
+                Vertex => arg_kind::SURFACE_VERTEX_CONSTANT,
+                Pixel => arg_kind::SURFACE_FRAGMENT_CONSTANT,
             },
-            Self::LiteralConstant { stage, .. } => match stage {
-                Vertex => mtl_arg::LITERAL_VERTEX_CONST,
-                Pixel => mtl_arg::LITERAL_PIXEL_CONST,
+            Self::InlineConstant { stage, .. } => match stage {
+                Vertex => arg_kind::INLINE_VERTEX_CONSTANT,
+                Pixel => arg_kind::INLINE_FRAGMENT_CONSTANT,
             },
-            Self::CodeConstant { stage, .. } => match stage {
-                Vertex => mtl_arg::CODE_VERTEX_CONST,
-                Pixel => mtl_arg::CODE_PIXEL_CONST,
+            Self::EngineConstant { stage, .. } => match stage {
+                Vertex => arg_kind::ENGINE_VERTEX_CONSTANT,
+                Pixel => arg_kind::ENGINE_FRAGMENT_CONSTANT,
             },
-            Self::Unknown { argument_type, .. } => *argument_type,
+            LiveArgumentBinding::Unknown { kind_code: kind, .. } => *kind,
         }
     }
 
     fn destination(&self) -> Option<u16> {
         match self {
-            Self::MaterialTexture { destination, .. }
-            | Self::CodeTexture { destination, .. }
-            | Self::MaterialConstant { destination, .. }
-            | Self::LiteralConstant { destination, .. }
-            | Self::CodeConstant { destination, .. } => Some(*destination),
+            Self::ShaderSamplerImage { destination: reg, .. }
+            | Self::EngineSuppliedTexture { destination: reg, .. }
+            | Self::ShaderParameterValue { destination: reg, .. }
+            | Self::InlineConstant { destination: reg, .. }
+            | Self::EngineConstant { destination: reg, .. } => Some(*reg),
             Self::Unknown { .. } => None,
         }
     }
 
     /// Kind first, then the material name for material-fed arguments and the
     /// register for the rest.
-    pub fn runtime_sort_key(&self) -> (u16, u32) {
+    pub fn draw_order_pair(&self) -> (u16, u32) {
         let tie_break = match self {
-            Self::MaterialConstant { name_hash, .. } | Self::MaterialTexture { name_hash, .. } => {
-                *name_hash
+            Self::ShaderParameterValue { label_digest, .. } | Self::ShaderSamplerImage { label_digest, .. } => {
+                *label_digest
             }
             _ => u32::from(self.destination().unwrap_or(u16::MAX)),
         };
-        (self.mtl_arg_type(), tie_break)
+        (self.material_argument_kind(), tie_break)
     }
 }

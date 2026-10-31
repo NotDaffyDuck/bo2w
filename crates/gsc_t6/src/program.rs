@@ -24,11 +24,11 @@ pub enum CallKind {
 
 impl CallKind {
     pub fn method(self) -> bool {
-        matches!(self, CallKind::Method | CallKind::MethodThread)
+        self == CallKind::Method || self == CallKind::MethodThread
     }
 
     pub fn thread(self) -> bool {
-        matches!(self, CallKind::Thread | CallKind::MethodThread)
+        self == CallKind::Thread || self == CallKind::MethodThread
     }
 }
 
@@ -59,7 +59,7 @@ pub enum Op {
     Return,
     Undefined,
     Int(i32),
-    Float(f32),
+    Real(f32),
     Str(Str),
     IStr(Str),
     /// Index into [`Program::vectors`].
@@ -105,7 +105,7 @@ pub enum Op {
     CastObject,
     CastBool,
     Not,
-    Complement,
+    BitNot,
     JumpFalse(u32),
     JumpTrue(u32),
     JumpFalseExpr(u32),
@@ -149,7 +149,7 @@ pub struct SwitchTable {
     pub ints: FxHashMap<i32, u32>,
     pub strs: FxHashMap<Str, u32>,
     pub default: Option<u32>,
-    pub end: u32,
+    pub end_addr: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -188,7 +188,7 @@ pub struct Program {
     pub builtin_index: FxHashMap<(Str, bool), u32>,
     /// Animation id -> (tree, animation).
     pub anims: Vec<(Str, Str)>,
-    anim_index: FxHashMap<(Str, Str), u32>,
+    clip_ordinal: FxHashMap<(Str, Str), u32>,
     pub trees: Vec<Str>,
     tree_index: FxHashMap<Str, u32>,
     pub vectors: Vec<[f32; 3]>,
@@ -199,9 +199,9 @@ pub struct Program {
 
 /// Normalize a script path: lower case, `/`, no `.gsc`.
 pub fn normalize(name: &str) -> String {
-    let s = name.replace('\\', "/").to_ascii_lowercase();
-    s.strip_suffix(".gsc")
-        .map_or_else(|| s.clone(), str::to_owned)
+    let lowered: String = name.chars().map(|c| if c == '\\' { '/' } else { c.to_ascii_lowercase() }).collect();
+    lowered.strip_suffix(".gsc")
+        .map_or_else(|| lowered.clone(), str::to_owned)
 }
 
 impl Program {
@@ -278,10 +278,25 @@ impl Program {
     }
 
     /// A function by script path and name.
-    pub fn find(&self, strings: &Strings, script: &str, name: &str) -> Option<u32> {
-        let si = *self.script_index.get(&normalize(script))?;
-        let n = strings.find(&name.to_ascii_lowercase())?;
+    pub fn find(&self, pool: &Strings, script_path: &str, func_name: &str) -> Option<u32> {
+        let si = *self.script_index.get(&normalize(script_path))?;
+        let n = pool.find(&func_name.to_ascii_lowercase())?;
         self.function_index.get(&(si, n)).copied()
+    }
+
+    /// Does a function of `script` call (or take a pointer to) function `fi`?
+    pub fn script_refers_to(&self, file: &str, fi: u32) -> bool {
+        let Some(&si) = self.script_index.get(&normalize(file)) else {
+            return false;
+        };
+        self.scripts[si as usize].functions.iter().any(|&f| {
+            self.functions[f as usize].code.iter().any(|op| match *op {
+                Op::Call(site, _) | Op::FuncRef(site) => {
+                    self.sites[site as usize].callee == FuncRef::Script(fi)
+                }
+                _ => false,
+            })
+        })
     }
 
     fn builtin(&mut self, name: Str, method: bool) -> u32 {
@@ -294,7 +309,7 @@ impl Program {
         id
     }
 
-    fn resolve(
+    fn resolve_calls(
         &mut self,
         script: u32,
         imp: &crate::object::Import,
@@ -382,7 +397,7 @@ impl Program {
                     op::CAST_FIELD_OBJECT => Op::CastObject,
                     op::CAST_BOOL => Op::CastBool,
                     op::BOOL_NOT => Op::Not,
-                    op::BOOL_COMPLEMENT => Op::Complement,
+                    op::BOOL_COMPLEMENT => Op::BitNot,
                     op::INC => Op::Inc,
                     op::DEC => Op::Dec,
                     op::BIT_OR => Op::Bin(BinOp::Or),
@@ -448,7 +463,7 @@ impl Program {
                     }
                     c => Op::Bad(c),
                 },
-                Insn::Float(f) => Op::Float(*f),
+                Insn::Real(f) => Op::Real(*f),
                 Insn::Vector(v) => {
                     self.vectors.push(*v);
                     Op::Vector(self.vectors.len() as u32 - 1)
@@ -479,7 +494,7 @@ impl Program {
                         op::SCRIPT_METHOD_THREAD_CALL => CallKind::MethodThread,
                         _ => CallKind::Func,
                     };
-                    let callee = self.resolve(script, imp, kind.method(), strings);
+                    let callee = self.resolve_calls(script, imp, kind.method(), strings);
                     let site = self.site(callee);
                     if *c == op::GET_FUNCTION {
                         Op::FuncRef(site)
@@ -502,7 +517,7 @@ impl Program {
                         ints: FxHashMap::default(),
                         strs: FxHashMap::default(),
                         default: None,
-                        end: to(*end),
+                        end_addr: to(*end),
                     };
                     for c in cases {
                         let t = to(c.target);
@@ -510,7 +525,7 @@ impl Program {
                             CaseValue::Int(i) => {
                                 table.ints.entry(*i).or_insert(t);
                             }
-                            CaseValue::Str(s) => {
+                            CaseValue::Quoted(s) => {
                                 table.strs.entry(strings.intern(s)).or_insert(t);
                             }
                             CaseValue::Default => table.default = Some(t),
@@ -522,12 +537,12 @@ impl Program {
                 Insn::EndSwitch { end } => Op::Jump(to(*end)),
                 Insn::Anim { tree, anim } => {
                     let key = (strings.intern(tree), strings.intern(anim));
-                    let id = match self.anim_index.get(&key) {
+                    let id = match self.clip_ordinal.get(&key) {
                         Some(&id) => id,
                         None => {
                             let id = self.anims.len() as u32;
                             self.anims.push(key);
-                            self.anim_index.insert(key, id);
+                            self.clip_ordinal.insert(key, id);
                             id
                         }
                     };

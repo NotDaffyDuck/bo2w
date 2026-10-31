@@ -1,17 +1,17 @@
 [package]
 name = "asset_model"
 version = "0.1.0"
+description = "Black Ops II models and what the game builds from them: rigs, view meshes, soldier bodies, world guns and projectiles."
 edition.workspace = true
-license.workspace = true
-description = "Models and what is built from them: skeletons, meshes, first-person views, bodies and projectiles."
-
-[dependencies]
-asset_core.workspace = true
-asset_material.workspace = true
-asset_t6.workspace = true
-bevy.workspace = true
-lighting_t6.workspace = true
-xmodel_runtime.workspace = true
+publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+bevy.workspace = true
+asset_core = { path = "../asset_core" }
+asset_material = { path = "../asset_material" }
+asset_t6 = { path = "../asset_t6" }
+lighting_t6 = { path = "../lighting_t6" }
+xmodel_runtime = { path = "../xmodel_runtime" }

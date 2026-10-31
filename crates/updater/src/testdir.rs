@@ -2,14 +2,15 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering::Relaxed;
 
 pub struct TestDir(PathBuf);
 
 impl TestDir {
     pub fn new(tag: &str) -> Self {
         static COUNT: AtomicU32 = AtomicU32::new(0);
-        let number = COUNT.fetch_add(1, Ordering::Relaxed);
+        let number = COUNT.fetch_add(1, Relaxed);
         let path = std::env::temp_dir().join(format!(
             "bo2mp-updater-test-{}-{number}-{tag}",
             std::process::id()
@@ -26,20 +27,17 @@ impl TestDir {
         self.0.join(name)
     }
 
-    /// The names of everything directly inside, in order.
-    pub fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(&self.0)
+    /// The entry_names of everything directly inside, in order.
+    pub fn entry_names(&self) -> Vec<String> {
+        let mut listed: Vec<String> = fs::read_dir(&self.0)
             .expect("the folder can be listed")
             .map(|entry| {
-                entry
-                    .expect("an entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
+                let name = entry.expect("an entry").file_name();
+                name.to_string_lossy().into_owned()
             })
             .collect();
-        names.sort();
-        names
+        listed.sort();
+        listed
     }
 }
 

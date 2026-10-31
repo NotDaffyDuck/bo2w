@@ -2,7 +2,7 @@
 name = "weapon_t6"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
+publish.workspace = true
 description = "BO2 (T6) weapon brain: BO2's weapon states, per-weapon player data and PM_Weapon tick order, rebuilt in Rust from facts."
 
 [dependencies]

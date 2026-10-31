@@ -22,7 +22,7 @@ pub struct Matcher<'a> {
     p: &'a [u8],
     level: usize,
     caps: [(usize, isize); MAX_CAPTURES],
-    depth: usize,
+    nesting: usize,
     pub error: Option<String>,
 }
 
@@ -50,14 +50,14 @@ impl<'a> Matcher<'a> {
             p,
             level: 0,
             caps: [(0, 0); MAX_CAPTURES],
-            depth: 0,
+            nesting: 0,
             error: None,
         }
     }
 
-    fn fail(&mut self, msg: &str) -> Option<usize> {
+    fn bail_out(&mut self, why: &str) -> Option<usize> {
         if self.error.is_none() {
-            self.error = Some(msg.to_owned());
+            self.error = Some(why.to_owned());
         }
         None
     }
@@ -68,7 +68,7 @@ impl<'a> Matcher<'a> {
         p += 1;
         if c == b'%' {
             if p >= self.p.len() {
-                return self.fail("malformed pattern (ends with '%')");
+                return self.bail_out("malformed pattern (ends with '%')");
             }
             return Some(p + 1);
         }
@@ -79,7 +79,7 @@ impl<'a> Matcher<'a> {
             // The first character is always part of the set (so `[]]`).
             loop {
                 if p >= self.p.len() {
-                    return self.fail("malformed pattern (missing ']')");
+                    return self.bail_out("malformed pattern (missing ']')");
                 }
                 let cc = self.p[p];
                 p += 1;
@@ -90,7 +90,7 @@ impl<'a> Matcher<'a> {
                     return Some(p + 1);
                 }
                 if p >= self.p.len() {
-                    return self.fail("malformed pattern (missing ']')");
+                    return self.bail_out("malformed pattern (missing ']')");
                 }
             }
         }
@@ -136,13 +136,13 @@ impl<'a> Matcher<'a> {
     /// Match the pattern from `p` against the subject from `s`; the end of
     /// the match.
     pub fn do_match(&mut self, s: usize, p: usize) -> Option<usize> {
-        self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            self.depth -= 1;
-            return self.fail("pattern too complex");
+        self.nesting += 1;
+        if self.nesting > MAX_DEPTH {
+            self.nesting -= 1;
+            return self.bail_out("pattern too complex");
         }
         let r = self.match_here(s, p);
-        self.depth -= 1;
+        self.nesting -= 1;
         r
     }
 
@@ -174,7 +174,7 @@ impl<'a> Matcher<'a> {
                     b'f' => {
                         p += 2;
                         if self.p.get(p) != Some(&b'[') {
-                            return self.fail("missing '[' after '%f' in pattern");
+                            return self.bail_out("missing '[' after '%f' in pattern");
                         }
                         let ep = self.class_end(p)?;
                         let prev = if s == 0 { 0 } else { self.s[s - 1] };
@@ -250,7 +250,7 @@ impl<'a> Matcher<'a> {
 
     fn start_capture(&mut self, s: usize, p: usize, what: isize) -> Option<usize> {
         if self.level >= MAX_CAPTURES {
-            return self.fail("too many captures");
+            return self.bail_out("too many captures");
         }
         self.caps[self.level] = (s, what);
         self.level += 1;
@@ -263,7 +263,7 @@ impl<'a> Matcher<'a> {
 
     fn end_capture(&mut self, s: usize, p: usize) -> Option<usize> {
         let Some(l) = (0..self.level).rev().find(|&i| self.caps[i].1 == CAP_UNFINISHED) else {
-            return self.fail("invalid pattern capture");
+            return self.bail_out("invalid pattern capture");
         };
         self.caps[l].1 = (s - self.caps[l].0) as isize;
         let r = self.do_match(s, p);
@@ -275,22 +275,22 @@ impl<'a> Matcher<'a> {
 
     fn match_balance(&mut self, s: usize, p: usize) -> Option<usize> {
         if p + 1 >= self.p.len() {
-            return self.fail("unbalanced pattern");
+            return self.bail_out("unbalanced pattern");
         }
         if s >= self.s.len() || self.s[s] != self.p[p] {
             return None;
         }
         let (b, e) = (self.p[p], self.p[p + 1]);
-        let mut depth = 1;
+        let mut open = 1;
         for i in s + 1..self.s.len() {
             let c = self.s[i];
             if c == e {
-                depth -= 1;
-                if depth == 0 {
+                open -= 1;
+                if open == 0 {
                     return Some(i + 1);
                 }
             } else if c == b {
-                depth += 1;
+                open += 1;
             }
         }
         None
@@ -298,11 +298,11 @@ impl<'a> Matcher<'a> {
 
     fn match_capture(&mut self, s: usize, d: u8) -> Option<usize> {
         if d < b'1' {
-            return self.fail("invalid capture index");
+            return self.bail_out("invalid capture index");
         }
         let l = usize::from(d - b'1');
         if l >= self.level || self.caps[l].1 == CAP_UNFINISHED {
-            return self.fail("invalid capture index");
+            return self.bail_out("invalid capture index");
         }
         let (start, len) = self.caps[l];
         let len = len.max(0) as usize;
@@ -315,7 +315,7 @@ impl<'a> Matcher<'a> {
 
     /// Capture `i` of a match from `s` to `e` (no captures: the whole
     /// match is capture 0).
-    pub fn capture(&self, i: usize, s: usize, e: usize) -> Capture {
+    pub fn capture_span(&self, i: usize, s: usize, e: usize) -> Capture {
         if i >= self.level {
             return Capture::Span(s, e);
         }
@@ -330,17 +330,17 @@ impl<'a> Matcher<'a> {
     /// Every capture of a match (the whole match if it has none).
     pub fn captures(&self, s: usize, e: usize) -> Vec<Capture> {
         let n = self.level.max(1);
-        (0..n).map(|i| self.capture(i, s, e)).collect()
+        (0..n).map(|i| self.capture_span(i, s, e)).collect()
     }
 
     /// Only the pattern's own captures (`string.find`'s extra results).
     pub fn own_captures(&self, s: usize, e: usize) -> Vec<Capture> {
-        (0..self.level).map(|i| self.capture(i, s, e)).collect()
+        (0..self.level).map(|i| self.capture_span(i, s, e)).collect()
     }
 
-    pub fn reset(&mut self) {
+    pub fn rewind(&mut self) {
         self.level = 0;
-        self.depth = 0;
+        self.nesting = 0;
     }
 }
 
@@ -351,7 +351,7 @@ pub fn find<'a>(s: &'a [u8], p: &'a [u8], init: usize) -> Result<Option<(usize, 
     let mut m = Matcher::new(s, p);
     let mut s1 = init;
     loop {
-        m.reset();
+        m.rewind();
         if let Some(e) = m.do_match(s1, p0) {
             return Ok(Some((s1, e, m)));
         }

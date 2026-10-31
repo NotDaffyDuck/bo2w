@@ -32,8 +32,7 @@ mod temp;
 mod tree;
 
 pub use contents::{
-    LeafList, angles_to_axis, box_leafnums, box_on_plane_side, point_contents, point_leafnum,
-    transformed_point_contents,
+    LeafList, angles_to_axis, box_leafnums, box_on_plane_side, point_contents, transformed_point_contents,
 };
 pub use mesh::{closest_point_on_tri, does_capsule_intersect_triangle, segment_distance_sq};
 pub use sectors::{
@@ -41,10 +40,10 @@ pub use sectors::{
 };
 pub use sight::SightPrim;
 pub use staticmodels::{
-    XMODEL_TRACE_SKIN, XMODEL_TRI_EPSILON, XModelColl, XModelCollSurf, XModelCollTri, inv_scaled_axis,
+    XMODEL_TRACE_SKIN, XMODEL_TRI_EPSILON, XModelColl, XModelCollSurf, ModelHitTriangle, reverse_scaled_basis,
 };
 pub use static_store::{StaticHit, StaticModelStore, StaticWorld, StoredCollSurf, StoredStaticModel, StoredXModel};
-pub use store::{ClipStore, StoreError, StoredBrush, StoredLeafBrushNode};
+pub use store::{ClipRepository, StoreError, StoredBrush, StoredLeafBrushNode};
 pub use temp::TempModels;
 pub use tree::{box_brushes, intersect_extents_aabb};
 
@@ -61,14 +60,14 @@ pub const POSITION_TEST_MAX_LEAFS: usize = 1024;
 /// `cplane_s`: a plane, which axis it lies on (3 for none) and the signs of
 /// its normal.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct CPlane {
+pub struct PlaneEquation {
     pub normal: [f32; 3],
     pub dist: f32,
     pub kind: u8,
     pub signbits: u8,
 }
 
-impl CPlane {
+impl PlaneEquation {
     /// A plane with its axis and sign bits worked out.
     #[must_use]
     pub fn new(normal: [f32; 3], dist: f32) -> Self {
@@ -100,7 +99,7 @@ impl CPlane {
 /// `-1 - child`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Node {
-    pub plane: CPlane,
+    pub plane: PlaneEquation,
     pub children: [i16; 2],
 }
 
@@ -108,12 +107,12 @@ pub struct Node {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Leaf {
     pub first_coll_aabb: u16,
-    pub coll_aabb_count: u16,
-    pub brush_contents: u32,
+    pub collision_box_total: u16,
+    pub solid_content_flags: u32,
     pub terrain_contents: u32,
     pub mins: [f32; 3],
     pub maxs: [f32; 3],
-    pub leaf_brush_node: i32,
+    pub brush_leaf_link: i32,
     pub cluster: i16,
 }
 
@@ -124,7 +123,7 @@ pub struct Leaf {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LeafBrushNode<'a> {
     pub axis: u8,
-    pub leaf_brush_count: i16,
+    pub leaf_solid_total: i16,
     pub contents: u32,
     pub brushes: &'a [u16],
     pub dist: f32,
@@ -138,7 +137,7 @@ pub struct LeafBrushNode<'a> {
 pub struct AabbTree {
     pub origin: [f32; 3],
     pub material_index: u16,
-    pub child_count: u16,
+    pub sub_element_total: u16,
     pub half_size: [f32; 3],
     pub u: u32,
 }
@@ -146,15 +145,15 @@ pub struct AabbTree {
 /// `CollisionPartition`: a run of mesh triangles.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Partition {
-    pub tri_count: u8,
-    pub first_tri: i32,
+    pub tri_tally: u8,
+    pub leading_triangle: i32,
 }
 
 /// `ClipMaterial`'s flags.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ClipMaterial {
     pub surface_flags: u32,
-    pub content_flags: u32,
+    pub pack_presence_bits: u32,
 }
 
 /// `cmodel_t`: a brush model and the leaf that holds it.
@@ -176,7 +175,7 @@ pub struct ClipMap<'a> {
     pub materials: &'a [ClipMaterial],
     pub aabb_trees: &'a [AabbTree],
     pub partitions: &'a [Partition],
-    pub verts: &'a [[f32; 3]],
+    pub vertex_points: &'a [[f32; 3]],
     pub tri_indices: &'a [[u16; 3]],
     /// Three bits a triangle, one an edge: a sphere stopped by that edge
     /// may stand on it.
@@ -217,7 +216,7 @@ impl ClipMap<'_> {
     /// `CM_ClipHandleToModel`: a brush model, or the temporary box model for
     /// either temporary handle.
     #[must_use]
-    pub fn brush_model(&self, model: u32) -> Option<&CModel> {
+    pub fn solid_model(&self, model: u32) -> Option<&CModel> {
         match self.cmodels.get(model as usize) {
             None if model == CAPSULE_MODEL_HANDLE || model == TEMP_BRUSH_MODEL_HANDLE => Some(&self.temp.box_model),
             found => found,
@@ -231,61 +230,61 @@ impl ClipMap<'_> {
     pub fn trace(
         &self,
         check: &mut CheckCount<'_>,
-        trace: &mut Trace,
-        start: [f32; 3],
+        hit: &mut Trace,
+        from_pt: [f32; 3],
         end: [f32; 3],
         mins: [f32; 3],
         maxs: [f32; 3],
         model: u32,
-        contents: u32,
+        solid_bits: u32,
     ) {
-        let mut tw = TraceWork::new(start, end, mins, maxs, contents);
+        let mut tw = TraceWork::new(from_pt, end, mins, maxs, solid_bits);
         check.global = check.global.wrapping_add(1);
-        let old_sflags = trace.sflags;
-        let old_fraction = trace.fraction;
-        trace.sflags = u32::MAX;
+        let old_sflags = hit.sflags;
+        let old_fraction = hit.fraction;
+        hit.sflags = u32::MAX;
         if tw.is_position_test() {
             tw.is_point = false;
             if model == 0 {
-                contents::position_test(self, check, &tw, trace);
+                contents::position_test(self, check, &tw, hit);
             } else if model == CAPSULE_MODEL_HANDLE {
-                if self.temp.box_contents & contents != 0 {
-                    temp::test_capsule_in_capsule(&tw, &self.temp, trace);
+                if self.temp.box_contents & solid_bits != 0 {
+                    temp::test_capsule_in_capsule(&tw, &self.temp, hit);
                 }
             } else if model == TEMP_BRUSH_MODEL_HANDLE {
-                if !trace.allsolid {
-                    temp::test_in_temp_brush(&tw, &self.temp, trace);
+                if !hit.fully_embedded {
+                    temp::test_in_temp_brush(&tw, &self.temp, hit);
                 }
-            } else if let Some(cm) = self.brush_model(model) {
+            } else if let Some(cm) = self.solid_model(model) {
                 let leaf = &cm.leaf;
-                if !trace.allsolid
-                    && (leaf.brush_contents & contents == 0
-                        || !tree::test_in_leaf_brush_node(self, &tw, leaf, trace))
-                    && leaf.terrain_contents & contents != 0
+                if !hit.fully_embedded
+                    && (leaf.solid_content_flags & solid_bits == 0
+                        || !tree::test_in_leaf_brush_node(self, &tw, leaf, hit))
+                    && leaf.terrain_contents & solid_bits != 0
                 {
-                    mesh::mesh_test_in_leaf(self, check, &tw, leaf, trace);
+                    mesh::mesh_test_in_leaf(self, check, &tw, leaf, hit);
                 }
             }
         } else if model == 0 {
-            let s = tw.extents.start;
-            let e = tw.extents.end;
+            let s = tw.extents.from;
+            let e = tw.extents.to;
             let p1 = [s[0], s[1], s[2], 0.0];
-            let p2 = [e[0], e[1], e[2], trace.fraction];
-            tree::trace_through_tree(self, check, &tw, 0, p1, p2, trace);
+            let p2 = [e[0], e[1], e[2], hit.fraction];
+            tree::trace_through_tree(self, check, &tw, 0, p1, p2, hit);
         } else if model == CAPSULE_MODEL_HANDLE {
-            if self.temp.box_contents & contents != 0 {
-                temp::trace_capsule_through_capsule(&tw, &self.temp, trace);
+            if self.temp.box_contents & solid_bits != 0 {
+                temp::trace_capsule_through_capsule(&tw, &self.temp, hit);
             }
         } else if model == TEMP_BRUSH_MODEL_HANDLE {
-            temp::trace_through_temp_brush(&tw, &self.temp, trace);
-        } else if let Some(cm) = self.brush_model(model) {
-            tree::trace_through_leaf(self, check, &tw, &cm.leaf, trace);
+            temp::trace_through_temp_brush(&tw, &self.temp, hit);
+        } else if let Some(cm) = self.solid_model(model) {
+            tree::trace_through_leaf(self, check, &tw, &cm.leaf, hit);
         }
-        if !trace.walkable && !trace.startsolid {
-            trace.walkable = 0.7 <= trace.normal[2];
+        if !hit.walkable && !hit.starts_inside {
+            hit.walkable = 0.7 <= hit.normal[2];
         }
-        if !(trace.fraction < old_fraction) {
-            trace.sflags = old_sflags;
+        if !(hit.fraction < old_fraction) {
+            hit.sflags = old_sflags;
         }
     }
 
@@ -295,28 +294,28 @@ impl ClipMap<'_> {
     pub fn box_trace(
         &self,
         check: &mut CheckCount<'_>,
-        start: [f32; 3],
+        from_pt: [f32; 3],
         end: [f32; 3],
         mins: [f32; 3],
         maxs: [f32; 3],
         model: u32,
-        contents: u32,
+        solid_bits: u32,
     ) -> Trace {
         let mut trace = Trace {
             fraction: 1.0,
             bone_index: 0xfe,
             ..Trace::default()
         };
-        self.trace(check, &mut trace, start, end, mins, maxs, model, contents);
+        self.trace(check, &mut trace, from_pt, end, mins, maxs, model, solid_bits);
         trace
     }
 
     pub(crate) fn tri_verts(&self, tri: usize) -> [[f32; 3]; 3] {
         let [a, b, c] = self.tri_indices[tri];
         [
-            self.verts[a as usize],
-            self.verts[b as usize],
-            self.verts[c as usize],
+            self.vertex_points[a as usize],
+            self.vertex_points[b as usize],
+            self.vertex_points[c as usize],
         ]
     }
 
@@ -330,15 +329,15 @@ pub(crate) fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 }
 
 pub(crate) fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    core::array::from_fn(|axis| a[axis] - b[axis])
 }
 
 pub(crate) fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+    core::array::from_fn(|axis| a[axis] + b[axis])
 }
 
-pub(crate) fn scale(a: [f32; 3], s: f32) -> [f32; 3] {
-    [a[0] * s, a[1] * s, a[2] * s]
+pub(crate) fn scale(a: [f32; 3], by: f32) -> [f32; 3] {
+    a.map(|component| component * by)
 }
 
 pub(crate) fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -349,12 +348,18 @@ pub(crate) fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// A vector split into its direction and its length.
+pub(crate) struct Normalized {
+    pub unit: [f32; 3],
+    pub length: f32,
+}
+
 /// `Vec3NormalizeTo`: the unit vector and the length (a zero vector stays
 /// zero).
-pub(crate) fn normalize_to(v: [f32; 3]) -> ([f32; 3], f32) {
+pub(crate) fn unit_and_length(v: [f32; 3]) -> Normalized {
     let len = libm::sqrtf(dot(v, v));
     let div = if 0.0 <= -len { 1.0 } else { len };
-    (scale(v, 1.0 / div), len)
+    Normalized { unit: scale(v, 1.0 / div), length: len }
 }
 
 #[cfg(test)]

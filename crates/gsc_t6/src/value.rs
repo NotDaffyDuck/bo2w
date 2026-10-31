@@ -7,10 +7,10 @@
 //! own array functions (`arrayremovevalue`, `arrayinsert`, ...) change the
 //! shared object in place, which scripts rely on. Structs,
 //! entities and the `level`/`anim` objects are references into the VM's
-//! object table (`ObjRef`, with a generation so a deleted entity reads as
+//! object table (`ObjRef`, with a stamp so a deleted entity reads as
 //! undefined).
 
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync;
 
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
@@ -22,8 +22,8 @@ pub struct Str(pub u32);
 /// The string table. Every id stays valid for the VM's life.
 #[derive(Default, Debug)]
 pub struct Strings {
-    list: Vec<Arc<str>>,
-    map: FxHashMap<Arc<str>, Str>,
+    list: Vec<sync::Arc<str>>,
+    map: FxHashMap<sync::Arc<str>, Str>,
 }
 
 impl Strings {
@@ -32,18 +32,18 @@ impl Strings {
             return id;
         }
         let id = Str(self.list.len() as u32);
-        let rc: Arc<str> = Arc::from(s);
+        let rc: sync::Arc<str> = sync::Arc::from(s);
         self.list.push(rc.clone());
         self.map.insert(rc, id);
         id
     }
 
-    pub fn find(&self, s: &str) -> Option<Str> {
-        self.map.get(s).copied()
+    pub fn find(&self, text: &str) -> Option<Str> {
+        self.map.get(text).copied()
     }
 
-    pub fn get(&self, id: Str) -> &str {
-        self.list.get(id.0 as usize).map_or("", |s| s)
+    pub fn get(&self, handle: Str) -> &str {
+        self.list.get(handle.0 as usize).map_or("", |s| s)
     }
 
     pub fn len(&self) -> usize {
@@ -80,18 +80,22 @@ pub enum Key {
 }
 
 impl Key {
-    pub fn value(self) -> Value {
+    pub fn value(self) -> ScriptValue {
         match self {
-            Key::Int(i) => Value::Int(i),
-            Key::Str(s) => Value::Str(s),
-            Key::Obj(o) => Value::Object(o),
+            Key::Int(i) => ScriptValue::Int(i),
+            Key::Str(s) => ScriptValue::Str(s),
+            Key::Obj(o) => ScriptValue::Object(o),
         }
     }
 }
 
-/// Array storage: insertion order kept; iteration (`getfirstarraykey`,
-/// `getnextarraykey`, `getarraykeys`) runs newest first.
-pub type ArrayMap = IndexMap<Key, Value, FxBuildHasher>;
+/// Array storage: insertion order kept (a write to a key it has keeps its
+/// place). As in BO2's engine (Scr_FirstArrayKey / Scr_NextArrayKey walk
+/// from the oldest; Scr_AddArrayKeys and getlastarraykey start at the
+/// newest): `foreach`, `getfirstarraykey` and `getnextarraykey` run oldest
+/// first, `getarraykeys` lists newest first. (Die Rise's tower legs and
+/// Buried's sloth table wait in the order their arrays were built.)
+pub type ArrayMap = IndexMap<Key, ScriptValue, FxBuildHasher>;
 
 #[derive(Clone, Debug, Default)]
 pub struct Array {
@@ -111,72 +115,74 @@ impl Array {
         self.map.is_empty()
     }
 
-    pub fn get(&self, k: &Key) -> Option<&Value> {
-        self.map.get(k)
+    pub fn get(&self, key: &Key) -> Option<&ScriptValue> {
+        self.map.get(key)
     }
 
     /// Store; undefined removes the key (order of the rest kept).
-    pub fn set(&mut self, k: Key, v: Value) {
-        if matches!(v, Value::Undefined) {
-            self.map.shift_remove(&k);
+    pub fn set(&mut self, key: Key, val: ScriptValue) {
+        if matches!(val, ScriptValue::Undefined) {
+            self.map.shift_remove(&key);
         } else {
-            self.map.insert(k, v);
+            self.map.insert(key, val);
         }
     }
 
-    pub fn push(&mut self, v: Value) {
-        let k = Key::Int(self.map.len() as i32);
-        self.set(k, v);
+    pub fn push(&mut self, val: ScriptValue) {
+        let next_key = Key::Int(self.map.len() as i32);
+        self.set(next_key, val);
     }
 
-    /// The first key in iteration order (the newest).
+    /// The first key `foreach` visits (the oldest).
     pub fn first_key(&self) -> Option<Key> {
+        self.map.first().map(|(k, _)| *k)
+    }
+
+    /// The key `foreach` visits after `k` (the next newer one).
+    pub fn next_key(&self, k: &Key) -> Option<Key> {
+        let i = self.map.get_index_of(k)?;
+        self.map.get_index(i + 1).map(|(k, _)| *k)
+    }
+
+    /// The newest key (`getlastarraykey`).
+    pub fn last_key(&self) -> Option<Key> {
         self.map.last().map(|(k, _)| *k)
     }
 
-    /// The key after `k` in iteration order (the next older one).
-    pub fn next_key(&self, k: &Key) -> Option<Key> {
-        let i = self.map.get_index_of(k)?;
-        if i == 0 {
-            return None;
-        }
-        self.map.get_index(i - 1).map(|(k, _)| *k)
-    }
-
-    /// Keys in iteration order.
-    pub fn keys(&self) -> impl Iterator<Item = Key> + '_ {
-        self.map.keys().rev().copied()
+    /// Keys as `getarraykeys` lists them: newest first.
+    pub fn keys(&self) -> Box<dyn Iterator<Item = Key> + '_> {
+        Box::new(self.map.keys().rev().copied())
     }
 
     /// Values in index order 0..n when the array is a plain list, else in
     /// insertion order.
-    pub fn values_in_order(&self) -> impl Iterator<Item = &Value> + '_ {
+    pub fn values_in_order(&self) -> impl Iterator<Item = &ScriptValue> + '_ {
         self.map.values()
     }
 }
 
 /// A script array: shared, copied on a script write while shared.
 #[derive(Clone, Debug, Default)]
-pub struct ArrayRef(Arc<RwLock<Array>>);
+pub struct ArrayRef(sync::Arc<sync::RwLock<Array>>);
 
 impl ArrayRef {
     pub fn new(a: Array) -> Self {
-        Self(Arc::new(RwLock::new(a)))
+        Self(sync::Arc::new(sync::RwLock::new(a)))
     }
 
     /// Read it (never hold the guard across a call back into the VM).
-    pub fn read(&self) -> RwLockReadGuard<'_, Array> {
+    pub fn read(&self) -> sync::RwLockReadGuard<'_, Array> {
         self.0
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Change it in place, for everyone sharing it (the engine's array
     /// functions do this).
-    pub fn write(&self) -> RwLockWriteGuard<'_, Array> {
+    pub fn write(&self) -> sync::RwLockWriteGuard<'_, Array> {
         self.0
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// A copy of the contents.
@@ -185,12 +191,12 @@ impl ArrayRef {
     }
 
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
-        Arc::ptr_eq(&a.0, &b.0)
+        sync::Arc::ptr_eq(&a.0, &b.0)
     }
 
     /// Before a script writes: a private copy when shared.
     pub fn make_unique(&mut self) {
-        if Arc::strong_count(&self.0) > 1 {
+        if sync::Arc::strong_count(&self.0) > 1 {
             *self = Self::new(self.snapshot());
         }
     }
@@ -203,14 +209,14 @@ impl ArrayRef {
         self.read().is_empty()
     }
 
-    pub fn get(&self, k: &Key) -> Option<Value> {
-        self.read().get(k).cloned()
+    pub fn get(&self, key: &Key) -> Option<ScriptValue> {
+        self.read().get(key).cloned()
     }
 }
 
 /// A script value.
 #[derive(Clone, Debug, Default)]
-pub enum Value {
+pub enum ScriptValue {
     #[default]
     Undefined,
     Int(i32),
@@ -231,72 +237,72 @@ pub enum Value {
     Marker,
 }
 
-impl Value {
-    pub fn array(a: Array) -> Value {
-        Value::Array(ArrayRef::new(a))
+impl ScriptValue {
+    pub fn array(a: Array) -> ScriptValue {
+        ScriptValue::Array(ArrayRef::new(a))
     }
 
     pub fn is_undefined(&self) -> bool {
-        matches!(self, Value::Undefined)
+        std::mem::discriminant(self) == std::mem::discriminant(&Self::Undefined)
     }
 
     pub fn as_int(&self) -> Option<i32> {
         match *self {
-            Value::Int(i) => Some(i),
-            Value::Float(f) => Some(f as i32),
+            ScriptValue::Int(i) => Some(i),
+            ScriptValue::Float(f) => Some(f as i32),
             _ => None,
         }
     }
 
     pub fn as_float(&self) -> Option<f32> {
         match *self {
-            Value::Int(i) => Some(i as f32),
-            Value::Float(f) => Some(f),
+            ScriptValue::Int(i) => Some(i as f32),
+            ScriptValue::Float(f) => Some(f),
             _ => None,
         }
     }
 
     pub fn as_vec3(&self) -> Option<[f32; 3]> {
         match *self {
-            Value::Vec3(v) => Some(v),
+            ScriptValue::Vec3(v) => Some(v),
             _ => None,
         }
     }
 
     pub fn as_obj(&self) -> Option<ObjRef> {
         match *self {
-            Value::Object(o) => Some(o),
+            ScriptValue::Object(o) => Some(o),
             _ => None,
         }
     }
 
     pub fn as_str_id(&self) -> Option<Str> {
         match *self {
-            Value::Str(s) | Value::IStr(s) => Some(s),
+            ScriptValue::Str(s) | ScriptValue::IStr(s) => Some(s),
             _ => None,
         }
     }
 
     pub fn type_name(&self) -> &'static str {
         match self {
-            Value::Undefined => "undefined",
-            Value::Int(_) => "int",
-            Value::Float(_) => "float",
-            Value::Str(_) => "string",
-            Value::IStr(_) => "localized string",
-            Value::Hash(_) => "hash",
-            Value::Vec3(_) => "vector",
-            Value::Object(_) => "object",
-            Value::Array(_) => "array",
-            Value::Func(_) => "function",
-            Value::Anim(_) => "animation",
-            Value::AnimTree(_) => "animtree",
-            Value::Marker => "(marker)",
+            ScriptValue::Undefined => "undefined",
+            ScriptValue::Int(_) => "int",
+            ScriptValue::Float(_) => "float",
+            ScriptValue::Str(_) => "string",
+            ScriptValue::IStr(_) => "localized string",
+            ScriptValue::Hash(_) => "hash",
+            ScriptValue::Vec3(_) => "vector",
+            ScriptValue::Object(_) => "object",
+            ScriptValue::Array(_) => "array",
+            ScriptValue::Func(_) => "function",
+            ScriptValue::Anim(_) => "animation",
+            ScriptValue::AnimTree(_) => "animtree",
+            ScriptValue::Marker => "(marker)",
         }
     }
 
-    pub fn bool(b: bool) -> Value {
-        Value::Int(i32::from(b))
+    pub fn bool(b: bool) -> ScriptValue {
+        ScriptValue::Int(i32::from(b))
     }
 }
 
@@ -314,13 +320,13 @@ pub enum ObjKind {
 
 #[derive(Debug)]
 pub struct Object {
-    pub generation: u32,
-    pub alive: bool,
+    pub stamp: u32,
+    pub living: bool,
     /// Deleted this frame: no longer defined, its fields still readable
     /// until the frame's scripts are done.
     pub dying: bool,
     pub kind: ObjKind,
-    pub fields: FxHashMap<Str, Value>,
+    pub fields: FxHashMap<Str, ScriptValue>,
 }
 
 /// Format a float the way script string concatenation does (`%g`-like).

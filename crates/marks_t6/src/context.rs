@@ -2,12 +2,12 @@
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GfxMarkContext {
-    pub lmap_index: u8,
-    pub primary_light_index: u8,
-    pub reflection_probe_index: u8,
+    pub baked_light_slot_number: u8,
+    pub key_light_index: u8,
+    pub env_probe_index: u8,
     /// Top two bits are the model type (`MARK_MODEL_TYPE_*`).
     pub model_type_and_surf: u8,
-    pub model_index: u16,
+    pub mesh_slot_number: u16,
 }
 
 const _: () = assert!(core::mem::size_of::<GfxMarkContext>() == 6);
@@ -27,47 +27,47 @@ pub const MARK_MODEL_DOBJ_MODEL_MASK: u8 = 0x1f;
 
 impl GfxMarkContext {
     pub const ZERO: Self = Self {
-        lmap_index: 0,
-        primary_light_index: 0,
-        reflection_probe_index: 0,
+        baked_light_slot_number: 0,
+        key_light_index: 0,
+        env_probe_index: 0,
         model_type_and_surf: 0,
-        model_index: 0,
+        mesh_slot_number: 0,
     };
 
     /// A world brush surface's context: type 0 and modelIndex 0, as BO2's world-brush
     /// marks always are.
     #[inline]
-    pub const fn world_surface(lmap: u8, primary_light: u8, probe: u8) -> Self {
+    pub const fn world_surface(baked_light_slot: u8, dominant_light: u8, probe: u8) -> Self {
         Self {
-            lmap_index: lmap,
-            primary_light_index: primary_light,
-            reflection_probe_index: probe,
+            baked_light_slot_number: baked_light_slot,
+            key_light_index: dominant_light,
+            env_probe_index: probe,
             model_type_and_surf: MARK_MODEL_TYPE_WORLD_BRUSH,
-            model_index: 0,
+            mesh_slot_number: 0,
         }
     }
 
     /// A glass pane's context: a world mark whose modelIndex is the pane's glass index,
     /// on the same world list as world-brush marks (BO2 glass marks).
     #[inline]
-    pub const fn glass_pane(lmap: u8, primary_light: u8, probe: u8, glass_index: u16) -> Self {
+    pub const fn glass_pane(baked_light_slot: u8, dominant_light: u8, probe: u8, glass_index: u16) -> Self {
         Self {
-            model_index: glass_index,
-            ..Self::world_surface(lmap, primary_light, probe)
+            mesh_slot_number: glass_index,
+            ..Self::world_surface(baked_light_slot, dominant_light, probe)
         }
     }
 
     /// A mark on one of an entity's DObj models; it has no lightmap. The model's index
     /// (0-31) goes in the low bits of the type byte, as in BO2.
     #[inline]
-    pub const fn entity_model(entity: u16, dobj_model_index: u8) -> Self {
+    pub const fn entity_model(ent: u16, dobj_model_index: u8) -> Self {
         Self {
-            lmap_index: crate::GFX_SURFACE_LIGHTMAP_NONE,
-            primary_light_index: 0,
-            reflection_probe_index: 0,
+            baked_light_slot_number: crate::SURFACE_BAKED_LIGHT_ABSENT,
+            key_light_index: 0,
+            env_probe_index: 0,
             model_type_and_surf: MARK_MODEL_TYPE_ENTITY_MODEL
                 | (dobj_model_index & MARK_MODEL_DOBJ_MODEL_MASK),
-            model_index: entity,
+            mesh_slot_number: ent,
         }
     }
 
@@ -113,11 +113,11 @@ impl GfxMarkContext {
 
     #[inline]
     pub const fn to_bytes(self) -> [u8; 6] {
-        let m = self.model_index.to_le_bytes();
+        let m = self.mesh_slot_number.to_le_bytes();
         [
-            self.lmap_index,
-            self.primary_light_index,
-            self.reflection_probe_index,
+            self.baked_light_slot_number,
+            self.key_light_index,
+            self.env_probe_index,
             self.model_type_and_surf,
             m[0],
             m[1],
@@ -127,11 +127,11 @@ impl GfxMarkContext {
     #[inline]
     pub const fn from_bytes(b: [u8; 6]) -> Self {
         Self {
-            lmap_index: b[0],
-            primary_light_index: b[1],
-            reflection_probe_index: b[2],
+            baked_light_slot_number: b[0],
+            key_light_index: b[1],
+            env_probe_index: b[2],
             model_type_and_surf: b[3],
-            model_index: u16::from_le_bytes([b[4], b[5]]),
+            mesh_slot_number: u16::from_le_bytes([b[4], b[5]]),
         }
     }
 }
@@ -143,11 +143,11 @@ mod tests {
     #[test]
     fn six_bytes_round_trip() {
         let c = GfxMarkContext {
-            lmap_index: 3,
-            primary_light_index: 7,
-            reflection_probe_index: 9,
+            baked_light_slot_number: 3,
+            key_light_index: 7,
+            env_probe_index: 9,
             model_type_and_surf: 0x45,
-            model_index: 0x1234,
+            mesh_slot_number: 0x1234,
         };
         assert_eq!(c.to_bytes(), [3, 7, 9, 0x45, 0x34, 0x12]);
         assert_eq!(GfxMarkContext::from_bytes(c.to_bytes()), c);
@@ -188,7 +188,7 @@ mod tests {
         assert_eq!(e5.dobj_model_index(), Some(5));
         assert!(!e5.is_viewmodel() && e5.model_type() == MARK_MODEL_TYPE_ENTITY_MODEL);
         assert!(!crate::mark_contexts_equal(&e, &e5));
-        assert_eq!((e.model_index, e.lmap_index), (0x123, crate::GFX_SURFACE_LIGHTMAP_NONE));
+        assert_eq!((e.mesh_slot_number, e.baked_light_slot_number), (0x123, crate::SURFACE_BAKED_LIGHT_ABSENT));
         let b = GfxMarkContext { model_type_and_surf: MARK_MODEL_TYPE_ENTITY_BRUSH, ..w };
         assert!(!b.is_world_list() && b.uses_world_vertex());
         let v = GfxMarkContext {

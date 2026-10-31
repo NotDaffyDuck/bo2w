@@ -21,27 +21,27 @@ mod register;
 mod reliable;
 mod sample;
 mod stores;
-mod teardown;
+mod match_forget;
 mod ticker;
 mod uplink;
 mod weapon_keys;
 
-pub use frame_time::{advance_cg_frame_clock, advance_cls_realtime};
+pub use frame_time::{step_presentation_clock, advance_receiver_wall_clock};
 pub use gun_pick::{WeaponSelect, cycle_weapon_select, follow_held_weapon_select};
-pub use intake::{receive_ticks, reconcile_prediction};
+pub use intake::{ingest_host_steps, correct_forecast};
 pub use listen_arm::{
-    arm_listen_prediction, listen_prediction_needs_content, register_listen_prediction_arm,
+    enable_local_host_forecast, forecast_needs_rearm, enroll_hosted_forecast_hookup,
 };
-pub use local_step::predict_local_move;
+pub use local_step::forecast_own_move;
 pub use location_cursor::LocationCursor;
-pub use outbox::PendingClientSends;
-pub use present::publish_presented;
-pub use register::register_client_runtime;
-pub use sample::sample_client_input;
+pub use outbox::QueuedOutgoingPlayerMessages;
+pub use present::expose_shown_frame;
+pub use register::enroll_receiver_systems;
+pub use sample::poll_receiver_controls;
 pub use stores::{
-    ClientCmdTemplate, ClientPhaseTrace, ClientPredictionState, ClientReliableAck,
-    LastAdoptedSnapshot, PendingDebris, PendingPelletFx, PendingPresentedEntityEvents,
-    ReceivedTicks, ReliableControlEvent, RemoteProxyState,
+    PlayerMoveBlueprint, ReceiverStageLog, ClientGuessState, PlayerGuaranteedReceipt,
+    NewestTakenSnapshot, PendingDebris, QueuedPelletEffect, StagedShownEntityEvents,
+    ArrivedStepQueue, GuaranteedSimEvent, OtherPlayerSmootherHolder,
 };
-pub use ticker::{ClientClock, ClockTick};
-pub use uplink::send_pending_commands;
+pub use ticker::{PlayerTimeStepper, TimerStepResult};
+pub use uplink::transmit_queued_inputs;

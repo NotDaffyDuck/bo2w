@@ -1,0 +1,31 @@
+# D: knife pressed mid-swap (AN-94 -> MP7): no swing while dropping (400 ms) or raising (500 ms).
+# A fresh press once the MP7 is up swings.
+# Spawn as BO2 does: empty hands, guns given, the primary's first raise (1600 ms) marks every held gun as raised.
+msec 50
+give an94_mp
+give mp7_mp
+select an94_mp
+run 33
+expect state READY
+select mp7_mp
+run 2
+expect state DROPPING
+hold melee
+run 1
+expect state DROPPING
+release melee
+run 6
+expect state RAISING
+expect weapon mp7_mp
+run 2
+hold melee
+run 1
+expect state RAISING
+release melee
+run 7
+expect state READY
+expect weapon mp7_mp
+hold melee
+run 1
+expect state MELEE_INIT
+expect weapon mp7_mp

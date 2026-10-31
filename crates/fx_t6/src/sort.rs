@@ -40,13 +40,13 @@ pub fn runner_parent_sort_order(non_runner_sort_orders: impl IntoIterator<Item =
 /// when the existing elem stays ahead of the new one.
 #[inline]
 pub fn existing_elem_sorts_before_new(
-    existing_sort_order: u8,
+    resident_rank: u8,
     existing_dist_sq: f32,
-    new_sort_order: u8,
+    incoming_rank: u8,
     new_dist_sq: f32,
 ) -> bool {
-    if existing_sort_order != new_sort_order {
-        return existing_sort_order < new_sort_order;
+    if resident_rank != incoming_rank {
+        return resident_rank < incoming_rank;
     }
     existing_dist_sq > new_dist_sq
 }

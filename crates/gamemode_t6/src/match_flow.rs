@@ -4,21 +4,21 @@
 /// Where warm-up stands: waiting for the first player, then the prematch countdown, then over. Both waiting states
 /// carry their time so far for the snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrematchStep {
-    Waiting { elapsed_ms: u32 },
-    Starting { elapsed_ms: u32 },
+pub enum WarmupStage {
+    Waiting { spent_ms: u32 },
+    Starting { spent_ms: u32 },
     Done,
 }
 
-impl Default for PrematchStep {
+impl Default for WarmupStage {
     /// A new match is waiting, from zero.
     fn default() -> Self {
-        PrematchStep::Waiting { elapsed_ms: 0 }
+        WarmupStage::Waiting { spent_ms: 0 }
     }
 }
 
 /// The first spawns of a match use the start points (every mode except free-for-all, see [`crate::dm`]).
-pub const USE_START_SPAWNS_AT_START: bool = true;
+pub const OPENING_USES_START_SPAWNS: bool = true;
 
 /// Class name of the spot the camera sits at for the end-of-match screen.
-pub const MP_GLOBAL_INTERMISSION: &str = "mp_global_intermission";
+pub const INTERLUDE_STATE_KEY: &str = "mp_global_intermission";

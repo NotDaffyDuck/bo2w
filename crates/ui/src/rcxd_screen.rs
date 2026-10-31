@@ -9,12 +9,13 @@
 //! or left side, or a blur at a random place.
 
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
-use frame::ClientSet;
-use net::{LocalPresentClient, PresentedSnapshot};
+use frame::ClientStep;
+use net::{HostViewClient, ShownWorldFrame};
 use std::collections::HashMap;
 
-use crate::layers::{UiLayer, UiLayerVisibility};
+use crate::{MainWindow, ScreenBox};
+use crate::lui_hud::PictureCache;
+use crate::tiers::{OverlayTier, OverlayStackShown};
 
 #[derive(Component)]
 struct RcxdScreenNode;
@@ -116,7 +117,7 @@ struct State {
     /// it fades out), per menu, and a dice.
     random_at: HashMap<bool, (f32, f32)>,
     dice: u32,
-    pictures: HashMap<&'static str, Handle<Image>>,
+    pictures: PictureCache,
 }
 
 /// The item's states from "in" (menus: `true` = fullscreen_dust, whose
@@ -145,12 +146,12 @@ fn steps(part: Part, dust: bool, random: (f32, f32)) -> Vec<(Look, f64)> {
 fn update(
     mut commands: Commands,
     nodes: Query<Entity, With<RcxdScreenNode>>,
-    window: Query<&Window, With<PrimaryWindow>>,
-    presented: Option<Res<PresentedSnapshot>>,
-    local: Option<Res<LocalPresentClient>>,
+    window: MainWindow,
+    presented: Option<Res<ShownWorldFrame>>,
+    local: Option<Res<HostViewClient>>,
     icons: Option<Res<assets::T6HudIcons>>,
     time: Res<Time>,
-    mut images: ResMut<Assets<Image>>,
+    mut pics: ResMut<Assets<Image>>,
     mut st: Local<State>,
 ) {
     for e in &nodes {
@@ -197,7 +198,7 @@ fn update(
             st.random_at.insert(key.0, (x, y));
         }
     }
-    let Ok(win) = window.single() else { return };
+    let Some(win) = window.shown() else { return };
     if st.tracks.is_empty() {
         return;
     }
@@ -205,8 +206,8 @@ fn update(
         && let Some(icons) = icons.as_deref()
     {
         for name in ["fullscreen_dirt_bottom", "fullscreen_dirt_bottom_b", "fullscreen_dirt_right", "fullscreen_dirt_left"] {
-            if let Some((_, image)) = icons.0.iter().find(|(n, _)| n == name) {
-                st.pictures.insert(name, images.add((**image).clone()));
+            if let Some(image) = crate::hud_picture(icons, name) {
+                st.pictures.keep(name.to_owned(), &pics.add((**image).clone()));
             }
         }
     }
@@ -217,34 +218,27 @@ fn update(
         for (i, part) in order.iter().enumerate() {
             let Some(track) = st.tracks.get(&(dust, *part)) else { continue };
             let look = track.at(now);
-            let Some(handle) = st.pictures.get(part.picture()) else { continue };
+            let Some(art) = st.pictures.kept(part.picture()) else { continue };
             if look.alpha <= 0.0 {
                 continue;
             }
             let [x, y, w, h] = look.rect;
             commands.spawn((
                 RcxdScreenNode,
-                UiLayer::Hud,
-                UiLayerVisibility,
-                ImageNode::new(handle.clone())
+                OverlayTier::Hud,
+                OverlayStackShown,
+                ImageNode::new(art)
                     .with_color(Color::srgba(TINT[0], TINT[1], TINT[2], look.alpha))
                     .with_mode(bevy::ui::widget::NodeImageMode::Stretch),
                 ZIndex(-2200 + i as i32 + if dust { 10 } else { 0 }),
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(x * kx),
-                    top: Val::Px(y * ky),
-                    width: Val::Px(w * kx),
-                    height: Val::Px(h * ky),
-                    ..default()
-                },
+                ScreenBox { left_px: x * kx, top_px: y * ky, width_px: w * kx, height_px: h * ky }.node(),
             ));
         }
     }
 }
 
-pub(crate) fn register(app: &mut App) {
-    app.add_systems(Update, update.in_set(ClientSet::Ui));
+pub(crate) fn register(host: &mut App) {
+    host.add_systems(Update, update.in_set(ClientStep::Ui));
 }
 
 #[cfg(test)]

@@ -1,35 +1,39 @@
-pub mod combat;
-pub mod drawsurf;
-pub mod entity_marks;
-pub mod fire_weapon_fx;
+//! Effects rendering: host-side effect state, per-frame plans and the plugin that wires
+//! them into the app.
+
+pub mod battle_fx;
+pub mod surface_build;
+mod entity_marks;
+pub mod shot_fx;
 pub mod host;
-pub mod model_append;
-pub mod model_draw;
-mod plugin;
-pub mod present;
-pub mod product;
+pub mod fx_models;
+mod model_draw;
+pub(crate) mod load_plugin;
+pub mod effect_play;
+mod product;
 pub mod system;
 pub mod tracer;
 
-pub use drawsurf::*;
-pub use entity_marks::{EntityMarkAttachment, EntityMarkRequest, EntityMarkStore, EntityMarks};
-pub use fire_weapon_fx::fire_weapon_fx_should_client_trace;
+pub use self::surface_build::*;
+pub use self::entity_marks::{
+    BoneSlot, BoundEntityMark, EntityMarkBoard, EntityMarkState, MarkPaint, MarkPlacement,
+    PendingEntityMark, Refusals,
+};
+pub use self::shot_fx::impact_needs_client_trace;
 pub use host::{
-    CombatFxDump, FxCameraOrigin, FxDumpRequest, FxJournalCursor, FxMarkDvars, FxWorldColorImages,
-    HostFxDlights, HostFxPostLights, HostFxSystem, LaserDvars, PreparedFxCatalog,
-    PreparedFxElemInfos, PreparedFxModels, PreparedImpactFx, PresentedVehicleFx,
-    PresentedVehicleFxRow,
+    BeamFate, BeamReport, ColorMaps, BattleEffectsSnapshot, CreateFxLedger, EffectsEyePosition, EffectDumpRequest,
+    EffectJournalCursor, EffectStainTunables, EffectLevelColorImages, EffectsDynamicLightSet, PostEffectLightSet,
+    EffectsSystemHandle, JournalCount, LaserSettings, MarkSwitch, PostLightFate, ReadyFxBook,
+    PreparedFxElemTable, ReadyFxProps, ReadyHitFx, TracerSample,
 };
-pub use model_append::append_fx_model_asset;
-pub use model_draw::{FxModelAssetDraw, FxModelDrawPlan, XMODEL_OBJECT_ID_FX_BASE};
-pub use plugin::RenderFxPlugin;
-pub use product::{
-    FxFrameOutcome, FxGeneratedFrame, FxUnavailableCause, clear_fx_owned_plans,
-    publish_empty_fx_owned_plans,
+pub use fx_models::push_effect_model_asset;
+pub use self::model_draw::{
+    DropTally, FxModelSurfaces, FxModelDrawList, FxModelStagingPlan, ModelDrop, PreparedFxModelPlan,
+    FIGURE_OBJECT_ID_EFFECT_BASE,
 };
+pub use self::load_plugin::EffectsRenderPlugin;
+pub use self::product::{FxFrameResult, FxFrameView, FxSkipCause, GeneratedFxFrame};
 pub use tracer::{
-    PreparedTracers, QueuedBeam, TracerDrawGate, TracerSpawnSkip, TracerWorld,
-    beam_undivided_colors, tick_tracer_beams, try_spawn_tracer,
+    StagedStreaks, PendingTracerBeam, TracerRenderGuard, TracerSpawnRefusal, StreakLevel,
+    beam_undivided_colors, step_tracer_beams, attempt_bullet_streak,
 };
-
-pub use model_draw::{FxModelStaging, PreparedFxModelGeometry};

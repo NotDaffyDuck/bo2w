@@ -1,0 +1,20 @@
+# Needs window 4's reload in the tick (gun/reload 68899527 or later) and the real facts dump.
+# B. Swap mid-reload: the reload is dropped at once (stop-sound event, parm = old state), plain drop follows.
+msec 50
+spawn an94_mp
+give mp7_mp
+everhad mp7_mp 1
+stock an94_mp 120
+clip an94_mp 5
+run 2
+hold reload
+run 3
+release reload
+expect state RELOADING
+select mp7_mp
+run 1
+expect state DROPPING
+expect anim DROP
+run 8
+expect state RAISING
+expect weapon mp7_mp

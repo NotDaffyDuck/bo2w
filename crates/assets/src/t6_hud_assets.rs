@@ -10,12 +10,12 @@ use std::sync::Arc;
 use bevy::prelude::{Image, Resource};
 
 /// One bitmap font from `fonts/720/*`: the pixel height it was cut at, and
-/// its glyphs. A glyph is (letter, [x0, y0 from the pen and baseline,
+/// its glyphs. A letter_shape is (letter, [x0, y0 from the pen and baseline,
 /// advance, width, height in pixels], [s0, t0, s1, t1 on the sheet]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct T6HudFont {
     pub name: String,
-    pub pixel_height: f32,
+    pub raster_rows: f32,
     pub glyphs: Vec<(u16, [i16; 5], [f32; 4])>,
 }
 
@@ -30,8 +30,8 @@ pub struct T6HudFonts {
 }
 
 impl PartialEq for T6HudFonts {
-    fn eq(&self, other: &Self) -> bool {
-        self.fonts == other.fonts && self.sheet.is_some() == other.sheet.is_some()
+    fn eq(&self, rhs: &Self) -> bool {
+        self.fonts == rhs.fonts && self.sheet.is_some() == rhs.sheet.is_some()
     }
 }
 
@@ -41,8 +41,8 @@ impl PartialEq for T6HudFonts {
 pub struct T6HudIcons(pub Vec<(String, Arc<Image>)>);
 
 impl PartialEq for T6HudIcons {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len() && self.0.iter().zip(&other.0).all(|(a, b)| a.0 == b.0)
+    fn eq(&self, rhs_set: &Self) -> bool {
+        self.0.len() == rhs_set.0.len() && self.0.iter().zip(&rhs_set.0).all(|(a, b)| a.0 == b.0)
     }
 }
 
@@ -59,19 +59,65 @@ pub struct T6Ui {
     /// The zones' config files (`default_private.cfg` and the like), by name,
     /// for the menus' `exec <file>`.
     pub configs: Arc<Vec<(String, String)>>,
+    /// The game settings' defaults (`gametype_setting <name> <value>` in
+    /// `zm_gamesettings_default.cfg`, then `_zstandard.cfg`): what Custom
+    /// Games shows before he changes anything.
+    pub game_settings: Arc<Vec<(String, f32)>>,
 }
 
 impl PartialEq for T6Ui {
-    fn eq(&self, other: &Self) -> bool {
-        let same_scripts = self.scripts.len() == other.scripts.len()
+    fn eq(&self, rhs: &Self) -> bool {
+        let same_scripts = self.scripts.len() == rhs.scripts.len()
             && self
                 .scripts
                 .iter()
-                .zip(&other.scripts)
+                .zip(&rhs.scripts)
                 .all(|((a_name, a), (b_name, b))| a_name == b_name && a.len() == b.len());
         same_scripts
-            && self.strings.len() == other.strings.len()
-            && self.tables.len() == other.tables.len()
+            && self.strings.len() == rhs.strings.len()
+            && self.tables.len() == rhs.tables.len()
+    }
+}
+
+/// A Black Ops II full-screen filter (a `generic_filter_*` material; Mob of
+/// the Dead's Afterlife is `generic_filter_afterlife_alcatraz`): its pictures
+/// by image name, read from the packs, and its constants by name (the zones
+/// keep the first 12 letters: `VignetteColo`).
+#[derive(Clone, Debug, Default)]
+pub struct T6ScreenFilter {
+    pub material: String,
+    pub tex_list: Vec<(String, Arc<Image>)>,
+    pub consts: Vec<(String, [f32; 4])>,
+}
+
+impl T6ScreenFilter {
+    pub fn constant(&self, name: &str) -> Option<[f32; 4]> {
+        self.consts
+            .iter()
+            .find_map(|(n, v)| (n == name).then_some(*v))
+    }
+
+    /// The first picture whose image name holds `part`.
+    pub fn image(&self, part: &str) -> Option<&Arc<Image>> {
+        self.tex_list
+            .iter()
+            .find(|(n, _)| n.contains(part))
+            .map(|(_, i)| i)
+    }
+}
+
+/// The map's full-screen filters, by material name.
+#[derive(Clone, Debug, Default, Resource)]
+pub struct T6ScreenFilters(pub Vec<T6ScreenFilter>);
+
+impl PartialEq for T6ScreenFilters {
+    fn eq(&self, rhs: &Self) -> bool {
+        self.0.len() == rhs.0.len()
+            && self.0.iter().zip(&rhs.0).all(|(a, b)| {
+                a.material == b.material
+                    && a.consts == b.consts
+                    && a.tex_list.len() == b.tex_list.len()
+            })
     }
 }
 

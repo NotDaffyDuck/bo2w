@@ -5,12 +5,12 @@ mod derive;
 mod model;
 mod table;
 
-pub use self::derive::derive_wgpu_pass_layout;
+pub use self::derive::plan_gpu_pass_bindings;
 pub use self::model::{
-    TextureTableDimension, WgpuBindLayoutEntry, WgpuBindingKind, WgpuLayoutRefusal, WgpuPassLayout, WgpuShaderVisibility,
-    WgpuVertexAttribute, WgpuVertexBufferLayout, WgpuVertexFormat,
+    TextureTableDimension, GpuBindSlotDescriptor, GpuBindResourceKind, WgpuLayoutRejection, GpuPassBindingPlan, GpuStageVisibility,
+    GpuVertexField, GpuVertexStreamLayout, GpuVertexElementKind,
 };
 pub use self::table::{
-    TEXTURE_TABLE_2D_CAPACITY, TEXTURE_TABLE_3D_CAPACITY, TEXTURE_TABLE_CUBE_CAPACITY,
-    TEXTURE_TABLE_SAMPLER_CAPACITY, texture_table_bind_entries,
+    FLAT_TEXTURE_TABLE_SLOTS, VOLUME_TEXTURE_TABLE_SIZE, CUBEMAP_TEXTURE_TABLE_SIZE,
+    SAMPLER_TABLE_SIZE, table_bind_entries,
 };

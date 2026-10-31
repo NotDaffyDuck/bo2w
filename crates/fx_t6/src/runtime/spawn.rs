@@ -1,11 +1,11 @@
 //! When an effect's elements spawn: the one-shot count, the looping
 //! schedule and the status a new effect starts with.
 
-use crate::runtime::life::sample_life_span_msec;
-use crate::runtime::status::FX_STATUS_HAS_PENDING_LOOP_ELEMS;
+use crate::runtime::lifespan::sample_life_span_msec;
+use crate::runtime::state_word::EMITTER_REPEAT_QUEUED_BIT;
 
 /// The element type of a trail.
-pub const FX_ELEM_TYPE_TRAIL: u8 = 3;
+pub const PARTICLE_SHAPE_STREAK: u8 = 3;
 
 /// An update window wider than this (in milliseconds) is trimmed before
 /// looping elements are caught up.
@@ -15,47 +15,41 @@ const CATCHUP_WINDOW_MSEC: i32 = 0x80;
 const NEW_EFFECT_STATUS: u32 = 0x4000_0001;
 
 /// How many one-shot elements to spawn: a whole number from `base ..= base +
-/// amplitude` picked by the 16-bit random `rand16`.
-pub fn sample_oneshot_spawn_count(base: i32, amplitude: i32, rand16: u16) -> i32 {
-    sample_life_span_msec(base, amplitude, rand16)
+/// amplitude` picked by the 16-bit random `roll16`.
+pub fn sample_oneshot_spawn_count(base: i32, spread: i32, roll16: u16) -> i32 {
+    sample_life_span_msec(base, spread, roll16)
 }
 
 /// One looping spawn that is due: when, and which one in the run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FxLoopingSpawn {
-    pub msec: i32,
+pub struct RepeatBirth {
+    pub due_ms: i32,
     pub sequence: i32,
 }
 
 /// The looping spawns that fall inside an update window, in order.
 #[derive(Clone, Debug)]
-pub struct FxLoopingSpawnSchedule {
-    msec_when_played: i32,
-    msec_update_end: i32,
-    interval_msec: i32,
-    max_count: i32,
-    next_sequence: i32,
+pub struct RepeatBirthTimetable {
+    /// Spawn `n` happens at `played_at + n * step`.
+    played_at: i32,
+    step: i32,
+    /// Spawns after this time wait for a later update.
+    until: i32,
+    /// The spawn numbers still to come (empty when the step is not positive).
+    left: core::ops::Range<i32>,
 }
 
-impl Iterator for FxLoopingSpawnSchedule {
-    type Item = FxLoopingSpawn;
+impl Iterator for RepeatBirthTimetable {
+    type Item = RepeatBirth;
 
-    fn next(&mut self) -> Option<FxLoopingSpawn> {
-        if self.interval_msec <= 0 || self.next_sequence >= self.max_count {
-            return None;
-        }
-        let msec = self
-            .msec_when_played
-            .wrapping_add(self.interval_msec.wrapping_mul(self.next_sequence));
-        if msec > self.msec_update_end {
-            return None;
-        }
-        let due = FxLoopingSpawn {
-            msec,
-            sequence: self.next_sequence,
-        };
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        Some(due)
+    fn next(&mut self) -> Option<RepeatBirth> {
+        let sequence = self.left.start;
+        let msec = self.step.wrapping_mul(sequence).wrapping_add(self.played_at);
+        let due = self.left.contains(&sequence) && msec <= self.until;
+        due.then(|| {
+            self.left.start += 1;
+            RepeatBirth { due_ms: msec, sequence }
+        })
     }
 }
 
@@ -64,68 +58,59 @@ impl Iterator for FxLoopingSpawnSchedule {
 /// anything older would already be dead; an open-ended window is not
 /// trimmed.
 pub fn looping_catchup_begin(
-    msec_update_begin: i32,
-    msec_update_end: i32,
-    elem_duration_msec: i32,
+    refresh_window_open_ms: i32,
+    refresh_window_close_ms: i32,
+    elem_life_ms: i32,
 ) -> i32 {
-    if msec_update_end == i32::MAX {
-        return msec_update_begin;
-    }
-    let window = msec_update_end.wrapping_sub(msec_update_begin);
-    if window <= CATCHUP_WINDOW_MSEC {
-        return msec_update_begin;
-    }
-    let keep = elem_duration_msec.wrapping_add(1);
-    if keep < window {
-        msec_update_begin.wrapping_add(window.wrapping_sub(keep))
+    let lifetime = elem_life_ms.wrapping_add(1);
+    let wide = refresh_window_close_ms.wrapping_sub(refresh_window_open_ms);
+    let open_ended = refresh_window_close_ms == i32::MAX;
+    if open_ended || wide <= CATCHUP_WINDOW_MSEC || lifetime >= wide {
+        refresh_window_open_ms
     } else {
-        msec_update_begin
+        // begin + (window - lifetime), i.e. one lifetime before the end.
+        refresh_window_close_ms.wrapping_sub(lifetime)
     }
 }
 
-/// The looping spawns due in an update: one every `interval_msec` from
-/// `msec_when_played`, numbered from zero and stopping before `max_count`.
+/// The looping spawns due in an update: one every `cadence_ms` from
+/// `started_at_effect_ms`, numbered from zero and stopping before `cap`.
 /// The run starts at the first spawn after the window's start (the spawn
 /// numbered zero happens when the effect is played) and ends at
-/// `msec_update_end`. An interval of zero or less spawns nothing.
+/// `refresh_window_close_ms`. An interval of zero or less spawns nothing.
 pub fn looping_spawn_schedule(
-    msec_when_played: i32,
-    msec_update_begin: i32,
-    msec_update_end: i32,
-    interval_msec: i32,
-    max_count: i32,
-) -> FxLoopingSpawnSchedule {
-    let next_sequence = if interval_msec <= 0 {
-        max_count
-    } else {
-        msec_update_begin.wrapping_sub(msec_when_played) / interval_msec + 1
-    };
-    FxLoopingSpawnSchedule {
-        msec_when_played,
-        msec_update_end,
-        interval_msec,
-        max_count,
-        next_sequence,
+    started_at_effect_ms: i32,
+    refresh_window_open_ms: i32,
+    refresh_window_close_ms: i32,
+    cadence_ms: i32,
+    cap: i32,
+) -> RepeatBirthTimetable {
+    let elapsed = refresh_window_open_ms.wrapping_sub(started_at_effect_ms);
+    // The first spawn after the window opens; none at all without a step.
+    let first = if cadence_ms > 0 { elapsed / cadence_ms + 1 } else { cap };
+    RepeatBirthTimetable {
+        played_at: started_at_effect_ms,
+        step: cadence_ms,
+        until: refresh_window_close_ms,
+        left: first..cap,
     }
 }
 
 /// The status word of a new effect. One that loops also holds a reference for
 /// its pending loop and sets the pending-loop bit.
-pub const fn spawn_effect_status(msec_looping_life: i32) -> u32 {
-    let looping = if msec_looping_life != 0 {
-        FX_STATUS_HAS_PENDING_LOOP_ELEMS + 1
-    } else {
-        0
-    };
-    NEW_EFFECT_STATUS.wrapping_add(looping)
+pub const fn spawn_effect_status(loop_lifetime_millis: i32) -> u32 {
+    match loop_lifetime_millis {
+        0 => NEW_EFFECT_STATUS,
+        _ => NEW_EFFECT_STATUS.wrapping_add(EMITTER_REPEAT_QUEUED_BIT + 1),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn due(schedule: FxLoopingSpawnSchedule) -> Vec<(i32, i32)> {
-        schedule.map(|spawn| (spawn.msec, spawn.sequence)).collect()
+    fn due(schedule: RepeatBirthTimetable) -> Vec<(i32, i32)> {
+        schedule.map(|spawn| (spawn.due_ms, spawn.sequence)).collect()
     }
 
     #[test]

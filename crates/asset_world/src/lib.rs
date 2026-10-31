@@ -1,5 +1,5 @@
-//! A map's world as engine-ready products: placed models, visibility,
-//! collision, glass and light.
+//! Everything a loaded map hands the engine: model placements, what each
+//! cell can see, solids for traces, windows and lights.
 
 mod clip_error;
 mod clip_flags;
@@ -9,7 +9,7 @@ mod clip_tables;
 mod clip_trace;
 mod dyn_ent_defs;
 mod dyn_ent_kind;
-mod film_vision;
+mod colour_grade;
 mod fog_params;
 mod glass_windows;
 mod mesh_report;
@@ -19,7 +19,7 @@ mod sun_shadow_casters;
 mod surface_stamp;
 mod trigger_hull;
 
-pub mod model_draw;
+pub mod prop_meshes;
 pub mod model_instances;
 pub mod model_scene_catalog;
 pub mod model_t6;
@@ -32,18 +32,18 @@ pub mod world_t6;
 pub mod world_visibility;
 
 pub use asset_core::*;
-pub use clip_error::ClipCollisionError;
+pub use clip_error::SolidsTraceFault;
 pub use clip_flags::t5_surface_flags;
 pub use clip_t6::*;
 pub use clip_tables::*;
-pub use clip_trace::ClipSweepHit;
+pub use clip_trace::SolidsTraceContact;
 pub use dyn_ent_defs::*;
 pub use dyn_ent_kind::*;
-pub use film_vision::*;
+pub use colour_grade::*;
 pub use fog_params::*;
 pub use glass_windows::*;
 pub use mesh_report::*;
-pub use model_draw::*;
+pub use prop_meshes::*;
 pub use model_instances::*;
 pub use model_scene_catalog::*;
 pub use model_t6::*;
@@ -53,7 +53,7 @@ pub use sun_shadow_casters::*;
 pub use surface_stamp::*;
 pub use t6_grade::*;
 pub use trigger_hull::*;
-pub use world_draw_policy::WorldDrawPolicy;
+pub use world_draw_policy::LevelRenderRules;
 pub use world_lightmap::*;
 pub use world_lights::*;
 pub use world_scene::*;

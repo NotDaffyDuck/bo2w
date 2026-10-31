@@ -1,10 +1,10 @@
 //! Weapons: what the zones say about each gun, and the table every other crate
 //! reads them from.
 //!
-//! The zone walk fills a [`WeaponCatalog`] with one [`CatalogWeapon`] per gun.
+//! The zone walk fills a [`ArmoryRoster`] with one [`RosterWeapon`] per gun.
 //! `into_build` turns that into a [`WeaponBuild`], the later passes link its
-//! names to models, animations, materials and effects, and `publish` hands out
-//! the finished [`WeaponRegistry`]. Weapon id 0 is "no weapon".
+//! names to meshes, clips, materials and fx entries, and `publish` hands out
+//! the finished [`WeaponLedger`]. Weapon id 0 is "no weapon".
 
 mod build;
 mod catalog;
@@ -19,64 +19,64 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asset_core::{
-    AssetEdge, AssetEdgeReason, FpvMeshSpace, FxSpace, MaterialSpace,
-    WorldWeaponSpace, XAnimSpace,
+    AssetDependencyLink, DependencyCause, FpvMeshRange, FxRange, SurfaceShaderSpace, WorldWeaponRange, XAnimRange,
 };
 use weapon_t6::asset_slots::WEAPON_ANIM_SLOTS;
-use weapon_t6::asset_slots::weap_anim_slot as weap_anim;
+use weapon_t6::asset_slots::weap_anim_slot;
 
-pub use combat_fx::WeaponCombatFx;
+pub use combat_fx::WeaponBattleEffects;
 pub use facts::*;
 pub use registry::overlay_name_is_hud_iris;
-pub use sounds::{WeaponSoundAliases, WeaponSoundSlot};
+pub use sounds::{WeaponAudioNicknames, WeaponAudioRole};
 pub use t6::{T6_SIGHT_ATTACHMENTS, t6_attachment_combo_name};
 
 /// A fresh revision number: no two registries, or two states of one, share one.
-fn mint_weapon_revision() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+fn fresh_epoch() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The key weapons are looked up by: lower case, without BO2's `_mp` suffix.
-fn normalize_weapon_name(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    lower.strip_suffix("_mp").unwrap_or(&lower).to_owned()
+fn weapon_key(raw: &str) -> String {
+    let mut key = raw.to_ascii_lowercase();
+    if key.ends_with("_mp") {
+        key.truncate(key.len() - 3);
+    }
+    key
 }
 
 /// The name a script calls a weapon by, from its catalog name.
-pub fn gsc_weapon_script_name(catalog_bare: &str) -> String {
-    if catalog_bare.is_empty() {
-        return String::new();
-    }
+pub fn gsc_weapon_script_name(index_unprefixed: &str) -> String {
     // A gun with a sight keeps its suffix in the middle (`mp7_mp+reflex`).
-    if catalog_bare.ends_with("_mp") || catalog_bare.contains("_mp+") {
-        catalog_bare.to_owned()
-    } else {
-        format!("{catalog_bare}_mp")
+    let suffixed = index_unprefixed.ends_with("_mp") || index_unprefixed.contains("_mp+");
+    match (index_unprefixed.is_empty(), suffixed) {
+        (true, _) => String::new(),
+        (false, true) => String::from(index_unprefixed),
+        (false, false) => [index_unprefixed, "_mp"].concat(),
     }
 }
 
 /// A weapon as the zone walk captured it, before anything is linked.
 #[derive(Clone, Debug)]
-pub struct CatalogWeapon {
-    pub namespace: crate::AssetNamespace,
+pub struct RosterWeapon {
+    pub namespace: crate::AssetCategoryScope,
     pub name: String,
     pub alternate_weapon: Option<String>,
-    pub display_name_key: Option<String>,
-    pub reticle: WeaponReticleAssets,
-    pub overlay_material: Option<String>,
-    pub hud_icon: Option<String>,
-    pub kill_icon: Option<String>,
-    pub proj_trail: Option<String>,
-    pub proj_ignition: Option<String>,
-    pub gun_xmodel: Option<String>,
-    pub world_model: Option<String>,
-    pub projectile_model: Option<String>,
-    pub rocket_model: Option<String>,
-    pub sz_xanims: [Option<String>; WEAPON_ANIM_SLOTS],
-    pub sz_xanims_right: [Option<String>; WEAPON_ANIM_SLOTS],
-    pub sz_xanims_left: [Option<String>; WEAPON_ANIM_SLOTS],
-    pub hide_tags: Vec<String>,
+    pub shown_title_token: Option<String>,
+    pub reticle: WeaponCrosshairResources,
+    pub hud_layer_surface: Option<String>,
+    pub badge_pic: Option<String>,
+    pub elimination_emblem: Option<String>,
+    pub shell_wake: Option<String>,
+    pub shell_ignite: Option<String>,
+    pub weapon_mesh: Option<String>,
+    pub third_person_mesh: Option<String>,
+    pub shell_mesh: Option<String>,
+    pub missile_mesh: Option<String>,
+    pub clip_names: [Option<String>; WEAPON_ANIM_SLOTS],
+    pub right_clip_names: [Option<String>; WEAPON_ANIM_SLOTS],
+    pub left_clip_names: [Option<String>; WEAPON_ANIM_SLOTS],
+    pub concealed_bones: Vec<String>,
     /// View-model attachments (magazine, scope) and where each sits on the gun.
     pub view_attachments: Vec<(String, asset_model::FpvMountOffset)>,
     /// The same list while aimed, when a sight swaps its model for a stripped
@@ -89,22 +89,26 @@ pub struct CatalogWeapon {
     /// Attachment world models (third person, on the floor) and the gun tag
     /// each goes on.
     pub world_attachments: Vec<(String, String)>,
-    pub sounds: WeaponSoundAliases,
-    pub combat_fx: WeaponCombatFx,
-    pub facts: WeaponBodyFacts,
+    /// bo2zm: the parts of the gun everyone else sees, on a wall or in the
+    /// box (`attachWorldModel`), and where each sits: an empty tag means the
+    /// gun's `tag_weapon`.
+    pub world_parts: Vec<(String, asset_model::FpvMountOffset)>,
+    pub sounds: WeaponAudioNicknames,
+    pub combat_fx: WeaponBattleEffects,
+    pub facts: WeaponChassisSummary,
 }
 
 /// A scope's reticle pictures.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WeaponReticleAssets {
-    pub center_material: Option<String>,
-    pub side_material: Option<String>,
-    pub center_edge: AssetEdge<MaterialSpace>,
-    pub side_edge: AssetEdge<MaterialSpace>,
-    pub center_image: Option<String>,
-    pub side_image: Option<String>,
-    pub center_size: i32,
-    pub side_size: i32,
+pub struct WeaponCrosshairResources {
+    pub middle_surface: Option<String>,
+    pub flank_surface: Option<String>,
+    pub center_edge: AssetDependencyLink<SurfaceShaderSpace>,
+    pub side_edge: AssetDependencyLink<SurfaceShaderSpace>,
+    pub middle_texture: Option<String>,
+    pub flank_texture: Option<String>,
+    pub middle_extent: i32,
+    pub flank_extent: i32,
     /// Whether the zone authored the material at all.
     pub center_authored: bool,
     pub side_authored: bool,
@@ -128,17 +132,17 @@ pub struct WeaponDependencyGap {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnknownWeaponName {
+pub struct UnrecognizedArmoryLabel {
     pub name: String,
 }
 
-impl core::fmt::Display for UnknownWeaponName {
+impl core::fmt::Display for UnrecognizedArmoryLabel {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "unknown weapon name `{}`", self.name)
+        f.write_fmt(format_args!("unknown weapon name `{}`", self.name))
     }
 }
 
-impl std::error::Error for UnknownWeaponName {}
+impl std::error::Error for UnrecognizedArmoryLabel {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FpvAssemblyCensus {
@@ -150,157 +154,155 @@ pub struct FpvAssemblyCensus {
 
 /// The weapons one zone walk captured.
 #[derive(Clone, Debug, Default)]
-pub struct WeaponCatalog {
-    entries: Vec<CatalogWeapon>,
-    capture_ns: crate::AssetNamespace,
+pub struct ArmoryRoster {
+    captured: Vec<RosterWeapon>,
+    into_ns: crate::AssetCategoryScope,
 }
 
-/// One weapon in the registry: the capture plus every link made since.
+/// A name a weapon carries and the catalog link made from it.
 #[derive(Clone, Debug)]
-struct WeaponRow {
-    name: String,
-    alternate_weapon: Option<String>,
-    alternate_index: u32,
-    namespace: crate::AssetNamespace,
-    facts: WeaponBodyFacts,
+struct NamedLink<S: asset_core::KeyDomain> {
+    caption: Option<String>,
+    resolved: AssetDependencyLink<S>,
+}
 
-    gun_xmodel: Option<String>,
-    gun_xmodel_edge: AssetEdge<FpvMeshSpace>,
-    rocket_model_edge: AssetEdge<FpvMeshSpace>,
-    attachment_view_model_edges: Vec<AssetEdge<FpvMeshSpace>>,
-    fpv_hands: [Option<(asset_model::FpvHands, crate::FpvMeshIndex)>; 2],
-    fpv_mount_plan: Option<Result<asset_model::FpvMountPlan, asset_model::FpvMountError>>,
-    /// The mount plan while aimed (a sight's stripped model).
-    ads_view_models: Vec<String>,
-    ads_view_offsets: Vec<Option<asset_model::FpvMountOffset>>,
-    fpv_mount_plan_ads: Option<Result<asset_model::FpvMountPlan, asset_model::FpvMountError>>,
-    fpv_assemblies: [Option<Result<crate::FpvSideAssemblies, String>>; 2],
+impl<S: asset_core::KeyDomain> NamedLink<S> {
+    /// A link that has a name but is not looked up yet.
+    fn named(caption: Option<String>) -> Self {
+        Self { caption, resolved: AssetDependencyLink::NothingThere }
+    }
+}
 
-    world_model: Option<String>,
-    world_model_edge: AssetEdge<WorldWeaponSpace>,
-    attachment_world_model_edges: Vec<AssetEdge<WorldWeaponSpace>>,
-    attachment_world_mounts: Vec<Option<String>>,
+impl<S: asset_core::KeyDomain> Default for NamedLink<S> {
+    fn default() -> Self {
+        Self::named(None)
+    }
+}
+
+/// A list of attached models with where each one sits and what it linked to.
+#[derive(Clone, Debug)]
+struct Attached<S: asset_core::KeyDomain> {
+    models: Vec<String>,
+    offsets: Vec<Option<asset_model::FpvMountOffset>>,
+    edges: Vec<AssetDependencyLink<S>>,
+}
+
+impl<S: asset_core::KeyDomain> Default for Attached<S> {
+    fn default() -> Self {
+        let (mesh_names, offsets, edges) = (vec![], vec![], vec![]);
+        Self { models: mesh_names, offsets, edges }
+    }
+}
+
+/// Everything the first-person view of a weapon is built from.
+#[derive(Clone, Debug, Default)]
+struct ViewLinks {
+    gun: NamedLink<FpvMeshRange>,
+    missile: NamedLink<FpvMeshRange>,
+    /// Attachments drawn while hip-firing.
+    hip: Attached<FpvMeshRange>,
+    /// Attachments drawn while aimed (a sight's stripped model).
+    aimed: Attached<FpvMeshRange>,
+    hands: [Option<(asset_model::FirstPersonArms, crate::FpvMeshSlot)>; 2],
+    plan_hip: Option<Result<asset_model::FpvMountPlan, asset_model::FpvMountError>>,
+    plan_aimed: Option<Result<asset_model::FpvMountPlan, asset_model::FpvMountError>>,
+    sides: [Option<Result<crate::FpvSideAssemblies, String>>; 2],
+}
+
+/// The third-person gun and what rides on it.
+#[derive(Clone, Debug, Default)]
+struct WorldLinks {
+    gun: NamedLink<WorldWeaponRange>,
+    attached: Attached<WorldWeaponRange>,
+    /// The bone each attachment is found on, once resolved.
+    mounts: Vec<Option<String>>,
     /// The gun tag each attachment world model names; empty: found by the
     /// model's root bone.
-    attachment_world_tags: Vec<String>,
-    projectile_model: Option<String>,
-    rocket_model: Option<String>,
-
-    sz_xanims: [Option<String>; WEAPON_ANIM_SLOTS],
-    sz_xanims_right: [Option<String>; WEAPON_ANIM_SLOTS],
-    sz_xanims_left: [Option<String>; WEAPON_ANIM_SLOTS],
-    sz_xanim_edges: [AssetEdge<XAnimSpace>; WEAPON_ANIM_SLOTS],
-    sz_xanim_right_edges: [AssetEdge<XAnimSpace>; WEAPON_ANIM_SLOTS],
-    sz_xanim_left_edges: [AssetEdge<XAnimSpace>; WEAPON_ANIM_SLOTS],
-    /// Notetrack name (lower case) to what it triggers.
-    notetrack_actions: HashMap<String, LinkedNotetrackAction>,
-
-    hide_tags: Vec<String>,
-    attachment_view_models: Vec<String>,
-    /// Each attachment view model's authored placement; none: the mount plan
-    /// places it itself.
-    attachment_view_offsets: Vec<Option<asset_model::FpvMountOffset>>,
-    attachment_world_models: Vec<String>,
-    dual_wield_weapon: Option<String>,
-    spawned_grenade_weapon: Option<String>,
-
-    sounds: WeaponSoundAliases,
-    combat_fx: WeaponCombatFx,
-    reticle: WeaponReticleAssets,
-    display_name_key: Option<String>,
-
-    overlay_material: Option<String>,
-    overlay_image: Option<String>,
-    overlay_edge: AssetEdge<MaterialSpace>,
-    hud_icon: Option<String>,
-    hud_icon_edge: AssetEdge<MaterialSpace>,
-    kill_icon: Option<String>,
-    kill_icon_edge: AssetEdge<MaterialSpace>,
-    proj_trail: Option<String>,
-    trail_edge: AssetEdge<FxSpace>,
-    proj_ignition: Option<String>,
-    ignition_edge: AssetEdge<FxSpace>,
+    tags: Vec<String>,
+    shot: Option<String>,
+    /// bo2zm: see `RosterWeapon::world_parts`.
+    pieces: Vec<(String, asset_model::FpvMountOffset)>,
 }
 
-impl Default for WeaponRow {
+const ANIM_SZ: usize = 0;
+const ANIM_RIGHT: usize = 1;
+const ANIM_LEFT: usize = 2;
+
+/// The three animation sets of a weapon (single, and the dual-wield pair),
+/// as names and as the links made from them.
+#[derive(Clone, Debug)]
+struct AnimLinks {
+    names: [[Option<String>; WEAPON_ANIM_SLOTS]; 3],
+    edges: [[AssetDependencyLink<XAnimRange>; WEAPON_ANIM_SLOTS]; 3],
+}
+
+impl Default for AnimLinks {
     fn default() -> Self {
         Self {
-            name: String::new(),
-            alternate_weapon: None,
-            alternate_index: 0,
-            namespace: crate::AssetNamespace::T6,
-            facts: WeaponBodyFacts::default(),
-            gun_xmodel: None,
-            gun_xmodel_edge: AssetEdge::Absent,
-            rocket_model_edge: AssetEdge::Absent,
-            attachment_view_model_edges: Vec::new(),
-            fpv_hands: [None, None],
-            fpv_mount_plan: None,
-            ads_view_models: Vec::new(),
-            ads_view_offsets: Vec::new(),
-            fpv_mount_plan_ads: None,
-            fpv_assemblies: [None, None],
-            world_model: None,
-            world_model_edge: AssetEdge::Absent,
-            attachment_world_model_edges: Vec::new(),
-            attachment_world_mounts: Vec::new(),
-            attachment_world_tags: Vec::new(),
-            projectile_model: None,
-            rocket_model: None,
-            sz_xanims: [const { None }; WEAPON_ANIM_SLOTS],
-            sz_xanims_right: [const { None }; WEAPON_ANIM_SLOTS],
-            sz_xanims_left: [const { None }; WEAPON_ANIM_SLOTS],
-            sz_xanim_edges: [AssetEdge::Absent; WEAPON_ANIM_SLOTS],
-            sz_xanim_right_edges: [AssetEdge::Absent; WEAPON_ANIM_SLOTS],
-            sz_xanim_left_edges: [AssetEdge::Absent; WEAPON_ANIM_SLOTS],
-            notetrack_actions: HashMap::new(),
-            hide_tags: Vec::new(),
-            attachment_view_models: Vec::new(),
-            attachment_view_offsets: Vec::new(),
-            attachment_world_models: Vec::new(),
-            dual_wield_weapon: None,
-            spawned_grenade_weapon: None,
-            sounds: WeaponSoundAliases::default(),
-            combat_fx: WeaponCombatFx::default(),
-            reticle: WeaponReticleAssets::default(),
-            display_name_key: None,
-            overlay_material: None,
-            overlay_image: None,
-            overlay_edge: AssetEdge::Absent,
-            hud_icon: None,
-            hud_icon_edge: AssetEdge::Absent,
-            kill_icon: None,
-            kill_icon_edge: AssetEdge::Absent,
-            proj_trail: None,
-            trail_edge: AssetEdge::Absent,
-            proj_ignition: None,
-            ignition_edge: AssetEdge::Absent,
+            names: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            edges: [[AssetDependencyLink::NothingThere; WEAPON_ANIM_SLOTS]; 3],
         }
     }
 }
 
+/// The 2D assets a weapon shows: scope, hud and kill-feed icons.
+#[derive(Clone, Debug, Default)]
+struct HudLinks {
+    scope: NamedLink<SurfaceShaderSpace>,
+    scope_image: Option<String>,
+    icon: NamedLink<SurfaceShaderSpace>,
+    elimination_emblem: NamedLink<SurfaceShaderSpace>,
+}
+
+/// One weapon in the registry: the capture plus every link made since.
+#[derive(Clone, Debug, Default)]
+struct WeaponEntry {
+    name: String,
+    source_ns: crate::AssetCategoryScope,
+    body: WeaponChassisSummary,
+    /// The alternate (mode-switch) weapon: its name, then its id once known.
+    alt: (Option<String>, u32),
+    dual_wield: Option<String>,
+    spawned_grenade: Option<String>,
+
+    view: ViewLinks,
+    world: WorldLinks,
+    anims: AnimLinks,
+    /// Notetrack name (lower case) to what it triggers.
+    notetracks: HashMap<String, LinkedNotetrackAction>,
+    hidden: Vec<String>,
+
+    aliases: WeaponAudioNicknames,
+    fx: WeaponBattleEffects,
+    sight: WeaponCrosshairResources,
+    display_key: Option<String>,
+    hud: HudLinks,
+    trail: NamedLink<FxRange>,
+    ignition: NamedLink<FxRange>,
+}
+
 /// The finished weapon table. Ids are row numbers; id 0 is "no weapon".
 #[derive(Clone, Debug, Default)]
-pub struct WeaponRegistry {
-    rows: Vec<WeaponRow>,
+pub struct WeaponLedger {
+    records: Vec<WeaponEntry>,
     world_catalog_identity: u64,
-    by_name: HashMap<String, u32>,
-    by_namespaced: HashMap<(crate::AssetNamespace, String), u32>,
+    slot_for_label: HashMap<String, u32>,
+    index_by_ns_name: HashMap<(crate::AssetCategoryScope, String), u32>,
     families: crate::WeaponFamilies,
     alternate_fpv: HashMap<(u32, u32), [Option<Result<crate::FpvSideAssemblies, String>>; 2]>,
     fpv_clip_tracks: Arc<crate::FpvClipTracks>,
-    revision: u64,
+    epoch_no: u64,
 }
 
 /// A registry still being linked. It reads as the registry it will become.
 #[derive(Clone, Debug, Default)]
 pub struct WeaponBuild {
-    registry: WeaponRegistry,
-    family_tables: Vec<(crate::AssetNamespace, crate::CapturedStringTable)>,
+    registry: WeaponLedger,
+    family_tables: Vec<(crate::AssetCategoryScope, crate::SnapshotStringTable)>,
 }
 
 impl std::ops::Deref for WeaponBuild {
-    type Target = WeaponRegistry;
+    type Target = WeaponLedger;
 
     fn deref(&self) -> &Self::Target {
         &self.registry

@@ -1,6 +1,6 @@
-//! The render frontend: everything the game builds each frame for the
-//! renderer to draw. It packs draw-surface lists, queues worker commands and
-//! tracks what occupies the scene, but never touches the GPU.
+//! Render frontend. Each frame it turns game state into what the renderer
+//! draws: draw-surface lists, worker commands and scene occupancy. Nothing in
+//! this crate talks to the GPU.
 
 extern crate self as render_frontend;
 
@@ -8,35 +8,37 @@ pub mod adapters;
 pub mod assemble;
 pub mod prepare;
 
-pub use adapters::RenderAdaptersPlugin;
-pub use assemble::RenderAssemblePlugin;
-pub use prepare::RenderPreparePlugin;
+pub use adapters::DrawAdaptersPlugin;
+pub use assemble::DrawAssemblePlugin;
+pub use prepare::DrawPreparePlugin;
 
-// Draw-surface lists and their packing.
-pub use assemble::drawsurf::*;
-pub use assemble::pack::{
-    HOST_XMODEL_RIGID_TESS_INFO_PACKED_ARM, PackDraw, PackKind, pack_spot_shadow_frontend,
-    pack_sun_shadow_frontend,
+// Draw surfaces and packing.
+pub use self::assemble::draw_items::*;
+pub use assemble::packed_word::{
+    RIGID_MODEL_TESS_FLAGS_PACKED_BRANCH, PackableDrawCall, BundleKind,
+    pack_cone_shadow_frontend, pack_daylight_shadow_frontend,
 };
 
-// The scene's occupancy: what is placed where, under which caps.
-pub use prepare::gfx_scene::{
-    AddBModelArgs, AddBModelPose, AddDObjArgs, AddDObjPose, GfxScene, GfxSceneBrush, GfxSceneDobj,
-    GfxSceneModel, SCENE_BRUSH_CAP, SCENE_DOBJ_CAP, SCENE_GFX_ENT_CAP, SCENE_INDEX_EMPTY,
-    SCENE_MODEL_CAP, SCENE_VIEWMODEL_ENTNUM, SCENE_VIEWMODEL_FX_FLAGS, SCENE_VIEWMODEL_LEFT_ENTNUM,
-    SceneAddError, SceneAddKind, SceneEntSkinnedSurfs, pack_scene_info, scene_info_entnum,
+// Scene occupancy: what stands where, within which limits.
+pub use prepare::visual_stage::{
+    BRUSH_SLOTS_PER_FRAME, ANIM_OBJECT_SLOTS_PER_FRAME, RENDER_ENTITY_SLOTS_PER_FRAME,
+    SLOT_INDEX_NONE, MODEL_SLOTS_PER_FRAME, FIRST_PERSON_WEAPON_SLOT,
+    FIRST_PERSON_WEAPON_EFFECT_BITS, FIRST_PERSON_OFFHAND_SLOT, InsertBrushModelArgs,
+    BrushModelPlacement, AnimatedObjectSpawn, DynObjectPlacementArgs, VisualStage,
+    SceneBrushInstance, VisualStagePuppet, SceneModelInstance, SceneInsertFault,
 };
-pub use prepare::scene::world::*;
+pub use self::prepare::scene::world::*;
 
-// Sun shadows.
-pub use prepare::sun::{add_bsp_sun_shadow_partition, pack_sun_shadow_caster_lists};
+// Sun shadow casters.
+pub use prepare::daylight::{add_level_tree_daylight_shadow_partition, pack_daylight_shadow_caster_lists};
 
-// The worker-command rings.
-pub use prepare::worker_cmds::{
-    AddWorkerCmd, BoundEntWorkerCmd, CellFrustumWorkerCmd, DpvsEntWorkerCmd,
-    SkinCachedStaticModelCmd, SpotShadowEntWorkerCmd, WORKER_CMD_BOUND_ENT, WORKER_CMD_BUSY,
-    WORKER_CMD_CELL_DYN_BRUSH, WORKER_CMD_CELL_DYN_MODEL, WORKER_CMD_CELL_SCENE_ENT,
-    WORKER_CMD_COUNT, WORKER_CMD_DPVS_ENT, WORKER_CMD_SMODELCACHE, WORKER_CMD_SPOT_SHADOW_ENT,
-    WorkerCmdBusy, WorkerCmdBusyInput, WorkerCmdError, WorkerCmdQueues, enqueue_cell_frustum_cmds,
-    worker_cmd_dispatch_skips_device_lost,
+// Worker command rings.
+pub use prepare::task_orders::{
+    AddTaskOrder, RoomViewVolumeTaskOrder, SightActorTaskOrder, SkinCachedPropOrder,
+    TaskOrderBusyInput, TaskOrderError, TaskOrderQueues, enqueue_room_view_volume_orders,
+};
+pub use prepare::task_orders::{
+    TASK_ORDER_BOUND_ACTOR, TASK_ORDER_ROOM_DEBRIS_SOLID, TASK_ORDER_ROOM_DEBRIS_MODEL,
+    TASK_ORDER_ROOM_STAGE_ACTOR, TASK_ORDER_TALLY, TASK_ORDER_SIGHT_ACTOR, TASK_ORDER_SMODELCACHE,
+    TASK_ORDER_CONE_SHADOW_ACTOR,
 };

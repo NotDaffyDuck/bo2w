@@ -2,7 +2,7 @@
 
 use bevy::prelude::*;
 
-macro_rules! entity_events {
+macro_rules! script_player_signals {
     ($($(#[$meta:meta])* $name:ident;)+) => {
         $(
             $(#[$meta])*
@@ -14,7 +14,7 @@ macro_rules! entity_events {
     };
 }
 
-entity_events! {
+script_player_signals! {
     /// A kill cam starts for the player.
     BeginKillcam;
     /// The player spawned into the match.
@@ -22,7 +22,7 @@ entity_events! {
     /// The kill cam was cut short.
     AbortKillcam;
     /// The kill cam ran to its end.
-    KillcamEnded;
+    KillReplayDone;
 }
 
 #[cfg(test)]
@@ -44,13 +44,13 @@ mod tests {
             });
         world
             .entity_mut(player)
-            .observe(|event: On<KillcamEnded>, mut seen: ResMut<Seen>| {
+            .observe(|event: On<KillReplayDone>, mut seen: ResMut<Seen>| {
                 seen.0.push(("ended", event.entity));
             });
 
         world.trigger(BeginKillcam { entity: player });
         world.trigger(SpawnedPlayer { entity: player });
-        world.trigger(KillcamEnded { entity: player });
+        world.trigger(KillReplayDone { entity: player });
 
         assert_eq!(
             world.resource::<Seen>().0,

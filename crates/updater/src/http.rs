@@ -1,14 +1,16 @@
 //! A bare HTTPS GET. The only authority trusted is the CA built into this
 //! binary, so a stranger's certificate never passes, whatever the system trusts.
 
-use std::io::{BufReader, Read, Write};
-use std::net::TcpStream;
+use std::io::{self, Read as _, Write as _};
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 use crate::channel::Endpoint;
+use io::BufReader;
+use std::net::TcpStream;
 
 /// The CA the channel's certificate must chain to (see `build.rs`).
 const PINNED_CA_PEM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bo2mp-ca.pem"));
@@ -21,106 +23,107 @@ const HEADER_ALLOWANCE: usize = 64 * 1024;
 /// The body of `url`, which must be an `https://` address.
 pub fn get(url: &str) -> Result<Vec<u8>, String> {
     let target = Endpoint::parse(url)?;
-    let tls = ClientConfig::builder()
-        .with_root_certificates(trusted_roots(PINNED_CA_PEM)?)
-        .with_no_client_auth();
-    let name = ServerName::try_from(target.host.clone())
-        .map_err(|_| format!("invalid TLS server name `{}`", target.host))?;
-    let connection =
-        ClientConnection::new(Arc::new(tls), name).map_err(|error| format!("TLS init: {error}"))?;
-    let socket = TcpStream::connect((target.host.as_str(), target.port))
-        .map_err(|error| format!("connect {}:{}: {error}", target.host, target.port))?;
-    let mut stream = StreamOwned::new(connection, socket);
+    let mut stream = open_tls(&target)?;
+    let io_failed = |why: io::Error| format!("GET {url}: {why}");
+    let ask = request(&target);
+    stream.write_all(ask.as_bytes()).and_then(|()| stream.flush()).map_err(io_failed)?;
 
-    let failed = |error: std::io::Error| format!("GET {url}: {error}");
-    stream
-        .write_all(request(&target).as_bytes())
-        .map_err(failed)?;
-    stream.flush().map_err(failed)?;
+    // Read at most one byte past the limit: enough to tell it was crossed.
+    let limit = MAX_BODY + HEADER_ALLOWANCE;
+    let mut whole = Vec::new();
+    stream.take(limit as u64 + 1).read_to_end(&mut whole).map_err(io_failed)?;
+    let fits = whole.len() <= limit;
+    let answer = if fits { body_of(whole) } else { Err("response exceeds limit".to_owned()) };
+    answer.map_err(|why| format!("GET {url}: {why}"))
+}
 
-    let mut raw = Vec::new();
-    let cap = (MAX_BODY + HEADER_ALLOWANCE + 1) as u64;
-    stream.take(cap).read_to_end(&mut raw).map_err(failed)?;
-    if raw.len() > MAX_BODY + HEADER_ALLOWANCE {
-        return Err(format!("GET {url}: response exceeds limit"));
-    }
-    body_of(raw).map_err(|why| format!("GET {url}: {why}"))
+/// A TLS stream to the endpoint that trusts only the pinned CA.
+fn open_tls(target: &Endpoint) -> Result<StreamOwned<ClientConnection, TcpStream>, String> {
+    let roots = trusted_roots(PINNED_CA_PEM)?;
+    let config = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+    let host = target.host.as_str();
+    let Ok(server) = ServerName::try_from(host.to_owned()) else {
+        return Err(format!("invalid TLS server name `{host}`"));
+    };
+    let session = ClientConnection::new(config, server).map_err(|why| format!("TLS init: {why}"))?;
+    let port = target.port;
+    let socket = TcpStream::connect((host, port)).map_err(|why| format!("connect {host}:{port}: {why}"))?;
+    Ok(StreamOwned::new(session, socket))
 }
 
 /// The roots to trust: every certificate in `pem`, and nothing else.
 fn trusted_roots(pem: &[u8]) -> Result<RootCertStore, String> {
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(pem))
-        .collect::<Result<_, _>>()
-        .map_err(|error| format!("embedded CA parse: {error}"))?;
-    if certs.is_empty() {
-        return Err(
-            "embedded CA contains no certificate; rebuild with `make launcher windows`".to_owned(),
-        );
+    let mut reader = BufReader::new(pem);
+    let mut found: Vec<CertificateDer<'static>> = Vec::new();
+    for parsed in rustls_pemfile::certs(&mut reader) {
+        found.push(parsed.map_err(|why| format!("embedded CA parse: {why}"))?);
     }
-    let mut roots = RootCertStore::empty();
-    for cert in certs {
-        roots
-            .add(cert)
-            .map_err(|error| format!("embedded CA: {error}"))?;
+    if found.is_empty() {
+        return Err(String::from("embedded CA contains no certificate; rebuild with `make launcher windows`"));
     }
-    Ok(roots)
+    found.into_iter().try_fold(RootCertStore::empty(), |mut roots, cert| {
+        roots.add(cert).map_err(|why| format!("embedded CA: {why}"))?;
+        Ok(roots)
+    })
 }
 
 /// The request text. HTTP/1.1 with `Connection: close`: the body ends where
 /// the connection does, and the server may not compress it.
 fn request(target: &Endpoint) -> String {
-    format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: bo2mp-launcher/{}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
-        target.path,
-        target.host,
-        env!("CARGO_PKG_VERSION"),
-    )
+    let version = env!("CARGO_PKG_VERSION");
+    let lines = [
+        format!("GET {} HTTP/1.1", target.path),
+        format!("Host: {}", target.host),
+        format!("User-Agent: bo2mp-launcher/{version}"),
+        "Accept-Encoding: identity".to_owned(),
+        "Connection: close".to_owned(),
+        String::new(),
+        String::new(),
+    ];
+    lines.join("\r\n")
 }
 
 /// The body of a whole response, if it is a success this client can read.
-fn body_of(mut raw: Vec<u8>) -> Result<Vec<u8>, String> {
-    let split = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or("malformed HTTP response")?;
-    let head = std::str::from_utf8(&raw[..split]).map_err(|_| "non-UTF8 HTTP headers")?;
-    let mut lines = head.lines();
-    let status = lines.next().ok_or("missing HTTP status")?;
+fn body_of(raw: Vec<u8>) -> Result<Vec<u8>, String> {
+    const BLANK_LINE: &[u8] = b"\r\n\r\n";
+    let Some(head_end) = raw.windows(BLANK_LINE.len()).position(|four| four == BLANK_LINE) else {
+        return Err("malformed HTTP response".into());
+    };
+    let head = std::str::from_utf8(&raw[..head_end]).map_err(|_| String::from("non-UTF8 HTTP headers"))?;
+    if head.is_empty() {
+        return Err("missing HTTP status".into());
+    }
+    let (first, headers) = head.split_once('\n').unwrap_or((head, ""));
+    let status = first.strip_suffix('\r').unwrap_or(first);
     if !is_success(status) {
         return Err(status.to_owned());
     }
-    let mut length = None;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("transfer-encoding")
-            && value.to_ascii_lowercase().contains("chunked")
-        {
-            return Err("chunked responses are unsupported".to_owned());
+    let fields = headers.lines().filter_map(|line| line.split_once(':')).map(|(key, value)| (key, value.trim()));
+    let mut promised = None;
+    for (key, value) in fields {
+        let chunked = key.eq_ignore_ascii_case("transfer-encoding") && value.to_ascii_lowercase().contains("chunked");
+        if chunked {
+            return Err("chunked responses are unsupported".into());
         }
-        if name.eq_ignore_ascii_case("content-length") {
-            length = length.or(value.parse::<usize>().ok());
+        if promised.is_none() && key.eq_ignore_ascii_case("content-length") {
+            promised = value.parse::<usize>().ok();
         }
     }
-    raw.drain(..split + 4);
-    match length {
-        Some(promised) if promised != raw.len() => {
-            Err(format!("body length {} != {promised}", raw.len()))
-        }
-        _ => Ok(raw),
+    let body = raw[head_end + BLANK_LINE.len()..].to_vec();
+    let got = body.len();
+    match promised {
+        Some(want) if want != got => Err(format!("body length {got} != {want}")),
+        _ => Ok(body),
     }
 }
 
 /// `HTTP/1.0 2xx` or `HTTP/1.1 2xx`.
-fn is_success(status_line: &str) -> bool {
-    let mut parts = status_line.split_whitespace();
-    let version = parts.next();
-    let code = parts.next().and_then(|code| code.parse::<u16>().ok());
-    matches!(version, Some("HTTP/1.1" | "HTTP/1.0")) && code.is_some_and(|code| code / 100 == 2)
+fn is_success(summary_banner: &str) -> bool {
+    let words: Vec<&str> = summary_banner.split_whitespace().take(2).collect();
+    let [version, code] = words[..] else { return false };
+    let known = version == "HTTP/1.1" || version == "HTTP/1.0";
+    known && code.parse::<u16>().is_ok_and(|number| (200..300).contains(&number))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

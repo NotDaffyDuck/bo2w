@@ -6,160 +6,209 @@
 //! culled or drawn, how a trail is cut, how an effect is bolted to a bone.
 
 mod angles;
-mod at_rest;
+mod rest_state;
 mod atlas;
-mod bolt;
-mod collide;
+mod attach;
+mod bounce_hit;
 mod cull;
 mod draw;
-mod effect_def;
+mod fx_template;
 mod elem;
-mod elem_def;
-mod emit;
-mod flags;
-mod gravity;
-mod impact;
-mod integrate;
-mod life;
-mod lighting;
+mod elem_template;
+mod emission;
+mod mode_bits;
+mod fall_accel;
+mod hit_table;
+mod step_motion;
+mod lifespan;
+mod probe_tint;
 mod orient;
-mod orientation;
-mod origin;
-mod particle_cloud;
-mod pool;
+mod axis_frame;
+mod birth_spot;
+mod point_cloud;
+mod bank;
 mod quat;
-mod random;
-mod rotate_axis;
-mod rotation;
+mod dice;
+mod axis_turn;
+mod angle_graph;
 mod sort;
 mod spawn;
-mod sprite_quad;
-mod status;
-mod tail_draw;
-mod trail;
-mod trail_def;
-mod trail_runtime;
+mod camera_quad;
+mod state_word;
+mod tail_quads;
+mod streak;
+mod trail_template;
+mod trail_live;
 mod vec;
-mod velocity;
+mod speed_graph;
 mod view;
-mod vis_blocker;
-mod visual;
+mod sight_block;
+mod look;
 
-pub use angles::{get_elem_angles_axis, mat3_mul};
-pub use at_rest::get_at_rest_fraction;
-pub use atlas::{FxSpriteAtlasUv, sprite_atlas_uv};
-pub use bolt::{
-    BoneOrientationRefuse, FX_BOLT_BONE_SHIFT, FX_BOLT_FREE_NONE, FX_BOLT_HANDLE_NONE,
-    FX_BOLT_PARENT_IDENTITY_QUAT, FX_BOLT_RECORD_CAPACITY, FX_BOLT_VIEWMODEL_DOBJ_BASE,
-    FxGetBoneOrientationRoute, FxUpdateEffectBolt, begin_iterating_over_effects_exclusive,
+pub use angles::get_elem_angles_axis;
+pub use angles::mat3_mul;
+pub use rest_state::get_at_rest_fraction;
+pub use atlas::BillboardSheetCell;
+pub use atlas::sprite_atlas_uv;
+pub use attach::{
+    BoneOrientationRefuse, ATTACH_JOINT_BIT_OFFSET, NO_SPARE_ATTACH, NO_ATTACH_TICKET,
+    ATTACH_ROOT_NO_TURN, ATTACH_RECORD_LIMIT, ATTACH_HELD_GUN_SKELETON_START,
+    JointFacingPath, EmitterAttachRefresh, begin_iterating_over_effects_exclusive,
     bolt_alloc, bolt_bone, bolt_centity_teleport_for_compare, bolt_compose_orientation, bolt_dobj,
     bolt_handle_is_none, bolt_init_next_index, bolt_init_parent_orientation, bolt_mark_lost,
     bolt_pack, bolt_spawn_teleport_bit, end_iterating_over_effects, end_iterating_runs_gc,
     get_bone_orientation_route, quat_mul, stop_effect_has_owned, stop_effect_non_recursive_allows,
     update_effect_bolt,
 };
-pub use collide::{
-    FX_COLLIDE_SUBSTEP_MS, FX_TRACE_MASK, FX_TRACE_MASK_ITEM_CLIP, FxCollideSubstep,
+pub use bounce_hit::{
+    BOUNCE_SLICE_MS, PARTICLE_HIT_FILTER, PARTICLE_HIT_FILTER_PICKUPS, ParticleBounceSlice,
     collide_marks_at_rest, collide_substep_schedule, collision_reflect_base_vel_delta,
     impact_child_speed_allows, sample_reflection_factor, trace_mask,
 };
-pub use cull::{cull_cloud, cull_elem_for_spawn_allows, cull_elem_light, elem_light_color_bgr};
-pub use draw::{FxElemType, draw_elem_handler_present};
-pub use effect_def::FxEffectDef;
-pub use elem::FX_ELEM_AT_REST_NONE;
-pub use elem_def::FxElemDef;
-pub use emit::{
-    FX_ELEM_EMIT_ORIENT_AXIS, FxEmitSchedule, FxEmitSpawn, emit_dist_range, emit_lerp_origin,
+pub use cull::cull_cloud;
+pub use cull::cull_elem_for_spawn_allows;
+pub use cull::cull_elem_light;
+pub use cull::elem_light_color_bgr;
+pub use draw::ParticleShape;
+pub use draw::draw_elem_handler_present;
+pub use fx_template::EffectBlueprint;
+pub use elem::PARTICLE_NEVER_SETTLED;
+pub use elem_template::ElemBlueprint;
+pub use emission::{
+    PARTICLE_EMISSION_FACES_BASIS, EmissionTimetable, EmissionBirth, emit_dist_range, emit_lerp_origin,
     process_emitting_schedule,
 };
-pub use flags::{
-    FX_ELEM_DIE_ON_TOUCH, FX_ELEM_RUN_MASK, FX_ELEM_RUN_RELATIVE_TO_EFFECT,
-    FX_ELEM_RUN_RELATIVE_TO_OFFSET, FX_ELEM_RUN_RELATIVE_TO_OFFSET_EFFECT_NOW,
-    FX_ELEM_RUN_RELATIVE_TO_SPAWN, FX_ELEM_RUNNER_USES_RAND_ROT, FX_ELEM_SPAWN_FRUSTUM_CULL,
-    FX_ELEM_USE_COLLISION, FX_ELEM_VEL_LOCAL, FX_ELEM_VEL_WORLD, elem_dies_on_touch, elem_run_mode,
+pub use mode_bits::{
     elem_runs_relative_to_offset, elem_skips_position_update, elem_update_has_velocity_graph,
     elem_uses_collision, elem_uses_vel_local, elem_uses_vel_world,
 };
-pub use gravity::elem_gravity_accel_z_sampled;
-pub use impact::{
-    FX_IMPACT_EXIT_SURFACE_FLAG, FX_IMPACT_FLESH_COUNT, FX_IMPACT_NONFLESH_COUNT,
-    FX_SURF_TYPE_FLESH, FxImpactEntry, FxImpactTable, flesh_effect_index, flesh_hit_flags,
-    impact_table_row, surface_type_index,
+pub use mode_bits::ELEM_ENDS_ON_TOUCH;
+pub use mode_bits::PARTICLE_PATH_BITS;
+pub use mode_bits::FX_ELEM_RUN_RELATIVE_TO_EFFECT;
+pub use mode_bits::FX_ELEM_RUN_RELATIVE_TO_OFFSET;
+pub use mode_bits::FX_ELEM_RUN_RELATIVE_TO_OFFSET_EFFECT_NOW;
+pub use mode_bits::FX_ELEM_RUN_RELATIVE_TO_SPAWN;
+pub use mode_bits::ELEM_RUNNER_ROLLS_AT_START;
+pub use mode_bits::ELEM_CULL_AT_BIRTH;
+pub use mode_bits::ELEM_COLLIDES_WITH_WORLD;
+pub use mode_bits::ELEM_SPEED_OWN_AXES;
+pub use mode_bits::ELEM_SPEED_WORLD_AXES;
+pub use mode_bits::elem_dies_on_touch;
+pub use mode_bits::elem_run_mode;
+pub use fall_accel::elem_gravity_accel_z_sampled;
+pub use hit_table::{
+    HIT_ON_WAY_OUT_BIT, BODY_HIT_KIND_TOTAL, SOLID_HIT_KIND_TOTAL,
+    impact_table_row, material_kind_number,
 };
-pub use integrate::{FxElemVec3Range, integrate_velocity_graph};
-pub use life::{
+pub use hit_table::MATERIAL_KIND_BODY;
+pub use hit_table::ImpactRow;
+pub use hit_table::ImpactSheet;
+pub use hit_table::flesh_effect_index;
+pub use hit_table::flesh_hit_flags;
+pub use step_motion::Vec3Spread;
+pub use step_motion::integrate_velocity_graph;
+pub use lifespan::{
     sample_life_span_msec, trail_elem_base_vel_z_pack, trail_elem_keep, trail_elem_norm_ages,
 };
-pub use lighting::{
+pub use probe_tint::{
     apply_lighting_frac_bgra, effect_def_needs_lighting_sample, elem_uses_lighting_frac,
 };
-pub use orient::{orientation_pos_from_world, orientation_pos_to_world};
-pub use orientation::{FxOrientFrame, FxOrientSpawnParams, FxOrientation, get_orientation};
-pub use origin::{
-    FxSpawnOffsetMode, elem_spawn_offset_mode, spawn_origin_world, world_delta_to_local,
+pub use orient::orientation_pos_from_world;
+pub use orient::orientation_pos_to_world;
+pub use axis_frame::EffectFacingBasis;
+pub use axis_frame::FacingBirthKnobs;
+pub use axis_frame::EffectFacing;
+pub use axis_frame::get_orientation;
+pub use birth_spot::{
+    BirthDisplacementStyle, elem_spawn_offset_mode, spawn_origin_world, world_delta_to_local,
 };
-pub use particle_cloud::{
-    FX_CODE_FOUNTAIN_PARM0, FX_CODE_FOUNTAIN_PARM1, FX_CODE_PARTICLE_CLOUD_COLOR,
-    FX_CODE_PARTICLE_CLOUD_MATRIX0, FX_CODE_SPARK_COLOR0, FX_PARTICLE_CLOUD_FLAG_SPARK,
-    FX_PARTICLE_CLOUD_GRID_X, FX_PARTICLE_CLOUD_GRID_Y, FX_PARTICLE_CLOUD_GRID_Z,
-    FX_PARTICLE_CLOUD_INDICES_PER_CELL, FX_PARTICLE_CLOUD_QUAD_INDICES,
-    FX_PARTICLE_CLOUD_TEMPLATE_CELLS, FX_PARTICLE_CLOUD_UV, FX_PARTICLE_CLOUD_VERTS_PER_CELL,
-    FX_PARTICLE_SPARK_INDICES_PER_CELL, FX_PARTICLE_SPARK_VERTS_PER_CELL,
-    GFX_POS_TEX_VERTEX_STRIDE, GfxParticleCloud, GfxPosTexVertex, MSVCRT_HOLDRAND_DEFAULT,
-    build_cloud, gfx_pos_tex_vertex_bytes, msvcrt_rand01, particle_cloud_cell_indices,
+pub use point_cloud::{
+    SPRAY_SHADER_KNOB_A, SPRAY_SHADER_KNOB_B, SWARM_SHADER_TINT,
+    SWARM_SHADER_BASIS_ROW, EMBER_SHADER_TINT, SWARM_IS_EMBERS,
+    SWARM_LATTICE_ACROSS, SWARM_LATTICE_DEEP, SWARM_LATTICE_TALL,
+    SWARM_TRIANGLE_SLOTS_EACH_SPECK, SWARM_RECT_TRIANGLE_SLOTS,
+    SWARM_STAMP_SPECKS, SWARM_CORNER_UVS, SWARM_CORNERS_EACH_SPECK,
+    EMBER_TRIANGLE_SLOTS_EACH_SPECK, EMBER_CORNERS_EACH_SPECK,
+    POINT_UV_CORNER_BYTES, VisualParticleCloud, PointUvCorner, CLASSIC_DICE_START,
     particle_cloud_cell_radius_sq, particle_cloud_cell_verts, particle_cloud_cell_xyz,
     particle_cloud_color_const, particle_cloud_compare_cell_radius, particle_cloud_draw_cell_count,
     particle_cloud_draw_counts, particle_cloud_matrix_diag, particle_cloud_particle_id,
     particle_fountain_parm0, particle_spark_cell_indices, particle_spark_cell_verts,
 };
-pub use pool::{
-    FX_EFFECT_HANDLE_RING_SIZE, FX_EFFECT_POOL_CAPACITY, FX_EFFECT_SLOT_SIZE,
-    FX_ELEM_POOL_CAPACITY, FX_ELEM_RUNTIME_STRIDE, FX_ENTITYNUM_WORLD, FX_PLAY_BOLT_NONE,
-    FX_RAND_TABLE_MOD, FX_SPAWN_BOLT_NONE, FX_SPOT_LIGHT_LIMIT, FX_TRAIL_ELEM_POOL_CAPACITY,
-    FX_TRAIL_ELEM_RUNTIME_STRIDE, FX_TRAIL_POOL_CAPACITY, FX_TRAIL_RUNTIME_STRIDE,
-    FX_WARN_ELEM_LIMIT, effect_handle_for_slot, elem_handle_from_ptr_delta,
-    trail_elem_handle_for_slot, trail_handle_for_slot,
+pub use point_cloud::build_cloud;
+pub use point_cloud::point_uv_corner_bytes;
+pub use point_cloud::classic_dice_unit;
+pub use point_cloud::particle_cloud_cell_indices;
+pub use bank::{
+    EMITTER_TICKET_WHEEL_LEN, EMITTER_BANK_LIMIT, EMITTER_SLOT_BYTES,
+    DICE_TABLE_WRAP, BIRTH_UNATTACHED, CONE_GLOW_LIMIT, STREAK_JOINT_BANK_LIMIT,
+    STREAK_JOINT_RECORD_BYTES, STREAK_BANK_LIMIT, STREAK_RECORD_BYTES,
+    PARTICLE_ALERT_THRESHOLD, effect_handle_for_slot, elem_handle_from_ptr_delta,
 };
-pub use quat::{axis_to_quat, quat_normalize, unit_quat_to_axis};
-pub use random::{
-    FX_RAND_CH_COLOR, FX_RAND_CH_DELAY, FX_RAND_CH_LIFE, FX_RAND_CH_ONESHOT_COUNT,
-    FX_RAND_CH_SCALE, FX_RAND_CH_SIZE0, FX_RANDOM_TABLE_FLOATS, effect_random_seed_from_msec,
-    elem_random_seed, elem_visual_index, random_table_f32, random_table_u16, trail_random_seed,
+pub use bank::PARTICLE_BANK_LIMIT;
+pub use bank::PARTICLE_LIVE_RECORD_BYTES;
+pub use bank::FX_ENTITYNUM_WORLD;
+pub use bank::START_UNATTACHED;
+pub use bank::trail_piece_ticket_for_slot;
+pub use bank::trail_ticket_for_slot;
+pub use quat::axis_to_quat;
+pub use quat::quat_normalize;
+pub use quat::unit_quat_to_axis;
+pub use dice::{
+    DICE_LANE_TINT, DICE_LANE_WAIT, DICE_LANE_LIFESPAN, DICE_LANE_BURST_TOTAL,
+    DICE_LANE_GROWTH, DICE_LANE_FIRST_EXTENT, DICE_TABLE_REALS, effect_random_seed_from_msec,
 };
-pub use rotate_axis::{impact_mark_axis, randomly_rotate_axis, runner_rand_rot_degrees};
-pub use rotation::clamp_elem_rotation_time;
-pub use sort::{existing_elem_sorts_before_new, sort_dist_to_cam_sq};
+pub use dice::elem_random_seed;
+pub use dice::elem_visual_index;
+pub use dice::random_table_f32;
+pub use dice::random_table_u16;
+pub use dice::trail_random_seed;
+pub use axis_turn::impact_mark_axis;
+pub use axis_turn::randomly_rotate_axis;
+pub use axis_turn::runner_rand_rot_degrees;
+pub use angle_graph::clamp_elem_rotation_time;
+pub use sort::existing_elem_sorts_before_new;
+pub use sort::sort_dist_to_cam_sq;
 pub use spawn::{
-    FX_ELEM_TYPE_TRAIL, looping_catchup_begin, looping_spawn_schedule, sample_oneshot_spawn_count,
+    PARTICLE_SHAPE_STREAK, looping_catchup_begin, looping_spawn_schedule, sample_oneshot_spawn_count,
     spawn_effect_status,
 };
-pub use sprite_quad::{FX_SPRITE_QUAD_INDICES, FX_SPRITE_QUAD_LOCAL_XY, sprite_quad_indices};
-pub use status::{
-    FX_STATUS_HAS_PENDING_LOOP_ELEMS, FX_STATUS_REF_COUNT_LOW_MASK, FX_STATUS_REF_COUNT_MASK,
+pub use camera_quad::BILLBOARD_TRIANGLE_SLOTS;
+pub use camera_quad::BILLBOARD_CORNER_OFFSETS;
+pub use camera_quad::sprite_quad_indices;
+pub use state_word::{
+    EMITTER_REPEAT_QUEUED_BIT, FX_STATUS_REF_COUNT_LOW_MASK, EMITTER_HOLDER_TALLY_BITS,
     status_is_unique_done,
 };
-pub use tail_draw::{tail_anchor_origin, tail_sprite_axes, tail_sprite_full_extent};
-pub use trail::{
-    FX_TRAIL_TANGENT_PACKED, FxTrailEmittedVert, FxTrailSegmentDrawState, compress_basis_from_axis,
+pub use tail_quads::tail_anchor_origin;
+pub use tail_quads::tail_sprite_axes;
+pub use tail_quads::tail_sprite_full_extent;
+pub use streak::{
     pack_code_mesh_vertex, trail_compute_u, trail_emit_index_quad, trail_emit_segment_verts,
     trail_index_quad_tris, trail_pack_normal, trail_pack_texcoord, trail_uncompress_basis,
 };
-pub use trail_def::{FxTrailDef, FxTrailVertex};
-pub use trail_runtime::{
-    FxTrailSplit, trail_split_interpolant_msec, trail_split_interpolant_t, trail_split_lerp_axis,
+pub use streak::TRAIL_TANGENT_WORD;
+pub use streak::StreakLaidCorner;
+pub use streak::StreakPiecePaintStatus;
+pub use streak::compress_basis_from_axis;
+pub use trail_template::StreakBlueprint;
+pub use trail_template::StreakCorner;
+pub use trail_live::{
+    StreakBreak, trail_split_interpolant_msec, trail_split_interpolant_t, trail_split_lerp_axis,
     trail_split_lerp_origin, trail_split_skips_update, trail_split_window,
 };
 pub use vec::{
     effect_orient_arc, perpendicular_vector, vec3_distance, vec3_length_sq, vec3_normalize,
-    vector_vectors,
+    contact_facing_basis,
 };
-pub use velocity::get_velocity_at_time;
-pub use view::{FxEffectDefView, FxElemDefView};
-pub use vis_blocker::{
-    FxVisBlockerBuf, FxVisBlockerRec, evaluate_distance_fade, vis_blocker_add_prepared,
+pub use speed_graph::get_velocity_at_time;
+pub use view::EmitterRecipeLens;
+pub use view::ParticleRecipeLens;
+pub use sight_block::{
+    SightOccluderStore, SightOccluderEntry, evaluate_distance_fade, vis_blocker_add_prepared,
     vis_blocker_generate_verts,
 };
-pub use visual::{
+pub use look::{
     elem_norm_time, evaluate_color_bgra, evaluate_rotation_total, evaluate_scale, evaluate_size0,
     evaluate_size1,
 };

@@ -13,7 +13,7 @@
 //! weapon's camo / render options on the item, BG_PlayerCanPickUpWeaponType (the class/perk
 //! restrictions on what a player may pick up) and the grenade throwback pickup.
 
-use crate::facts::{FactsTable, inventory, offhand_class, weap_type};
+use crate::facts::{FactsTable, inventory, secondary_hand_category, gun_family_code};
 use crate::player::{T6WeaponPs, wf};
 
 /// One ammo slot on a dropped gun: slot 1 is the gun itself, slot 2 its left-hand gun (dual
@@ -36,7 +36,7 @@ pub enum ThrowDown {
     /// The gun is taken and nothing lands (no ammo to carry, or not held).
     TakeOnly(u32),
     /// The gun lands carrying this ammo, then it is taken.
-    Drop(u32, ItemAmmo),
+    Drop(u32, [ItemSlot; 2]),
 }
 
 /// What walking over a gun did (WeaponPickup's ammo leech).
@@ -84,7 +84,7 @@ pub fn clip(ps: &T6WeaponPs, facts: &FactsTable, w: u32) -> i32 {
 pub fn stock(ps: &T6WeaponPs, facts: &FactsTable, w: u32) -> i32 {
     let pw = facts.ammo_pool_weapon(w);
     if ps.has_weapon(pw) {
-        ps.pool_slot(pw)
+        ps.reserve_index(pw)
     } else {
         0
     }
@@ -116,25 +116,25 @@ pub fn player_max(
     excluded: u32,
 ) -> i32 {
     let c = facts.get(w).core;
-    if c.clip_only {
-        return c.clip_size;
+    if c.motion_clip_exclusive {
+        return c.magazine_capacity;
     }
     let pool = facts.ammo_pool_weapon(w);
-    let mut total = 0;
+    let mut pooled = 0;
     for h in held_list(ps) {
         if h == excluded || facts.ammo_pool_weapon(h) != pool {
             continue;
         }
         let hc = facts.get(h).core;
-        if hc.inventory_type == inventory::ALTMODE
+        if hc.carry_slot_kind == inventory::ALTMODE
             && excluded != 0
             && same_base(facts, hc.alt_weapon, excluded)
         {
             continue;
         }
-        total += max(h);
+        pooled += max(h);
     }
-    total
+    pooled
 }
 
 /// BG_GetMaxPickupableAmmo: room left in the magazine (clip-only) or the reserve.
@@ -144,8 +144,8 @@ pub fn max_pickupable(
     max: &dyn Fn(u32) -> i32,
     w: u32,
 ) -> i32 {
-    if facts.get(w).core.clip_only {
-        facts.get(w).core.clip_size - clip(ps, facts, w)
+    if facts.get(w).core.motion_clip_exclusive {
+        facts.get(w).core.magazine_capacity - clip(ps, facts, w)
     } else {
         player_max(ps, facts, max, w, 0) - stock(ps, facts, w)
     }
@@ -187,7 +187,7 @@ pub fn compatible_weapon(ps: &T6WeaponPs, facts: &FactsTable, w: u32) -> u32 {
 }
 
 fn is_frag(facts: &FactsTable, w: u32) -> bool {
-    facts.get(w).core.offhand_class == offhand_class::FRAG_GRENADE
+    facts.get(w).core.secondary_hand_category == secondary_hand_category::FRAG_GRENADE
 }
 
 /// The dropped gun's second ammo slot: its left-hand gun when dual wield, else its alternate.
@@ -214,7 +214,7 @@ pub fn has_ammo_to_transfer(
 /// TransferPlayerAmmoToWeaponEntity: each slot takes the gun's magazine and the reserve the
 /// player's other guns cannot carry. The player's own rows are left as they are (the take that
 /// follows clears them).
-pub fn transfer(ps: &T6WeaponPs, facts: &FactsTable, max: &dyn Fn(u32) -> i32, w: u32) -> ItemAmmo {
+pub fn transfer(ps: &T6WeaponPs, facts: &FactsTable, max: &dyn Fn(u32) -> i32, w: u32) -> [ItemSlot; 2] {
     let mut out = [ItemSlot::default(); 2];
     for (slot, ws) in out.iter_mut().zip([w, slot2_weapon(facts, w)]) {
         if ws == 0 {
@@ -239,7 +239,7 @@ pub fn throw_down(
 ) -> ThrowDown {
     let mut w = w;
     let c = facts.get(w).core;
-    if c.inventory_type == inventory::ALTMODE {
+    if c.carry_slot_kind == inventory::ALTMODE {
         if c.alt_weapon == 0 {
             return ThrowDown::Nothing;
         }
@@ -248,15 +248,15 @@ pub fn throw_down(
     if !ps.has_weapon(w) || !has_ammo_to_transfer(ps, facts, max, w) {
         return ThrowDown::TakeOnly(w);
     }
-    if facts.get(w).core.clip_only && clip(ps, facts, w) == 0 {
+    if facts.get(w).core.motion_clip_exclusive && clip(ps, facts, w) == 0 {
         return ThrowDown::TakeOnly(w);
     }
     ThrowDown::Drop(w, transfer(ps, facts, max, w))
 }
 
 /// Fill_Clip: the magazine tops up from the reserve.
-fn fill_clip(clip_size: i32, clip: &mut i32, pool: &mut i32) {
-    let n = (clip_size - *clip).min(*pool).max(0);
+fn fill_clip(magazine_capacity: i32, clip: &mut i32, pool: &mut i32) {
+    let n = (magazine_capacity - *clip).min(*pool).max(0);
     *pool -= n;
     *clip += n;
 }
@@ -281,16 +281,16 @@ pub fn add_ammo(
     let cap = player_max(ps, facts, max, w, 0);
     let mut pool = (stock0 + count).max(0);
     let mut clip_n = clip0;
-    if c.clip_only {
-        fill_clip(c.clip_size, &mut clip_n, &mut pool);
+    if c.motion_clip_exclusive {
+        fill_clip(c.magazine_capacity, &mut clip_n, &mut pool);
         pool = 0;
     } else {
         if fill {
-            fill_clip(c.clip_size, &mut clip_n, &mut pool);
+            fill_clip(c.magazine_capacity, &mut clip_n, &mut pool);
         }
         pool = pool.min(cap);
     }
-    clip_n = clip_n.min(c.clip_size);
+    clip_n = clip_n.min(c.magazine_capacity);
     set_clip(ps, facts, w, clip_n);
     set_stock(ps, facts, w, pool);
     clip_n + pool - clip0 - stock0
@@ -303,7 +303,7 @@ pub fn leech(
     ps: &mut T6WeaponPs,
     facts: &FactsTable,
     max: &dyn Fn(u32) -> i32,
-    item: &mut ItemAmmo,
+    item: &mut [ItemSlot; 2],
     exact: bool,
 ) -> Leech {
     let mut any_left = false;
@@ -317,15 +317,15 @@ pub fn leech(
         if compat == 0 {
             continue;
         }
-        grenade |= facts.get(s.weapon).core.weap_type == weap_type::GRENADE;
+        grenade |= facts.get(s.weapon).core.gun_family_code == gun_family_code::GRENADE;
         let amount = s.stock + if exact { s.clip } else { 0 };
-        let added = add_ammo(ps, facts, max, compat, amount, false);
-        if added == 0 {
+        let gained = add_ammo(ps, facts, max, compat, amount, false);
+        if gained == 0 {
             any_left |= s.stock >= 1 || s.clip > 0;
             continue;
         }
         added_any = true;
-        s.stock -= added;
+        s.stock -= gained;
         if s.stock >= 0 {
             any_left |= s.stock >= 1 || s.clip > 0;
         } else {
@@ -362,7 +362,7 @@ fn ent_can_be_grabbed(
 /// BG_CanItemBeGrabbed's first gate: with the weapons taken away (disableweapons) nothing on
 /// the ground can be touched or picked up.
 pub fn weapons_disabled(ps: &T6WeaponPs) -> bool {
-    ps.weap_flags & wf::DISABLE_SWITCH_TO_NONE != 0
+    ps.weapon_state_bits & wf::DISABLE_SWITCH_TO_NONE != 0
 }
 
 /// BG_CanItemBeGrabbed on the use path (WeaponEntCanBeGrabbed with no touch): the gun, or its
@@ -380,11 +380,11 @@ pub fn can_be_grabbed(
     ps: &T6WeaponPs,
     facts: &FactsTable,
     max: &dyn Fn(u32) -> i32,
-    item: &ItemAmmo,
-    scavenger: bool,
+    item: &[ItemSlot; 2],
+    has_scavenger: bool,
     has_perk: bool,
 ) -> bool {
-    if scavenger {
+    if has_scavenger {
         return has_perk;
     }
     let w = item[0].weapon;
@@ -414,7 +414,7 @@ pub fn primaries_full(ps: &T6WeaponPs, facts: &FactsTable) -> bool {
         .into_iter()
         .filter(|&h| {
             let c = facts.get(h).core;
-            c.inventory_type == inventory::PRIMARY && !c.carried_killstreak
+            c.carry_slot_kind == inventory::PRIMARY && !c.carried_killstreak
         })
         .count()
         > 1
@@ -424,10 +424,10 @@ pub fn primaries_full(ps: &T6WeaponPs, facts: &FactsTable) -> bool {
 pub fn current_primary(ps: &T6WeaponPs, facts: &FactsTable) -> u32 {
     let mut w = ps.weapon;
     let c = facts.get(w).core;
-    if c.inventory_type == inventory::ALTMODE {
+    if c.carry_slot_kind == inventory::ALTMODE {
         w = c.alt_weapon;
     }
-    if ps.has_weapon(w) && facts.get(w).core.inventory_type == inventory::PRIMARY {
+    if ps.has_weapon(w) && facts.get(w).core.carry_slot_kind == inventory::PRIMARY {
         w
     } else {
         0
@@ -441,14 +441,14 @@ pub fn swap_target(ps: &T6WeaponPs, facts: &FactsTable) -> u32 {
         .into_iter()
         .find(|&h| {
             let c = facts.get(h).core;
-            c.inventory_type == inventory::PRIMARY && c.weap_type == weap_type::MELEE
+            c.carry_slot_kind == inventory::PRIMARY && c.gun_family_code == gun_family_code::CLOSE_COMBAT
         })
         .unwrap_or_else(|| current_primary(ps, facts))
 }
 
 /// Whether picking up `w` needs a swap: a primary while both primaries are full.
 pub fn needs_swap(ps: &T6WeaponPs, facts: &FactsTable, w: u32) -> bool {
-    facts.get(w).core.inventory_type == inventory::PRIMARY && primaries_full(ps, facts)
+    facts.get(w).core.carry_slot_kind == inventory::PRIMARY && primaries_full(ps, facts)
 }
 
 /// WeaponPickup_AddWeapon's refusal: the hands hold a gun that is not in the held list.
@@ -462,7 +462,7 @@ pub fn add_ammo_for_new_weapon(
     ps: &mut T6WeaponPs,
     facts: &FactsTable,
     max: &dyn Fn(u32) -> i32,
-    item: &ItemAmmo,
+    item: &[ItemSlot; 2],
 ) {
     for s in item {
         if s.weapon == 0 || !ps.has_weapon(s.weapon) {
@@ -479,8 +479,8 @@ pub fn add_ammo_for_new_weapon(
 /// in an offhand slot.
 pub fn grab_selects(facts: &FactsTable, w: u32) -> bool {
     let c = facts.get(w).core;
-    !((c.weap_type == weap_type::GRENADE || c.weap_type == weap_type::MINE)
-        && c.offhand_class != offhand_class::NONE)
+    !((c.gun_family_code == gun_family_code::GRENADE || c.gun_family_code == gun_family_code::MINE)
+        && c.secondary_hand_category != secondary_hand_category::NONE)
 }
 
 #[cfg(test)]
@@ -493,14 +493,14 @@ mod tests {
     const KNIFE: u32 = 3;
     const FIVE7: u32 = 4;
     const FIVE7_LH: u32 = 5;
-    const FRAG: u32 = 6;
+    const SAMPLE_FRAG_ASSET: u32 = 6;
     const AN94_FMJ: u32 = 7;
     const MP7: u32 = 8;
     const BALLISTIC: u32 = 9;
 
     fn row(f: impl FnOnce(&mut crate::facts::CoreFacts)) -> T6WeaponFacts {
         let mut t = T6WeaponFacts::default();
-        t.core.clip_size = 30;
+        t.core.magazine_capacity = 30;
         f(&mut t.core);
         t
     }
@@ -512,16 +512,16 @@ mod tests {
             AN94_GL,
             "gl_an94_mp",
             row(|c| {
-                c.inventory_type = inventory::ALTMODE;
+                c.carry_slot_kind = inventory::ALTMODE;
                 c.ignore_attachments = true;
                 c.alt_weapon = AN94;
-                c.clip_size = 1;
+                c.magazine_capacity = 1;
             }),
         );
         t.set(
             KNIFE,
             "knife_mp",
-            row(|c| c.inventory_type = inventory::MELEE),
+            row(|c| c.carry_slot_kind = inventory::CLOSE_COMBAT),
         );
         t.set(
             FIVE7,
@@ -529,28 +529,28 @@ mod tests {
             row(|c| {
                 c.dual_wield = true;
                 c.dual_wield_weapon = FIVE7_LH;
-                c.clip_size = 20;
+                c.magazine_capacity = 20;
             }),
         );
         t.set(
             FIVE7_LH,
             "fiveseven_lh_mp",
             row(|c| {
-                c.inventory_type = inventory::DWLEFTHAND;
+                c.carry_slot_kind = inventory::DWLEFTHAND;
                 c.dual_wield = true;
                 c.dual_wield_weapon = FIVE7;
-                c.clip_size = 20;
+                c.magazine_capacity = 20;
             }),
         );
         t.set(
-            FRAG,
+            SAMPLE_FRAG_ASSET,
             "frag_grenade_mp",
             row(|c| {
-                c.inventory_type = inventory::OFFHAND;
-                c.weap_type = weap_type::GRENADE;
-                c.offhand_class = offhand_class::FRAG_GRENADE;
-                c.clip_only = true;
-                c.clip_size = 2;
+                c.carry_slot_kind = inventory::OFFHAND;
+                c.gun_family_code = gun_family_code::GRENADE;
+                c.secondary_hand_category = secondary_hand_category::FRAG_GRENADE;
+                c.motion_clip_exclusive = true;
+                c.magazine_capacity = 2;
             }),
         );
         t.set(AN94_FMJ, "an94_mp+fmj", row(|_| {}));
@@ -559,8 +559,8 @@ mod tests {
             BALLISTIC,
             "knife_ballistic_mp",
             row(|c| {
-                c.weap_type = weap_type::MELEE;
-                c.clip_size = 1;
+                c.gun_family_code = gun_family_code::CLOSE_COMBAT;
+                c.magazine_capacity = 1;
             }),
         );
         t
@@ -571,7 +571,7 @@ mod tests {
             AN94 | AN94_FMJ | MP7 => 120,
             AN94_GL => 1,
             FIVE7 | FIVE7_LH => 80,
-            FRAG => 2,
+            SAMPLE_FRAG_ASSET => 2,
             BALLISTIC => 2,
             _ => 0,
         }
@@ -644,10 +644,10 @@ mod tests {
         let facts = table();
         let ps = holding(&[(MP7, 0, 0)]);
         assert_eq!(throw_down(&ps, &facts, &max, MP7), ThrowDown::TakeOnly(MP7));
-        let ps = holding(&[(FRAG, 0, 0)]);
+        let ps = holding(&[(SAMPLE_FRAG_ASSET, 0, 0)]);
         assert_eq!(
-            throw_down(&ps, &facts, &max, FRAG),
-            ThrowDown::TakeOnly(FRAG)
+            throw_down(&ps, &facts, &max, SAMPLE_FRAG_ASSET),
+            ThrowDown::TakeOnly(SAMPLE_FRAG_ASSET)
         );
         // Not held at all.
         assert_eq!(throw_down(&ps, &facts, &max, MP7), ThrowDown::TakeOnly(MP7));
@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(player_max(&ps, &facts, &max, AN94_GL, AN94), 0);
         assert_eq!(player_max(&ps, &facts, &max, AN94_GL, 0), 1);
         // Clip-only: the magazine.
-        assert_eq!(player_max(&ps, &facts, &max, FRAG, 0), 2);
+        assert_eq!(player_max(&ps, &facts, &max, SAMPLE_FRAG_ASSET, 0), 2);
     }
 
     #[test]
@@ -677,9 +677,9 @@ mod tests {
         assert_eq!(add_ammo(&mut ps, &facts, &max, MP7, 50, true), 50);
         assert_eq!((clip(&ps, &facts, MP7), stock(&ps, &facts, MP7)), (30, 30));
         // A clip-only grenade: the rounds go to the magazine, up to its size.
-        let mut ps = holding(&[(FRAG, 1, 0)]);
-        assert_eq!(add_ammo(&mut ps, &facts, &max, FRAG, 3, false), 1);
-        assert_eq!((clip(&ps, &facts, FRAG), stock(&ps, &facts, FRAG)), (2, 0));
+        let mut ps = holding(&[(SAMPLE_FRAG_ASSET, 1, 0)]);
+        assert_eq!(add_ammo(&mut ps, &facts, &max, SAMPLE_FRAG_ASSET, 3, false), 1);
+        assert_eq!((clip(&ps, &facts, SAMPLE_FRAG_ASSET), stock(&ps, &facts, SAMPLE_FRAG_ASSET)), (2, 0));
         // Not held, nothing like it held: nothing.
         let mut ps = holding(&[(KNIFE, 0, 0)]);
         assert_eq!(add_ammo(&mut ps, &facts, &max, MP7, 50, false), 0);
@@ -765,10 +765,10 @@ mod tests {
     #[test]
     fn a_grenade_emptied_by_a_touch_goes() {
         let facts = table();
-        let mut ps = holding(&[(FRAG, 1, 0)]);
+        let mut ps = holding(&[(SAMPLE_FRAG_ASSET, 1, 0)]);
         let mut item = [
             ItemSlot {
-                weapon: FRAG,
+                weapon: SAMPLE_FRAG_ASSET,
                 clip: 0,
                 stock: 1,
             },
@@ -782,7 +782,7 @@ mod tests {
                 take: true
             }
         );
-        assert_eq!(clip(&ps, &facts, FRAG), 2);
+        assert_eq!(clip(&ps, &facts, SAMPLE_FRAG_ASSET), 2);
     }
 
     #[test]
@@ -851,14 +851,14 @@ mod tests {
         add_ammo_for_new_weapon(&mut ps, &facts, &max, &item);
         assert_eq!((clip(&ps, &facts, MP7), stock(&ps, &facts, MP7)), (30, 20));
         assert!(grab_selects(&facts, MP7));
-        assert!(!grab_selects(&facts, FRAG));
+        assert!(!grab_selects(&facts, SAMPLE_FRAG_ASSET));
     }
 
     #[test]
     fn disabled_weapons_stop_every_pickup() {
         let mut ps = holding(&[(MP7, 30, 0)]);
         assert!(!weapons_disabled(&ps));
-        ps.weap_flags |= wf::DISABLE_SWITCH_TO_NONE;
+        ps.weapon_state_bits |= wf::DISABLE_SWITCH_TO_NONE;
         assert!(weapons_disabled(&ps));
     }
 

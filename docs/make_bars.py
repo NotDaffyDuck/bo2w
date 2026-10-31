@@ -4,6 +4,7 @@
     python docs/make_bars.py            # rewrite the table in README.md
     python docs/make_bars.py --print    # only print the table
     python docs/make_bars.py --check    # also fail if a pass/match has no evidence
+    python docs/make_bars.py --mp       # multiplayer maps only (ids mp_*), as the fan README shows
 
 docs/maps.json holds one row per map:
 
@@ -24,6 +25,7 @@ nothing wrong; "close" when the shot shows nothing wrong but some data values st
 look.txt names them); "wrong" when the shot shows something wrong. Footage is never the proof. Every pass/match
 names its proof in "evidence" (a run folder or a shot), as a path relative to the work folder, never a drive
 letter or a user folder.
+A row may carry "notes": {cell: text}, what a cell's proof does not show (the bars ignore it).
 
 The table goes between the two marker lines in README.md:
     <!-- map-bars:start -->
@@ -109,6 +111,8 @@ def build(data, problems):
 def main(argv):
     with open(DATA, encoding="utf-8") as f:
         data = json.load(f)
+    if "--mp" in argv:
+        data["maps"] = [m for m in data["maps"] if m.get("id", "").startswith("mp_")]
     problems = []
     table = build(data, problems)
     for p in problems:

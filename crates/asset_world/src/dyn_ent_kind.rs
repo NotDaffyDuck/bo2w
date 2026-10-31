@@ -2,7 +2,7 @@
 
 /// The kind a map gives a dynamic entity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DynEntType {
+pub enum MovableObjectKind {
     /// Not a real entity; a map row nobody filled in.
     Invalid,
     /// A loose prop that physics can knock about.
@@ -13,21 +13,21 @@ pub enum DynEntType {
 
 /// What a kind of dynamic entity is allowed to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DynEntProps {
-    pub use_physics: bool,
-    pub destroyable: bool,
+pub struct DynEntAbilities {
+    pub is_simulated: bool,
+    pub can_be_wrecked: bool,
 }
 
 /// What `ty` can do. Nothing for an invalid kind.
-pub fn dyn_ent_props(ty: DynEntType) -> Option<DynEntProps> {
-    let (use_physics, destroyable) = match ty {
-        DynEntType::Invalid => return None,
-        DynEntType::Clutter => (true, false),
-        DynEntType::Destruct => (true, true),
+pub fn dyn_ent_props(ty: MovableObjectKind) -> Option<DynEntAbilities> {
+    let (use_physics, can_be_wrecked) = match ty {
+        MovableObjectKind::Invalid => return None,
+        MovableObjectKind::Clutter => (true, false),
+        MovableObjectKind::Destruct => (true, true),
     };
-    Some(DynEntProps {
-        use_physics,
-        destroyable,
+    Some(DynEntAbilities {
+        is_simulated: use_physics,
+        can_be_wrecked,
     })
 }
 
@@ -37,18 +37,18 @@ mod tests {
 
     #[test]
     fn clutter_moves_but_does_not_break() {
-        let props = dyn_ent_props(DynEntType::Clutter).expect("clutter");
-        assert!(props.use_physics && !props.destroyable);
+        let props = dyn_ent_props(MovableObjectKind::Clutter).expect("clutter");
+        assert!(props.is_simulated && !props.can_be_wrecked);
     }
 
     #[test]
     fn a_destructible_moves_and_breaks() {
-        let props = dyn_ent_props(DynEntType::Destruct).expect("destruct");
-        assert!(props.use_physics && props.destroyable);
+        let props = dyn_ent_props(MovableObjectKind::Destruct).expect("destruct");
+        assert!(props.is_simulated && props.can_be_wrecked);
     }
 
     #[test]
     fn an_invalid_kind_can_do_nothing() {
-        assert_eq!(dyn_ent_props(DynEntType::Invalid), None);
+        assert_eq!(dyn_ent_props(MovableObjectKind::Invalid), None);
     }
 }

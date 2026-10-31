@@ -17,8 +17,8 @@ pub const CONTROLLER_SLOTS: usize = 6;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerControllers {
     pub angles: [[f32; 3]; CONTROLLER_SLOTS],
-    pub tag_origin_angles: [f32; 3],
-    pub tag_origin_offset: [f32; 3],
+    pub origin_tag_turn: [f32; 3],
+    pub origin_tag_shift: [f32; 3],
 }
 
 impl PlayerControllers {
@@ -28,11 +28,11 @@ impl PlayerControllers {
     /// code applying them to a bone was found.
     pub fn root_write(&self) -> Option<([f32; 3], [f32; 3])> {
         let any = self
-            .tag_origin_offset
+            .origin_tag_shift
             .iter()
-            .chain(&self.tag_origin_angles)
+            .chain(&self.origin_tag_turn)
             .any(|v| *v != 0.0);
-        any.then_some((self.tag_origin_offset, self.tag_origin_angles))
+        any.then_some((self.origin_tag_shift, self.origin_tag_turn))
     }
 }
 
@@ -63,7 +63,7 @@ mod tests {
         let mut c = PlayerControllers::default();
         c.angles[CONTROLLER_HEAD] = [10.0, 0.0, 0.0];
         assert_eq!(c.root_write(), None);
-        c.tag_origin_angles[1] = 5.0;
+        c.origin_tag_turn[1] = 5.0;
         assert_eq!(c.root_write(), Some(([0.0; 3], [0.0, 5.0, 0.0])));
     }
 

@@ -28,18 +28,20 @@
 //! State rides in the replicated player state, so the host and the local
 //! prediction agree: `PMF_DIVE` (BO2's dive bit) in the air and sliding,
 //! `PMF_DIVE_PRONE` held prone after the slide (the still moment included),
-//! `PMF_DIVE_GETUP` from a get-up press until the player is up; `jump_time` =
+//! `PMF_DIVE_GETUP` from a get-up press until the player is up; `hop_start_ms` =
 //! take-off, then minus the touch-down (below 0 = sliding, as BO2's
-//! Dtp_IsSliding); `jump_origin_z` = the take-off height;
+//! Dtp_IsSliding); `takeoff_height` = the take-off height;
 //! `dive_end_time` = when the slide ended.
 
-use playerstate_t6::game::{ENTITYNUM_NONE, PlayerState, UserCmd, buttons, eflags, pm_flags};
+use playerstate_t6::game::{NO_ENTITY_SLOT, AvatarState, InputCommand, buttons, entity_flag_bits, movement_state_bits};
 
-use crate::bridge::{CROUCH_MAXS_Z, PRONE_MAXS_Z, STAND_MAXS_Z};
+use crate::bridge::{SQUAT_HULL_TOP, BELLY_HULL_TOP, UPRIGHT_HULL_TOP};
 use crate::bridge::{
-    AirMoveContext, CONTENTS_MANTLE, CollisionBackend, GroundTraceInput, MoveBounds, Pml,
-    add_predictable_event, end_sprint, view_height,
+    AirborneStepArgs, SOLID_CLIMBABLE, SolidProbe, SweepAsk, HullExtents, TickLocals,
 };
+use crate::bridge::queue_forecast_happening;
+use crate::bridge::end_sprint;
+use crate::bridge::eye_level;
 
 /// Black Ops II's dive bit: from take-off until the slide ends.
 pub const PMF_DIVE: u32 = crate::bridge::PMF_DIVE;
@@ -76,201 +78,201 @@ const PAUSE_MS: i32 = 100;
 const PMF_TIME_KNOCKBACK: u32 = 0x100;
 
 /// A dive is under way: in the air or sliding.
-pub fn active(ps: &PlayerState) -> bool {
-    ps.pm_flags & PMF_DIVE != 0
+pub fn active(avatar: &AvatarState) -> bool {
+    avatar.movement_state_bits & PMF_DIVE != 0
 }
 
 /// BO2's Dtp_IsSliding: the landed dive slides.
-pub fn sliding(ps: &PlayerState) -> bool {
-    active(ps) && ps.jump_time < 0
+pub fn sliding(avatar: &AvatarState) -> bool {
+    active(avatar) && avatar.hop_start_ms < 0
 }
 
 /// In the air, diving.
-pub fn in_air(ps: &PlayerState) -> bool {
-    active(ps) && ps.jump_time >= 0
+pub fn in_air(avatar: &AvatarState) -> bool {
+    active(avatar) && avatar.hop_start_ms >= 0
 }
 
 /// BO2's `divetoprone` for scripts: from take-off until the slide ends.
 /// PhD Flopper's blast and the dive notifies read this.
-pub fn dive_to_prone(ps: &PlayerState) -> bool {
-    active(ps)
+pub fn dive_to_prone(avatar: &AvatarState) -> bool {
+    active(avatar)
 }
 
 /// Any part of a dive, up to the player being back on their feet.
-pub fn any(ps: &PlayerState) -> bool {
-    ps.pm_flags & (PMF_DIVE | PMF_DIVE_PRONE | PMF_DIVE_GETUP) != 0
+pub fn any(avatar: &AvatarState) -> bool {
+    avatar.movement_state_bits & (PMF_DIVE | PMF_DIVE_PRONE | PMF_DIVE_GETUP) != 0
 }
 
 /// The still moment after a dive's slide: the player's push is ignored.
-pub fn pausing(ps: &PlayerState, now: i32) -> bool {
-    !active(ps)
-        && ps.dive_end_time != 0
-        && (0..PAUSE_MS).contains(&now.wrapping_sub(ps.dive_end_time))
+pub fn pausing(avatar: &AvatarState, now: i32) -> bool {
+    !active(avatar)
+        && avatar.dive_end_time != 0
+        && (0..PAUSE_MS).contains(&now.wrapping_sub(avatar.dive_end_time))
 }
 
 /// The dive owns the stance, from the frame after take-off to the end of the
 /// still moment after the slide.
-pub fn owns_stance(ps: &PlayerState, now: i32) -> bool {
-    active(ps) || pausing(ps, now)
+pub fn owns_stance(avatar: &AvatarState, now: i32) -> bool {
+    active(avatar) || pausing(avatar, now)
 }
 
 /// BO2 aims the view at prone through the whole dive; it gets there by the
 /// usual steps, standing to crouched, then crouched to lying.
-pub fn force_prone(ps: &mut PlayerState) {
-    ps.e_flags &= !eflags::DUCK;
-    ps.pm_flags = (ps.pm_flags & !pm_flags::CROUCH) | pm_flags::PRONE;
-    ps.view_height_target = view_height::PRONE;
+pub fn force_prone(avatar: &mut AvatarState) {
+    avatar.e_flags &= !entity_flag_bits::CROUCH_BIT;
+    avatar.movement_state_bits = (avatar.movement_state_bits & !movement_state_bits::DUCK_BUTTON_BIT) | movement_state_bits::LYING_FLAT;
+    avatar.eye_height_goal = eye_level::LYING_FLAT;
 }
 
 /// The body's height through a dive, from where the view has dropped to:
 /// standing until the view is below crouch height, crouched until it is
 /// below prone height, then prone.
-pub fn hull_height(ps: &PlayerState) -> f32 {
-    let view = ps.view_height_current;
-    if view < PRONE_MAXS_Z {
-        PRONE_MAXS_Z
-    } else if view < CROUCH_MAXS_Z {
-        CROUCH_MAXS_Z
+pub fn hull_height(avatar: &AvatarState) -> f32 {
+    let view = avatar.eye_height_now;
+    if view < BELLY_HULL_TOP {
+        BELLY_HULL_TOP
+    } else if view < SQUAT_HULL_TOP {
+        SQUAT_HULL_TOP
     } else {
-        STAND_MAXS_Z
+        UPRIGHT_HULL_TOP
     }
 }
 
 /// Whether this command starts a dive: sprinting on the ground long enough
 /// and fast enough, and prone newly pressed.
-pub fn wants(ps: &PlayerState, cmd: &UserCmd, old_buttons: u32) -> bool {
-    if active(ps)
-        || ps.pm_flags & pm_flags::SPRINTING == 0
-        || ps.pm_flags & (pm_flags::LADDER | pm_flags::MANTLE) != 0
-        || ps.ground_entity_num == ENTITYNUM_NONE
-        || (ps.pm_type != 0 && ps.pm_type != 1)
+pub fn wants(avatar: &AvatarState, ucmd: &InputCommand, last_tick_buttons: u32) -> bool {
+    if active(avatar)
+        || avatar.movement_state_bits & movement_state_bits::SPRINTING == 0
+        || avatar.movement_state_bits & (movement_state_bits::LADDER | movement_state_bits::MANTLE) != 0
+        || avatar.standing_on == NO_ENTITY_SLOT
+        || (avatar.movement_mode != 0 && avatar.movement_mode != 1)
     {
         return false;
     }
     // Prone newly pressed. A pad's stance button sends prone once held
     // `cl_dtpHoldTime` while sprinting (the legacy input); a crouch only crouches.
-    if (cmd.buttons & !old_buttons) & buttons::PRONE == 0 {
+    if (ucmd.buttons & !last_tick_buttons) & buttons::LYING_FLAT == 0 {
         return false;
     }
-    if cmd.server_time.wrapping_sub(ps.sprint_state.last_sprint_start) <= STARTUP_MS {
+    if ucmd.authority_clock_ms.wrapping_sub(avatar.sprint_state.sprint_begin_ms) <= STARTUP_MS {
         return false;
     }
-    if ps.dive_end_time != 0
-        && (0..=EXHAUSTION_MS).contains(&cmd.server_time.wrapping_sub(ps.dive_end_time))
+    if avatar.dive_end_time != 0
+        && (0..=EXHAUSTION_MS).contains(&ucmd.authority_clock_ms.wrapping_sub(avatar.dive_end_time))
     {
         return false;
     }
-    ground_speed(ps) > MIN_SPEED
+    ground_speed(avatar) > MIN_SPEED
 }
 
-fn ground_speed(ps: &PlayerState) -> f32 {
-    libm::sqrtf(ps.velocity[0] * ps.velocity[0] + ps.velocity[1] * ps.velocity[1])
+fn ground_speed(avatar: &AvatarState) -> f32 {
+    libm::sqrtf(avatar.velocity[0] * avatar.velocity[0] + avatar.velocity[1] * avatar.velocity[1])
 }
 
 /// The take-off's upward speed: `POP_SCALE` times a jump's.
-fn pop_speed(ps: &PlayerState, jump_height: f32) -> f32 {
-    POP_SCALE * libm::sqrtf(2.0 * jump_height * ps.gravity as f32)
+fn pop_speed(avatar: &AvatarState, jump_height: f32) -> f32 {
+    POP_SCALE * libm::sqrtf(2.0 * jump_height * avatar.gravity as f32)
 }
 
 /// Launch the dive: sprint ends and the player leaves the ground at their
 /// running speed and direction, with `pop_speed` upward. The stance is left
 /// as it is this frame; the drop to prone starts on the next.
-pub fn start(ps: &mut PlayerState, pml: &mut Pml, cmd: &UserCmd, jump_height: f32) {
-    end_sprint(ps, cmd);
-    ps.velocity[2] = pop_speed(ps, jump_height);
-    ps.pm_flags = (ps.pm_flags
-        & !(pm_flags::TIME_HARDLANDING
+pub fn start(avatar: &mut AvatarState, tick_vars: &mut TickLocals, ucmd: &InputCommand, jump_height: f32) {
+    end_sprint(avatar, ucmd);
+    avatar.velocity[2] = pop_speed(avatar, jump_height);
+    avatar.movement_state_bits = (avatar.movement_state_bits
+        & !(movement_state_bits::TIME_HARDLANDING
             | PMF_TIME_KNOCKBACK
-            | pm_flags::JUMPING
+            | movement_state_bits::JUMPING
             | PMF_DIVE_PRONE
             | PMF_DIVE_GETUP))
         | PMF_DIVE;
-    ps.pm_time = 0;
-    ps.ground_entity_num = ENTITYNUM_NONE;
-    ps.jump_time = cmd.server_time;
-    ps.jump_origin_z = ps.origin[2];
-    pml.walking = 0;
-    pml.ground_plane = 0;
-    pml.almost_ground_plane = 0;
+    avatar.move_timer = 0;
+    avatar.standing_on = NO_ENTITY_SLOT;
+    avatar.hop_start_ms = ucmd.authority_clock_ms;
+    avatar.takeoff_height = avatar.origin[2];
+    tick_vars.walking = 0;
+    tick_vars.standing_on_floor = 0;
+    tick_vars.near_floor_contact = 0;
 }
 
 /// A key that gets the player up from a dive: jump, crouch, prone or sprint
 /// newly pressed, or a stance toggle switched off (a pad, or toggle-style
 /// keys).
-fn getup_pressed(cmd: &UserCmd, old_buttons: u32) -> bool {
-    let new = cmd.buttons & !old_buttons;
-    if new & (buttons::JUMP | buttons::CROUCH | buttons::PRONE | buttons::SPRINT) != 0 {
+fn getup_pressed(ucmd: &InputCommand, last_tick_buttons: u32) -> bool {
+    let new = ucmd.buttons & !last_tick_buttons;
+    if new & (buttons::LEAP | buttons::DUCK_BUTTON_BIT | buttons::LYING_FLAT | buttons::SPRINT) != 0 {
         return true;
     }
-    old_buttons & buttons::STANCE_HELD == 0
-        && old_buttons & !cmd.buttons & (buttons::PRONE | buttons::CROUCH) != 0
+    last_tick_buttons & buttons::STANCE_LOCK_BIT == 0
+        && last_tick_buttons & !ucmd.buttons & (buttons::LYING_FLAT | buttons::DUCK_BUTTON_BIT) != 0
 }
 
 /// While the dive owns the stance, a get-up press is kept for when it ends.
-pub fn queue_getup(ps: &mut PlayerState, cmd: &UserCmd, old_buttons: u32) {
-    if getup_pressed(cmd, old_buttons) {
-        ps.pm_flags |= PMF_DIVE_GETUP;
+pub fn queue_getup(avatar: &mut AvatarState, ucmd: &InputCommand, last_tick_buttons: u32) {
+    if getup_pressed(ucmd, last_tick_buttons) {
+        avatar.movement_state_bits |= PMF_DIVE_GETUP;
     }
 }
 
 /// Getting up: a prone toggle still on would drop the player straight back
 /// down, so the client is told to let it go (as when a sprint stands a
 /// prone player up).
-fn begin_getup(ps: &mut PlayerState, cmd: &UserCmd) {
-    ps.pm_flags = (ps.pm_flags & !PMF_DIVE_PRONE) | PMF_DIVE_GETUP;
-    if cmd.buttons & buttons::PRONE != 0 && cmd.buttons & buttons::STANCE_HELD == 0 {
-        add_predictable_event(ps, EV_STANCE_FORCE_STAND, 0);
+fn begin_getup(avatar: &mut AvatarState, ucmd: &InputCommand) {
+    avatar.movement_state_bits = (avatar.movement_state_bits & !PMF_DIVE_PRONE) | PMF_DIVE_GETUP;
+    if ucmd.buttons & buttons::LYING_FLAT != 0 && ucmd.buttons & buttons::STANCE_LOCK_BIT == 0 {
+        queue_forecast_happening(avatar, STAND_FORCED, 0);
     }
 }
 
-const EV_STANCE_FORCE_STAND: i32 = entity_t6::event::STANCE_FORCE_STAND as i32;
+const STAND_FORCED: i32 = entity_t6::event::STANCE_FORCE_STAND as i32;
 
 /// A slide that has come to a stop (into a wall) is over at once. Run
 /// before the stance update.
-pub fn end_stopped_slide(ps: &mut PlayerState, now: i32) {
-    if sliding(ps) && speed_3d(ps) < MIN_SPEED {
-        end_slide(ps, now);
+pub fn end_stopped_slide(avatar: &mut AvatarState, now: i32) {
+    if sliding(avatar) && speed_3d(avatar) < MIN_SPEED {
+        end_slide(avatar, now);
     }
 }
 
 /// The slide is over: the player stops, lies still for `PAUSE_MS`, then
 /// holds prone.
-fn end_slide(ps: &mut PlayerState, now: i32) {
-    ps.pm_flags = (ps.pm_flags & !PMF_DIVE) | PMF_DIVE_PRONE;
-    ps.velocity = [0.0; 3];
-    ps.jump_time = 0;
-    ps.dive_end_time = now;
-    ps.sprint_state.sprint_button_up_required = 0;
+fn end_slide(avatar: &mut AvatarState, now: i32) {
+    avatar.movement_state_bits = (avatar.movement_state_bits & !PMF_DIVE) | PMF_DIVE_PRONE;
+    avatar.velocity = Default::default();
+    avatar.hop_start_ms = 0;
+    avatar.dive_end_time = now;
+    avatar.sprint_state.sprint_needs_release = 0;
 }
 
 /// Move one frame of a dive: touch-down starts the slide, the dive does not
 /// rise above a jump's height (and hangs there early on), then the ordinary
 /// air move runs, its ground friction scaled through the slide.
 pub fn advance<C: crate::gjk::Bo2Collision>(
-    ps: &mut PlayerState,
-    pml: &Pml,
-    cmd: &UserCmd,
-    bounds: MoveBounds,
-    collision: &C,
+    avatar: &mut AvatarState,
+    tick_vars: &TickLocals,
+    ucmd: &InputCommand,
+    bounds: HullExtents,
+    solids: &C,
     jump_height: f32,
-    air: AirMoveContext,
+    air: AirborneStepArgs,
 ) -> f32 {
-    let now = cmd.server_time;
-    if in_air(ps) && pml.walking != 0 {
+    let now = ucmd.authority_clock_ms;
+    if in_air(avatar) && tick_vars.walking != 0 {
         // BO2 marks the slide with jumpTime below 0: minus the touch-down.
-        ps.jump_time = now.wrapping_neg();
+        avatar.hop_start_ms = now.wrapping_neg();
     }
-    if ps.origin[2] >= ps.jump_origin_z + jump_height {
-        if in_air(ps) && now.wrapping_sub(ps.jump_time) < GLIDE_MS {
-            ps.velocity[2] = 0.0;
+    if avatar.origin[2] >= avatar.takeoff_height + jump_height {
+        if in_air(avatar) && now.wrapping_sub(avatar.hop_start_ms) < GLIDE_MS {
+            avatar.velocity[2] = 0.0;
         }
-        ps.velocity[2] = ps.velocity[2].min(0.0);
+        avatar.velocity[2] = avatar.velocity[2].min(0.0);
     }
     // A dive never happens in last stand, the only time Zombies' prone check
     // differs.
     // A dive is never a knife lunge.
-    crate::air::air_move_with(ps, pml, cmd, air, bounds, collision, false, None, |ps| {
-        slide_friction(ps, now, collision, bounds)
+    crate::air::air_move_with(avatar, tick_vars, ucmd, air, bounds, solids, false, None, |avatar| {
+        slide_friction(avatar, now, solids, bounds)
     })
 }
 
@@ -278,45 +280,46 @@ pub fn advance<C: crate::gjk::Bo2Collision>(
 /// to all of it at `SLIDE_MS`, when the slide ends; none over a ledge top
 /// the player could climb (mantle ground). Asked only when ground friction
 /// applies.
-fn slide_friction<C: CollisionBackend>(
-    ps: &mut PlayerState,
+fn slide_friction<C: SolidProbe>(
+    avatar: &mut AvatarState,
     now: i32,
-    collision: &C,
-    bounds: MoveBounds,
+    solids: &C,
+    bounds: HullExtents,
 ) -> f32 {
-    if !sliding(ps) {
+    if !sliding(avatar) {
         return 1.0;
     }
-    let elapsed = now.wrapping_add(ps.jump_time);
+    let elapsed = now.wrapping_add(avatar.hop_start_ms);
     if elapsed < SLIDE_MS {
-        if on_mantle_ground(ps, collision, bounds) {
+        if on_mantle_ground(avatar, solids, bounds) {
             return 0.0;
         }
         return elapsed.max(0) as f32 / SLIDE_MS as f32;
     }
-    end_slide(ps, now);
+    end_slide(avatar, now);
     1.0
 }
 
-fn speed_3d(ps: &PlayerState) -> f32 {
-    let v = ps.velocity;
+fn speed_3d(avatar: &AvatarState) -> f32 {
+    let v = avatar.velocity;
     libm::sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
 }
 
 /// Ground the player could mantle (a ledge top) under them.
-fn on_mantle_ground<C: CollisionBackend>(
-    ps: &PlayerState,
-    collision: &C,
-    bounds: MoveBounds,
+fn on_mantle_ground<C: SolidProbe>(
+    avatar: &AvatarState,
+    solids: &C,
+    bounds: HullExtents,
 ) -> bool {
-    let o = ps.origin;
-    collision
-        .trace(GroundTraceInput {
+    let o = avatar.origin;
+    let HullExtents { lo_corner: hull_lo, hi_corner: hull_hi, .. } = bounds;
+    solids
+        .trace(SweepAsk {
             start: [o[0], o[1], o[2] + 1.0],
             end: [o[0], o[1], o[2] - 1.0],
-            mins: bounds.mins,
-            maxs: bounds.maxs,
-            tracemask: CONTENTS_MANTLE,
+            lo_corner: hull_lo,
+            hi_corner: hull_hi,
+            collide_filter: SOLID_CLIMBABLE,
         })
         .fraction
         < 1.0
@@ -325,19 +328,19 @@ fn on_mantle_ground<C: CollisionBackend>(
 /// After a dive the player holds prone until a get-up key (or one pressed
 /// during the dive, or something else stood them up); `true` while it
 /// holds, so the stance update is skipped.
-pub fn holds_prone(ps: &mut PlayerState, cmd: &UserCmd, old_buttons: u32) -> bool {
-    if ps.pm_flags & PMF_DIVE_PRONE == 0 {
+pub fn holds_prone(avatar: &mut AvatarState, ucmd: &InputCommand, last_tick_buttons: u32) -> bool {
+    if avatar.movement_state_bits & PMF_DIVE_PRONE == 0 {
         return false;
     }
-    if ps.pm_flags & PMF_DIVE_GETUP != 0
-        || getup_pressed(cmd, old_buttons)
-        || ps.pm_flags & pm_flags::SPRINTING != 0
+    if avatar.movement_state_bits & PMF_DIVE_GETUP != 0
+        || getup_pressed(ucmd, last_tick_buttons)
+        || avatar.movement_state_bits & movement_state_bits::SPRINTING != 0
     {
-        begin_getup(ps, cmd);
+        begin_getup(avatar, ucmd);
         return false;
     }
-    if ps.pm_flags & pm_flags::PRONE == 0 {
-        ps.pm_flags &= !PMF_DIVE_PRONE;
+    if avatar.movement_state_bits & movement_state_bits::LYING_FLAT == 0 {
+        avatar.movement_state_bits &= !PMF_DIVE_PRONE;
         return false;
     }
     true
@@ -345,19 +348,19 @@ pub fn holds_prone(ps: &mut PlayerState, cmd: &UserCmd, old_buttons: u32) -> boo
 
 /// Getting up from a dive, as opposed to a get-up only queued while the dive
 /// still owns the stance.
-pub fn getting_up(ps: &PlayerState) -> bool {
-    ps.pm_flags & PMF_DIVE_GETUP != 0
-        && ps.pm_flags & (PMF_DIVE | PMF_DIVE_PRONE) == 0
+pub fn getting_up(avatar: &AvatarState) -> bool {
+    avatar.movement_state_bits & PMF_DIVE_GETUP != 0
+        && avatar.movement_state_bits & (PMF_DIVE | PMF_DIVE_PRONE) == 0
 }
 
 /// The command the stance and sprint updates see: while getting up from a
 /// dive, a held prone key is left out, so it does not drop the player back
 /// down (a hold-style key pressed to dive, or a prone toggle the client has
 /// not yet let go).
-pub fn stance_cmd(ps: &PlayerState, cmd: &UserCmd) -> UserCmd {
-    let mut out = *cmd;
-    if ps.pm_flags & PMF_DIVE_GETUP != 0 {
-        out.buttons &= !buttons::PRONE;
+pub fn stance_cmd(avatar: &AvatarState, ucmd: &InputCommand) -> InputCommand {
+    let mut out = *ucmd;
+    if avatar.movement_state_bits & PMF_DIVE_GETUP != 0 {
+        out.buttons &= !buttons::LYING_FLAT;
     }
     out
 }
@@ -365,14 +368,14 @@ pub fn stance_cmd(ps: &PlayerState, cmd: &UserCmd) -> UserCmd {
 /// The command the aim update sees: the sprint key, held through a dive,
 /// does not drop the aim, and the player's own push (it only steers a dive)
 /// does not count as crawling.
-pub fn ads_cmd(ps: &PlayerState, cmd: &UserCmd, diving: bool) -> UserCmd {
-    let mut out = *cmd;
-    if diving || ps.pm_flags & PMF_DIVE_PRONE != 0 {
+pub fn ads_cmd(avatar: &AvatarState, ucmd: &InputCommand, diving: bool) -> InputCommand {
+    let mut out = *ucmd;
+    if diving || avatar.movement_state_bits & PMF_DIVE_PRONE != 0 {
         out.buttons &= !buttons::SPRINT;
     }
     if diving {
-        out.forwardmove = 0;
-        out.rightmove = 0;
+        out.thrust_ahead = 0;
+        out.thrust_lateral = 0;
     }
     out
 }
@@ -381,28 +384,28 @@ pub fn ads_cmd(ps: &PlayerState, cmd: &UserCmd, diving: bool) -> UserCmd {
 /// steps, lying to crouched and crouched to standing, are done) and the
 /// prone key is let go. Run before the view update, so a step that has just
 /// ended and the next one not yet begun does not end it early.
-pub fn finish_getup(ps: &mut PlayerState, cmd: &UserCmd) {
-    if !getting_up(ps) {
+pub fn finish_getup(avatar: &mut AvatarState, ucmd: &InputCommand) {
+    if !getting_up(avatar) {
         return;
     }
-    if ps.view_height_lerp_time == 0
-        && ps.view_height_target != view_height::PRONE
-        && ps.view_height_current == ps.view_height_target as f32
-        && cmd.buttons & buttons::PRONE == 0
+    if avatar.eye_blend_clock == 0
+        && avatar.eye_height_goal != eye_level::LYING_FLAT
+        && avatar.eye_height_now == avatar.eye_height_goal as f32
+        && ucmd.buttons & buttons::LYING_FLAT == 0
     {
-        ps.pm_flags &= !PMF_DIVE_GETUP;
+        avatar.movement_state_bits &= !PMF_DIVE_GETUP;
     }
 }
 
 /// BO2's Dtp_Interrupt: something else (a link to an entity) takes the
 /// player out of a dive at once. The dive is over, they stop, and the next
 /// dive's rest window counts from just before now.
-pub fn interrupt(ps: &mut PlayerState, now: i32) {
-    ps.pm_flags &= !(PMF_DIVE | PMF_DIVE_PRONE | PMF_DIVE_GETUP);
-    ps.jump_time = 0;
-    ps.velocity = [0.0; 3];
-    ps.dive_end_time = now.wrapping_sub(INTERRUPT_BACKDATE_MS).max(0);
-    ps.sprint_state.sprint_button_up_required = 0;
+pub fn interrupt(avatar: &mut AvatarState, now: i32) {
+    avatar.movement_state_bits &= !(PMF_DIVE | PMF_DIVE_PRONE | PMF_DIVE_GETUP);
+    avatar.hop_start_ms = 0;
+    avatar.velocity = Default::default();
+    avatar.dive_end_time = now.wrapping_sub(INTERRUPT_BACKDATE_MS).max(0);
+    avatar.sprint_state.sprint_needs_release = 0;
 }
 
 /// How far before now an interrupted dive counts as ended.

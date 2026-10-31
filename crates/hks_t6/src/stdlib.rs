@@ -1,18 +1,17 @@
 //! The parts of Lua's standard library the UI scripts use: the base
 //! functions, `string`, `table` and `math`.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::value::{Table, TableRef, Value, format_number};
+use crate::value::{LuaTable, Value, format_number};
 use crate::vm::{LuaError, Vm};
-
-type Res<T> = Result<T, LuaError>;
 
 fn arg(a: &[Value], i: usize) -> Value {
     a.get(i).cloned().unwrap_or(Value::Nil)
 }
 
-fn num(a: &[Value], i: usize, f: &str) -> Res<f32> {
+fn num(a: &[Value], i: usize, f: &str) -> Result<f32, LuaError> {
     arg(a, i).as_num().ok_or_else(|| {
         LuaError::new(format!(
             "bad argument #{} to '{f}' (number expected)",
@@ -21,7 +20,13 @@ fn num(a: &[Value], i: usize, f: &str) -> Res<f32> {
     })
 }
 
-fn string(a: &[Value], i: usize, f: &str) -> Res<String> {
+/// The numbers among the arguments, folded with `pick` from `start` (what
+/// math.min and math.max give, `start` when no argument is a number).
+fn fold_nums(a: &[Value], start: f32, pick: fn(f32, f32) -> f32) -> f32 {
+    a.iter().filter_map(Value::as_num).fold(start, pick)
+}
+
+fn string(a: &[Value], i: usize, f: &str) -> Result<String, LuaError> {
     match arg(a, i) {
         Value::Str(s) => Ok(s.to_string()),
         Value::Num(n) => Ok(format_number(n)),
@@ -32,7 +37,7 @@ fn string(a: &[Value], i: usize, f: &str) -> Res<String> {
     }
 }
 
-fn table(a: &[Value], i: usize, f: &str) -> Res<TableRef> {
+fn table(a: &[Value], i: usize, f: &str) -> Result<Rc<RefCell<LuaTable>>, LuaError> {
     match arg(a, i) {
         Value::Table(t) => Ok(t),
         _ => Err(LuaError::new(format!(
@@ -44,9 +49,9 @@ fn table(a: &[Value], i: usize, f: &str) -> Res<TableRef> {
 
 fn set(
     vm: &mut Vm,
-    t: &TableRef,
+    t: &Rc<RefCell<LuaTable>>,
     name: &'static str,
-    f: impl Fn(&mut Vm, Vec<Value>) -> Res<Vec<Value>> + 'static,
+    f: impl Fn(&mut Vm, Vec<Value>) -> Result<Vec<Value>, LuaError> + 'static,
 ) {
     let v = vm.native(name, f);
     t.borrow_mut().set_str(name, v);
@@ -82,13 +87,17 @@ fn captures_of(src: &str, caps: &[crate::pattern::Capture]) -> Vec<Value> {
 }
 
 /// `string.find` (`find`) and `string.match`.
-fn str_find(a: &[Value], find: bool) -> Res<Vec<Value>> {
+fn str_find(a: &[Value], find: bool) -> Result<Vec<Value>, LuaError> {
     let name = if find { "find" } else { "match" };
     let src = string(a, 0, name)?;
     let pat = string(a, 1, name)?;
     let len = src.len() as i64;
     let init = arg(a, 2).as_num().map_or(1, |n| n as i64);
-    let init = if init < 0 { (len + init + 1).max(1) } else { init.max(1) };
+    let init = if init < 0 {
+        (len + init + 1).max(1)
+    } else {
+        init.max(1)
+    };
     if init - 1 > len {
         return Ok(vec![Value::Nil]);
     }
@@ -116,10 +125,10 @@ fn str_find(a: &[Value], find: bool) -> Res<Vec<Value>> {
 
 /// Plain substring find (Lua patterns' special characters taken literally
 /// unless the pattern has none).
-fn find_plain(hay: &str, needle: &str, from: usize) -> Option<(usize, usize)> {
-    hay.get(from..)?
+fn find_plain(hay: &str, needle: &str, start_at: usize) -> Option<(usize, usize)> {
+    hay.get(start_at..)?
         .find(needle)
-        .map(|p| (from + p, from + p + needle.len()))
+        .map(|p| (start_at + p, start_at + p + needle.len()))
 }
 
 pub fn open(vm: &mut Vm) {
@@ -177,10 +186,10 @@ pub fn open(vm: &mut Vm) {
         let f = a.remove(0);
         match vm.call(f, a) {
             Ok(mut r) => {
-                r.insert(0, Value::Bool(true));
+                r.insert(0, Value::Boolean(true));
                 Ok(r)
             }
-            Err(e) => Ok(vec![Value::Bool(false), e.value]),
+            Err(e) => Ok(vec![Value::Boolean(false), e.value]),
         }
     });
     set(vm, &g, "select", |_, a| match arg(&a, 0) {
@@ -196,16 +205,16 @@ pub fn open(vm: &mut Vm) {
         }
     });
     set(vm, &g, "rawget", |_, a| {
-        Ok(vec![table(&a, 0, "rawget")?.borrow().get(&arg(&a, 1))])
+        Ok(vec![table(&a, 0, "rawget")?.borrow().read_key(&arg(&a, 1))])
     });
     set(vm, &g, "rawset", |_, a| {
         table(&a, 0, "rawset")?
             .borrow_mut()
-            .set(arg(&a, 1), arg(&a, 2));
+            .store(arg(&a, 1), arg(&a, 2));
         Ok(vec![arg(&a, 0)])
     });
     set(vm, &g, "rawequal", |_, a| {
-        Ok(vec![Value::Bool(arg(&a, 0).raw_eq(&arg(&a, 1)))])
+        Ok(vec![Value::Boolean(arg(&a, 0).raw_eq(&arg(&a, 1)))])
     });
     set(vm, &g, "setmetatable", |_, a| {
         let t = table(&a, 0, "setmetatable")?;
@@ -241,7 +250,7 @@ pub fn open(vm: &mut Vm) {
     });
     let inext = vm.native("ipairs_next", |vm, a| {
         let i = arg(&a, 1).as_num().unwrap_or(0.0) + 1.0;
-        let v = vm.index(&arg(&a, 0), &Value::Num(i))?;
+        let v = vm.lookup_index(&arg(&a, 0), &Value::Num(i))?;
         Ok(if matches!(v, Value::Nil) {
             vec![Value::Nil]
         } else {
@@ -256,7 +265,7 @@ pub fn open(vm: &mut Vm) {
         let t = t.borrow();
         let i = arg(&a, 1).as_num().unwrap_or(1.0) as usize;
         let j = arg(&a, 2).as_num().map_or(t.len(), |j| j as usize);
-        Ok((i..=j).map(|n| t.get(&Value::Num(n as f32))).collect())
+        Ok((i..=j).map(|n| t.read_key(&Value::Num(n as f32))).collect())
     });
     g.borrow_mut().set_str("unpack", unpack.clone());
     // collectgarbage(opt): memory is Rust's; "count" answers 0 KB.
@@ -264,7 +273,7 @@ pub fn open(vm: &mut Vm) {
     g.borrow_mut().set_str("collectgarbage", gc);
 
     // ---- string -----------------------------------------------------------
-    let s = Table::new_ref();
+    let s = LuaTable::new_ref();
     set(vm, &s, "len", |_, a| {
         Ok(vec![Value::Num(string(&a, 0, "len")?.len() as f32)])
     });
@@ -282,6 +291,11 @@ pub fn open(vm: &mut Vm) {
     });
     set(vm, &s, "lower", |_, a| {
         Ok(vec![Value::str(&string(&a, 0, "lower")?.to_lowercase())])
+    });
+    set(vm, &s, "reverse", |_, a| {
+        Ok(vec![Value::str(
+            &string(&a, 0, "reverse")?.chars().rev().collect::<String>(),
+        )])
     });
     set(vm, &s, "rep", |_, a| {
         let st = string(&a, 0, "rep")?;
@@ -317,7 +331,7 @@ pub fn open(vm: &mut Vm) {
             let mut m = crate::pattern::Matcher::new(sb, pb);
             let mut at = pos.get();
             while at <= sb.len() {
-                m.reset();
+                m.rewind();
                 if let Some(e) = m.do_match(at, 0) {
                     pos.set(if e == at { e + 1 } else { e });
                     return Ok(captures_of(&src, &m.captures(at, e)));
@@ -337,19 +351,15 @@ pub fn open(vm: &mut Vm) {
         let mut out = String::new();
         let mut it = a.iter().skip(1);
         let mut chars = fmt.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch != '%' {
-                out.push(ch);
+        while let Some(glyph) = chars.next() {
+            if glyph != '%' {
+                out.push(glyph);
                 continue;
             }
             let mut spec = String::new();
-            while let Some(&n) = chars.peek() {
-                if n.is_ascii_digit() || matches!(n, '.' | '-' | '+' | ' ' | '#') {
-                    spec.push(n);
-                    chars.next();
-                } else {
-                    break;
-                }
+            let is_spec = |c: &char| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | ' ' | '#');
+            while let Some(flag) = chars.next_if(is_spec) {
+                spec.push(flag);
             }
             let conv = chars.next().unwrap_or('%');
             let prec = spec.split('.').nth(1).and_then(|p| p.parse::<usize>().ok());
@@ -421,14 +431,20 @@ pub fn open(vm: &mut Vm) {
         let src = string(&a, 0, "gsub")?;
         let pat = string(&a, 1, "gsub")?;
         let repl = arg(&a, 2);
-        let max_n = arg(&a, 3).as_num().map_or(usize::MAX, |n| n.max(0.0) as usize);
+        let max_n = arg(&a, 3)
+            .as_num()
+            .map_or(usize::MAX, |n| n.max(0.0) as usize);
         let (sb, pb) = (src.as_bytes(), pat.as_bytes());
-        let (anchor, p0) = if pb.first() == Some(&b'^') { (true, 1) } else { (false, 0) };
+        let (anchor, p0) = if pb.first() == Some(&b'^') {
+            (true, 1)
+        } else {
+            (false, 0)
+        };
         let mut m = crate::pattern::Matcher::new(sb, pb);
         let mut out: Vec<u8> = Vec::with_capacity(sb.len());
         let (mut at, mut n) = (0usize, 0usize);
         while n < max_n {
-            m.reset();
+            m.rewind();
             let e = m.do_match(at, p0);
             if let Some(err) = m.error.take() {
                 return Err(LuaError::new(err));
@@ -437,7 +453,7 @@ pub fn open(vm: &mut Vm) {
                 n += 1;
                 let caps = m.captures(at, e);
                 let whole = &sb[at..e];
-                let value = match &repl {
+                let substitute = match &repl {
                     Value::Str(r) => {
                         let rb = r.as_bytes();
                         let mut i = 0;
@@ -450,8 +466,12 @@ pub fn open(vm: &mut Vm) {
                                 } else if d.is_ascii_digit() {
                                     let k = usize::from(d - b'1');
                                     match caps.get(k).copied() {
-                                        Some(Capture::Span(x, y)) => out.extend_from_slice(&sb[x..y]),
-                                        Some(Capture::Position(p)) => out.extend_from_slice(p.to_string().as_bytes()),
+                                        Some(Capture::Span(x, y)) => {
+                                            out.extend_from_slice(&sb[x..y])
+                                        }
+                                        Some(Capture::Position(p)) => {
+                                            out.extend_from_slice(p.to_string().as_bytes())
+                                        }
                                         None => return Err(LuaError::new("invalid capture index")),
                                     }
                                 } else {
@@ -469,20 +489,35 @@ pub fn open(vm: &mut Vm) {
                         None
                     }
                     Value::Table(t) => {
-                        let key = captures_of(&src, &caps).into_iter().next().unwrap_or(Value::Nil);
-                        Some(vm.index(&Value::Table(t.clone()), &key)?)
+                        let key = captures_of(&src, &caps)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Value::Nil);
+                        Some(vm.lookup_index(&Value::Table(t.clone()), &key)?)
                     }
-                    f @ (Value::Func(_) | Value::Native(_)) => {
-                        Some(vm.call(f.clone(), captures_of(&src, &caps))?.into_iter().next().unwrap_or(Value::Nil))
+                    f @ (Value::Func(_) | Value::Native(_)) => Some(
+                        vm.call(f.clone(), captures_of(&src, &caps))?
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Value::Nil),
+                    ),
+                    _ => {
+                        return Err(LuaError::new(
+                            "bad argument #3 to 'gsub' (string/function/table expected)",
+                        ));
                     }
-                    _ => return Err(LuaError::new("bad argument #3 to 'gsub' (string/function/table expected)")),
                 };
-                match value {
+                match substitute {
                     None => {}
-                    Some(Value::Nil | Value::Bool(false)) => out.extend_from_slice(whole),
-                    Some(v @ (Value::Str(_) | Value::Num(_))) => out.extend_from_slice(v.to_string().as_bytes()),
+                    Some(Value::Nil | Value::Boolean(false)) => out.extend_from_slice(whole),
+                    Some(v @ (Value::Str(_) | Value::Num(_))) => {
+                        out.extend_from_slice(v.to_string().as_bytes())
+                    }
                     Some(v) => {
-                        return Err(LuaError::new(format!("invalid replacement value (a {})", v.type_name())));
+                        return Err(LuaError::new(format!(
+                            "invalid replacement value (a {})",
+                            v.type_name()
+                        )));
                     }
                 }
                 if e > at {
@@ -504,17 +539,20 @@ pub fn open(vm: &mut Vm) {
             }
         }
         out.extend_from_slice(&sb[at.min(sb.len())..]);
-        Ok(vec![Value::str(&String::from_utf8_lossy(&out)), Value::Num(n as f32)])
+        Ok(vec![
+            Value::str(&String::from_utf8_lossy(&out)),
+            Value::Num(n as f32),
+        ])
     });
     let string_table = s.clone();
     g.borrow_mut().set_str("string", Value::Table(s));
-    let meta = Table::new_ref();
+    let meta = LuaTable::new_ref();
     meta.borrow_mut()
         .set_str("__index", Value::Table(string_table));
     vm.string_meta = Some(meta);
 
     // ---- table ------------------------------------------------------------
-    let t = Table::new_ref();
+    let t = LuaTable::new_ref();
     set(vm, &t, "insert", |_, a| {
         let tab = table(&a, 0, "insert")?;
         let mut tab = tab.borrow_mut();
@@ -522,12 +560,12 @@ pub fn open(vm: &mut Vm) {
         if a.len() >= 3 {
             let pos = num(&a, 1, "insert")? as usize;
             for i in (pos..=n).rev() {
-                let v = tab.get(&Value::Num(i as f32));
-                tab.set(Value::Num((i + 1) as f32), v);
+                let v = tab.read_key(&Value::Num(i as f32));
+                tab.store(Value::Num((i + 1) as f32), v);
             }
-            tab.set(Value::Num(pos as f32), arg(&a, 2));
+            tab.store(Value::Num(pos as f32), arg(&a, 2));
         } else {
-            tab.set(Value::Num((n + 1) as f32), arg(&a, 1));
+            tab.store(Value::Num((n + 1) as f32), arg(&a, 1));
         }
         Ok(vec![])
     });
@@ -539,12 +577,12 @@ pub fn open(vm: &mut Vm) {
             return Ok(vec![Value::Nil]);
         }
         let pos = arg(&a, 1).as_num().map_or(n, |p| p as usize);
-        let removed = tab.get(&Value::Num(pos as f32));
+        let removed = tab.read_key(&Value::Num(pos as f32));
         for i in pos..n {
-            let v = tab.get(&Value::Num((i + 1) as f32));
-            tab.set(Value::Num(i as f32), v);
+            let v = tab.read_key(&Value::Num((i + 1) as f32));
+            tab.store(Value::Num(i as f32), v);
         }
-        tab.set(Value::Num(n as f32), Value::Nil);
+        tab.store(Value::Num(n as f32), Value::Nil);
         Ok(vec![removed])
     });
     set(vm, &t, "getn", |_, a| {
@@ -558,7 +596,7 @@ pub fn open(vm: &mut Vm) {
         let items: Vec<Value> = {
             let tab = tab.borrow();
             (1..=tab.len())
-                .map(|i| tab.get(&Value::Num(i as f32)))
+                .map(|i| tab.read_key(&Value::Num(i as f32)))
                 .collect()
         };
         let parts: Vec<String> = items
@@ -573,41 +611,41 @@ pub fn open(vm: &mut Vm) {
         let mut items: Vec<Value> = {
             let tab = tab.borrow();
             (1..=tab.len())
-                .map(|i| tab.get(&Value::Num(i as f32)))
+                .map(|i| tab.read_key(&Value::Num(i as f32)))
                 .collect()
         };
         // Insertion sort with the script's comparator (lists are short).
-        for i in 1..items.len() {
-            let mut j = i;
-            while j > 0 {
-                let less = if matches!(cmp, Value::Nil) {
-                    match (&items[j], &items[j - 1]) {
+        // Each new item sinks left past every neighbour it sorts before.
+        for newest in 1..items.len() {
+            for at in (1..=newest).rev() {
+                let (here, before) = (&items[at], &items[at - 1]);
+                let sinks = if matches!(cmp, Value::Nil) {
+                    match (here, before) {
                         (Value::Num(x), Value::Num(y)) => x < y,
                         (Value::Str(x), Value::Str(y)) => x < y,
                         _ => false,
                     }
                 } else {
-                    vm.call(cmp.clone(), vec![items[j].clone(), items[j - 1].clone()])?
+                    vm.call(cmp.clone(), vec![here.clone(), before.clone()])?
                         .first()
                         .is_some_and(Value::truthy)
                 };
-                if !less {
+                if !sinks {
                     break;
                 }
-                items.swap(j, j - 1);
-                j -= 1;
+                items.swap(at - 1, at);
             }
         }
         let mut tab = tab.borrow_mut();
         for (i, v) in items.into_iter().enumerate() {
-            tab.set(Value::Num((i + 1) as f32), v);
+            tab.store(Value::Num((i + 1) as f32), v);
         }
         Ok(vec![])
     });
     g.borrow_mut().set_str("table", Value::Table(t));
 
     // ---- math -------------------------------------------------------------
-    let m = Table::new_ref();
+    let m = LuaTable::new_ref();
     let one = |name: &'static str, f: fn(f32) -> f32| (name, f);
     for (name, f) in [
         one("floor", f32::floor),
@@ -649,16 +687,12 @@ pub fn open(vm: &mut Vm) {
     });
     set(vm, &m, "min", |_, a| {
         Ok(vec![Value::Num(
-            a.iter()
-                .filter_map(Value::as_num)
-                .fold(f32::INFINITY, f32::min),
+            fold_nums(&a, f32::INFINITY, f32::min),
         )])
     });
     set(vm, &m, "max", |_, a| {
         Ok(vec![Value::Num(
-            a.iter()
-                .filter_map(Value::as_num)
-                .fold(f32::NEG_INFINITY, f32::max),
+            fold_nums(&a, f32::NEG_INFINITY, f32::max),
         )])
     });
     let seed = Rc::new(std::cell::Cell::new(0x2545_f491_u32));
@@ -686,11 +720,16 @@ pub fn open(vm: &mut Vm) {
     m.borrow_mut()
         .set_str("pi", Value::Num(std::f32::consts::PI));
     m.borrow_mut().set_str("huge", Value::Num(f32::INFINITY));
+    // modf(x): its whole part and its fraction (both with x's sign).
+    set(vm, &m, "modf", |_, a| {
+        let x = num(&a, 0, "modf")?;
+        Ok(vec![Value::Num(x.trunc()), Value::Num(x.fract())])
+    });
     g.borrow_mut().set_str("math", Value::Table(m));
 
     // ---- os (bo2mp: the clock; BO2's menus seed math.random with
     // os.time(), the After Action Report's match rating) -----------------
-    let o = Table::new_ref();
+    let o = LuaTable::new_ref();
     set(vm, &o, "time", |_, _| {
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         // (f32 holds whole seconds to 2^24: the low bits, a seed.)

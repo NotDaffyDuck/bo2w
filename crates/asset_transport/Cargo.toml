@@ -2,7 +2,7 @@
 name = "asset_transport"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
+publish.workspace = true
 description = "Filesystem transport: find games and zones, inflate zone files, index IWD sounds, cache blobs, report load progress."
 
 [dependencies]

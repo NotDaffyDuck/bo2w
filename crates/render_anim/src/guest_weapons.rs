@@ -23,18 +23,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use asset_world::ClipCollision;
+use asset_world::CollisionClipData;
 use bevy::input::gamepad::Gamepad;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use frame::{ActivePad, GamePaused, PresentedPublished, ViewSubject};
-use net::{LocalPresentClient, PresentedSnapshot};
-use sim::guest::{Ask, Guest, GuestZombie};
+use frame::{ActivePad, GamePaused, ShownStatePosted, EyeSubject};
+use net::{HostViewClient, ShownWorldFrame};
+use sim::guest_arms::{Ask, Guest, GuestZombie};
 
 pub use crate::guest_gravgun::{GuestTexture, GuestVertex};
 use crate::guest_gravgun::{Action, Cue, Gravgun, ViewInput};
-use crate::occupancy::dyn_ent_phys::DynEntPhysClip;
+use crate::occupancy::debris_phys::PropPhysicsShape;
 use crate::occupancy::ragdoll;
+use diag::info;
 
 /// BO2's view model (the Ray Gun the five ride on) stays hidden while one is
 /// out: it draws itself.
@@ -53,26 +54,26 @@ pub struct GuestWeaponView {
     pub vertices: Vec<u8>,
     pub indices: Vec<u32>,
     pub solid: u32,
-    pub clip: [f32; 16],
+    pub to_clip: [f32; 16],
     /// Half-Life 2's sheets (vertices with `pad[1]` 0) and Minecraft's item
     /// pictures (`pad[1]` 1); a vertex's layer is its colour's alpha.
     pub hl2: Option<Arc<GuestTexture>>,
     pub items: Option<Arc<GuestTexture>>,
     /// The arrows in the map: `GuestVertex` bytes in map units.
-    pub world_vertices: Vec<u8>,
-    pub world_indices: Vec<u32>,
+    pub level_vertex_total: Vec<u8>,
+    pub level_indices: Vec<u32>,
     /// Seconds, for the enchanted shine.
     pub clock: f32,
 }
 
-pub fn register(app: &mut App) {
-    app.init_resource::<GuestWeaponView>()
-        .add_systems(Update, guest_weapons.after(PresentedPublished));
+pub fn register(application: &mut App) {
+    application.init_resource::<GuestWeaponView>()
+        .add_systems(bevy::app::Update, guest_weapons.after(ShownStatePosted));
 }
 
 /// Map units to a block.
 const B: f32 = 36.0;
-const CONTENTS_SOLID: u32 = 1;
+const HARD_SURFACE_FLAG: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // The Gravity Gun in the world (Half-Life 2's `weapon_physcannon`, inches as
@@ -115,19 +116,19 @@ fn impact(speed: f32) -> f32 {
 
 /// Nothing but the map between `from` and `to`, give or take a hand's
 /// width at the far end: no grabbing through a wall or the floor.
-fn in_sight(clip: Option<&ClipCollision>, from: Vec3, to: Vec3) -> bool {
-    let Some(clip) = clip else { return true };
-    let t = clip.sweep_box(from.to_array(), to.to_array(), [0.0; 3], [0.0; 3], CONTENTS_SOLID);
+fn in_sight(solids: Option<&CollisionClipData>, from: Vec3, to: Vec3) -> bool {
+    let Some(solids) = solids else { return true };
+    let t = solids.sweep_box(from.to_array(), to.to_array(), [0.0; 3], [0.0; 3], HARD_SURFACE_FLAG);
     t.fraction >= 1.0 || (to - from).length() * (1.0 - t.fraction) < 12.0
 }
 
 /// Where a held thing `half` units big hangs on the way from `from` to
 /// `to`: short of the first wall in the way.
-fn short_of_wall(clip: Option<&ClipCollision>, from: Vec3, to: Vec3, half: f32) -> Vec3 {
-    let Some(clip) = clip else { return to };
-    let trace = |r: f32| clip.sweep_box(from.to_array(), to.to_array(), [-r; 3], [r; 3], CONTENTS_SOLID);
+fn short_of_wall(solids: Option<&CollisionClipData>, from: Vec3, to: Vec3, half: f32) -> Vec3 {
+    let Some(solids) = solids else { return to };
+    let trace = |r: f32| solids.sweep_box(from.to_array(), to.to_array(), [-r; 3], [r; 3], HARD_SURFACE_FLAG);
     let t = trace(half);
-    if !t.startsolid {
+    if !t.began_inside {
         return from.lerp(to, t.fraction);
     }
     // Up against a wall: a thin line, backed off by the size.
@@ -182,9 +183,9 @@ struct GunFrame<'a> {
     dt: f32,
     eye: Vec3,
     look: Vec3,
-    primary: bool,
+    main: bool,
     secondary: bool,
-    clip: Option<&'a ClipCollision>,
+    solids: Option<&'a CollisionClipData>,
 }
 
 /// Test aid BO2MP_GRAVGUN_AUTOAIM=1 (a scripted run cannot aim at zombies):
@@ -201,11 +202,11 @@ fn autoaim_look(from: Vec3, look: Vec3, skip: Option<u32>, zombies: &[GuestZombi
     }
     zombies
         .iter()
-        .filter(|z| z.alive && Some(z.ent) != skip)
+        .filter(|z| z.living && Some(z.ent) != skip)
         .map(|z| Vec3::from_array(z.origin) + Vec3::Z * z.height * 0.5)
         // From what it throws, at one a block or more off it.
         .filter(|at| (*at - from).length() > B)
-        .min_by(|a, b| (*a - from).length().total_cmp(&(*b - from).length()))
+        .min_by(|lhs, rhs| (*lhs - from).length().total_cmp(&(*rhs - from).length()))
         .map_or(look, |at| (at - from).normalize_or(look))
 }
 
@@ -213,15 +214,15 @@ fn autoaim_look(from: Vec3, look: Vec3, skip: Option<u32>, zombies: &[GuestZombi
 fn body_point(z: &GuestZombie, bodies: &HashMap<u32, ragdoll::BodySeen>) -> Vec3 {
     let feet = Vec3::from_array(z.origin);
     match bodies.get(&z.wire) {
-        Some(b) if !z.alive => b.at,
-        _ => feet + Vec3::Z * if z.alive { z.height * 0.5 } else { 10.0 },
+        Some(b) if !z.living => b.at,
+        _ => feet + Vec3::Z * if z.living { z.height * 0.5 } else { 10.0 },
     }
 }
 
-fn hit(ent: u32, damage: i32, at: Vec3, dir: Vec3, launch: Vec3) {
-    sim::guest::ask(Ask::GravHit {
+fn hit(ent: u32, hurt: i32, at: Vec3, dir: Vec3, launch: Vec3) {
+    sim::guest_arms::ask(Ask::GravHit {
         ent,
-        damage,
+        harm: hurt,
         means: "MOD_IMPACT".into(),
         at: at.to_array(),
         dir: dir.to_array(),
@@ -234,7 +235,7 @@ impl GravPlay {
         let dt = f.dt.max(0.0);
         self.refire = (self.refire - dt).max(0.0);
         self.regrab = (self.regrab - dt).max(0.0);
-        let zombies = sim::guest::zombies();
+        let zombies = sim::guest_arms::zombies();
         let mut shown = Shown::default();
         match f.gun {
             None => self.let_go(),
@@ -243,7 +244,7 @@ impl GravPlay {
                 // The right button takes a body (the Super one a live
                 // zombie too); the left one punts a live zombie as well.
                 let aim = self.aim(f, range, upgraded, &zombies);
-                let punt_aim = if f.primary && !upgraded && self.held.is_none() { self.aim(f, range, true, &zombies) } else { None };
+                let punt_aim = if f.main && !upgraded && self.held.is_none() { self.aim(f, range, true, &zombies) } else { None };
                 if f.secondary && self.held.is_some() {
                     self.let_go();
                     self.regrab = REFIRE;
@@ -255,7 +256,7 @@ impl GravPlay {
                         shown.action = Action::AltFire;
                         shown.cues.push(if self.held.is_some() { Cue::Pickup } else { Cue::TooHeavy });
                     }
-                } else if f.primary && self.refire <= 0.0 {
+                } else if f.main && self.refire <= 0.0 {
                     self.refire = REFIRE;
                     shown.action = self.fire(f, punt_aim.as_ref().or(aim.as_ref()), upgraded, &zombies);
                     shown.cues.push(if shown.action == Action::Fire { Cue::Launch } else { Cue::DryFire });
@@ -285,18 +286,18 @@ impl GravPlay {
         let mut best: Option<Aim> = None;
         let mut best_d = f32::MAX;
         for z in zombies {
-            if z.alive && !live {
+            if z.living && !live {
                 continue;
             }
             let at = body_point(z, &bodies);
             let to = at - f.eye;
             let d = to.length();
-            if d > range + z.radius || to.normalize_or_zero().dot(f.look) < cone || !in_sight(f.clip, f.eye, at) {
+            if d > range + z.reach || to.normalize_or_zero().dot(f.look) < cone || !in_sight(f.solids, f.eye, at) {
                 continue;
             }
             if d < best_d {
                 best_d = d;
-                best = Some(if z.alive { Aim::Zombie(*z) } else { Aim::Body(*z, d) });
+                best = Some(if z.living { Aim::Zombie(*z) } else { Aim::Body(*z, d) });
             }
         }
         best
@@ -308,15 +309,15 @@ impl GravPlay {
                 // One still in its death animation goes limp, so the beam
                 // can carry it.
                 hit(z.ent, 0, Vec3::from_array(z.origin), f.look, Vec3::ZERO);
-                diag::info!(World, "gravity gun: grabbed body {} (#{})", z.ent, z.wire);
+                info!(World, "gravity gun: grabbed body {} (#{})", z.ent, z.wire);
                 self.held = Some((z.ent, z.wire));
                 self.body_missing = 0.0;
             }
             Aim::Zombie(z) => {
                 // The Super one's grab kills it, then holds the body.
-                let damage = sim::guest::zombie_health() * 20;
-                hit(z.ent, damage, f.eye + f.look * B, f.look, Vec3::new(0.0, 0.0, 40.0));
-                diag::info!(World, "gravity gun: grabbed live zombie {} (#{})", z.ent, z.wire);
+                let damage = sim::guest_arms::zombie_health() * 20;
+                hit(z.ent, damage, f.eye + f.look * B, f.look, Vec3::ZERO.with_z(40.0));
+                info!(World, "gravity gun: grabbed live zombie {} (#{})", z.ent, z.wire);
                 self.held = Some((z.ent, z.wire));
                 self.body_missing = 0.0;
             }
@@ -329,7 +330,7 @@ impl GravPlay {
         if let Some((ent, wire)) = self.held.take() {
             let from = ragdoll::bodies_seen().get(&wire).map_or(f.eye, |b| b.at);
             let look = autoaim_look(from, f.look, Some(ent), zombies);
-            diag::info!(World, "gravity gun: threw body {ent} (#{wire}) at {throw:.0} u/s");
+            info!(World, "gravity gun: threw body {ent} (#{wire}) at {throw:.0} u/s");
             ragdoll::beam_throw(wire, look * throw);
             self.thrown.push(Thrown { ent, wire, age: 0.0, upgraded, struck: Vec::new(), last: None });
             return Action::Fire;
@@ -340,7 +341,7 @@ impl GravPlay {
         }), zombies);
         match aim {
             Some(Aim::Body(z, d)) if *d <= RANGE || upgraded => {
-                diag::info!(World, "gravity gun: punted body {} (#{})", z.ent, z.wire);
+                info!(World, "gravity gun: punted body {} (#{})", z.ent, z.wire);
                 ragdoll::beam_throw(z.wire, look * throw);
                 self.thrown.push(Thrown { ent: z.ent, wire: z.wire, age: 0.0, upgraded, struck: Vec::new(), last: None });
                 Action::Fire
@@ -349,8 +350,8 @@ impl GravPlay {
                 // It hits as a thing thrown at the punt's speed would (Half-
                 // Life 2's impact table, 500); one it kills flies off as a
                 // body that knocks down others. The Super one kills any.
-                let damage = if upgraded { sim::guest::zombie_health() * 20 } else { impact(throw).round() as i32 };
-                diag::info!(World, "gravity gun: punted zombie {} (#{}) for {damage}", z.ent, z.wire);
+                let damage = if upgraded { sim::guest_arms::zombie_health() * 20 } else { impact(throw).round() as i32 };
+                info!(World, "gravity gun: punted zombie {} (#{}) for {damage}", z.ent, z.wire);
                 hit(z.ent, damage, f.eye + f.look * B, look, look * throw);
                 self.thrown.push(Thrown { ent: z.ent, wire: z.wire, age: 0.0, upgraded, struck: Vec::new(), last: None });
                 Action::Fire
@@ -364,7 +365,7 @@ impl GravPlay {
         let Some((ent, mut wire)) = self.held else { return };
         // bo2mp: a player the Super one killed in its grab is a new body
         // (the corpse's own entity): the beam takes that one.
-        if let Some(z) = zombies.iter().find(|z| z.ent == ent && !z.alive && z.wire != wire) {
+        if let Some(z) = zombies.iter().find(|z| z.ent == ent && !z.living && z.wire != wire) {
             ragdoll::beam_hold(wire, None);
             wire = z.wire;
             self.held = Some((ent, wire));
@@ -372,24 +373,24 @@ impl GravPlay {
         // bo2mp: once he respawns his body goes by its own number: the
         // beam keeps it.
         let mut ent = ent;
-        if let Some(z) = zombies.iter().find(|z| z.wire == wire && z.ent != ent && !z.alive) {
+        if let Some(z) = zombies.iter().find(|z| z.wire == wire && z.ent != ent && !z.living) {
             ent = z.ent;
             self.held = Some((ent, wire));
         }
         let point = f.eye + f.look * BODY_AHEAD - Vec3::Z * BODY_BELOW;
-        let point = short_of_wall(f.clip, f.eye, point, BODY_HALF);
+        let point = short_of_wall(f.solids, f.eye, point, BODY_HALF);
         ragdoll::beam_hold(wire, Some(point));
         let there = zombies.iter().any(|z| z.ent == ent);
         self.body_missing = if there { 0.0 } else { self.body_missing + dt };
         if self.body_missing > 1.0 {
-            diag::info!(World, "gravity gun: body {ent} gone, let go");
+            info!(World, "gravity gun: body {ent} gone, let go");
             self.let_go();
         }
     }
 
     /// Drops what it holds: the body goes limp.
     fn let_go(&mut self) {
-        if let Some((_, wire)) = self.held.take() {
+        if let Some((_held, wire)) = self.held.take() {
             ragdoll::beam_hold(wire, None);
         }
     }
@@ -411,20 +412,20 @@ impl GravPlay {
             }
             let damage = impact(speed).min(500.0) * 2.0 * if t.upgraded { 2.0 } else { 1.0 };
             for z in zombies {
-                if !z.alive || z.ent == t.ent || t.struck.contains(&z.ent) {
+                if !z.living || z.ent == t.ent || t.struck.contains(&z.ent) {
                     continue;
                 }
                 let middle = Vec3::from_array(z.origin) + Vec3::Z * z.height * 0.5;
                 let way = now - from;
                 let at = from + way * ((middle - from).dot(way) / way.length_squared().max(1e-3)).clamp(0.0, 1.0);
-                let near = Vec2::new(at.x - z.origin[0], at.y - z.origin[1]).length() < z.radius + 24.0
+                let near = Vec2::new(at.x - z.origin[0], at.y - z.origin[1]).length() < z.reach + 24.0
                     && at.z > z.origin[2] - 12.0
                     && at.z < z.origin[2] + z.height + 12.0;
                 if !near {
                     continue;
                 }
                 t.struck.push(z.ent);
-                diag::info!(World, "gravity gun: body {} hits zombie {} at {speed:.0} u/s for {damage:.0}", t.ent, z.ent);
+                info!(World, "gravity gun: body {} hits zombie {} at {speed:.0} u/s for {damage:.0}", t.ent, z.ent);
                 hit(z.ent, damage.round() as i32, seen.at, seen.speed.normalize_or_zero(), seen.speed * 0.7);
             }
         }
@@ -437,7 +438,7 @@ impl GravPlay {
 
 /// The item pictures' layers.
 const BOW: u8 = 0;
-const BOW_PULLING: [u8; 3] = [1, 2, 3];
+const BOW_PULLING: &[u8; 3] = &[1, 2, 3];
 const STICK: u8 = 4;
 const ARROW: u8 = 5;
 const PICTURES: [&str; 6] = ["bow", "bow_pulling_0", "bow_pulling_1", "bow_pulling_2", "stick", "arrow"];
@@ -597,12 +598,12 @@ fn extrude(rgba: &[u8]) -> Vec<Quad> {
     let mut quads = vec![
         // South (front) and north (back): the whole picture.
         Quad {
-            corners: [Vec3::new(0.0, 0.0, z1), Vec3::new(1.0, 0.0, z1), Vec3::new(1.0, 1.0, z1), Vec3::new(0.0, 1.0, z1)],
+            corners: [Vec3::ZERO.with_z(z1), Vec3::X.with_z(z1), Vec3::ONE.with_z(z1), Vec3::Y.with_z(z1)],
             uv: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
             shade: 1.0,
         },
         Quad {
-            corners: [Vec3::new(1.0, 0.0, z0), Vec3::new(0.0, 0.0, z0), Vec3::new(0.0, 1.0, z0), Vec3::new(1.0, 1.0, z0)],
+            corners: [Vec3::X.with_z(z0), Vec3::ZERO.with_z(z0), Vec3::Y.with_z(z0), Vec3::ONE.with_z(z0)],
             uv: [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
             shade: 1.0,
         },
@@ -642,16 +643,16 @@ fn load_items() -> Items {
     }
     let pictures: Vec<Vec<u8>> = PICTURES.iter().map(|name| picture(assets.as_ref(), name)).collect();
     let quads = pictures.iter().map(|p| extrude(p)).collect();
-    let mut sounds = HashMap::new();
+    let mut sound_list = HashMap::new();
     if let Some(a) = &assets {
         for name in MC_SOUNDS {
             if let Ok(bytes) = std::fs::read(a.join(format!("sounds/{name}.ogg"))) {
-                sounds.insert(name, Arc::from(bytes));
+                sound_list.insert(name, Arc::from(bytes));
             }
         }
     }
     let layers = pictures.into_iter().map(|p| vec![p]).collect();
-    Items { texture: Arc::new(GuestTexture { size: PIXELS, layers }), quads, sounds }
+    Items { texture: Arc::new(GuestTexture { size: PIXELS, layers }), quads, sounds: sound_list }
 }
 
 /// The item's `firstperson_righthand` display (every one of the three:
@@ -701,20 +702,20 @@ fn bow_pose(ticks: f32) -> Mat4 {
         * display()
 }
 
-fn push_quads(vertices: &mut Vec<GuestVertex>, indices: &mut Vec<u32>, quads: &[Quad], pose: Mat4, layer: u8, enchanted: bool) {
-    for q in quads {
-        let base = vertices.len() as u32;
+fn push_quads(verts: &mut Vec<GuestVertex>, indices_in: &mut Vec<u32>, quads_in: &[Quad], pose: Mat4, layer: u8, enchanted: bool) {
+    for q in quads_in {
+        let base = verts.len() as u32;
         let c = (q.shade * 255.0).round() as u8;
         for k in 0..4 {
-            vertices.push(GuestVertex {
+            verts.push(GuestVertex {
                 position: pose.transform_point3(q.corners[k]).to_array(),
-                uv: q.uv[k],
-                color: [c, c, c, layer],
+                tex_uv: q.uv[k],
+                tint: [c, c, c, layer],
                 light: [240, 240],
                 pad: [if enchanted { 255 } else { 0 }, 255],
             });
         }
-        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        indices_in.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 }
 
@@ -733,11 +734,11 @@ fn hand_clip(aspect: f32) -> [f32; 16] {
 
 /// A portal on a wall or a floor: one quad the shader cuts to an oval
 /// (`pad.y` 128), blue or orange, darker inside once the pair is linked.
-fn push_portal(vertices: &mut Vec<GuestVertex>, indices: &mut Vec<u32>, p: &sim::guest::PortalView) {
-    let n = Vec3::from_array(p.normal).normalize_or(Vec3::Z);
-    let up = Vec3::from_array(p.up).normalize_or(Vec3::Y);
+fn push_portal(vertices_v: &mut Vec<GuestVertex>, indices_val: &mut Vec<u32>, p: &sim::guest_arms::GuestPortal) {
+    let n = Vec3::from_array(p.face_dir).normalize_or(Vec3::Z);
+    let up = Vec3::from_array(p.up_dir).normalize_or(Vec3::Y);
     let right = up.cross(n).normalize_or(Vec3::X);
-    let [half_w, half_h] = sim::guest::PORTAL_HALF;
+    let [half_w, half_h] = sim::guest_arms::PORTAL_HALF;
     // Just off the surface, so the wall does not cover it.
     let centre = Vec3::from_array(p.centre) + n * 0.5;
     let colour = if p.orange { [255, 140, 20] } else { [40, 140, 255] };
@@ -745,26 +746,26 @@ fn push_portal(vertices: &mut Vec<GuestVertex>, indices: &mut Vec<u32>, p: &sim:
     // second; the Super one's halo reaches 1.45 times past the oval.
     let grow = (p.age / 0.2).clamp(0.05, 1.0);
     let reach = if p.upgraded { 1.45 } else { 1.0 };
-    let base = vertices.len() as u32;
+    let base = vertices_v.len() as u32;
     for (u, v) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
         let (u, v) = (u * reach, v * reach);
-        vertices.push(GuestVertex {
+        vertices_v.push(GuestVertex {
             position: (centre + right * u * half_w + up * v * half_h).to_array(),
-            uv: [u, v],
-            color: [colour[0], colour[1], colour[2], 0],
+            tex_uv: [u, v],
+            tint: [colour[0], colour[1], colour[2], 0],
             // The Super bit, and which gun's pair it is: the oval shows the
             // view through its partner (`portal_view`) when it is that pair.
             light: [(grow * 255.0).round() as u8, if p.upgraded { 128 } else { 0 } | (p.pair & 127) as u8],
             // Linked: 160 the blue end, 200 the orange.
-            pad: [match (p.linked, p.orange) { (false, _) => 0, (true, false) => 160, (true, true) => 200 }, 128],
+            pad: [match (p.paired, p.orange) { (false, _) => 0, (true, false) => 160, (true, true) => 200 }, 128],
         });
     }
-    indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    indices_val.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 /// An arrow in the map: Minecraft's arrow picture on two crossed planes
 /// along its flight, its tip at `at`.
-fn push_arrow(vertices: &mut Vec<GuestVertex>, indices: &mut Vec<u32>, at: Vec3, heading: Vec3, enchanted: bool) {
+fn push_arrow(vertices_in: &mut Vec<GuestVertex>, indices_v: &mut Vec<u32>, at: Vec3, heading: Vec3, enchanted: bool) {
     let d = heading.normalize_or(Vec3::X);
     let s1 = d.cross(Vec3::Z).normalize_or(Vec3::Y);
     let s2 = d.cross(s1).normalize_or(Vec3::Z);
@@ -772,20 +773,20 @@ fn push_arrow(vertices: &mut Vec<GuestVertex>, indices: &mut Vec<u32>, at: Vec3,
     let k = 14.0;
     let centre = at - d * k * 0.8;
     for side in [s1, s2] {
-        let base = vertices.len() as u32;
+        let base = vertices_in.len() as u32;
         for (u, v) in [(0.0f32, 1.0f32), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)] {
             // The picture's diagonal (fletching bottom left, tip top right)
             // lies along the flight.
             let p = centre + d * (u - v) * k + side * (u + v - 1.0) * k;
-            vertices.push(GuestVertex {
+            vertices_in.push(GuestVertex {
                 position: p.to_array(),
-                uv: [u, v],
-                color: [255, 255, 255, ARROW],
+                tex_uv: [u, v],
+                tint: [255, 255, 255, ARROW],
                 light: [240, 240],
                 pad: [if enchanted { 255 } else { 0 }, 255],
             });
         }
-        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        indices_v.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 }
 
@@ -797,7 +798,7 @@ struct State {
     play: GravPlay,
     items: Option<Items>,
     /// The hand's counters last frame, and the draw.
-    last: sim::guest::Hand,
+    last: sim::guest_arms::Hand,
     /// Seconds into a swing.
     swing: Option<f32>,
     clock: f32,
@@ -811,12 +812,12 @@ impl State {
     }
 
     /// One of Minecraft's sounds (none without its files).
-    fn mc_sound(&mut self, queue: &mut Vec<(audio::GuestSoundRequest, Option<Vec3>)>, name: &'static str, volume: f32, pitch: f32, at: Option<Vec3>) {
-        let Some(bytes) = self.items.as_ref().and_then(|i| i.sounds.get(name)).cloned() else { return };
+    fn mc_sound(&mut self, queue: &mut Vec<(audio::GuestSoundRequest, Option<Vec3>)>, sound_name: &'static str, vol: f32, pitch: f32, at: Option<Vec3>) {
+        let Some(bytes) = self.items.as_ref().and_then(|i| i.sounds.get(sound_name)).cloned() else { return };
         if std::env::var_os("BO2MP_SOUND_LOG").is_some() {
-            diag::info!(World, "guest sound: Minecraft {name}");
+            info!(World, "guest sound: Minecraft {sound_name}");
         }
-        queue.push((audio::GuestSoundRequest { key: format!("mc:{name}"), bytes, volume, pitch, hold: None }, at));
+        queue.push((audio::GuestSoundRequest { key: format!("mc:{sound_name}"), bytes, volume: vol, pitch_mul: pitch, hold: None }, at));
     }
 
     fn pick(&mut self, names: &[&'static str]) -> &'static str {
@@ -824,42 +825,42 @@ impl State {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "kept as written")]
 fn guest_weapons(
-    presented: Res<PresentedSnapshot>,
-    local: Res<LocalPresentClient>,
-    subject: Res<ViewSubject>,
-    time: Res<Time>,
+    presented: Res<ShownWorldFrame>,
+    local: Res<HostViewClient>,
+    subject: Res<EyeSubject>,
+    time_in: Res<Time>,
     paused: Option<Res<GamePaused>>,
     buttons: Option<Res<ButtonInput<MouseButton>>>,
     pad: Option<Res<ActivePad>>,
     pads: Query<&Gamepad>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    clip: Option<Res<DynEntPhysClip>>,
+    windows_in: Query<&Window, With<PrimaryWindow>>,
+    solids: Option<Res<PropPhysicsShape>>,
     sounds: Option<ResMut<audio::GuestSoundQueue>>,
     mut view: ResMut<GuestWeaponView>,
     mut state: Local<State>,
 ) {
     let state = &mut *state;
     let paused = paused.is_some_and(|p| p.0);
-    let dt = if paused { 0.0 } else { time.delta_secs() };
+    let dt = if paused { 0.0 } else { time_in.delta_secs() };
     state.clock += dt;
-    sim::guest::set_viewer(local.0.0);
-    let hand = sim::guest::hand();
-    let ps = presented.player(local.0).copied();
-    let alive = ps.is_some_and(|ps| ps.pm_type == 0 || ps.pm_type == 2);
-    let third = crate::occupancy::third_person::presented_is_third_person(&presented, local.0, subject.in_killcam());
+    sim::guest_arms::set_viewer(local.0.0);
+    let hand = sim::guest_arms::hand();
+    let pstate = presented.player(local.0).copied();
+    let alive = pstate.is_some_and(|pstate| pstate.movement_mode == 0 || pstate.movement_mode == 2);
+    let third = crate::occupancy::other_view::shown_in_third_person(&presented, local.0, subject.replaying_final_death());
     let weapon = hand.weapon.filter(|_| alive && !third);
     HIDE.store(hand.weapon.is_some(), Ordering::Relaxed);
 
     let mut queue = Vec::new();
     let mut out = GuestWeaponView { clock: state.clock, ..Default::default() };
-    let aspect = windows.iter().next().map_or(16.0 / 9.0, |w| w.width() / w.height().max(1.0));
-    let (eye, look, pitch) = match ps {
-        Some(ps) => {
-            let (p, y) = (ps.viewangles[0].to_radians(), ps.viewangles[1].to_radians());
+    let aspect = windows_in.iter().next().map_or(16.0 / 9.0, |w| w.width() / w.height().max(1.0));
+    let (eye, look, pitch) = match pstate {
+        Some(pstate) => {
+            let (p, y) = (pstate.look_angles[0].to_radians(), pstate.look_angles[1].to_radians());
             let look = Vec3::new(p.cos() * y.cos(), p.cos() * y.sin(), -p.sin());
-            (Vec3::from_array(ps.origin) + Vec3::Z * ps.view_height_current, look, ps.viewangles[0])
+            (Vec3::from_array(pstate.origin) + Vec3::Z * pstate.eye_height_now, look, pstate.look_angles[0])
         }
         None => (Vec3::ZERO, Vec3::X, 0.0),
     };
@@ -871,14 +872,14 @@ fn guest_weapons(
     let gun = weapon.filter(|w| w.is_gravgun()).map(|w| w == Guest::SuperGravityGun);
     let primary = free && (buttons.as_ref().is_some_and(|b| b.just_pressed(MouseButton::Left)) || trigger(GamepadButton::RightTrigger2));
     let secondary = free && (buttons.as_ref().is_some_and(|b| b.just_pressed(MouseButton::Right)) || trigger(GamepadButton::LeftTrigger2));
-    let clip_ref = clip.as_ref().and_then(|c| c.0.as_deref());
-    let shown = state.play.frame(&GunFrame { gun, dt, eye, look, primary, secondary, clip: clip_ref });
+    let clip_ref = solids.as_ref().and_then(|c| c.0.as_deref());
+    let shown = state.play.frame(&GunFrame { gun, dt, eye, look, main: primary, secondary, solids: clip_ref });
     let mut cue_sounds = Vec::new();
     state.gravgun.play_cues(&shown.cues, &mut cue_sounds);
     queue.extend(cue_sounds.into_iter().map(|s| (s, None)));
     // Minecraft's axes for the view model: x, then up, then south.
     let mc = |v: Vec3| [v.x, v.z, -v.y];
-    let feet = ps.map_or([0.0; 3], |ps| [ps.origin[0] as f64 / 36.0, ps.origin[2] as f64 / 36.0, -ps.origin[1] as f64 / 36.0]);
+    let feet = pstate.map_or([0.0; 3], |pstate| [pstate.origin[0] as f64 / 36.0, pstate.origin[2] as f64 / 36.0, -pstate.origin[1] as f64 / 36.0]);
     // The Portal Gun shows in the same view (Half-Life 2's hand): each
     // portal shot is its fire.
     let portal = weapon.filter(|w| w.is_portalgun());
@@ -894,9 +895,9 @@ fn guest_weapons(
         weapon: gun_name.map(str::to_owned),
         dt,
         look: mc(look),
-        pitch,
+        tilt: pitch,
         feet,
-        aspect,
+        aspect_ratio: aspect,
         eye_light: [15.0, 0.0],
         holding: shown.holding,
         open: shown.open,
@@ -904,21 +905,21 @@ fn guest_weapons(
         orange: hand.orange,
     });
     if let Some(mesh) = gun_view {
-        out.vertices = mesh.vertices;
-        out.indices = mesh.indices;
-        out.solid = mesh.solid;
-        out.clip = mesh.clip;
+        out.vertices = mesh.verts;
+        out.indices = mesh.idx_list;
+        out.solid = mesh.solid_count;
+        out.to_clip = mesh.to_clip;
         out.hl2 = Some(mesh.texture);
     }
 
     // The bow and the stick.
-    let items_needed = weapon.is_some_and(|w| !w.is_gravgun() && !w.is_portalgun()) || !sim::guest::arrows().is_empty();
+    let items_needed = weapon.is_some_and(|w| !w.is_gravgun() && !w.is_portalgun()) || !sim::guest_arms::arrows().is_empty();
     if items_needed && state.items.is_none() {
         state.items = Some(load_items());
     }
     if hand.swings != state.last.swings {
         state.swing = Some(0.0);
-        if hand.hits != state.last.hits {
+        if hand.struck != state.last.struck {
             let name = state.pick(&[
                 "entity/player/attack/strong1",
                 "entity/player/attack/strong2",
@@ -955,7 +956,7 @@ fn guest_weapons(
         let pitch = 1.0 / (state.random() * 0.4 + 1.2) + power * 0.5;
         state.mc_sound(&mut queue, "random/bow", 1.0, pitch, None);
     }
-    for at in sim::guest::take_arrow_hits() {
+    for at in sim::guest_arms::take_arrow_hits() {
         let name = state.pick(&["random/bowhit1", "random/bowhit2", "random/bowhit3", "random/bowhit4"]);
         let pitch = 1.2 / (state.random() * 0.2 + 0.9);
         state.mc_sound(&mut queue, name, 1.0, pitch, Some(Vec3::from_array(at)));
@@ -969,7 +970,7 @@ fn guest_weapons(
     state.last = hand;
     if let (Some(w), Some(items)) = (weapon.filter(|w| !w.is_gravgun() && !w.is_portalgun()), state.items.as_ref()) {
         let mut vertices = Vec::new();
-        let mut indices = Vec::new();
+        let mut index_list = Vec::new();
         let (layer, pose) = match (w, hand.draw) {
             (Guest::Bow | Guest::EnchantedBow, Some(t)) => {
                 // Minecraft's pulling pictures: 0, then 1 from 0.65 of a
@@ -980,25 +981,25 @@ fn guest_weapons(
             (Guest::Stick, _) => (STICK, item_pose(state.swing.map_or(0.0, |t| (t * 20.0 / SWING_TICKS).clamp(0.0, 1.0)))),
             _ => (BOW, item_pose(0.0)),
         };
-        push_quads(&mut vertices, &mut indices, &items.quads[layer as usize], pose, layer, w.enchanted());
-        out.solid = indices.len() as u32;
+        push_quads(&mut vertices, &mut index_list, &items.quads[layer as usize], pose, layer, w.enchanted());
+        out.solid = index_list.len() as u32;
         out.vertices = bytemuck::cast_slice(&vertices).to_vec();
-        out.indices = indices;
-        out.clip = hand_clip(aspect);
+        out.indices = index_list;
+        out.to_clip = hand_clip(aspect);
     }
     let mut vertices = Vec::new();
-    let mut indices = Vec::new();
+    let mut index_list = Vec::new();
     if let Some(items) = state.items.as_ref() {
         out.items = Some(items.texture.clone());
-        for a in sim::guest::arrows() {
-            push_arrow(&mut vertices, &mut indices, Vec3::from_array(a.at), Vec3::from_array(a.velocity), a.enchanted);
+        for a in sim::guest_arms::arrows() {
+            push_arrow(&mut vertices, &mut index_list, Vec3::from_array(a.at), Vec3::from_array(a.motion), a.enchanted);
         }
     }
-    for p in sim::guest::portals() {
-        push_portal(&mut vertices, &mut indices, &p);
+    for p in sim::guest_arms::portals() {
+        push_portal(&mut vertices, &mut index_list, &p);
     }
-    out.world_vertices = bytemuck::cast_slice(&vertices).to_vec();
-    out.world_indices = indices;
+    out.level_vertex_total = bytemuck::cast_slice(&vertices).to_vec();
+    out.level_indices = index_list;
     if let Some(mut sounds) = sounds {
         sounds.0.extend(queue);
     }

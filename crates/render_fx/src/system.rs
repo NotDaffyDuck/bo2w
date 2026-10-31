@@ -1,151 +1,159 @@
+//! The systems that keep the effect host in step with the client frame: clock, camera,
+//! sound requests and the teardown after a match.
+
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use frame::{FxSoundPublished, MatchTornDown, SessionSwapApplied};
-use fx::{FxGapCause, FxMsec, set_presentation_clock};
+use frame::{EffectAudioPosted, GameSessionClosed, MatchSwapDone};
+use fx::{EffectHoleReason, EffectClockMs, set_show_clock};
 use net::{
-    ClientSet, FrameClock, GameActive, LastAdoptedSnapshot, advance_cg_frame_clock,
-    reconcile_prediction,
+    ClientStep, FrameClock, GameActive, NewestTakenSnapshot, step_presentation_clock,
+    correct_forecast,
 };
-use render_anim::sync_camera_from_presented;
-use render_scene::{FlyCamera, WorldPresentFacts};
+use render_anim::sync_camera_from_shown;
+use render_scene::{FreeRoamCamera, LevelPresentFacts};
 
 use crate::{
-    EntityMarks, FxCameraOrigin, FxJournalCursor, HostFxDlights, HostFxPostLights, HostFxSystem,
-    PreparedFxCatalog, PreparedFxModels, PreparedImpactFx, PreparedTracers, PresentedVehicleFx,
-    TracerDrawGate, TracerWorld,
+    EntityMarkBoard, EffectsEyePosition, EffectJournalCursor, FxModelDrawList, FxModelStagingPlan, EffectsDynamicLightSet,
+    PostEffectLightSet, EffectsSystemHandle, ReadyFxBook, PreparedFxModelPlan, ReadyFxProps,
+    ReadyHitFx, StagedStreaks, TracerRenderGuard, StreakLevel,
 };
 
-pub fn register_fx_orchestration(app: &mut App) {
+/// Schedules the effect host's per-frame bookkeeping inside the client frame sets.
+pub fn install_effect_coordination(app: &mut App) {
+    app.add_systems(
+        Update,
+        reset_fx_after_match
+            .in_set(ClientStep::Load)
+            .after(MatchSwapDone),
+    );
+    // The game is active before the frame clock moves; the presentation clock follows it.
     app.add_systems(
         Update,
         (
-            kill_fx_on_match_torn_down
-                .in_set(ClientSet::Load)
-                .after(SessionSwapApplied),
-            latch_cgame_active
-                .in_set(ClientSet::Reconcile)
-                .after(reconcile_prediction)
-                .before(advance_cg_frame_clock),
-            stamp_presentation_clock
-                .in_set(ClientSet::Reconcile)
-                .after(advance_cg_frame_clock),
-        ),
-    )
-    .add_systems(
+            set_game_active
+                .after(correct_forecast)
+                .before(step_presentation_clock),
+            sync_presentation_clock.after(step_presentation_clock),
+        )
+            .in_set(ClientStep::Reconcile),
+    );
+    app.add_systems(
         Update,
-        clear_presented_vehicle_fx.in_set(ClientSet::Receive),
-    )
-    .add_systems(
+        record_effects_eye_position
+            .in_set(ClientStep::Present)
+            .after(sync_camera_from_shown),
+    );
+    app.add_systems(
         Update,
-        stamp_fx_camera_origin
-            .after(sync_camera_from_presented)
-            .in_set(ClientSet::Present),
-    )
-    .add_systems(
-        Update,
-        play_pending_fx_sounds
-            .before(FxSoundPublished)
-            .in_set(ClientSet::Effects),
+        send_queued_fx_sounds
+            .in_set(ClientStep::Effects)
+            .before(EffectAudioPosted),
     );
 }
 
-pub fn stamp_fx_camera_origin(
-    cameras: Query<&Transform, With<FlyCamera>>,
-    mut origin: ResMut<FxCameraOrigin>,
+/// Copies the fly camera's position, or the world origin when there is no camera.
+pub fn record_effects_eye_position(
+    eyes: Query<&Transform, With<FreeRoamCamera>>,
+    mut origin: ResMut<EffectsEyePosition>,
 ) {
-    origin.0 = cameras
-        .iter()
-        .next()
-        .map(|transform| transform.translation.to_array())
-        .unwrap_or([0.0; 3]);
+    let position = eyes.iter().next().map(|camera| camera.translation);
+    origin.0 = position.map_or([0.0; 3], |at| at.to_array());
 }
 
-fn kill_fx_on_match_torn_down(
-    mut torn: MessageReader<MatchTornDown>,
-    mut host: ResMut<HostFxSystem>,
-    mut cursor: ResMut<FxJournalCursor>,
-    mut dlights: ResMut<HostFxDlights>,
-    mut post_lights: ResMut<HostFxPostLights>,
-    mut tracers: ResMut<TracerWorld>,
-    mut tracer_gate: ResMut<TracerDrawGate>,
-    mut entity_marks: ResMut<EntityMarks>,
+/// Everything the effect host keeps between frames that a finished match must not leave
+/// behind.
+#[derive(SystemParam)]
+struct FxMatchState<'w> {
+    host: ResMut<'w, EffectsSystemHandle>,
+    journal: ResMut<'w, EffectJournalCursor>,
+    lamp_list: ResMut<'w, EffectsDynamicLightSet>,
+    after_lights: ResMut<'w, PostEffectLightSet>,
+    tracers: ResMut<'w, StreakLevel>,
+    tracer_gate: ResMut<'w, TracerRenderGuard>,
+    marks: ResMut<'w, EntityMarkBoard>,
+}
+
+impl FxMatchState<'_> {
+    fn start_over(&mut self) {
+        *self.host = EffectsSystemHandle::default();
+        self.journal.reset_createfx();
+        *self.lamp_list = EffectsDynamicLightSet::default();
+        *self.after_lights = PostEffectLightSet::default();
+        *self.tracers = StreakLevel::default();
+        *self.tracer_gate = TracerRenderGuard::default();
+        *self.marks = EntityMarkBoard::default();
+    }
+}
+
+/// After a match is torn down: a fresh host, empty queues, and no prepared fx data left
+/// over from the old world.
+fn reset_fx_after_match(
+    mut torn_down: MessageReader<GameSessionClosed>,
+    mut state: FxMatchState,
     mut commands: Commands,
 ) {
-    if torn.read().count() == 0 {
+    if torn_down.read().count() == 0 {
         return;
     }
-    *host = HostFxSystem::default();
-    cursor.createfx_booted = false;
-    cursor.createfx_boot_msec = None;
-    *dlights = HostFxDlights::default();
-    *post_lights = HostFxPostLights::default();
-    *tracers = TracerWorld::default();
-    *tracer_gate = TracerDrawGate::default();
-    *entity_marks = EntityMarks::default();
-    commands.remove_resource::<PreparedFxCatalog>();
-    commands.remove_resource::<PreparedFxModels>();
-    commands.remove_resource::<crate::PreparedFxModelGeometry>();
-    commands.insert_resource(crate::FxModelDrawPlan::default());
-    commands.insert_resource(crate::FxModelStaging::default());
-    commands.remove_resource::<PreparedImpactFx>();
-    commands.remove_resource::<PreparedTracers>();
+    state.start_over();
+    commands.insert_resource(FxModelDrawList::without_geometry(0));
+    commands.insert_resource(FxModelStagingPlan::default());
+    commands.remove_resource::<ReadyFxBook>();
+    commands.remove_resource::<ReadyFxProps>();
+    commands.remove_resource::<PreparedFxModelPlan>();
+    commands.remove_resource::<ReadyHitFx>();
+    commands.remove_resource::<StagedStreaks>();
 }
 
-fn latch_cgame_active(
-    facts: Res<WorldPresentFacts>,
-    adopted: Option<Res<LastAdoptedSnapshot>>,
+fn set_game_active(
+    facts: Res<LevelPresentFacts>,
+    adopted: Option<Res<NewestTakenSnapshot>>,
     mut active: ResMut<GameActive>,
 ) {
-    let spawned = facts.spawned;
-    let has_snap = adopted.as_ref().is_some_and(|snap| snap.next().is_some());
-    active.0 = GameActive::from_first_snapshot(spawned, has_snap);
+    let has_snapshot = adopted.is_some_and(|snapshot| snapshot.next().is_some());
+    active.0 = GameActive::once_world_and_snapshot(facts.spawned, has_snapshot);
 }
 
-fn stamp_presentation_clock(mut host: ResMut<HostFxSystem>, clock: Res<FrameClock>) {
-    let msec = FxMsec(clock.time());
-    set_presentation_clock(&mut host.0, msec);
+fn sync_presentation_clock(mut host: ResMut<EffectsSystemHandle>, clock: Res<FrameClock>) {
+    set_show_clock(&mut host.0, EffectClockMs(clock.time()));
 }
 
-fn play_pending_fx_sounds(
-    mut host: ResMut<HostFxSystem>,
-    catalog: Option<Res<PreparedFxCatalog>>,
-    bank: Option<Res<audio::SoundBank>>,
+/// Turns the sounds the effect host queued this frame into alias commands. Requests older
+/// than the previous frame are stale and dropped; ones whose alias cannot be found are
+/// reported as gaps.
+fn send_queued_fx_sounds(
+    mut host: ResMut<EffectsSystemHandle>,
+    recipe_book: Option<Res<ReadyFxBook>>,
+    bank: Option<Res<audio::AudioCatalogRes>>,
     clock: Res<FrameClock>,
-    mut output: MessageWriter<audio::AliasCommand>,
+    mut commands_out: MessageWriter<audio::AliasCommand>,
 ) {
-    let Some(catalog) = catalog else {
+    let (Some(recipes), Some(bank)) = (recipe_book, bank) else {
         return;
     };
-    let Some(bank) = bank else {
-        return;
-    };
-    let batch = std::mem::take(&mut host.0.pending_sounds);
-    for req in batch {
-        if req.msec_begin < clock.old_time() {
+    let oldest_kept = clock.prior_ms();
+    let requests = std::mem::take(&mut host.0.pending_sounds);
+    for request in requests.into_iter().filter(|r| r.window_open_ms >= oldest_kept) {
+        let elem = crate::effect_play::recipe_lookup(&recipes.0, request.ledger_index)
+            .and_then(|parent| parent.elems.get(request.definition_slot as usize));
+        let sound = elem.map(|elem| elem.sound_in_bank(request.dice_start, &bank.0));
+        let playable = match sound {
+            Some(asset_game::FxBankSound::Silent) => continue,
+            Some(asset_game::FxBankSound::Play { namespace, alias }) => Some((namespace, alias)),
+            Some(asset_game::FxBankSound::Gap) | None => None,
+        };
+        let Some((pack_ns, alias)) = playable else {
+            host.0.gaps.log_hole(EffectHoleReason::ElemSoundSpawnSkipped {
+                definition_slot: request.definition_slot,
+            });
             continue;
-        }
-        match crate::present::catalog_lookup(&catalog.0, req.catalog_index)
-            .and_then(|parent| parent.elems.get(req.def_index as usize))
-            .map(|elem| elem.sound_in_bank(req.random_seed, &bank.0))
-        {
-            None | Some(asset_game::FxBankSound::Gap) => {
-                host.0.gaps.raise(FxGapCause::ElemSoundSpawnSkipped {
-                    def_index: req.def_index,
-                });
-            }
-            Some(asset_game::FxBankSound::Silent) => {}
-            Some(asset_game::FxBankSound::Play { namespace, alias }) => {
-                output.write(audio::AliasCommand::Play(audio::PlayAlias {
-                    namespace,
-                    alias: alias.to_owned(),
-                    fallback: None,
-                    origin_inches: Some(req.origin),
-                    snd_ent: Some(fx_t6::runtime::FX_ENTITYNUM_WORLD),
-                }));
-            }
-        }
+        };
+        commands_out.write(audio::AliasCommand::Play(audio::TriggerCueMsg {
+            cue_ns: pack_ns,
+            alias: alias.to_owned(),
+            fallback: None,
+            position_in_inches: Some(request.anchor),
+            source_entity_no: Some(fx_t6::runtime::FX_ENTITYNUM_WORLD),
+        }));
     }
-}
-
-fn clear_presented_vehicle_fx(mut presented: ResMut<PresentedVehicleFx>) {
-    presented.by_id.clear();
 }

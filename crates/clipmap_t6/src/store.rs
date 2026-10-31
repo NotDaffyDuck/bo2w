@@ -12,7 +12,7 @@ use trace_t6::{Brush, BrushSide};
 use crate::{AabbTree, CModel, ClipMap, ClipMaterial, Leaf, LeafBrushNode, Node, Partition, TempModels};
 
 /// `cbrush_t`, with its sides as `side_count` entries of
-/// `ClipStore::brush_sides` from `first_side`.
+/// `ClipRepository::brush_sides` from `first_side`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StoredBrush {
     pub mins: [f32; 3],
@@ -25,13 +25,13 @@ pub struct StoredBrush {
 }
 
 /// `cLeafBrushNode_s`, with its brushes (a positive count) as that many
-/// entries of `ClipStore::leaf_brushes` from `first_brush`.
+/// entries of `ClipRepository::leaf_brushes` from `initial_convex_solid`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StoredLeafBrushNode {
     pub axis: u8,
-    pub leaf_brush_count: i16,
+    pub leaf_solid_total: i16,
     pub contents: u32,
-    pub first_brush: u32,
+    pub initial_convex_solid: u32,
     pub dist: f32,
     pub range: f32,
     pub child_offset: [u16; 2],
@@ -39,7 +39,7 @@ pub struct StoredLeafBrushNode {
 
 /// The tables of one map's `clipMap_t` that the traces read.
 #[derive(Clone, Debug, Default)]
-pub struct ClipStore {
+pub struct ClipRepository {
     pub nodes: Vec<Node>,
     pub leafs: Vec<Leaf>,
     pub leaf_brush_nodes: Vec<StoredLeafBrushNode>,
@@ -49,7 +49,7 @@ pub struct ClipStore {
     pub materials: Vec<ClipMaterial>,
     pub aabb_trees: Vec<AabbTree>,
     pub partitions: Vec<Partition>,
-    pub verts: Vec<[f32; 3]>,
+    pub vertex_points: Vec<[f32; 3]>,
     pub tri_indices: Vec<[u16; 3]>,
     pub tri_edge_is_walkable: Vec<u8>,
     pub cmodels: Vec<CModel>,
@@ -74,7 +74,7 @@ impl fmt::Display for StoreError {
     }
 }
 
-impl ClipStore {
+impl ClipRepository {
     /// Every index the traces follow lands inside its table, so no trace
     /// over this map reads past one.
     pub fn check(&self) -> Result<(), StoreError> {
@@ -107,12 +107,12 @@ impl ClipStore {
         let lbn = self.leaf_brush_nodes.len();
         for (i, n) in self.leaf_brush_nodes.iter().enumerate() {
             // A node with brushes is a leaf: no walk reads its axis.
-            let ok = if n.leaf_brush_count > 0 {
-                n.first_brush as usize + n.leaf_brush_count as usize <= self.leaf_brushes.len()
+            let ok = if n.leaf_solid_total > 0 {
+                n.initial_convex_solid as usize + n.leaf_solid_total as usize <= self.leaf_brushes.len()
             } else {
                 n.axis < 3
                     && n.child_offset.iter().all(|&o| i + usize::from(o) < lbn)
-                    && (n.leaf_brush_count == 0 || i + 1 < lbn)
+                    && (n.leaf_solid_total == 0 || i + 1 < lbn)
             };
             if !ok {
                 return bad("leaf_brush_nodes", i);
@@ -121,8 +121,8 @@ impl ClipStore {
         let box_run = self
             .box_brush_node
             .and_then(|i| self.leaf_brush_nodes.get(i as usize))
-            .filter(|n| n.leaf_brush_count > 0)
-            .map(|n| n.first_brush as usize..n.first_brush as usize + n.leaf_brush_count as usize);
+            .filter(|n| n.leaf_solid_total > 0)
+            .map(|n| n.initial_convex_solid as usize..n.initial_convex_solid as usize + n.leaf_solid_total as usize);
         let in_box_run = |i: usize| box_run.as_ref().is_some_and(|r| r.contains(&i));
         if let Some(i) = self.leaf_brushes.iter().enumerate().position(|(i, &b)| {
             let b = usize::from(b);
@@ -137,8 +137,8 @@ impl ClipStore {
         }
         for (i, t) in self.aabb_trees.iter().enumerate() {
             let ok = usize::from(t.material_index) < self.materials.len()
-                && if t.child_count > 0 {
-                    t.u as usize + usize::from(t.child_count) <= self.aabb_trees.len()
+                && if t.sub_element_total > 0 {
+                    t.u as usize + usize::from(t.sub_element_total) <= self.aabb_trees.len()
                 } else {
                     (t.u as usize) < self.partitions.len()
                 };
@@ -147,14 +147,14 @@ impl ClipStore {
             }
         }
         for (i, p) in self.partitions.iter().enumerate() {
-            if p.first_tri < 0 || p.first_tri as usize + usize::from(p.tri_count) > self.tri_indices.len() {
+            if p.leading_triangle < 0 || p.leading_triangle as usize + usize::from(p.tri_tally) > self.tri_indices.len() {
                 return bad("partitions", i);
             }
         }
         if let Some(i) = self
             .tri_indices
             .iter()
-            .position(|t| t.iter().any(|&v| usize::from(v) >= self.verts.len()))
+            .position(|t| t.iter().any(|&v| usize::from(v) >= self.vertex_points.len()))
         {
             return bad("tri_indices", i);
         }
@@ -167,10 +167,10 @@ impl ClipStore {
     /// A leaf with brush contents reads its leaf brush node even when that is
     /// node 0; point contents takes node 0 as no brushes.
     fn leaf_ok(&self, leaf: &Leaf) -> bool {
-        usize::from(leaf.first_coll_aabb) + usize::from(leaf.coll_aabb_count) <= self.aabb_trees.len()
-            && leaf.leaf_brush_node >= 0
-            && ((leaf.leaf_brush_node as usize) < self.leaf_brush_nodes.len()
-                || (leaf.leaf_brush_node == 0 && leaf.brush_contents == 0))
+        usize::from(leaf.first_coll_aabb) + usize::from(leaf.collision_box_total) <= self.aabb_trees.len()
+            && leaf.brush_leaf_link >= 0
+            && ((leaf.brush_leaf_link as usize) < self.leaf_brush_nodes.len()
+                || (leaf.brush_leaf_link == 0 && leaf.solid_content_flags == 0))
     }
 
     fn brush_views(&self) -> Vec<Brush<'_>> {
@@ -179,8 +179,8 @@ impl ClipStore {
             .map(|b| {
                 let first = b.first_side as usize;
                 Brush {
-                    mins: b.mins,
-                    maxs: b.maxs,
+                    lower: b.mins,
+                    upper: b.maxs,
                     contents: b.contents,
                     sides: self.brush_sides.get(first..first + b.side_count as usize).unwrap_or(&[]),
                     axial_cflags: b.axial_cflags,
@@ -194,11 +194,11 @@ impl ClipStore {
         self.leaf_brush_nodes
             .iter()
             .map(|n| {
-                let first = n.first_brush as usize;
-                let count = usize::try_from(n.leaf_brush_count).unwrap_or(0);
+                let first = n.initial_convex_solid as usize;
+                let count = usize::try_from(n.leaf_solid_total).unwrap_or(0);
                 LeafBrushNode {
                     axis: n.axis,
-                    leaf_brush_count: n.leaf_brush_count,
+                    leaf_solid_total: n.leaf_solid_total,
                     contents: n.contents,
                     brushes: self.leaf_brushes.get(first..first + count).unwrap_or(&[]),
                     dist: n.dist,
@@ -236,7 +236,7 @@ impl ClipStore {
             materials: &self.materials,
             aabb_trees: &self.aabb_trees,
             partitions: &self.partitions,
-            verts: &self.verts,
+            vertex_points: &self.vertex_points,
             tri_indices: &self.tri_indices,
             tri_edge_is_walkable: &self.tri_edge_is_walkable,
             cmodels: &self.cmodels,

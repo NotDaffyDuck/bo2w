@@ -1,29 +1,54 @@
 use std::time::Instant;
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use frame::{AppScreen, LaunchIdentity, LaunchReport, LifeFrontPublished, LifeStarted, UiDraw};
-use net::{ClientSet, UpdatePhaseCensus};
+use bevy::ui::Node;
+use bevy::ui::PositionType;
+use bevy::ui::UiTargetCamera;
+use frame::LifeStatePosted;
+use frame::ShellScreen;
+use frame::StartupPersona;
+use frame::StartupReport;
+use frame::SpawnLifeBegun;
+use frame::MenuPaintPass;
+use net::ClientStep;
+use net::CardSlotCommand;
+use net::MenuOpenCommand;
+use net::FrameUpdateTally;
 
-use crate::flash::{FlashGpuJob, FlashWhiteoutLatch, update_flash_whiteout};
-use crate::gaps::{HudPresentationGaps, report_hud_gaps};
-use crate::gpu_list::{self, GpuListLatch, HudTessGpuFrame, HudTessPass};
+use crate::flash::WhiteoutJob;
+use crate::flash::WhiteoutCache;
+use crate::flash::drive_whiteout;
+use crate::gaps::HudGapBook;
+use crate::gaps::log_hud_shortages;
+use crate::draw_batch;
+use crate::draw_batch::ListLatch;
+use crate::draw_batch::OverlayMeshBatch;
+use crate::draw_batch::LayerRequests;
+use crate::draw_batch::LayerJob;
 use crate::hud_elems::{
     HudElemsBackRaster, HudElemsRaster, spawn_hud_elems, spawn_hud_elems_back, update_hud_elems,
 };
-use crate::images::HudImages;
-use crate::iris::{IrisLetterboxFill, spawn_iris, update_iris};
-use crate::overhead_names::OverheadNamesRaster;
-use crate::reticle::{ReticleAdsLatch, spawn_reticle, update_reticle};
-use crate::surface::Hud2dSurface;
+use crate::images::HudPictures;
+use crate::iris::ScopeStripFill;
+use crate::iris::spawn_scope;
+use crate::iris::update_scope;
+use crate::name_tags::OverheadNamesRaster;
+use crate::aim_mark::CrosshairScopeHold;
+use crate::surface::{FlatOverlayCanvas, refresh_hud_surface};
+use crate::aim_mark::spawn_aim_mark;
+use bevy::prelude::Visibility;
 
 /// The root of every HUD node except the scope picture.
 #[derive(Component)]
-struct HudRoot;
+struct MainHudRoot;
 
-/// `Some(1)` while the HUD roots are shown, `Some(0)` while hidden; `None`
-/// before the first visibility pass.
+/// `Some(true)` while the HUD roots are shown, `Some(false)` while hidden;
+/// `None` before the first visibility pass.
 #[derive(Resource, Default, Clone, Debug)]
-pub(crate) struct HudRootVisible(pub Option<i32>);
+struct RootsShown {
+    last_pass: Option<bool>,
+}
 
 /// The scope picture and its black surround. Black Ops II draws them on the
 /// match world's frame, under the match HUD (score panel, ammo and killfeed
@@ -31,307 +56,328 @@ pub(crate) struct HudRootVisible(pub Option<i32>);
 /// the world camera, below the LUI HUD root (`GlobalZIndex(0)`), and not on
 /// the top UI camera with the rest of this crate's nodes.
 #[derive(Component)]
-struct HudIrisRoot;
+struct ScopeRoot;
 
-/// Stamps the start of the present stage, to time the stages after it.
+/// Where the HUD's frame timers last stopped: `since_open` is the start of the
+/// present stage, `since_layer` the end of the last HUD stage.
 #[derive(Resource, Default)]
-struct HudPresentStamp(Option<Instant>);
-
-/// Stamps the end of the last HUD stage, to time the next one.
-#[derive(Resource, Default)]
-struct HudStageStamp(Option<Instant>);
+struct HudLaps {
+    since_open: Option<Instant>,
+    since_layer: Option<Instant>,
+}
 
 #[derive(Component)]
-struct FrontendCamera;
+struct MenuBackdropCamera;
 
-pub struct HudPlugin;
+pub struct OverlayModule;
 
-impl Plugin for HudPlugin {
+impl bevy::app::Plugin for OverlayModule {
     fn build(&self, app: &mut App) {
-        gpu_list::register(app);
         // Starts the millisecond clock now, so the first HUD frame does not
         // read a clock that began late.
         let _ = crate::clock::milliseconds();
 
-        app.init_resource::<HudImages>()
-            .init_resource::<HudPresentationGaps>()
-            .init_resource::<ReticleAdsLatch>()
-            .init_resource::<IrisLetterboxFill>()
-            .init_resource::<FlashWhiteoutLatch>()
-            .init_resource::<FlashGpuJob>()
-            .init_resource::<HudRootVisible>()
-            .init_resource::<Hud2dSurface>()
-            .init_resource::<HudPresentStamp>()
-            .init_resource::<HudStageStamp>()
-            .init_resource::<crate::menus::ScriptMenus>()
-            .add_message::<net::SvcCardSlotCmd>()
-            .add_message::<net::SvcOpenMenuCmd>();
-
-        frame::register_ui_contracts(app);
-        crate::overhead_names::register(app);
-        crate::rangefinder::register(app);
-
-        // Setting the roots up: who the HUD is for, what it draws on, and
-        // whether it shows at all.
-        app.add_message::<LifeStarted>().add_systems(
-            Update,
-            (
-                hud_stamp_open,
-                sync_games_root,
-                sync_map_zone_tree,
-                warm_hud_images,
-                ensure_hud_root,
-                retarget_iris_root,
-                sync_frontend_camera,
-                hud_stamp_setup,
-                ApplyDeferred,
-                hud_stamp_deferred,
-                sync_hud_visibility,
-                hud_stamp_visibility,
-            )
-                .chain()
-                .in_set(ClientSet::Ui),
-        );
-
-        // The HUD layers, in draw order, with a stage timer after each group.
-        app.add_systems(
-            Update,
-            (
-                hud_surfaces_open,
-                crate::surface::update_hud_surface,
-                update_reticle,
-                hud_stage_close::<0>,
-                update_iris,
-                crate::sight::update_sight,
-                hud_stage_close::<1>,
-                hud_stage_close::<2>,
-                update_flash_whiteout,
-                hud_stage_close::<3>,
-                hud_stage_close::<4>,
-                hud_stage_close::<5>,
-                update_hud_elems,
-                crate::menus::track_lui_menus,
-                hud_stage_close::<7>,
-                report_hud_gaps,
-                hud_stage_close::<8>,
-                hud_surfaces_close,
-            )
-                .chain()
-                .in_set(LifeFrontPublished),
-        );
-
-        // The tessellated layers are flushed to the GPU list between the last
-        // HUD stage and the gap report.
-        app.add_systems(
-            Update,
-            (
-                begin_hud_tess_frame,
-                flush_flash_tess,
-                flush_overhead_names_tess,
-                flush_hud_elems_tess,
-            )
-                .chain()
-                .after(hud_stage_close::<7>)
-                .before(report_hud_gaps)
-                .in_set(LifeFrontPublished),
-        );
-        app.add_systems(
-            Update,
-            hide_tess_when_hud_hidden
-                .after(hud_surfaces_close)
-                .in_set(LifeFrontPublished),
-        );
+        let steps: [fn(&mut App); 8] = [
+            draw_batch::install,
+            add_hud_state,
+            frame::register_ui_contracts,
+            crate::name_tags::register,
+            crate::rangefinder::install_rangefinder,
+            add_root_systems,
+            add_layer_systems,
+            add_flush_systems,
+        ];
+        steps.into_iter().for_each(|step| step(app));
     }
 }
 
-fn hud_root_should_show(screen: AppScreen, ui_draw: bool) -> bool {
-    ui_draw && matches!(screen, AppScreen::InGame | AppScreen::ClassSelect)
+fn add_hud_state(app: &mut App) {
+    app.add_message::<CardSlotCommand>();
+    app.add_message::<MenuOpenCommand>();
+    app.init_resource::<FlatOverlayCanvas>();
+    app.init_resource::<RootsShown>();
+    app.init_resource::<HudLaps>();
+    app.init_resource::<HudPictures>();
+    app.init_resource::<crate::menus::ScriptMenus>();
+    app.init_resource::<HudGapBook>();
+    app.init_resource::<CrosshairScopeHold>();
+    app.init_resource::<ScopeStripFill>();
+    app.init_resource::<WhiteoutCache>();
+    app.init_resource::<WhiteoutJob>();
+}
+
+/// Setting the roots up: who the HUD is for, what it draws on, and whether it
+/// shows at all.
+fn add_root_systems(app: &mut App) {
+    app.add_message::<SpawnLifeBegun>().add_systems(
+        Update,
+        (
+            lap_open,
+            take_games_root,
+            take_map_zone_tree,
+            prime_hud_pictures,
+            ensure_hud_roots,
+            aim_scope_root,
+            keep_menu_backdrop_camera,
+            lap_setup,
+            bevy::ecs::schedule::ApplyDeferred,
+            lap_deferred,
+            show_or_hide_roots,
+            lap_visibility,
+        )
+            .chain()
+            .in_set(ClientStep::Ui),
+    );
+}
+
+/// The HUD layers, in draw order, with a stage timer after each group.
+fn add_layer_systems(app: &mut App) {
+    app.add_systems(
+        Update,
+        (
+            lap_surfaces_open,
+            refresh_hud_surface,
+            crate::aim_mark::refresh_reticle,
+            lap_stage_close::<0>,
+            update_scope,
+            crate::sight::update_sight,
+            lap_stage_close::<1>,
+            lap_stage_close::<2>,
+            drive_whiteout,
+            lap_stage_close::<3>,
+            lap_stage_close::<4>,
+            lap_stage_close::<5>,
+            update_hud_elems,
+            crate::menus::track_lui_menus,
+            lap_stage_close::<7>,
+            log_hud_shortages,
+            lap_stage_close::<8>,
+            lap_surfaces_close,
+        )
+            .chain()
+            .in_set(LifeStatePosted),
+    );
+}
+
+/// The tessellated layers are flushed to the GPU list between the last HUD
+/// stage and the gap report.
+fn add_flush_systems(app: &mut App) {
+    app.add_systems(
+        Update,
+        (
+            begin_tess_frame,
+            flush_whiteout_tess,
+            flush_overhead_names_tess,
+            flush_hud_elems_tess,
+        )
+            .chain()
+            .after(lap_stage_close::<7>)
+            .before(log_hud_shortages)
+            .in_set(LifeStatePosted),
+    );
+    app.add_systems(
+        Update,
+        blank_tess_while_hud_hidden
+            .after(lap_surfaces_close)
+            .in_set(LifeStatePosted),
+    );
+}
+
+fn hud_root_should_show(shown_screen: ShellScreen, draw_ui: bool) -> bool {
+    draw_ui && matches!(shown_screen, ShellScreen::InGame | ShellScreen::KitPicker)
+}
+
+/// Whether enough menus are dimming the world that the HUD should stay down.
+/// Two or more of the black menu dims stacked (the pause menu, then a popup
+/// over it) are applied in the world pass and not drawn as UI (`lui_hud`),
+/// so nothing would darken the HUD under them: the hip-fire crosshair and
+/// the overhead name skulls showed through the popup's 0.8 panel at full
+/// white. The game darkens the HUD by both dims to about nothing and the
+/// panel covers the rest, so the HUD stays down while both are up. With a
+/// single dim (the pause menu) the dim is a UI node over the HUD root and
+/// darkens it like the world.
+fn dims_keep_hud_down(world_dim: Option<f32>, menu_dims: Option<u32>) -> bool {
+    world_dim.is_some_and(|dim| dim >= 2.0) || menu_dims.is_some_and(|count| count >= 2)
 }
 
 /// A frame where the HUD is hidden (and not the main menu) must not leave the
 /// last frame's geometry on screen.
-fn hide_tess_when_hud_hidden(
-    root: Res<HudRootVisible>,
-    screen: Res<AppScreen>,
-    mut frame: ResMut<HudTessGpuFrame>,
-    mut latches: Query<&mut GpuListLatch>,
+fn blank_tess_while_hud_hidden(
+    shown: Res<RootsShown>,
+    app_screen: Res<ShellScreen>,
+    mut latches: Query<&mut ListLatch>,
+    mut frame: ResMut<OverlayMeshBatch>,
 ) {
-    if root.0 == Some(1) || *screen == AppScreen::MainMenu {
+    if shown.last_pass == Some(true) || *app_screen == ShellScreen::MainMenu {
         return;
     }
-    frame.clear_geometry();
-    frame.visible = false;
-    latches.iter_mut().for_each(|mut latch| latch.mark_hidden());
+    frame.reset_geometry();
+    frame.visible &= false;
+    latches.iter_mut().for_each(|mut latch| latch.hide());
 }
 
-fn begin_hud_tess_frame(surface: Res<Hud2dSurface>, mut frame: ResMut<HudTessGpuFrame>) {
-    let _body = gpu_list::TessBody::open();
-    *frame = HudTessGpuFrame::default();
-    if surface.is_ready() {
-        frame.surface_w = surface.width();
-        frame.surface_h = surface.height();
-        frame.visible = true;
-    }
-}
-
-fn flush_flash_tess(
-    latch: Res<FlashWhiteoutLatch>,
-    job: Res<FlashGpuJob>,
-    mut frame: ResMut<HudTessGpuFrame>,
-) {
-    let _body = gpu_list::TessBody::open();
-    frame.saved_screen_sequence = latch.save_sequence;
-    if matches!(*job, FlashGpuJob::Write) && !latch.packed.is_empty() {
-        frame.append_packed(&latch.saved);
-        frame.append_packed(&latch.packed);
-    }
-}
-
-fn sync_games_root(mut hud_images: ResMut<HudImages>, identity: Option<Res<LaunchIdentity>>) {
-    let Some(identity) = identity else {
-        return;
+fn begin_tess_frame(surface: Res<FlatOverlayCanvas>, mut frame: ResMut<OverlayMeshBatch>) {
+    let _body = draw_batch::BodyTimer::start();
+    let ready = surface.has_size();
+    *frame = OverlayMeshBatch {
+        visible: ready,
+        canvas_w: if ready { surface.width() } else { 0.0 },
+        canvas_h: if ready { surface.height() } else { 0.0 },
+        ..OverlayMeshBatch::default()
     };
-    if !identity.games_root.as_os_str().is_empty() {
-        hud_images.set_games_root(&identity.games_root);
+}
+
+fn flush_whiteout_tess(
+    cache: Res<WhiteoutCache>,
+    job: Res<WhiteoutJob>,
+    mut frame: ResMut<OverlayMeshBatch>,
+) {
+    let _body = draw_batch::BodyTimer::start();
+    frame.saved_screen_sequence = cache.grab_serial;
+    let uploading = matches!(*job, WhiteoutJob::Upload) && !cache.overlay.is_empty();
+    if uploading {
+        [&cache.grab, &cache.overlay]
+            .into_iter()
+            .for_each(|packed| frame.append_list(packed));
     }
 }
 
-fn sync_map_zone_tree(mut hud_images: ResMut<HudImages>, report: Option<Res<LaunchReport>>) {
-    if let Some(Ok(zone_ff)) = report.as_ref().map(|report| &report.zone_ff) {
-        hud_images.adopt_map_zone(zone_ff);
+fn take_games_root(mut hud_images: ResMut<HudPictures>, identity: Option<Res<StartupPersona>>) {
+    let install = identity
+        .as_deref()
+        .map(|launch| launch.titles_install_dir.as_path())
+        .filter(|root| !root.as_os_str().is_empty());
+    if let Some(root) = install {
+        hud_images.point_at_install(root);
     }
 }
 
-fn warm_hud_images(mut hud_images: ResMut<HudImages>, mut images: ResMut<Assets<Image>>) {
-    hud_images.warm_present_stems(&mut images);
+fn take_map_zone_tree(mut hud_images: ResMut<HudPictures>, report: Option<Res<StartupReport>>) {
+    if let Some(zone_archive_file) = report.as_deref().and_then(|launch| launch.zone_archive_file.as_ref().ok()) {
+        hud_images.add_map_zone(zone_archive_file);
+    }
+}
+
+fn prime_hud_pictures(mut pictures: ResMut<HudPictures>, mut assets: ResMut<Assets<Image>>) {
+    pictures.warm_first_frame(&mut assets);
+}
+
+/// What the main-menu backdrop camera is built from.
+fn menu_backdrop_camera() -> impl Bundle {
+    let behind_everything = Camera {
+        order: -1,
+        ..default()
+    };
+    (
+        (Camera3d::default(), behind_everything),
+        (
+            bevy::camera::CompositingSpace::Srgb,
+            bevy::core_pipeline::tonemapping::Tonemapping::None,
+            bevy::render::view::Msaa::Off,
+        ),
+        (frame::UiCamera, MenuBackdropCamera),
+    )
 }
 
 /// The main menu draws through a 3D camera of its own; a match brings its
 /// own cameras, so this one goes away with the menu.
-fn sync_frontend_camera(
+fn keep_menu_backdrop_camera(
     mut commands: Commands,
-    screen: Res<AppScreen>,
-    cameras: Query<Entity, With<FrontendCamera>>,
+    app_screen: Res<ShellScreen>,
+    backdrops: Query<Entity, With<MenuBackdropCamera>>,
 ) {
-    if *screen != AppScreen::MainMenu {
-        for camera in &cameras {
-            commands.entity(camera).despawn();
+    if *app_screen == ShellScreen::MainMenu {
+        if backdrops.is_empty() {
+            commands.spawn(menu_backdrop_camera());
         }
         return;
     }
-    if !cameras.is_empty() {
-        return;
+    for camera in &backdrops {
+        commands.entity(camera).despawn();
     }
-    commands.spawn((
-        FrontendCamera,
-        Camera3d::default(),
-        bevy::camera::CompositingSpace::Srgb,
-        bevy::core_pipeline::tonemapping::Tonemapping::None,
-        Camera {
-            order: -1,
-            ..default()
-        },
-        bevy::render::view::Msaa::Off,
-        frame::UiCamera,
-    ));
 }
 
 /// A full-window, transparent root node, hidden until the visibility pass.
-fn root_node() -> Node {
-    Node {
-        position_type: PositionType::Absolute,
-        width: Val::Percent(100.0),
-        height: Val::Percent(100.0),
-        ..default()
-    }
+fn hidden_full_window_root() -> impl Bundle {
+    (
+        Node {
+            position_type: PositionType::Absolute,
+            width: Val::Percent(100.0_f32),
+            height: Val::Percent(100.0_f32),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.0_f32, 0.0, 0.0, 0.0)),
+        Visibility::Hidden,
+    )
 }
 
-fn ensure_hud_root(mut commands: Commands, existing: Query<Entity, With<HudRoot>>) {
-    if !existing.is_empty() {
+fn ensure_hud_roots(mut commands: Commands, existing: Query<(), With<MainHudRoot>>) {
+    if existing.iter().next().is_some() {
         return;
     }
-    commands
-        .spawn((
-            HudIrisRoot,
-            root_node(),
-            BackgroundColor(Color::NONE),
-            GlobalZIndex(-1),
-            Visibility::Hidden,
-        ))
-        .with_children(|root| spawn_iris(root));
-    commands
-        .spawn((
-            HudRoot,
-            root_node(),
-            BackgroundColor(Color::NONE),
-            Visibility::Hidden,
-        ))
-        .with_children(|root| {
-            crate::font_overlay::spawn_overlay(root, OverheadNamesRaster);
-            spawn_reticle(root);
-            spawn_hud_elems_back(root);
-            spawn_hud_elems(root);
-        });
+    let mut scope = commands.spawn((hidden_full_window_root(), ScopeRoot, GlobalZIndex(-1)));
+    scope.with_children(|root| spawn_scope(root));
+    let mut main = commands.spawn((hidden_full_window_root(), MainHudRoot));
+    main.with_children(|root| {
+        let layers: [fn(&mut ChildSpawnerCommands); 4] = [
+            |root| crate::glyph_layer::spawn_layer_node(root, OverheadNamesRaster),
+            spawn_aim_mark,
+            spawn_hud_elems_back,
+            spawn_hud_elems,
+        ];
+        layers.iter().for_each(|spawn| spawn(root));
+    });
 }
 
 /// The scope root draws on the match world's camera when there is one (as
 /// the LUI HUD does), otherwise on the default UI camera.
-fn retarget_iris_root(
+fn aim_scope_root(
     mut commands: Commands,
     world_cam: Query<
         Entity,
         (
-            With<Camera3d>,
+            With<bevy::prelude::Camera3d>,
             With<bevy::camera::CompositingSpace>,
             Without<frame::UiCamera>,
         ),
     >,
-    root: Query<(Entity, Option<&UiTargetCamera>), With<HudIrisRoot>>,
+    root: Query<(Entity, Option<&UiTargetCamera>), With<ScopeRoot>>,
 ) {
     let wanted = world_cam.iter().next();
-    for (entity, current) in &root {
-        if wanted == current.map(|target| target.0) {
-            continue;
+    let stale = root
+        .iter()
+        .filter(|&(_, current)| current.map(|target| target.0) != wanted);
+    for (scope_ent, _) in stale {
+        let mut scope = commands.entity(scope_ent);
+        if let Some(camera) = wanted {
+            scope.insert(UiTargetCamera(camera));
+        } else {
+            scope.remove::<UiTargetCamera>();
         }
-        let mut root = commands.entity(entity);
-        match wanted {
-            Some(camera) => root.insert(UiTargetCamera(camera)),
-            None => root.remove::<UiTargetCamera>(),
-        };
     }
 }
 
-fn sync_hud_visibility(
-    screen: Res<AppScreen>,
-    ui_draw: Option<Res<UiDraw>>,
+fn show_or_hide_roots(
+    app_screen: Res<ShellScreen>,
+    draw_flag: Option<Res<MenuPaintPass>>,
     world_dim: Option<Res<frame::WorldDim>>,
     menu_dims: Option<Res<frame::MenuDims>>,
-    mut roots: Query<&mut Visibility, Or<(With<HudRoot>, With<HudIrisRoot>)>>,
-    mut visible: ResMut<HudRootVisible>,
+    mut shown: ResMut<RootsShown>,
+    mut root_vis: Query<&mut Visibility, Or<(With<MainHudRoot>, With<ScopeRoot>)>>,
 ) {
-    // Two or more of the black menu dims stacked (the pause menu, then a popup
-    // over it) are applied in the world pass and not drawn as UI (`lui_hud`),
-    // so nothing would darken the HUD under them: the hip-fire crosshair and
-    // the overhead name skulls showed through the popup's 0.8 panel at full
-    // white. The game darkens the HUD by both dims to about nothing and the
-    // panel covers the rest, so the HUD stays down while both are up. With a
-    // single dim (the pause menu) the dim is a UI node over the HUD root and
-    // darkens it like the world.
-    let stacked_dims = world_dim.is_some_and(|dim| dim.0 >= 2.0)
-        || menu_dims.is_some_and(|dims| dims.0 >= 2);
-    let show = hud_root_should_show(*screen, ui_draw.is_some_and(|draw| draw.0)) && !stacked_dims;
-    visible.0 = Some(i32::from(show));
+    let held_down = dims_keep_hud_down(world_dim.map(|dim| dim.0), menu_dims.map(|dims| dims.0));
+    let drawing = draw_flag.is_some_and(|draw| draw.0);
+    let visible = hud_root_should_show(*app_screen, drawing) && !held_down;
+    shown.last_pass = Some(visible);
 
-    let wanted = if show {
-        Visibility::Visible
-    } else {
-        Visibility::Hidden
-    };
-    for mut visibility in &mut roots {
-        if *visibility != wanted {
-            *visibility = wanted;
-        }
-    }
+    let wanted = visible
+        .then_some(Visibility::Visible)
+        .unwrap_or(Visibility::Hidden);
+    root_vis
+        .iter_mut()
+        .for_each(|mut visibility| {
+            visibility.set_if_neq(wanted);
+        });
 }
 
 /// Milliseconds from `since` to `now`, when there is a `since`.
@@ -339,120 +385,153 @@ fn millis_between(since: Option<Instant>, now: Instant) -> Option<f32> {
     since.map(|start| (now - start).as_secs_f32() * 1000.0)
 }
 
-fn hud_stamp_open(mut stamp: ResMut<HudPresentStamp>) {
-    stamp.0 = Some(Instant::now());
-}
-
-fn hud_stamp_setup(mut stamp: ResMut<HudPresentStamp>, mut census: ResMut<UpdatePhaseCensus>) {
+/// Milliseconds since the mark was last set (when it was), and sets it to now.
+fn lap(mark: &mut Option<Instant>) -> Option<f32> {
     let now = Instant::now();
-    census.hud_root_setup_ms = millis_between(stamp.0, now);
-    stamp.0 = Some(now);
+    millis_between(mark.replace(now), now)
 }
 
-fn hud_stamp_deferred(mut stamp: ResMut<HudPresentStamp>, mut census: ResMut<UpdatePhaseCensus>) {
-    let now = Instant::now();
-    census.present_apply_deferred_ms = millis_between(stamp.0, now);
-    stamp.0 = Some(now);
+fn lap_open(mut laps: ResMut<HudLaps>) {
+    laps.since_open = Some(Instant::now());
 }
 
-fn hud_stamp_visibility(stamp: Res<HudPresentStamp>, mut census: ResMut<UpdatePhaseCensus>) {
-    census.hud_visibility_ms = millis_between(stamp.0, Instant::now());
+fn lap_setup(mut laps: ResMut<HudLaps>, mut census: ResMut<FrameUpdateTally>) {
+    census.overlay_root_prep_millis = lap(&mut laps.since_open);
 }
 
-fn hud_surfaces_open(
-    mut stamp: ResMut<HudPresentStamp>,
-    mut stages: ResMut<HudStageStamp>,
-    mut pass: ResMut<HudTessPass>,
+fn lap_deferred(mut laps: ResMut<HudLaps>, mut census: ResMut<FrameUpdateTally>) {
+    census.display_deferred_apply_millis = lap(&mut laps.since_open);
+}
+
+fn lap_visibility(laps: Res<HudLaps>, mut census: ResMut<FrameUpdateTally>) {
+    census.overlay_visibility_millis = millis_between(laps.since_open, Instant::now());
+}
+
+fn lap_surfaces_open(mut laps: ResMut<HudLaps>, mut pass: ResMut<LayerRequests>) {
+    let now = Some(Instant::now());
+    laps.since_open = now;
+    laps.since_layer = now;
+    *pass = LayerRequests::default();
+}
+
+fn lap_stage_close<const N: usize>(
+    mut laps: ResMut<HudLaps>,
+    mut phases: ResMut<FrameUpdateTally>,
 ) {
-    let now = Instant::now();
-    stamp.0 = Some(now);
-    stages.0 = Some(now);
-    *pass = HudTessPass::default();
+    let spent = lap(&mut laps.since_layer);
+    phases.hud_stage_millis[N] = spent.or(phases.hud_stage_millis[N]);
 }
 
-fn hud_stage_close<const N: usize>(
-    mut stages: ResMut<HudStageStamp>,
-    mut census: ResMut<UpdatePhaseCensus>,
-) {
-    let now = Instant::now();
-    if let Some(started) = stages.0 {
-        census.hud_stage_ms[N] = millis_between(Some(started), now);
-    }
-    stages.0 = Some(now);
-}
-
-fn hud_surfaces_close(stamp: Res<HudPresentStamp>, mut census: ResMut<UpdatePhaseCensus>) {
-    census.hud_surfaces_ms = millis_between(stamp.0, Instant::now());
+fn lap_surfaces_close(laps: Res<HudLaps>, mut census: ResMut<FrameUpdateTally>) {
+    census.overlay_surface_millis = millis_between(laps.since_open, Instant::now());
     // Two different quantities, published side by side on purpose: the line
     // above is the gap between two systems, and the tess bodies below ran
     // inside part of it. Whatever else the executor put in that gap is the
     // difference, and naming it is the point.
-    let (body_ms, jobs) = gpu_list::take_tess_body_cost();
+    let (body_ms, jobs) = draw_batch::drain_body_cost();
     census.hud_tess_body_ms = Some(body_ms);
     census.hud_tess_jobs = Some(jobs);
 }
 
-fn flush_hud_elems_tess(
-    surface: Res<Hud2dSurface>,
-    mut pass: ResMut<HudTessPass>,
-    mut hud_images: ResMut<HudImages>,
-    mut images: ResMut<Assets<Image>>,
-    mut frame: ResMut<HudTessGpuFrame>,
-    mut front: Query<
-        (Entity, &mut Node, &mut GpuListLatch),
-        (With<HudElemsRaster>, Without<HudElemsBackRaster>),
-    >,
-    mut back: Query<(Entity, &mut Node, &mut GpuListLatch), With<HudElemsBackRaster>>,
-) {
-    let _body = gpu_list::TessBody::open();
-    if !surface.is_ready() {
-        return;
-    }
-    let jobs = [
-        (std::mem::take(&mut pass.hud_elems), front.single_mut()),
-        (std::mem::take(&mut pass.hud_elems_back), back.single_mut()),
-    ];
-    for (job, layer) in jobs {
-        let Ok((_, mut host, mut latch)) = layer else {
-            continue;
-        };
-        gpu_list::apply_tess_job(
+/// What a flush system needs to hand one layer's job to the GPU list.
+#[derive(SystemParam)]
+pub(crate) struct TessSink<'w> {
+    surface: Res<'w, FlatOverlayCanvas>,
+    hud_images: ResMut<'w, HudPictures>,
+    image_assets: ResMut<'w, Assets<Image>>,
+    frame: ResMut<'w, OverlayMeshBatch>,
+}
+
+impl TessSink<'_> {
+    fn deliver(&mut self, job: LayerJob, ui_node: &mut Node, latch: &mut ListLatch) {
+        let (width, height) = (self.surface.width(), self.surface.height());
+        draw_batch::flush_layer(
+            &mut self.frame,
+            &mut self.hud_images,
+            &mut self.image_assets,
+            (width, height),
+            ui_node,
+            latch,
             job,
-            &mut host,
-            &mut latch,
-            &mut hud_images,
-            &mut images,
-            &mut frame,
-            surface.width(),
-            surface.height(),
         );
     }
 }
 
-pub(crate) fn flush_overhead_names_tess(
-    surface: Res<Hud2dSurface>,
-    mut pass: ResMut<HudTessPass>,
-    mut hud_images: ResMut<HudImages>,
-    mut images: ResMut<Assets<Image>>,
-    mut frame: ResMut<HudTessGpuFrame>,
-    mut layer: Query<(Entity, &mut Node, &mut GpuListLatch), With<OverheadNamesRaster>>,
+fn flush_hud_elems_tess(
+    mut sink: TessSink,
+    mut pass: ResMut<LayerRequests>,
+    mut front: Query<
+        (&mut Node, &mut ListLatch),
+        (With<HudElemsRaster>, Without<HudElemsBackRaster>),
+    >,
+    mut back: Query<(&mut Node, &mut ListLatch), With<HudElemsBackRaster>>,
 ) {
-    let _body = gpu_list::TessBody::open();
-    if !surface.is_ready() {
+    let _body = draw_batch::BodyTimer::start();
+    if !sink.surface.has_size() {
         return;
     }
-    let job = std::mem::take(&mut pass.overhead_names);
-    let Ok((_, mut host, mut latch)) = layer.single_mut() else {
+    let front_job = std::mem::take(&mut pass.elems_front);
+    let back_job = std::mem::take(&mut pass.elems_behind);
+    if let Ok((mut host, mut latch)) = front.single_mut() {
+        sink.deliver(front_job, &mut host, &mut latch);
+    }
+    if let Ok((mut host, mut latch)) = back.single_mut() {
+        sink.deliver(back_job, &mut host, &mut latch);
+    }
+}
+
+pub(crate) fn flush_overhead_names_tess(
+    mut sink: TessSink,
+    mut pass: ResMut<LayerRequests>,
+    mut layer: Query<(&mut Node, &mut ListLatch), With<OverheadNamesRaster>>,
+) {
+    let _body = draw_batch::BodyTimer::start();
+    if !sink.surface.has_size() {
         return;
-    };
-    gpu_list::apply_tess_job(
-        job,
-        &mut host,
-        &mut latch,
-        &mut hud_images,
-        &mut images,
-        &mut frame,
-        surface.width(),
-        surface.height(),
-    );
+    }
+    let job = std::mem::take(&mut pass.names);
+    if let Ok((mut host, mut latch)) = layer.single_mut() {
+        sink.deliver(job, &mut host, &mut latch);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_hud_shows_only_in_game_screens_with_ui_drawing_on() {
+        assert!(hud_root_should_show(ShellScreen::InGame, true));
+        assert!(hud_root_should_show(ShellScreen::KitPicker, true));
+        assert!(!hud_root_should_show(ShellScreen::InGame, false));
+        assert!(!hud_root_should_show(ShellScreen::MainMenu, true));
+    }
+
+    #[test]
+    fn one_dim_leaves_the_hud_up_and_two_put_it_down() {
+        assert!(!dims_keep_hud_down(None, None));
+        assert!(!dims_keep_hud_down(Some(1.0), Some(1)));
+        assert!(dims_keep_hud_down(Some(2.0), None));
+        assert!(dims_keep_hud_down(None, Some(2)));
+    }
+
+    #[test]
+    fn millis_between_needs_a_start_mark() {
+        let now = Instant::now();
+        assert_eq!(millis_between(None, now), None);
+        let earlier = now - Duration::from_millis(250);
+        let spent = millis_between(Some(earlier), now).expect("a mark was set");
+        assert!((spent - 250.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_lap_reports_the_gap_and_restarts_the_mark() {
+        let mut mark = None;
+        assert_eq!(lap(&mut mark), None);
+        assert!(mark.is_some());
+        let first = mark;
+        assert!(lap(&mut mark).is_some());
+        assert!(mark >= first);
+    }
 }

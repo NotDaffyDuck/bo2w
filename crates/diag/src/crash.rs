@@ -66,14 +66,12 @@ mod exception {
         context: *const c_void,
     }
 
-    type Filter = unsafe extern "system" fn(*const Pointers) -> i32;
-
     /// Lets Windows carry on as if no filter were set: the process ends.
     const CONTINUE_SEARCH: i32 = 0;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn SetUnhandledExceptionFilter(filter: Option<Filter>) -> Option<Filter>;
+        fn SetUnhandledExceptionFilter(filter: Option<unsafe extern "system" fn(*const Pointers) -> i32>) -> Option<unsafe extern "system" fn(*const Pointers) -> i32>;
         fn GetModuleHandleW(name: *const u16) -> *mut c_void;
     }
 

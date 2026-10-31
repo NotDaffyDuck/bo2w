@@ -16,9 +16,10 @@
 //! mesh's strength. They are set to match the real game's lobby shots.
 
 use bevy::prelude::*;
-use bevy::render::render_resource::AsBindGroup;
+use bevy::asset::RenderAssetUsages;
+use bevy::image::{ImageSampler, ToExtents};
+use bevy::render::render_resource::{AsBindGroup, Extent3d, TextureDimension, TextureFormat};
 use bevy::shader::ShaderRef;
-use std::collections::HashMap;
 
 /// A texture's pixels (RGBA8, as stored).
 pub(crate) struct Tex<'a> {
@@ -35,10 +36,10 @@ impl<'a> Tex<'a> {
         (px.len() >= w * h * 4 && w > 0 && h > 0).then_some(Tex { w, h, px })
     }
 
-    /// Bilinear sample at (u, v) in 0..1, repeating; 0..1 floats.
-    fn sample(&self, u: f32, v: f32) -> [f32; 4] {
-        let x = u.rem_euclid(1.0) * self.w as f32 - 0.5;
-        let y = v.rem_euclid(1.0) * self.h as f32 - 0.5;
+    /// Bilinear sample at (across, down) in 0..1, repeating; 0..1 floats.
+    fn pick_at(&self, across: f32, down: f32) -> [f32; 4] {
+        let x = across.rem_euclid(1.0) * self.w as f32 - 0.5;
+        let y = down.rem_euclid(1.0) * self.h as f32 - 0.5;
         let (x0, y0) = (x.floor(), y.floor());
         let (fx, fy) = (x - x0, y - y0);
         let at = |xi: f32, yi: f32| {
@@ -102,10 +103,10 @@ fn grid_ps(q: [f32; 2], t: f32, tv: Option<&Tex>, tex: &Tex, dn: f32) -> [f32; 3
     let bright = g * 0.1 + 0.25;
     let rq = turn(q);
     // The lookup splits the colours apart sideways, over time.
-    let l = tv.map_or(0.5, |tv| tv.sample(frac(0.5 + 0.25 * t), rq[1])[0]);
+    let l = tv.map_or(0.5, |tv| tv.pick_at(frac(0.5 + 0.25 * t), rq[1])[0]);
     let split = 2.0 * l * off;
     let (sx, sy) = (frac(t * 0.000625), frac(t * -0.00125));
-    let at = |dx: f32| tex.sample((rq[0] + dx + sx) * 32.0, (rq[1] + sy) * 32.0);
+    let at = |step_along_x: f32| tex.pick_at((rq[0] + step_along_x + sx) * 32.0, (rq[1] + sy) * 32.0);
     let (rp, gc, bm) = (at(split), at(0.0), at(-split));
     let base = [rp[0] * bright, gc[1] * bright, bm[2] * bright];
     // Toward orange near the middle, pulsing in and out.
@@ -126,11 +127,11 @@ fn grid2_ps(q: [f32; 2], t: f32, tv: Option<&Tex>, tex: &Tex) -> [f32; 3] {
     let pulse = 0.75 + 1.25 * (2.0 * sfrac(0.175 * t).abs() - 1.0).abs();
     let rq = turn(q);
     let tc = [(rq[0] + frac(t * 0.00125)) * 8.0, (rq[1] + frac(t * -0.0025)) * 8.0];
-    let l = tv.map_or(0.5, |tv| tv.sample(frac(0.25 * t + 0.5), tc[1])[0]);
+    let l = tv.map_or(0.5, |tv| tv.pick_at(frac(0.25 * t + 0.5), tc[1])[0]);
     let split = 0.01 * (l * l) * (l * l) * 8.0;
-    let c = tex.sample(tc[0], tc[1]);
-    let xp = tex.sample(tc[0] + split, tc[1]);
-    let xm = tex.sample(tc[0] - split, tc[1]);
+    let c = tex.pick_at(tc[0], tc[1]);
+    let xp = tex.pick_at(tc[0] + split, tc[1]);
+    let xm = tex.pick_at(tc[0] - split, tc[1]);
     [xp[0] * pulse, xm[1] * pulse, c[2] * pulse]
 }
 
@@ -225,22 +226,22 @@ impl UiMaterial for SceneUi {
     }
 }
 
-pub(crate) fn register(app: &mut App) {
-    bevy::asset::embedded_asset!(app, "lui_scene.wgsl");
-    app.add_plugins(UiMaterialPlugin::<SceneUi>::default());
+pub(crate) fn attach(host: &mut App) {
+    bevy::asset::embedded_asset!(host, "lui_scene.wgsl");
+    host.add_plugins(UiMaterialPlugin::<SceneUi>::default());
 }
 
 /// A backdrop texture for the graphics card: its texels read as stored (as
 /// `Tex` reads them), repeating, made once.
 pub(crate) fn gpu_texture(
-    cache: &mut HashMap<String, Handle<Image>>,
+    cache: &mut crate::lui_hud::PictureCache,
     icons: &assets::T6HudIcons,
-    images: &mut Assets<Image>,
+    pics: &mut Assets<Image>,
     name: &str,
 ) -> Option<Handle<Image>> {
     let key = format!("\u{1}scene gpu {name}");
-    if let Some(h) = cache.get(&key) {
-        return Some(h.clone());
+    if let Some(h) = cache.kept(&key) {
+        return Some(h);
     }
     let img = icons.0.iter().find(|(k, _)| k == name).map(|(_, i)| i.clone())?;
     let mut img = (*img).clone();
@@ -250,18 +251,30 @@ pub(crate) fn gpu_texture(
         address_mode_v: bevy::image::ImageAddressMode::Repeat,
         ..bevy::image::ImageSamplerDescriptor::linear()
     });
-    let h = images.add(img);
-    cache.insert(key, h.clone());
+    let h = pics.add(img);
+    cache.keep(key, &h);
     Some(h)
 }
 
-/// An RGBA8 sRGB picture of `w` x `h` from `px`.
+/// A smoothly sampled RGBA8 picture of `w` x `h` from `px`, its bytes read as `format`.
+/// A flat picture's size: `w` x `h` texels, one layer.
+pub(crate) fn picture_size(w: usize, h: usize) -> Extent3d {
+    UVec2::new(w as u32, h as u32).to_extents()
+}
+
+fn smooth_picture(w: usize, h: usize, px: Vec<u8>, format: TextureFormat) -> Image {
+    let flat = Image::new(picture_size(w, h), TextureDimension::D2, px, format, RenderAssetUsages::default());
+    Image { sampler: ImageSampler::linear(), ..flat }
+}
+
+/// An RGBA8 picture of `w` x `h` from linear bytes `px`.
 pub(crate) fn image(w: usize, h: usize, px: Vec<u8>) -> Image {
-    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-    let size = Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };
-    let mut img = Image::new(size, TextureDimension::D2, px, TextureFormat::Rgba8Unorm, bevy::asset::RenderAssetUsages::default());
-    img.sampler = bevy::image::ImageSampler::linear();
-    img
+    smooth_picture(w, h, px, TextureFormat::Rgba8Unorm)
+}
+
+/// An RGBA8 picture of `w` x `h` from sRGB-encoded bytes `px`.
+pub(crate) fn srgb_image(w: usize, h: usize, px: Vec<u8>) -> Image {
+    smooth_picture(w, h, px, TextureFormat::Rgba8UnormSrgb)
 }
 
 /// Blur an RGBA8 picture in place (three box passes each way, about a
@@ -271,15 +284,15 @@ pub(crate) fn blur(px: &mut [u8], w: usize, h: usize, radius: usize) {
     if radius == 0 || w == 0 || h == 0 {
         return;
     }
-    let mut buf = vec![0u8; px.len()];
+    let mut spare = vec![0u8; px.len()];
     for _ in 0..3 {
-        box_pass(px, &mut buf, w, h, radius, true);
-        box_pass(&buf, px, w, h, radius, false);
+        box_pass(px, &mut spare, w, h, radius, true);
+        box_pass(&spare, px, w, h, radius, false);
     }
 }
 
-/// One box blur along rows (`horizontal`) or columns, `src` into `dst`.
-fn box_pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizontal: bool) {
+/// One box blur along rows (`horizontal`) or columns, `input` into `output`.
+fn box_pass(input: &[u8], output: &mut [u8], w: usize, h: usize, r: usize, horizontal: bool) {
     let (lines, len) = if horizontal { (h, w) } else { (w, h) };
     let at = |line: usize, i: usize| if horizontal { (line * w + i) * 4 } else { (i * w + line) * 4 };
     let n = (2 * r + 1) as u32;
@@ -287,24 +300,24 @@ fn box_pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizontal
         let mut sum = [0u32; 4];
         for i in 0..=r.min(len - 1) {
             for k in 0..4 {
-                sum[k] += u32::from(src[at(line, i) + k]);
+                sum[k] += u32::from(input[at(line, i) + k]);
             }
         }
         for i in 0..len {
             let o = at(line, i);
             for k in 0..4 {
-                dst[o + k] = (sum[k] / n) as u8;
+                output[o + k] = (sum[k] / n) as u8;
             }
             if i + r + 1 < len {
                 let a = at(line, i + r + 1);
                 for k in 0..4 {
-                    sum[k] += u32::from(src[a + k]);
+                    sum[k] += u32::from(input[a + k]);
                 }
             }
             if i >= r {
                 let b = at(line, i - r);
                 for k in 0..4 {
-                    sum[k] -= u32::from(src[b + k]);
+                    sum[k] -= u32::from(input[b + k]);
                 }
             }
         }

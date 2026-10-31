@@ -12,11 +12,12 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
-use bo2_profile::{Attachment, Item, Profile, SLOTS, StatValue};
+use bo2_profile::{Item, Profile, SLOTS, StatValue};
 
 use crate::host::{EngineValues, Host};
-use crate::value::{Table, Value};
+use crate::value::{LuaTable, Value};
 use crate::vm::Vm;
+use bo2_profile::Attachment;
 
 /// The engine's own dvars the front end reads (`Dvar.<name>:get()`), with
 /// the values an offline PC game has; set where the host has none. Mostly
@@ -136,8 +137,8 @@ pub struct MpState {
     /// START MATCH was pressed (`Engine.PartyHostToggleStart`) and the
     /// owner has not started it yet.
     pub start_requested: bool,
-    /// YES on the main menu's ZOMBIES prompt (`startZombies`): our
-    /// Nuketown Zombies starts.
+    /// YES on the main menu's ZOMBIES prompt (`startZombies`) when the
+    /// Zombies menus could not start: our Nuketown Zombies starts here.
     pub zombies_requested: bool,
     /// Game timers counting down (`setTimeLeft`): the element and the LUI
     /// time it reaches 0.
@@ -222,7 +223,7 @@ pub struct EmblemEdit {
 
 impl EmblemEdit {
     /// `emblemClearAll`: every layer empty again, the first selected.
-    pub fn clear_all(&mut self) {
+    pub fn wipe(&mut self) {
         self.layers.clear();
         self.selected = 0;
     }
@@ -349,15 +350,15 @@ pub struct BoardRow {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ObjectiveRow {
     pub state: u8,
-    pub pos: [f32; 3],
+    pub spot: [f32; 3],
     /// The entity it follows (-1: none).
     pub entity: i32,
     pub icon: String,
     pub name: String,
     pub team_mask: i32,
     /// 0-255.
-    pub progress: f32,
-    pub flags: i32,
+    pub fill: f32,
+    pub objective_bits: i32,
     pub team: i32,
     /// The clients using it, a bit each.
     pub using: u64,
@@ -368,7 +369,11 @@ pub struct ObjectiveRow {
     /// `scr_express_size` 45); otherwise BO2's `compassObjectiveWidth` 32.
     pub icon_size: Option<f32>,
     /// Its entity's yaw, for an icon that turns with it.
-    pub yaw: f32,
+    pub facing: f32,
+    /// The colour code gives an icon coloured in code
+    /// (`OBJ_COLOR_MATERIAL_IN_CODE`), as this client sees it (BO2's
+    /// relative team colour), 0-1.
+    pub tint: Option<[f32; 3]>,
 }
 
 /// objectiveMapInfo: the icon turns with its entity's yaw.
@@ -382,11 +387,12 @@ pub const OBJ_COLOR_MATERIAL_IN_CODE: i32 = 0x10;
 
 /// The server's objectives (`index,state,x,y,z,entity,icon,name,teammask,
 /// progress,flags,team,using`, then for a client script's own objective
-/// `,mapinfo,size,yaw`, mapinfo in hex; `;` between), by index.
+/// `,mapinfo,size,yaw,tint`, mapinfo in hex, tint rrggbb or empty; `;`
+/// between), by index.
 pub fn parse_objectives(s: &str) -> BTreeMap<i32, ObjectiveRow> {
     s.split(';')
-        .filter_map(|row| {
-            let f: Vec<&str> = row.split(',').collect();
+        .filter_map(|entry| {
+            let f: Vec<&str> = entry.split(',').collect();
             if f.len() < 13 {
                 return None;
             }
@@ -396,18 +402,21 @@ pub fn parse_objectives(s: &str) -> BTreeMap<i32, ObjectiveRow> {
                 int(0),
                 ObjectiveRow {
                     state: u8::try_from(int(1)).unwrap_or(0),
-                    pos: [n(2), n(3), n(4)],
+                    spot: [n(2), n(3), n(4)],
                     entity: f[5].trim().parse().unwrap_or(-1),
                     icon: f[6].to_owned(),
                     name: f[7].to_owned(),
                     team_mask: int(8),
-                    progress: n(9),
-                    flags: int(10),
+                    fill: n(9),
+                    objective_bits: int(10),
                     team: int(11),
                     using: u64::from_str_radix(f[12].trim(), 16).unwrap_or(0),
                     map_info: f.get(13).and_then(|s| i32::from_str_radix(s.trim(), 16).ok()).unwrap_or(0),
                     icon_size: f.get(14).and_then(|s| s.trim().parse().ok()),
-                    yaw: f.get(15).and_then(|s| s.trim().parse().ok()).unwrap_or(0.0),
+                    facing: f.get(15).and_then(|s| s.trim().parse().ok()).unwrap_or(0.0),
+                    tint: f.get(16).and_then(|s| u32::from_str_radix(s.trim(), 16).ok()).map(|c| {
+                        [(c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff].map(|v| v as f32 / 255.0)
+                    }),
                 },
             ))
         })
@@ -439,7 +448,7 @@ fn table<'a>(v: &'a EngineValues, name: &str) -> Option<&'a Vec<Vec<String>>> {
 
 /// A string table's rows (none when it is not loaded).
 pub fn table_rows<'a>(v: &'a EngineValues, name: &str) -> &'a [Vec<String>] {
-    table(v, name).map_or(&[], Vec::as_slice)
+    table(v, name).map(Vec::as_slice).unwrap_or_default()
 }
 
 fn cell(row: &[String], i: usize) -> String {
@@ -453,8 +462,8 @@ fn int(row: &[String], i: usize) -> i32 {
 fn stat_value(v: &Value) -> StatValue {
     match v {
         Value::Num(n) => StatValue::Num(*n),
-        Value::Bool(b) => StatValue::Num(if *b { 1.0 } else { 0.0 }),
-        other => StatValue::Str(other.to_string()),
+        Value::Boolean(b) => StatValue::Num(if *b { 1.0 } else { 0.0 }),
+        other => StatValue::Text(other.to_string()),
     }
 }
 
@@ -471,7 +480,7 @@ impl MpState {
         self.loaded = true;
         let atts = table(values, "mp/attachmenttable.csv").cloned().unwrap_or_default();
         let localize = |k: &str| values.localize.get(k).cloned();
-        self.profile = Profile::from_tables(stats, &atts, &localize, self.saved.take().unwrap_or_default());
+        self.profile = Profile::out_of_charts(stats, &atts, &localize, self.saved.take().unwrap_or_default());
         if let Some(ranks) = table(values, "mp/ranktable.csv") {
             self.profile.set_rank_table(ranks);
         }
@@ -480,8 +489,8 @@ impl MpState {
 
     /// His stats file's text (`Profile::to_text`), read before the menus
     /// open: the defaults fill only what it lacks.
-    pub fn load_text(&mut self, text: &str) {
-        let stats = Profile::stats_from_text(text);
+    pub fn load_text(&mut self, body: &str) {
+        let stats = Profile::stats_from_text(body);
         if self.loaded {
             self.profile.stats.extend(stats);
         } else {
@@ -528,7 +537,7 @@ impl MpState {
         match self.stable.as_ref() {
             Some(s) => match s.get(path) {
                 Some(StatValue::Num(n)) => Value::Num(*n),
-                Some(StatValue::Str(t)) => Value::str(t),
+                Some(StatValue::Text(t)) => Value::str(t),
                 None => Value::Num(0.0),
             },
             None => self.stat(path),
@@ -552,20 +561,20 @@ impl MpState {
 
     /// His stats file's text as it was before a ranked match (the front
     /// end keeps it over the match), for the After Action Report.
-    pub fn set_stable_text(&mut self, text: &str) {
-        self.stable = Some(Profile::stats_from_text(text));
+    pub fn set_stable_text(&mut self, body: &str) {
+        self.stable = Some(Profile::stats_from_text(body));
     }
 
     pub fn stat(&self, path: &str) -> Value {
         match self.profile.stat(path) {
             Some(StatValue::Num(n)) => Value::Num(*n),
-            Some(StatValue::Str(s)) => Value::str(s),
+            Some(StatValue::Text(s)) => Value::str(s),
             None => Value::Num(0.0),
         }
     }
 
-    fn set_stat(&mut self, path: String, v: &Value) {
-        self.profile.set_stat(path, stat_value(v));
+    fn set_stat(&mut self, stat_path: String, v: &Value) {
+        self.profile.set_stat(stat_path, stat_value(v));
     }
 
     /// Everything is free in a private match (BO2's custom games unlock
@@ -604,33 +613,33 @@ fn node(vm: &mut Vm, mp: &Mp, path: String) -> Value {
 /// A stats node over his stats now, or (`stable`) as they were when his
 /// last ranked match started (BO2's STATS_LOCATION_STABLE: the After
 /// Action Report's "before").
-fn node_at(vm: &mut Vm, mp: &Mp, path: String, stable: bool) -> Value {
-    let t = Table::new_ref();
-    let meta = Table::new_ref();
+fn node_at(vm: &mut Vm, mp: &Mp, stat_path: String, stable: bool) -> Value {
+    let t = LuaTable::new_ref();
+    let meta = LuaTable::new_ref();
     let m = mp.clone();
     let index = vm.native("stats_index", move |vm, a| {
         let key = arg(&a, 1);
         let k = part(&key);
         let v = match k.as_str() {
             "get" if stable => {
-                let (m, p) = (m.clone(), path.clone());
+                let (m, p) = (m.clone(), stat_path.clone());
                 vm.native("stats_get", move |_, _| Ok(vec![m.borrow().stable_stat(&p)]))
             }
             "get" => {
-                let (m, p) = (m.clone(), path.clone());
+                let (m, p) = (m.clone(), stat_path.clone());
                 vm.native("stats_get", move |_, _| Ok(vec![m.borrow().stat(&p)]))
             }
             "set" => {
-                let (m, p) = (m.clone(), path.clone());
+                let (m, p) = (m.clone(), stat_path.clone());
                 vm.native("stats_set", move |_, a| {
                     m.borrow_mut().set_stat(p.clone(), &arg(&a, 1));
                     Ok(vec![])
                 })
             }
-            _ => node_at(vm, &m, if path.is_empty() { k } else { format!("{path}.{k}") }, stable),
+            _ => node_at(vm, &m, if stat_path.is_empty() { k } else { format!("{stat_path}.{k}") }, stable),
         };
         if let Value::Table(t) = arg(&a, 0) {
-            t.borrow_mut().set(key, v.clone());
+            t.borrow_mut().store(key, v.clone());
         }
         Ok(vec![v])
     });
@@ -645,7 +654,7 @@ fn node_at(vm: &mut Vm, mp: &Mp, path: String, stable: bool) -> Value {
 /// Each frame: the game timers' text (`m:ss`, BO2's countdown) and the
 /// match clock's.
 pub fn update_timers(mp: &Mp) {
-    let now = crate::lui::now_ms();
+    let now = crate::lui::clock_millis();
     let m = mp.borrow();
     let clock = m.game_end_ms.map(|end| {
         let left = ((end - now).max(0.0) / 1000.0).ceil() as i64;
@@ -691,7 +700,7 @@ pub fn after_base(host: &mut Host) {
     if let Some(t) = host.field("LUI", "UIElement").table()
         && t.borrow().meta.is_none()
     {
-        let meta = Table::new_ref();
+        let meta = LuaTable::new_ref();
         meta.borrow_mut().set_str("__index", Value::Table(crate::lui::natives()));
         t.borrow_mut().meta = Some(meta);
     }
@@ -699,7 +708,7 @@ pub fn after_base(host: &mut Host) {
 
 /// Bind the multiplayer front end's engine functions; the state they
 /// share comes back (the game saves `stats`).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, reason = "one native per Engine call")]
 /// A game type's settings as BO2 sets them with the game type:
 /// mp/gamesettings_default.cfg, then mp/gamesettings_<type>.cfg
 /// (`gametype_setting <name> <value>` lines).
@@ -759,13 +768,13 @@ pub fn apply_stat_commands(mp: &Mp, values: &RefCell<EngineValues>) {
 /// (mp/rankIconTable.csv: the row of his rank, the column of his prestige),
 /// the party's host, ready; in a private match on the allies (a team game
 /// lists its teams), else on no team.
-fn lobby_member(m: &MpState, v: &EngineValues, (allies, free): (f32, f32)) -> crate::value::TableRef {
+fn lobby_member(m: &MpState, v: &EngineValues, (allies, free): (f32, f32)) -> Rc<RefCell<LuaTable>> {
     let rank = m.profile.rank().max(0);
     let prestige = m.profile.plevel().max(0);
     let icon = rank_icon(v, rank, prestige);
     let name = v.dvars.get("name").filter(|n| !n.trim().is_empty()).cloned().unwrap_or_else(|| "Player".to_owned());
     let private = m.game_modes.contains(&1);
-    let e = Table::new_ref();
+    let e = LuaTable::new_ref();
     {
         let mut t = e.borrow_mut();
         t.set_str("xuid", Value::str("1"));
@@ -776,18 +785,18 @@ fn lobby_member(m: &MpState, v: &EngineValues, (allies, free): (f32, f32)) -> cr
         t.set_str("isLocal", Value::Num(1.0));
         t.set_str("controller", Value::Num(0.0));
         t.set_str("clientNum", Value::Num(0.0));
-        t.set_str("isHost", Value::Bool(true));
+        t.set_str("isHost", Value::Boolean(true));
         // (A score only in a game lobby: the party's list shows none.)
         if private {
             t.set_str("score", Value::Num(0.0));
         }
-        t.set_str("isInParty", Value::Bool(false));
+        t.set_str("isInParty", Value::Boolean(false));
         t.set_str("subparty", Value::Num(0.0));
-        t.set_str("isGuest", Value::Bool(false));
+        t.set_str("isGuest", Value::Boolean(false));
         t.set_str("rank", Value::Num((rank + 1) as f32));
         t.set_str("prestige", Value::Num(prestige as f32));
         t.set_str("rankIcon", Value::str(&icon));
-        t.set_str("isReady", Value::Bool(true));
+        t.set_str("isReady", Value::Boolean(true));
         t.set_str("missingMapPacks", Value::Num(0.0));
         t.set_str("leagueTeamID", Value::str("0"));
     }
@@ -814,7 +823,7 @@ pub fn install(host: &mut Host) -> Mp {
         let el = arg(&a, 0);
         if let Some(u) = crate::lui::element(&el) {
             if let Some(e) = u.data.borrow_mut().downcast_mut::<crate::lui::Element>() {
-                e.kind = "messages";
+                e.element_kind = "messages";
             }
             m.borrow_mut().windows.push((el, num(&a, 1)));
         }
@@ -825,7 +834,7 @@ pub fn install(host: &mut Host) -> Mp {
     crate::lui::add_native(&mut host.vm, "setupGameTimer", move |_, a| {
         if let Some(u) = crate::lui::element(&arg(&a, 0)) {
             if let Some(e) = u.data.borrow_mut().downcast_mut::<crate::lui::Element>() {
-                e.kind = "text";
+                e.element_kind = "text";
             }
             m.borrow_mut().game_timers.push(u);
         }
@@ -846,7 +855,7 @@ pub fn install(host: &mut Host) -> Mp {
     let m = mp.clone();
     crate::lui::add_native(&mut host.vm, "setTimeLeft", move |_, a| {
         if let Some(u) = crate::lui::element(&arg(&a, 0)) {
-            let end = crate::lui::now_ms() + f64::from(arg(&a, 1).as_num().unwrap_or(0.0));
+            let end = crate::lui::clock_millis() + f64::from(arg(&a, 1).as_num().unwrap_or(0.0));
             let mut m = m.borrow_mut();
             m.timers.retain(|(t, _)| !Rc::ptr_eq(t, &u));
             m.timers.push((u, end));
@@ -862,8 +871,8 @@ pub fn install(host: &mut Host) -> Mp {
             let t = lobby_member(&m.borrow(), &v.borrow(), (1.0, 0.0));
             let t = t.borrow();
             (
-                t.get(&Value::str("gamertag")).as_str().unwrap_or("").to_owned(),
-                t.get(&Value::str("rankIcon")).as_str().unwrap_or("").to_owned(),
+                t.read_key(&Value::str("gamertag")).as_str().unwrap_or("").to_owned(),
+                t.read_key(&Value::str("rankIcon")).as_str().unwrap_or("").to_owned(),
             )
         };
         let font = crate::lui::font_of(&u);
@@ -906,7 +915,7 @@ pub fn install(host: &mut Host) -> Mp {
                 _ => a.get(1).and_then(Value::as_num).unwrap_or(0.0),
             };
             let kind = if t == 1.0 { full } else { partial };
-            crate::lui::with(u, |e| e.kind = kind);
+            crate::lui::with(u, |e| e.element_kind = kind);
             Ok(vec![])
         });
     }
@@ -918,14 +927,14 @@ pub fn install(host: &mut Host) -> Mp {
     }
     host.bind("UIExpression", "SessionMode_IsZombiesGame", |_, _| Ok(vec![Value::Num(0.0)]));
     host.bind("UIExpression", "GetCurrentMapTableName", |_, _| Ok(vec![Value::str("mp/mapstable.csv")]));
-    host.bind("Engine", "CanPauseZombiesGame", |_, _| Ok(vec![Value::Bool(false)]));
+    host.bind("Engine", "CanPauseZombiesGame", |_, _| Ok(vec![Value::Boolean(false)]));
     // His PC: one local player (keyboard and mouse, or one pad), stats
     // read from his saved file at start, no online service (Demonware):
     // the front end's local (LAN) path.
     let one = |_: &mut Vm, _: Vec<Value>| Ok(vec![Value::Num(1.0)]);
     let zero = |_: &mut Vm, _: Vec<Value>| Ok(vec![Value::Num(0.0)]);
-    let yes = |_: &mut Vm, _: Vec<Value>| Ok(vec![Value::Bool(true)]);
-    let no = |_: &mut Vm, _: Vec<Value>| Ok(vec![Value::Bool(false)]);
+    let yes = |_: &mut Vm, _: Vec<Value>| Ok(vec![Value::Boolean(true)]);
+    let no = |_: &mut Vm, _: Vec<Value>| Ok(vec![Value::Boolean(false)]);
     let nothing = |_: &mut Vm, _: Vec<Value>| Ok(vec![]);
     for name in [
         "GetMaxControllerCount",
@@ -999,7 +1008,7 @@ pub fn install(host: &mut Host) -> Mp {
             cands.push(up);
             let text = cands.iter().find_map(|k| vb.localize.get(k).cloned()).unwrap_or(key);
             let limit = vb.dvars.get("ui_scorelimit").and_then(|x| x.trim().parse::<f32>().ok()).or_else(|| vb.settings.get("scorelimit").copied()).unwrap_or(0.0);
-            Ok(vec![Value::str(&text.replace("&&1", &format!("{}", limit as i64)))])
+            Ok(vec![Value::str(&text.replace("&&1", &(limit as i64).to_string()))])
         });
     }
     // The name card's background (his emblem background; the default's).
@@ -1109,9 +1118,9 @@ pub fn install(host: &mut Host) -> Mp {
     // shows NEW beside "Personalize Weapon"); nothing else is.
     host.bind("Engine", "IsWeaponOptionGroupNew", |vm, a| {
         let cod = vm.global("CoD");
-        let util = vm.index(&cod, &Value::str("CACUtility")).unwrap_or(Value::Nil);
-        let camo = vm.index(&util, &Value::str("WEAPONOPTION_GROUP_CAMO")).ok().and_then(|x| x.as_num());
-        Ok(vec![Value::Bool(camo.is_some() && arg(&a, 2).as_num() == camo)])
+        let util = vm.lookup_index(&cod, &Value::str("CACUtility")).unwrap_or(Value::Nil);
+        let camo = vm.lookup_index(&util, &Value::str("WEAPONOPTION_GROUP_CAMO")).ok().and_then(|x| x.as_num());
+        Ok(vec![Value::Boolean(camo.is_some() && arg(&a, 2).as_num() == camo)])
     });
     host.bind("Engine", "GetDLC0PublisherOfferId", zero);
     host.bind("Engine", "ServerListUpdateFilter", nothing);
@@ -1183,17 +1192,17 @@ pub fn install(host: &mut Host) -> Mp {
     // GetPermanentUnlockCount(controller) = those unspent (Create-a-Class's
     // footer), IsPrestigeTokenSpent(controller) = this prestige's one
     // (the Barracks' Prestige Awards card),
-    // IsItemPermanentlyUnlocked(controller, item), PermanentlyUnlockItem(
-    // controller, item) (ConfirmPrestigeUnlock).
+    // IsItemPermanentlyUnlocked(pad, item), PermanentlyUnlockItem(
+    // pad, item) (ConfirmPrestigeUnlock).
     let (st, m) = (state.clone(), mp.clone());
     host.bind("Engine", "GetPermanentUnlockCount", move |_, _| {
         Ok(vec![Value::Num(st(&m).borrow().profile.prestige_tokens() as f32)])
     });
     let (st, m) = (state.clone(), mp.clone());
-    host.bind("Engine", "IsPrestigeTokenSpent", move |_, _| Ok(vec![Value::Bool(st(&m).borrow().profile.prestige_token_spent())]));
+    host.bind("Engine", "IsPrestigeTokenSpent", move |_, _| Ok(vec![Value::Boolean(st(&m).borrow().profile.prestige_token_spent())]));
     let (st, m) = (state.clone(), mp.clone());
     host.bind("Engine", "IsItemPermanentlyUnlocked", move |_, a| {
-        Ok(vec![Value::Bool(st(&m).borrow().profile.permanently_unlocked(num(&a, 1)))])
+        Ok(vec![Value::Boolean(st(&m).borrow().profile.permanently_unlocked(num(&a, 1)))])
     });
     let (st, m) = (state.clone(), mp.clone());
     host.bind("Engine", "PermanentlyUnlockItem", move |_, a| {
@@ -1224,12 +1233,12 @@ pub fn install(host: &mut Host) -> Mp {
         let cod = vm.global("CoD");
         let mut col = 0;
         for (name, c) in [("TEAM_ALLIES", 1), ("TEAM_AXIS", 2)] {
-            if vm.index(&cod, &Value::str(name))?.as_num().is_some_and(|n| Some(n) == team) {
+            if vm.lookup_index(&cod, &Value::str(name))?.as_num().is_some_and(|n| Some(n) == team) {
                 col = c;
             }
         }
         // (Free for all: the table's "free" row, black.)
-        if col == 0 && vm.index(&cod, &Value::str("TEAM_FREE"))?.as_num().is_some_and(|n| Some(n) == team) {
+        if col == 0 && vm.lookup_index(&cod, &Value::str("TEAM_FREE"))?.as_num().is_some_and(|n| Some(n) == team) {
             return Ok(vec![Value::str("free")]);
         }
         let vb = v.borrow();
@@ -1266,12 +1275,12 @@ pub fn install(host: &mut Host) -> Mp {
     host.bind("Engine", "GetTeamPositions", move |_, _| {
         let mut teams = m.borrow().team_scores.clone();
         teams.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         for (i, (team, score)) in teams.iter().enumerate() {
-            let row = Table::new_ref();
+            let row = LuaTable::new_ref();
             row.borrow_mut().set_str("team", Value::Num(*team as f32));
             row.borrow_mut().set_str("score", Value::Num(*score));
-            t.borrow_mut().set(Value::Num((i + 1) as f32), Value::Table(row));
+            t.borrow_mut().store(Value::Num((i + 1) as f32), Value::Table(row));
         }
         Ok(vec![Value::Table(t)])
     });
@@ -1291,7 +1300,7 @@ pub fn install(host: &mut Host) -> Mp {
         let (i, team) = (num(&a, 0), num(&a, 1));
         let hit = m.board.iter().enumerate().filter(|(_, r)| r.team == team).nth(usize::try_from(i).unwrap_or(usize::MAX));
         Ok(match hit {
-            Some((index, r)) => vec![Value::Num(index as f32), Value::Num(r.client as f32)],
+            Some((place, r)) => vec![Value::Num(place as f32), Value::Num(r.client as f32)],
             None => vec![Value::Nil, Value::Nil],
         })
     });
@@ -1356,7 +1365,7 @@ pub fn install(host: &mut Host) -> Mp {
     host.bind("Engine", "GetFactionForClient", move |vm, _| {
         let team = v.borrow().team as f32;
         let f = vm.global("Engine");
-        let g = vm.index(&f, &Value::str("GetFactionForTeam"))?;
+        let g = vm.lookup_index(&f, &Value::str("GetFactionForTeam"))?;
         vm.call(g, vec![Value::Num(team)])
     });
     // GetPredictedClientNum(controller): the player the killcam watches (the
@@ -1389,7 +1398,7 @@ pub fn install(host: &mut Host) -> Mp {
         };
         let icon = rank_icon(&v.borrow(), rank, prestige);
         let shown = if client == 0 { rank + 1 } else { 1 };
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         {
             let mut t = t.borrow_mut();
             t.set_str("xuid", Value::str("0"));
@@ -1420,7 +1429,7 @@ pub fn install(host: &mut Host) -> Mp {
         }
         let cod = vm.global("CoD");
         for name in ["TEAM_ALLIES", "TEAM_AXIS", "TEAM_SPECTATOR", "TEAM_FREE"] {
-            if vm.index(&cod, &Value::str(name)).ok().and_then(|x| x.as_num()) == Some(team) {
+            if vm.lookup_index(&cod, &Value::str(name)).ok().and_then(|x| x.as_num()) == Some(team) {
                 return Ok(vec![Value::str(name)]);
             }
         }
@@ -1480,7 +1489,7 @@ pub fn install(host: &mut Host) -> Mp {
     });
     let m = mp.clone();
     host.bind("Engine", "GetObjectivePosition", move |_, a| {
-        let p = objective(&m, &a, |o| o.pos).unwrap_or_default();
+        let p = objective(&m, &a, |o| o.spot).unwrap_or_default();
         Ok(p.iter().map(|v| Value::Num(*v)).collect())
     });
     let m = mp.clone();
@@ -1489,11 +1498,11 @@ pub fn install(host: &mut Host) -> Mp {
     });
     let m = mp.clone();
     host.bind("Engine", "GetObjectiveProgress", move |_, a| {
-        Ok(vec![Value::Num(objective(&m, &a, |o| o.progress / 255.0).unwrap_or(0.0))])
+        Ok(vec![Value::Num(objective(&m, &a, |o| o.fill / 255.0).unwrap_or(0.0))])
     });
     let m = mp.clone();
     host.bind("Engine", "GetObjectiveGamemodeFlags", move |_, a| {
-        Ok(vec![Value::Num(objective(&m, &a, |o| o.flags).unwrap_or(0) as f32)])
+        Ok(vec![Value::Num(objective(&m, &a, |o| o.objective_bits).unwrap_or(0) as f32)])
     });
     // GetObjectiveIndexFromName(controller, name): -1 when none has it.
     let m = mp.clone();
@@ -1505,20 +1514,20 @@ pub fn install(host: &mut Host) -> Mp {
     // IsPlayerUsing(controller, index, client); ObjectiveIsPlayerUsing
     // (controller, index): him.
     let m = mp.clone();
-    host.bind("Engine", "IsPlayerUsing", move |_, a| Ok(vec![Value::Bool(using(&m, &a, num(&a, 2)))]));
+    host.bind("Engine", "IsPlayerUsing", move |_, a| Ok(vec![Value::Boolean(using(&m, &a, num(&a, 2)))]));
     let m = mp.clone();
     host.bind("Engine", "ObjectiveIsPlayerUsing", move |_, a| {
         let client = if a.len() > 2 { num(&a, 2) } else { 0 };
-        Ok(vec![Value::Bool(using(&m, &a, client))])
+        Ok(vec![Value::Boolean(using(&m, &a, client))])
     });
     let (m, v) = (mp.clone(), host.values.clone());
     host.bind("Engine", "ObjectiveIsTeamUsing", move |_, a| {
-        Ok(vec![Value::Bool(using_teams(&m, &v, &a).contains(&num(&a, 2)))])
+        Ok(vec![Value::Boolean(using_teams(&m, &v, &a).contains(&num(&a, 2)))])
     });
     let (m, v) = (mp.clone(), host.values.clone());
     host.bind("Engine", "ObjectiveIsAnyOtherTeamUsing", move |_, a| {
         let team = num(&a, 2);
-        Ok(vec![Value::Bool(using_teams(&m, &v, &a).iter().any(|t| *t != team))])
+        Ok(vec![Value::Boolean(using_teams(&m, &v, &a).iter().any(|t| *t != team))])
     });
     let (m, v) = (mp.clone(), host.values.clone());
     host.bind("Engine", "ObjectiveGetTeamUsingCount", move |_, a| {
@@ -1526,14 +1535,14 @@ pub fn install(host: &mut Host) -> Mp {
     });
     // No vehicles or remote-controlled streaks hide the waypoints yet.
     for name in ["IsPlayerInVehicle", "IsPlayerRemoteControlling", "IsPlayerWeaponViewOnlyLinked"] {
-        host.bind("Engine", name, |_, _| Ok(vec![Value::Bool(false)]));
+        host.bind("Engine", name, |_, _| Ok(vec![Value::Boolean(false)]));
     }
     // SetObjectiveIcon(controller, index, type, material): the map's (and
     // the shoutcaster's) icon for one, kept for the minimap.
     let m = mp.clone();
     host.bind("Engine", "SetObjectiveIcon", move |_, a| {
         let icon = match arg(&a, 3) {
-            Value::User(u) => crate::lui::material_name(&u).unwrap_or_default(),
+            Value::User(u) => crate::lui::surface_title(&u).unwrap_or_default(),
             v => v.to_string(),
         };
         m.borrow_mut().objective_icons.insert((num(&a, 1), num(&a, 2)), icon);
@@ -1565,18 +1574,18 @@ pub fn install(host: &mut Host) -> Mp {
     // His party (him alone, its host) and the lobby around it: no friends
     // online, no invites, not after a match; a private match shows its
     // teams and runs a game lobby.
-    host.bind("Engine", "GetTitleFriendsOfAllLocalPlayers", |_, _| Ok(vec![Value::Table(Table::new_ref())]));
+    host.bind("Engine", "GetTitleFriendsOfAllLocalPlayers", |_, _| Ok(vec![Value::Table(LuaTable::new_ref())]));
     for name in ["IsJoiningAnotherParty", "PartyIsPostGame"] {
-        host.bind("Engine", name, |_, _| Ok(vec![Value::Bool(false)]));
+        host.bind("Engine", name, |_, _| Ok(vec![Value::Boolean(false)]));
     }
     for name in ["IsPartyLobbyRunning", "IsXuidPrivatePartyHost", "PartyShowTruePlayerInfo"] {
-        host.bind("Engine", name, |_, _| Ok(vec![Value::Bool(true)]));
+        host.bind("Engine", name, |_, _| Ok(vec![Value::Boolean(true)]));
     }
     host.bind("UIExpression", "AcceptingInvite", |_, _| Ok(vec![Value::Num(0.0)]));
     host.bind("Engine", "GetMaxUserPlayerCount", |_, _| Ok(vec![Value::Num(18.0)]));
     for name in ["PartyShowTeams", "IsGameLobbyRunning"] {
         let m = mp.clone();
-        host.bind("Engine", name, move |_, _| Ok(vec![Value::Bool(m.borrow().game_modes.contains(&1))]));
+        host.bind("Engine", name, move |_, _| Ok(vec![Value::Boolean(m.borrow().game_modes.contains(&1))]));
     }
     // GetProfileVarInt(controller, name): his profile's number.
     let (v, m) = (host.values.clone(), mp.clone());
@@ -1592,10 +1601,10 @@ pub fn install(host: &mut Host) -> Mp {
     let (m, v) = (mp.clone(), host.values.clone());
     host.bind("Engine", "GetPlayersInLobby", move |vm, _| {
         let cod = vm.global("CoD");
-        let field = |vm: &mut Vm, k: &str, d: f32| vm.index(&cod, &Value::str(k)).ok().and_then(|x| x.as_num()).unwrap_or(d);
+        let field = |vm: &mut Vm, k: &str, d: f32| vm.lookup_index(&cod, &Value::str(k)).ok().and_then(|x| x.as_num()).unwrap_or(d);
         let teams = (field(vm, "TEAM_ALLIES", 1.0), field(vm, "TEAM_FREE", 0.0));
-        let members = Table::new_ref();
-        members.borrow_mut().set(Value::Num(1.0), Value::Table(lobby_member(&m.borrow(), &v.borrow(), teams)));
+        let members = LuaTable::new_ref();
+        members.borrow_mut().store(Value::Num(1.0), Value::Table(lobby_member(&m.borrow(), &v.borrow(), teams)));
         Ok(vec![Value::Table(members)])
     });
     // A selected player's card (the lobby's overview pane): his own row's
@@ -1603,39 +1612,39 @@ pub fn install(host: &mut Host) -> Mp {
     let (m, v) = (mp.clone(), host.values.clone());
     host.bind("Engine", "GetPlayerInfoByXuid", move |vm, _| {
         let cod = vm.global("CoD");
-        let field = |vm: &mut Vm, k: &str, d: f32| vm.index(&cod, &Value::str(k)).ok().and_then(|x| x.as_num()).unwrap_or(d);
+        let field = |vm: &mut Vm, k: &str, d: f32| vm.lookup_index(&cod, &Value::str(k)).ok().and_then(|x| x.as_num()).unwrap_or(d);
         let teams = (field(vm, "TEAM_ALLIES", 1.0), field(vm, "TEAM_FREE", 0.0));
         Ok(vec![Value::Table(lobby_member(&m.borrow(), &v.borrow(), teams))])
     });
-    host.bind("Engine", "GetLeagueTeamInfo", |_, _| Ok(vec![Value::Table(Table::new_ref())]));
+    host.bind("Engine", "GetLeagueTeamInfo", |_, _| Ok(vec![Value::Table(LuaTable::new_ref())]));
     // League teams, offline: only the Solo team (id 1), his own, with no
     // placement yet (the Barracks tab's card and "Awaiting Placement").
     host.bind("Engine", "GetLeagueTeams", |_, _| {
-        let solo = Table::new_ref();
+        let solo = LuaTable::new_ref();
         solo.borrow_mut().set_str("teamID", Value::Num(1.0));
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         t.borrow_mut().set_str("soloTeamID", Value::Num(1.0));
         t.borrow_mut().set_str("numTeams", Value::Num(0.0));
-        t.borrow_mut().set(Value::Num(1.0), Value::Table(solo));
+        t.borrow_mut().store(Value::Num(1.0), Value::Table(solo));
         Ok(vec![Value::Table(t)])
     });
     let v = host.values.clone();
     host.bind("Engine", "GetLeagueTeamMemberInfo", move |_, _| {
         let name = v.borrow().dvars.get("name").filter(|n| !n.trim().is_empty()).cloned().unwrap_or_else(|| "Player".to_owned());
-        let me = Table::new_ref();
+        let me = LuaTable::new_ref();
         me.borrow_mut().set_str("userName", Value::str(&name));
-        let members = Table::new_ref();
-        members.borrow_mut().set(Value::Num(1.0), Value::Table(me));
-        let t = Table::new_ref();
+        let members = LuaTable::new_ref();
+        members.borrow_mut().store(Value::Num(1.0), Value::Table(me));
+        let t = LuaTable::new_ref();
         t.borrow_mut().set_str("members", Value::Table(members));
         t.borrow_mut().set_str("numMembers", Value::Num(1.0));
         Ok(vec![Value::Table(t)])
     });
     // (fetch status, divisions): none yet.
     host.bind("Engine", "GetLeagueTeamSubdivisionInfos", |_, _| {
-        Ok(vec![Value::str("fetched"), Value::Table(Table::new_ref())])
+        Ok(vec![Value::str("fetched"), Value::Table(LuaTable::new_ref())])
     });
-    host.bind("Engine", "PartyShowTruePlayerInfoByXuid", |_, _| Ok(vec![Value::Bool(false)]));
+    host.bind("Engine", "PartyShowTruePlayerInfoByXuid", |_, _| Ok(vec![Value::Boolean(false)]));
     // GetSystemInfo(controller, what): the lobby footer's NAT line.
     host.bind("UIExpression", "GetSystemInfo", |_, a| {
         let nat_type_lobby = 10.0;
@@ -1656,21 +1665,21 @@ pub fn install(host: &mut Host) -> Mp {
     // map pack). Entries as the change-mode / change-map popups read them.
     let v = host.values.clone();
     host.bind("Engine", "GetGametypesBase", move |_, _| {
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         let vb = v.borrow();
         let mut n = 0;
         // In the table's sort order (TDM, FFA, DOM, DEM, KC, KOTH, HQ, CTF, S&D).
         let mut rows: Vec<&Vec<String>> = table(&vb, "mp/gametypestable.csv").into_iter().flatten().filter(|r| cell(r, 0) == "0").collect();
         rows.sort_by_key(|r| int(r, 5));
         for r in rows {
-            let e = Table::new_ref();
+            let e = LuaTable::new_ref();
             for (k, x) in [("gametype", 1), ("ref", 1), ("name", 2), ("description", 3), ("icon", 4), ("category", 9)] {
                 e.borrow_mut().set_str(k, Value::str(&cell(r, x)));
             }
             e.borrow_mut().set_str("sortIndex", Value::Num(int(r, 5) as f32));
-            e.borrow_mut().set_str("locked", Value::Bool(false));
+            e.borrow_mut().set_str("locked", Value::Boolean(false));
             n += 1;
-            t.borrow_mut().set(Value::Num(n as f32), Value::Table(e));
+            t.borrow_mut().store(Value::Num(n as f32), Value::Table(e));
         }
         Ok(vec![Value::Table(t)])
     });
@@ -1679,26 +1688,26 @@ pub fn install(host: &mut Host) -> Mp {
     // nil check, so the entry exists with a zero value).
     host.bind("Engine", "SortItemsForCombatRecord", |_, _| Ok(vec![]));
     host.bind("Engine", "GetCombatRecordSortedItemInfo", |_, _| {
-        let e = Table::new_ref();
+        let e = LuaTable::new_ref();
         e.borrow_mut().set_str("itemIndex", Value::Num(0.0));
         e.borrow_mut().set_str("itemValue", Value::Num(0.0));
         Ok(vec![Value::Table(e)])
     });
     let v = host.values.clone();
     host.bind("Engine", "GetMaps", move |_, _| {
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         let vb = v.borrow();
         let mut n = 0;
         for r in table(&vb, "mp/mapstable.csv").into_iter().flatten().filter(|r| cell(r, 0).starts_with("mp_")) {
-            let e = Table::new_ref();
+            let e = LuaTable::new_ref();
             for (k, x) in [("loadName", 0), ("name", 3), ("icon", 4), ("description", 6)] {
                 e.borrow_mut().set_str(k, Value::str(&cell(r, x)));
             }
             e.borrow_mut().set_str("sortIndex", Value::Num(int(r, 5) as f32));
             e.borrow_mut().set_str("mapPackTypeIndex", Value::Num(int(r, 11) as f32));
-            e.borrow_mut().set_str("locked", Value::Bool(false));
+            e.borrow_mut().set_str("locked", Value::Boolean(false));
             n += 1;
-            t.borrow_mut().set(Value::Num(n as f32), Value::Table(e));
+            t.borrow_mut().store(Value::Num(n as f32), Value::Table(e));
         }
         Ok(vec![Value::Table(t)])
     });
@@ -1707,7 +1716,7 @@ pub fn install(host: &mut Host) -> Mp {
         let map = arg(&a, 0).to_string();
         let vb = v.borrow();
         let hit = table(&vb, "mp/mapstable.csv").is_some_and(|rows| rows.iter().any(|r| r.first() == Some(&map)));
-        Ok(vec![Value::Bool(hit)])
+        Ok(vec![Value::Boolean(hit)])
     });
     // His new account: every emblem icon and calling card is new (the
     // barracks tiles show NEW, as the real front end does for a fresh
@@ -1719,7 +1728,7 @@ pub fn install(host: &mut Host) -> Mp {
             .iter()
             .filter(|r| cell(r, 0) == "icon")
             .any(|r| !m.emblem.old.contains(&int(r, 2)) && !emblem_icon_locked(&m, &vb, int(r, 2)));
-        Ok(vec![Value::Bool(new)])
+        Ok(vec![Value::Boolean(new)])
     });
     host.bind("Engine", "IsAnyEmblemBackgroundNew", yes);
     // The Emblem Editor card's list screen (the CODTv menu, root
@@ -1729,7 +1738,7 @@ pub fn install(host: &mut Host) -> Mp {
     host.bind("Engine", "GetCodtvRoot", |_, a| Ok(vec![if arg(&a, 0).to_string() == "emblems" { Value::Num(1.0) } else { Value::Nil }]));
     host.bind("Engine", "GetCodtvContent", |_, a| {
         let folder = |name: &str, index: f32, kind: &str, subs: f32| {
-            let e = Table::new_ref();
+            let e = LuaTable::new_ref();
             e.borrow_mut().set_str("name", Value::str(name));
             e.borrow_mut().set_str("folderIndex", Value::Num(index));
             e.borrow_mut().set_str("type", Value::str(kind));
@@ -1739,8 +1748,8 @@ pub fn install(host: &mut Host) -> Mp {
         match arg(&a, 0).as_num().unwrap_or(0.0) as i64 {
             1 => {
                 let r = folder("EMBLEMS", 1.0, "folder", 2.0);
-                r.borrow_mut().set(Value::Num(1.0), Value::Table(folder("EMBLEMS", 2.0, "dwfolder", 0.0)));
-                r.borrow_mut().set(Value::Num(2.0), Value::Table(folder("NEW EMBLEM", 3.0, "folder", 1.0)));
+                r.borrow_mut().store(Value::Num(1.0), Value::Table(folder("EMBLEMS", 2.0, "dwfolder", 0.0)));
+                r.borrow_mut().store(Value::Num(2.0), Value::Table(folder("NEW EMBLEM", 3.0, "folder", 1.0)));
                 return Ok(vec![Value::Table(r)]);
             }
             2 => return Ok(vec![Value::Table(folder("EMBLEMS", 2.0, "dwfolder", 0.0))]),
@@ -1751,7 +1760,7 @@ pub fn install(host: &mut Host) -> Mp {
                 b.borrow_mut().set_str("imageName", Value::str("white"));
                 b.borrow_mut().set_str("imageType", Value::str("material"));
                 b.borrow_mut().set_str("parentFolderIndex", Value::Num(3.0));
-                r.borrow_mut().set(Value::Num(1.0), Value::Table(b));
+                r.borrow_mut().store(Value::Num(1.0), Value::Table(b));
                 return Ok(vec![Value::Table(r)]);
             }
             _ => {}
@@ -1760,11 +1769,11 @@ pub fn install(host: &mut Host) -> Mp {
     });
     // The emblem slots: none used, 15 free; the next free one is the first.
     host.bind("Engine", "GetFileshareCategories", |_, _| {
-        let c = Table::new_ref();
+        let c = LuaTable::new_ref();
         c.borrow_mut().set_str("occupied", Value::Num(0.0));
         c.borrow_mut().set_str("remaining", Value::Num(15.0));
-        let t = Table::new_ref();
-        t.borrow_mut().set(Value::Num(1.0), Value::Table(c));
+        let t = LuaTable::new_ref();
+        t.borrow_mut().store(Value::Num(1.0), Value::Table(c));
         Ok(vec![Value::Table(t)])
     });
     host.bind("Engine", "GetFileshareNextSlot", |_, _| Ok(vec![Value::Num(1.0)]));
@@ -1781,7 +1790,7 @@ pub fn install(host: &mut Host) -> Mp {
     host.bind("Engine", "GetSelectedLayerColor", move |_, _| {
         let m = m.borrow();
         let rgba = m.emblem.layers.get(m.emblem.selected).and_then(|l| l.rgba).unwrap_or_else(|| emblem_default_color(&v.borrow()));
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         for (k, c) in ["red", "green", "blue", "alpha"].into_iter().zip(rgba) {
             t.borrow_mut().set_str(k, Value::Num(c));
         }
@@ -1815,7 +1824,7 @@ pub fn install(host: &mut Host) -> Mp {
         Ok(vec![Value::Num(id.map_or(-1.0, |i| i as f32))])
     });
     let (m, v) = (mp.clone(), host.values.clone());
-    host.bind("Engine", "EmblemIconIsLocked", move |_, a| Ok(vec![Value::Bool(emblem_icon_locked(&m.borrow(), &v.borrow(), num(&a, 1)))]));
+    host.bind("Engine", "EmblemIconIsLocked", move |_, a| Ok(vec![Value::Boolean(emblem_icon_locked(&m.borrow(), &v.borrow(), num(&a, 1)))]));
     let m = mp.clone();
     host.bind("Engine", "SetEmblemIconAsOld", move |_, a| {
         m.borrow_mut().emblem.old.insert(num(&a, 1));
@@ -1830,25 +1839,25 @@ pub fn install(host: &mut Host) -> Mp {
     let (m, v) = (mp.clone(), host.values.clone());
     host.bind("Engine", "GetChallengeInfoByEmblemOrBackingId", move |_, a| {
         let vb = v.borrow();
-        let Some((row, t, c)) = emblem_challenge(&vb, num(&a, 2), num(&a, 1)) else { return Ok(vec![Value::Nil]) };
+        let Some((challenge_row, t, c)) = emblem_challenge(&vb, num(&a, 2), num(&a, 1)) else { return Ok(vec![Value::Nil]) };
         let modes: Vec<&Vec<String>> = table_rows(&vb, "mp/gametypestable.csv").iter().filter(|r| cell(r, 0) == "0").collect();
         let mode = (cell(&c, 3) == "gamemode")
             .then(|| cell(&c, 13).split_whitespace().next().and_then(|g| modes.iter().position(|r| cell(r, 1) == g)))
             .flatten();
-        let e = Table::new_ref();
+        let e = LuaTable::new_ref();
         {
             let mut e = e.borrow_mut();
-            e.set_str("challengeRow", Value::Num(row as f32));
+            e.set_str("challengeRow", Value::Num(challenge_row as f32));
             e.set_str("tableNum", Value::Num(t as f32));
             e.set_str("challengeType", Value::Num(if mode.is_some() { 2.0 } else { 0.0 }));
-            e.set_str("isDefault", Value::Bool(false));
-            e.set_str("isLocked", Value::Bool(emblem_milestone_locked(&m.borrow(), &c)));
+            e.set_str("isDefault", Value::Boolean(false));
+            e.set_str("isLocked", Value::Boolean(emblem_milestone_locked(&m.borrow(), &c)));
             if let Some(i) = mode {
                 e.set_str("itemIndex", Value::Num(i as f32));
             }
         }
-        let list = Table::new_ref();
-        list.borrow_mut().set(Value::Num(1.0), Value::Table(e));
+        let list = LuaTable::new_ref();
+        list.borrow_mut().store(Value::Num(1.0), Value::Table(e));
         Ok(vec![Value::Table(list)])
     });
     let v = host.values.clone();
@@ -1907,12 +1916,12 @@ pub fn install(host: &mut Host) -> Mp {
         let want = arg(&a, 2).to_string();
         let vb = v.borrow();
         let Some(rows) = table(&vb, &arg(&a, 0).to_string()) else { return Ok(vec![Value::Nil]) };
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         let mut n = 0;
         for (i, r) in rows.iter().enumerate() {
             if r.get(col).is_some_and(|c| *c == want) {
                 n += 1;
-                t.borrow_mut().set(Value::Num(n as f32), Value::Num(i as f32));
+                t.borrow_mut().store(Value::Num(n as f32), Value::Num(i as f32));
             }
         }
         Ok(vec![if n == 0 { Value::Nil } else { Value::Table(t) }])
@@ -1920,7 +1929,7 @@ pub fn install(host: &mut Host) -> Mp {
     // Challenge progress lists (camos, reticles, calling cards): none
     // started on a fresh profile. (Stub: the challenge tables are not
     // read yet.)
-    host.bind("Engine", "GetChallengeInfoForImages", |_, _| Ok(vec![Value::Table(Table::new_ref())]));
+    host.bind("Engine", "GetChallengeInfoForImages", |_, _| Ok(vec![Value::Table(LuaTable::new_ref())]));
     // CommitProfileChanges: the owner saves what changed.
     let m = mp.clone();
     host.bind("Engine", "CommitProfileChanges", move |_, _| {
@@ -1968,7 +1977,7 @@ pub fn install(host: &mut Host) -> Mp {
         let m = mp.clone();
         host.bind("Engine", name, move |_, _| {
             let m = m.borrow();
-            Ok(vec![Value::Bool(m.start_requested || crate::playlists::start_timer_running(&m))])
+            Ok(vec![Value::Boolean(m.start_requested || crate::playlists::start_timer_running(&m))])
         });
     }
     let m = mp.clone();
@@ -2009,7 +2018,7 @@ pub fn install(host: &mut Host) -> Mp {
         Ok(vec![])
     });
     let m = mp.clone();
-    host.bind("Engine", "GameModeIsMode", move |_, a| Ok(vec![Value::Bool(m.borrow().game_modes.contains(&num(&a, 0)))]));
+    host.bind("Engine", "GameModeIsMode", move |_, a| Ok(vec![Value::Boolean(m.borrow().game_modes.contains(&num(&a, 0)))]));
     let m = mp.clone();
     host.bind("Engine", "GameModeResetModes", move |_, _| {
         m.borrow_mut().game_modes.clear();
@@ -2067,7 +2076,7 @@ pub fn install(host: &mut Host) -> Mp {
         // (controller, location): CoD.STATS_LOCATION_STABLE (3) = before
         // his last ranked match.
         let stable = arg(&a, 1).as_num() == Some(3.0);
-        Ok(vec![node_at(vm, &m, String::new(), stable)])
+        Ok(vec![node_at(vm, &m, String::default(), stable)])
     });
     // GetDStat(controller, part, part, ...): the value at that path.
     let (st, m) = (state.clone(), mp.clone());
@@ -2084,8 +2093,8 @@ pub fn install(host: &mut Host) -> Mp {
         Ok(vec![m.borrow().stat(&path)])
     });
 
-    // Classes: GetClassItem(controller, class, slot) / SetClassItem(
-    // controller, class, slot, value) in the set the menus edit (a preset
+    // Classes: GetClassItem(pad, class, slot) / SetClassItem(
+    // pad, class, slot, value) in the set the menus edit (a preset
     // class, 10-14, read from the match's presets).
     let (st, m, v) = (state.clone(), mp.clone(), host.values.clone());
     host.bind("Engine", "GetClassItem", move |_, a| {
@@ -2097,12 +2106,12 @@ pub fn install(host: &mut Host) -> Mp {
         // A grenade's `<slot>status<n>` (each one carried: Create-a-Class
         // writes them beside `<slot>count`): a class set by BO2's defaults
         // (count only) carries the first `count` of them.
-        if let Some((base, n)) = slot.rsplit_once("status").and_then(|(b, n)| Some((b, n.parse::<i32>().ok()?)))
-            && base.ends_with("grenade")
+        if let Some((stem, n)) = slot.rsplit_once("status").and_then(|(b, n)| Some((b, n.parse::<i32>().ok()?)))
+            && stem.ends_with("grenade")
             && m.profile.stat(&key(&slot)).is_none()
         {
-            let count = m.stat(&key(&format!("{base}count"))).as_num().unwrap_or(0.0) as i32;
-            let item = m.stat(&key(base)).as_num().unwrap_or(0.0) as i32;
+            let count = m.stat(&key(&format!("{stem}count"))).as_num().unwrap_or(0.0) as i32;
+            let item = m.stat(&key(stem)).as_num().unwrap_or(0.0) as i32;
             return Ok(vec![Value::Num(if item > 0 && n <= count { 1.0 } else { 0.0 })]);
         }
         // Scorestreaks he has not picked yet are the defaults ("all" classes
@@ -2111,7 +2120,7 @@ pub fn install(host: &mut Host) -> Mp {
         if lower.starts_with("killstreak")
             && m.profile.stat(&key(&lower)).is_none()
             && !(1..=3).any(|n| m.profile.stat(&key(&format!("killstreak{n}"))).is_some())
-            && let Some((_, item)) = m.default_class("all").into_iter().find(|(s, _)| *s == lower)
+            && let Some((_slot, item)) = m.default_class("all").into_iter().find(|(s, _)| *s == lower)
         {
             return Ok(vec![Value::Num(item as f32)]);
         }
@@ -2139,7 +2148,7 @@ pub fn install(host: &mut Host) -> Mp {
         if std::env::var_os("BO2MP_CLASSLOG").is_some() {
             eprintln!("bo2mp classlog: GetCustomClass({class}) key {} primary {:?}", key("primary"), m.stat(&key("primary")));
         }
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         let mut spent = 0;
         for slot in SLOTS {
             let v = m.stat(&key(slot));
@@ -2176,8 +2185,7 @@ pub fn install(host: &mut Host) -> Mp {
     });
 
     // Items (mp/statstable.csv): UIExpression.<fn>(controller, index).
-    type Field = fn(&Item) -> Value;
-    let fields: [(&'static str, Field); 7] = [
+    let fields: [(&'static str, fn(&Item) -> Value); 7] = [
         ("GetItemName", |it| Value::str(&it.name)),
         ("GetItemImage", |it| Value::str(&it.image)),
         ("GetItemDesc", |it| Value::str(&it.desc)),
@@ -2235,9 +2243,9 @@ pub fn install(host: &mut Host) -> Mp {
         Ok(vec![])
     });
     let (st, m) = (state.clone(), mp.clone());
-    host.bind("Engine", "ItemIndexValid", move |_, a| Ok(vec![Value::Bool(st(&m).borrow().item(num(&a, 0)).is_some())]));
+    host.bind("Engine", "ItemIndexValid", move |_, a| Ok(vec![Value::Boolean(st(&m).borrow().item(num(&a, 0)).is_some())]));
     let (st, m) = (state.clone(), mp.clone());
-    host.bind("Engine", "AreAllItemsFree", move |_, _| Ok(vec![Value::Bool(st(&m).borrow().all_free())]));
+    host.bind("Engine", "AreAllItemsFree", move |_, _| Ok(vec![Value::Boolean(st(&m).borrow().all_free())]));
     host.bind("UIExpression", "GetItemCost", one);
 
     // Attachments: Engine.<fn>(weapon index, attachment number).
@@ -2258,11 +2266,11 @@ pub fn install(host: &mut Host) -> Mp {
         let m = st(&m);
         let m = m.borrow();
         let group = arg(&a, 0).to_string();
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         let mut n = 0;
         for it in m.items().iter().filter(|it| it.cost >= 0 && it.group == group && !it.slot.is_empty()) {
             n += 1;
-            t.borrow_mut().set(Value::Num(n as f32), Value::Num(it.index as f32));
+            t.borrow_mut().store(Value::Num(n as f32), Value::Num(it.index as f32));
         }
         Ok(vec![Value::Table(t)])
     });
@@ -2350,7 +2358,7 @@ pub fn install(host: &mut Host) -> Mp {
     let c = challenge;
     host.bind("Engine", "GetItemOptionLocked", move |_, a| {
         let locked = c(num(&a, 1), num(&a, 2)).is_some_and(|(.., target, have)| have < target);
-        Ok(vec![Value::Bool(locked)])
+        Ok(vec![Value::Boolean(locked)])
     });
     // A weapon's n-th attachment (Create-a-Class's attachment grid):
     // GetItemAttachment(weapon, n) = its attachment table index;
@@ -2431,9 +2439,9 @@ pub fn install(host: &mut Host) -> Mp {
             (Some(x), Some(y)) => m.profile.attachments_compatible(&x.reference, &y.reference),
             _ => false,
         };
-        Ok(vec![Value::Bool(ok)])
+        Ok(vec![Value::Boolean(ok)])
     });
-    host.bind("Engine", "IsAttachmentNew", |_, _| Ok(vec![Value::Bool(false)]));
+    host.bind("Engine", "IsAttachmentNew", |_, _| Ok(vec![Value::Boolean(false)]));
     host.bind("Engine", "GetPreReqChallengeValue", zero);
     // Class sets (CHOOSE CLASS's "CLASS SET 1" header, its 10 pips and
     // Class Set Options; his real game shows them): the classes he edits
@@ -2499,7 +2507,7 @@ pub fn install(host: &mut Host) -> Mp {
         let m = m.borrow();
         let n = num(&a, 1);
         let name = match m.profile.stat(&format!("classsets.{}.{n}.name", m.class_set())) {
-            Some(StatValue::Str(s)) if !s.is_empty() => s.clone(),
+            Some(StatValue::Text(s)) if !s.is_empty() => s.clone(),
             _ => format!("CLASS SET {}", n + 1),
         };
         Ok(vec![Value::str(&name)])
@@ -2509,7 +2517,7 @@ pub fn install(host: &mut Host) -> Mp {
         let m = st(&m);
         let mut m = m.borrow_mut();
         let key = format!("classsets.{}.{}.name", m.class_set(), num(&a, 1));
-        m.profile.set_stat(key, StatValue::Str(arg(&a, 2).to_string()));
+        m.profile.set_stat(key, StatValue::Text(arg(&a, 2).to_string()));
         Ok(vec![])
     });
     // GetUnlockablesBySlotName(slot): the item indices that go in that
@@ -2523,9 +2531,9 @@ pub fn install(host: &mut Host) -> Mp {
         let m = st(&m);
         let m = m.borrow();
         let slot = arg(&a, 0).to_string();
-        let t = Table::new_ref();
+        let t = LuaTable::new_ref();
         for (n, it) in m.items().iter().filter(|it| it.cost >= 0 && it.slot.eq_ignore_ascii_case(&slot)).enumerate() {
-            t.borrow_mut().set(Value::Num((n + 1) as f32), Value::Num(it.index as f32));
+            t.borrow_mut().store(Value::Num((n + 1) as f32), Value::Num(it.index as f32));
         }
         Ok(vec![Value::Table(t)])
     });
@@ -2566,8 +2574,7 @@ pub fn install(host: &mut Host) -> Mp {
         let n = m.borrow().item(num(&a, 1)).map_or(1, |it| it.attachments.len() + 1);
         Ok(vec![Value::Num(n as f32)])
     });
-    type AttField = fn(&Attachment) -> Value;
-    let att_fields: [(&'static str, AttField); 5] = [
+    let att_fields: [(&'static str, fn(&Attachment) -> Value); 5] = [
         ("GetAttachmentRef", |a| Value::str(&a.reference)),
         ("GetAttachmentName", |a| Value::str(&a.name)),
         ("GetAttachmentImage", |a| Value::str(&a.image)),
@@ -2627,16 +2634,19 @@ mod tests {
         assert_eq!(train.entity, 77);
         assert_eq!(train.map_info, OBJ_ROTATE_WITH_ENTITY | OBJ_CLIP_TO_MAP);
         assert_eq!(train.icon_size, Some(45.0));
-        assert_eq!(train.yaw, 90.0);
+        assert_eq!(train.facing, 90.0);
         let crate_mark = &rows[&3];
-        assert_eq!((crate_mark.map_info, crate_mark.icon_size, crate_mark.yaw), (0, None, 0.0));
+        assert_eq!((crate_mark.map_info, crate_mark.icon_size, crate_mark.facing), (0, None, 0.0));
         // The Hellstorm: 50 wide, turning with it, tinted in code, kept on
         // the map's edge.
-        let rows = parse_objectives("33,1,1,2,3,90,remotemissile_target,,0,0,0,0,0,12,50,-45.5");
+        let rows = parse_objectives("33,1,1,2,3,90,remotemissile_target,,0,0,0,0,0,12,50,-45.5,ff5059");
         let hellstorm = &rows[&33];
         assert_eq!(hellstorm.map_info, OBJ_ROTATE_WITH_ENTITY | OBJ_COLOR_MATERIAL_IN_CODE);
         assert_eq!(hellstorm.map_info & OBJ_CLIP_TO_MAP, 0);
-        assert_eq!((hellstorm.icon_size, hellstorm.yaw), (Some(50.0), -45.5));
+        assert_eq!((hellstorm.icon_size, hellstorm.facing), (Some(50.0), -45.5));
+        // An enemy's, in BO2's g_TeamColor_EnemyTeam (1, 0.315, 0.35).
+        assert_eq!(hellstorm.tint, Some([1.0, 80.0 / 255.0, 89.0 / 255.0]));
+        assert_eq!(train.tint, None);
     }
 
     #[test]
@@ -2648,17 +2658,17 @@ mod tests {
         assert_eq!(dvar(&h, "party_maxplayers_theater"), "6");
         assert_eq!(dvar(&h, "party_maxplayers_local_splitscreen"), "1");
         let e = h.vm.global("Engine");
-        let set = h.vm.index(&e, &Value::str("PartySetMaxPlayerCount")).unwrap();
+        let set = h.vm.lookup_index(&e, &Value::str("PartySetMaxPlayerCount")).unwrap();
         h.vm.call(set.clone(), vec![Value::Num(12.0)]).unwrap();
         assert_eq!(dvar(&h, "party_maxplayers"), "12");
         h.vm.call(set, vec![Value::Num(40.0)]).unwrap();
         assert_eq!(dvar(&h, "party_maxplayers"), "19");
         // The public lobby: not ready while its map vote is open, ready
         // once its start timer runs.
-        let ready = h.vm.index(&e, &Value::str("PartyIsReadyToStart")).unwrap();
-        let yes = |out: Vec<Value>| matches!(out.first(), Some(Value::Bool(true)));
+        let ready = h.vm.lookup_index(&e, &Value::str("PartyIsReadyToStart")).unwrap();
+        let yes = |out: Vec<Value>| matches!(out.first(), Some(Value::Boolean(true)));
         assert!(!yes(h.vm.call(ready.clone(), vec![]).unwrap()));
-        let now = crate::lui::now_ms();
+        let now = crate::lui::clock_millis();
         mp.borrow_mut().public_start_ms = Some(now + crate::playlists::START_TIMER_MS + 5_000.0);
         assert!(!yes(h.vm.call(ready.clone(), vec![]).unwrap()), "the map vote is open");
         mp.borrow_mut().public_start_ms = Some(now + crate::playlists::START_TIMER_MS - 1_000.0);
@@ -2693,11 +2703,11 @@ mod tests {
             );
         }
         let e = h.vm.global("Engine");
-        let f = h.vm.index(&e, &Value::str("AreAttachmentsCompatible")).unwrap();
+        let f = h.vm.lookup_index(&e, &Value::str("AreAttachmentsCompatible")).unwrap();
         // The HK416's list: 1 reflex, 2 acog, 3 extbarrel.
         let mut ask = |a: f32, b: f32| {
             let out = h.vm.call(f.clone(), vec![Value::Num(31.0), Value::Num(a), Value::Num(b)]).unwrap();
-            matches!(out.first(), Some(Value::Bool(true)))
+            matches!(out.first(), Some(Value::Boolean(true)))
         };
         assert!(ask(2.0, 3.0) && ask(3.0, 2.0));
         assert!(!ask(1.0, 2.0), "the reflex goes with nothing here");
@@ -2715,15 +2725,15 @@ mod tests {
         }
         h.values.borrow_mut().tables.insert("mp/statstable.csv".into(), vec![r]);
         let e = h.vm.global("Engine");
-        let index = h.vm.index(&e, &Value::str("GetClassIndexFromName")).unwrap();
+        let index = h.vm.lookup_index(&e, &Value::str("GetClassIndexFromName")).unwrap();
         let out = h.vm.call(index, vec![Value::str("class_smg")]).unwrap();
         assert_eq!(out.first().and_then(Value::as_num), Some(10.0));
         // Class 10 is the match's SMG preset: its gun, for the menu's picture.
-        let class = h.vm.index(&e, &Value::str("GetCustomClass")).unwrap();
+        let class = h.vm.lookup_index(&e, &Value::str("GetCustomClass")).unwrap();
         let out = h.vm.call(class, vec![Value::Num(0.0), Value::Num(10.0)]).unwrap();
         let Some(Value::Table(t)) = out.first() else { panic!("no class") };
         assert_eq!(t.borrow().get_str("primary").as_num(), Some(10.0));
-        let item = h.vm.index(&e, &Value::str("GetClassItem")).unwrap();
+        let item = h.vm.lookup_index(&e, &Value::str("GetClassItem")).unwrap();
         let out = h.vm.call(item, vec![Value::Num(0.0), Value::Num(10.0), Value::str("primary")]).unwrap();
         assert_eq!(out.first().and_then(Value::as_num), Some(10.0));
     }

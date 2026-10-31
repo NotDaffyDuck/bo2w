@@ -1,18 +1,18 @@
 //! A compact identity for the textures a draw binds, so draws that bind the same
 //! things can be recognised without comparing the bindings themselves.
 
-use render_material::{PackedCodeSamplerLane, PackedCodeSamplers, PackedLocalSamplers, PortId};
+use render_material::{CodeSamplerChannel, CompactEngineSamplers, LocalSamplerBundle, ShaderPortKey};
 
-use crate::SurfaceSamplerInputs;
+use crate::FacetSamplerInputs;
 
 /// What distinguishes one texture binding set from another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TextureBindIdentity {
-    pub port: PortId,
+pub struct TextureBindingKey {
+    pub port: ShaderPortKey,
     /// Id of the material-local samplers; 0 when there are none.
     pub local: u64,
     pub code: u64,
-    pub surface: SurfaceSamplerInputs,
+    pub surf: FacetSamplerInputs,
 }
 
 /// 64-bit FNV-1a, fed incrementally.
@@ -26,50 +26,50 @@ impl Fnv {
         Self(Self::BASIS)
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
-        self.0 = bytes
+    fn feed(&mut self, chunk: &[u8]) {
+        self.0 = chunk
             .iter()
             .fold(self.0, |state, &b| (state ^ u64::from(b)).wrapping_mul(Self::PRIME));
     }
 }
 
-fn local_id(local: Option<&PackedLocalSamplers>) -> u64 {
+fn local_id(local: Option<&LocalSamplerBundle>) -> u64 {
     local.map_or(0, |packed| packed.id)
 }
 
-impl TextureBindIdentity {
+impl TextureBindingKey {
     /// From samplers already packed under a single id.
-    pub fn from_packed(
-        port: PortId,
-        local: Option<&PackedLocalSamplers>,
-        code: &PackedCodeSamplers,
-        surface: SurfaceSamplerInputs,
+    pub fn unpack_from_bits(
+        port: ShaderPortKey,
+        local: Option<&LocalSamplerBundle>,
+        code: &CompactEngineSamplers,
+        surf: FacetSamplerInputs,
     ) -> Self {
-        Self { port, local: local_id(local), code: code.id, surface }
+        Self { port, local: local_id(local), code: code.id, surf }
     }
 
     /// From the individual code-sampler lanes: the `code` field is a digest of
     /// their count and of each lane's register, index, sampler state and image.
-    pub fn from_lanes(
-        port: PortId,
-        local: Option<&PackedLocalSamplers>,
-        code: &[PackedCodeSamplerLane],
-        surface: SurfaceSamplerInputs,
+    pub fn assemble_from_channels(
+        port: ShaderPortKey,
+        local: Option<&LocalSamplerBundle>,
+        code: &[CodeSamplerChannel],
+        surf: FacetSamplerInputs,
     ) -> Self {
         let mut digest = Fnv::new();
         digest.feed(&(code.len() as u64).to_le_bytes());
-        for lane in code {
-            digest.feed(&lane.register.to_le_bytes());
-            digest.feed(&lane.index.to_le_bytes());
-            digest.feed(&[lane.sampler_state]);
-            match lane.image {
-                Some(image) => {
+        for bind_lane in code {
+            digest.feed(&bind_lane.sampler_reg.to_le_bytes());
+            digest.feed(&bind_lane.index.to_le_bytes());
+            digest.feed(&[bind_lane.texture_sampling_mode]);
+            match bind_lane.image {
+                Some(bound_image) => {
                     digest.feed(&[1]);
-                    digest.feed(&image.0.to_le_bytes());
+                    digest.feed(&bound_image.0.to_le_bytes());
                 }
                 None => digest.feed(&[0]),
             }
         }
-        Self { port, local: local_id(local), code: digest.0, surface }
+        Self { port, local: local_id(local), code: digest.0, surf }
     }
 }

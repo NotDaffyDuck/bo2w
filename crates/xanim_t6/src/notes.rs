@@ -18,20 +18,20 @@ pub fn fired_notes(
     note_times: &[f32],
     old: f32,
     cur: f32,
-    looping: bool,
+    wraps: bool,
     first_update: bool,
 ) -> FiredNotes {
     let at_old_fires = old == 0.0 || first_update;
     let after_old = |t: f32| t > old || (t == old && at_old_fires);
     let mut fired = FiredNotes::default();
     if cur < old {
-        if looping {
+        if wraps {
             fired.notes.extend((0..note_times.len()).filter(|&i| after_old(note_times[i])));
             fired.notes.extend((0..note_times.len()).filter(|&i| note_times[i] <= cur));
         }
         return fired;
     }
-    if !looping && cur >= 1.0 {
+    if !wraps && cur >= 1.0 {
         fired.end = true;
         if old >= 1.0 {
             return fired;

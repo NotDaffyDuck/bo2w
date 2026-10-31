@@ -1,0 +1,15 @@
+# C: knife with an empty AN-94: same timeline, the empty swing anim (knife_mp has no empty version, so the full
+# swing plays), then the quick raise.
+msec 50
+spawn an94_mp
+clip an94_mp 0
+hold melee
+run 1
+expect state MELEE_INIT
+expect anim MELEE_ATTACK_EMPTY
+release melee
+run 16
+expect state MELEE_END
+expect anim QUICK_RAISE
+run 8
+expect state READY

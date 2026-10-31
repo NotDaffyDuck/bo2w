@@ -4,18 +4,18 @@
 //! StartFiring (fire time, last shot, intro shots, fire delay, kick restriction), FireWeapon
 //! (ammo, events, the viewmodel fire anim), the bolt rechamber, the continuous-fire states
 //! (Death Machine / War Machine style), minigun and jet gun spin, charge shots and fuel tanks.
-//! Timing spec: docs/gun/FIRE.md.
+//! Timing spec: docs/gun/TRIGGER_SLOT.md.
 
-use fastfile_t6::layout::{WeaponDef as D, WeaponVariantDef as V};
+use fastfile_t6::layout::{WeaponDef, WeaponVariantDef};
 
 use super::Pm;
 use crate::anim;
 use crate::base;
 use crate::cmd::button;
-use crate::env::{ef2, pm_type};
+use crate::env::{ef2, movement_mode};
 use crate::events;
 use crate::events::AnimScript;
-use crate::facts::{fire_type, weap_type};
+use crate::facts::{fire_type, gun_family_code};
 use crate::player::wf;
 use crate::state;
 
@@ -59,13 +59,13 @@ pub struct FireFacts {
     pub hold_fire_time: i32,
     pub cont_fire_in_time: i32,
     pub cont_fire_out_time: i32,
-    pub fuse_time: i32,
+    pub detonation_delay: i32,
     /// `iJamFireTime`: a single-shot gun's trigger pressed again sooner than this may jam (the
     /// client's roll, see [`crate::facts::T6WeaponFacts::jam_window`]). 0 = never.
     pub jam_fire_time: i32,
     pub require_lockon_to_fire: bool,
-    pub rechamber_while_ads: bool,
-    pub ads_fire_only: bool,
+    pub rack_bolt_when_scoped: bool,
+    pub fire_only_when_scoped: bool,
     pub continuous_fire: bool,
     pub no_ads_auto_reload: bool,
     /// `iShotsBeforeRechamber` (0 = rechamber after every shot).
@@ -98,47 +98,47 @@ fn rd_i32(b: &[u8], at: usize) -> i32 {
 
 fn rd_f32(b: &[u8], at: usize) -> f32 {
     b.get(at..at + 4)
-        .map_or(0.0, |s| f32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        .map_or(0f32, |s| f32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-fn rd_bool(b: &[u8], at: usize) -> bool {
-    b.get(at).is_some_and(|&v| v != 0)
+fn rd_bool(b: &[u8], off: usize) -> bool {
+    b.get(off).is_some_and(|&v| v != 0)
 }
 
 impl FireFacts {
     pub fn read(variant: &[u8], def: &[u8]) -> Self {
         Self {
-            fire_delay: rd_i32(def, D::iFireDelay),
-            spin_up_time: rd_i32(def, D::iSpinUpTime),
-            spin_down_time: rd_i32(def, D::iSpinDownTime),
-            fire_time: rd_i32(def, D::iFireTime),
-            last_fire_time: rd_i32(def, D::iLastFireTime),
-            rechamber_time: rd_i32(def, D::iRechamberTime),
-            rechamber_bolt_time: rd_i32(def, D::iRechamberBoltTime),
-            hold_fire_time: rd_i32(def, D::iHoldFireTime),
-            cont_fire_in_time: rd_i32(def, D::contFireInTime),
-            cont_fire_out_time: rd_i32(def, D::contFireOutTime),
-            fuse_time: rd_i32(def, D::fuseTime),
-            jam_fire_time: rd_i32(def, D::iJamFireTime),
-            require_lockon_to_fire: rd_bool(def, D::requireLockonToFire),
-            rechamber_while_ads: rd_bool(def, D::bRechamberWhileAds),
-            ads_fire_only: rd_bool(def, D::adsFireOnly),
-            continuous_fire: rd_bool(def, D::bContinuousFire),
-            no_ads_auto_reload: rd_bool(def, D::bNoADSAutoReload),
-            shots_before_rechamber: rd_i32(def, D::iShotsBeforeRechamber),
-            freeze_movement_when_firing: rd_bool(def, D::freezeMovementWhenFiring),
-            ads_kick_reduced_bullets: rd_i32(def, D::adsGunKickReducedKickBullets),
-            hip_kick_reduced_bullets: rd_i32(def, D::hipGunKickReducedKickBullets),
-            intro_fire_time: rd_i32(def, D::iIntroFireTime),
-            intro_fire_length: rd_i32(def, D::iIntroFireLength),
-            overheat: rd_i32(def, D::overheatWeapon) != 0,
-            overheat_rate: rd_f32(def, D::overheatRate),
-            cooldown_rate: rd_f32(def, D::cooldownRate),
-            overheat_end_val: rd_f32(def, D::overheatEndVal),
-            cool_while_firing: rd_bool(def, D::coolWhileFiring),
-            fuel_tank: rd_bool(def, D::fuelTankWeapon),
-            tank_life_time: rd_i32(def, D::iTankLifeTime),
-            oo_pos_anim_length: rd_f32(variant, V::fOOPosAnimLength),
+            fire_delay: rd_i32(def, WeaponDef::iFireDelay),
+            spin_up_time: rd_i32(def, WeaponDef::iSpinUpTime),
+            spin_down_time: rd_i32(def, WeaponDef::iSpinDownTime),
+            fire_time: rd_i32(def, WeaponDef::iFireTime),
+            last_fire_time: rd_i32(def, WeaponDef::iLastFireTime),
+            rechamber_time: rd_i32(def, WeaponDef::iRechamberTime),
+            rechamber_bolt_time: rd_i32(def, WeaponDef::iRechamberBoltTime),
+            hold_fire_time: rd_i32(def, WeaponDef::iHoldFireTime),
+            cont_fire_in_time: rd_i32(def, WeaponDef::contFireInTime),
+            cont_fire_out_time: rd_i32(def, WeaponDef::contFireOutTime),
+            detonation_delay: rd_i32(def, WeaponDef::fuseTime),
+            jam_fire_time: rd_i32(def, WeaponDef::iJamFireTime),
+            require_lockon_to_fire: rd_bool(def, WeaponDef::requireLockonToFire),
+            rack_bolt_when_scoped: rd_bool(def, WeaponDef::bRechamberWhileAds),
+            fire_only_when_scoped: rd_bool(def, WeaponDef::adsFireOnly),
+            continuous_fire: rd_bool(def, WeaponDef::bContinuousFire),
+            no_ads_auto_reload: rd_bool(def, WeaponDef::bNoADSAutoReload),
+            shots_before_rechamber: rd_i32(def, WeaponDef::iShotsBeforeRechamber),
+            freeze_movement_when_firing: rd_bool(def, WeaponDef::freezeMovementWhenFiring),
+            ads_kick_reduced_bullets: rd_i32(def, WeaponDef::adsGunKickReducedKickBullets),
+            hip_kick_reduced_bullets: rd_i32(def, WeaponDef::hipGunKickReducedKickBullets),
+            intro_fire_time: rd_i32(def, WeaponDef::iIntroFireTime),
+            intro_fire_length: rd_i32(def, WeaponDef::iIntroFireLength),
+            overheat: rd_i32(def, WeaponDef::overheatWeapon) != 0,
+            overheat_rate: rd_f32(def, WeaponDef::overheatRate),
+            cooldown_rate: rd_f32(def, WeaponDef::cooldownRate),
+            overheat_end_val: rd_f32(def, WeaponDef::overheatEndVal),
+            cool_while_firing: rd_bool(def, WeaponDef::coolWhileFiring),
+            fuel_tank: rd_bool(def, WeaponDef::fuelTankWeapon),
+            tank_life_time: rd_i32(def, WeaponDef::iTankLifeTime),
+            oo_pos_anim_length: rd_f32(variant, WeaponVariantDef::fOOPosAnimLength),
         }
     }
 }
@@ -173,24 +173,24 @@ fn weapon_of(pm: &Pm, left: bool) -> u32 {
 }
 
 fn is_thrown(t: u8) -> bool {
-    t == weap_type::GRENADE || t == weap_type::MINE
+    t == gun_family_code::GRENADE || t == gun_family_code::MINE
 }
 
 /// BG_PlayerWeaponNeedsRechambered.
-fn needs_rechamber(pm: &Pm, weapon: u32) -> bool {
-    pm.ps.held(weapon).is_some_and(|h| h.needs_rechamber)
+fn needs_rechamber(pm: &Pm, gun: u32) -> bool {
+    pm.ps.held(gun).is_some_and(|h| h.needs_rechamber)
 }
 
 /// BG_PlayerWeaponSetNeedsRechamber.
-fn set_needs_rechamber(pm: &mut Pm, weapon: u32, on: bool) {
-    if let Some(h) = pm.ps.held_mut(weapon) {
+fn set_needs_rechamber(pm: &mut Pm, gun: u32, on: bool) {
+    if let Some(h) = pm.ps.held_mut(gun) {
         h.needs_rechamber = on;
     }
 }
 
 /// BG_PlayerWeaponOverheating: `weapon` overheats and the held gun is over its limit.
-fn overheating(pm: &Pm, weapon: u32) -> bool {
-    pm.facts.get(weapon).fire.overheat
+fn overheating(pm: &Pm, gun: u32) -> bool {
+    pm.facts.get(gun).fire.overheat
         && pm
             .ps
             .held(pm.ps.weapon)
@@ -198,9 +198,9 @@ fn overheating(pm: &Pm, weapon: u32) -> bool {
 }
 
 /// BG_GetFireTime.
-fn fire_time(pm: &Pm, weapon: u32) -> i32 {
-    let t = pm.facts.get(weapon).fire.fire_time;
-    let t = (t as f32 * fire_time_attachment_scale(pm, weapon)) as i32;
+fn fire_time(pm: &Pm, gun: u32) -> i32 {
+    let t = pm.facts.get(gun).fire.fire_time;
+    let t = (t as f32 * fire_time_attachment_scale(pm, gun)) as i32;
     if pm.env.rapid_fire { (t / 3).max(30) } else { t }
 }
 
@@ -223,13 +223,13 @@ fn ammo_required(pm: &Pm) -> i32 {
 }
 
 /// PM_WeaponUseAmmo: the clip left (sustain ammo keeps it full and says 1).
-fn use_ammo(pm: &mut Pm, weapon: u32, amount: i32) -> i32 {
+fn use_ammo(pm: &mut Pm, gun: u32, amount: i32) -> i32 {
     if pm.env.dvars.player_sustain_ammo {
         return 1;
     }
-    let clip = pm.ps.ammo_in_clip(pm.facts, weapon);
+    let clip = pm.ps.ammo_in_clip(pm.facts, gun);
     let left = (clip - amount.min(clip)).max(0);
-    pm.ps.set_ammo_in_clip(pm.facts, weapon, left);
+    pm.ps.set_ammo_in_clip(pm.facts, gun, left);
     left
 }
 
@@ -239,21 +239,21 @@ fn clip_empty(pm: &Pm) -> bool {
 }
 
 /// BG_CheckIfLastShot: this shot (or this burst) empties the clip.
-fn is_last_shot(pm: &Pm, weapon: u32) -> bool {
-    let clip = pm.ps.ammo_in_clip(pm.facts, weapon);
-    match pm.facts.get(weapon).core.fire_type {
+fn is_last_shot(pm: &Pm, gun: u32) -> bool {
+    let clip = pm.ps.ammo_in_clip(pm.facts, gun);
+    match pm.facts.get(gun).core.fire_type {
         t @ fire_type::BURSTFIRE2..=fire_type::BURSTFIRE5 => clip < i32::from(t) + 1,
         _ => clip < 2,
     }
 }
 
 /// ShotLimitReached: the trigger has fired all the shots one pull allows.
-fn shot_limit_reached(pm: &Pm, weapon: u32, count: u32) -> bool {
+fn shot_limit_reached(pm: &Pm, gun: u32, count: u32) -> bool {
     let held = pm.weapon_facts().core;
     if held.fire_type == fire_type::STACKED {
-        return held.clip_size <= count as i32;
+        return held.magazine_capacity <= count as i32;
     }
-    match pm.facts.get(weapon).core.fire_type {
+    match pm.facts.get(gun).core.fire_type {
         fire_type::CHARGESHOT => pm.ps.charge_shot_level <= count as i32,
         t if rapid_auto(pm, t) => false,
         fire_type::SINGLESHOT => count >= 1,
@@ -263,11 +263,11 @@ fn shot_limit_reached(pm: &Pm, weapon: u32, count: u32) -> bool {
 }
 
 /// Spin progress per frame for a spin time (0 = instant).
-fn spin_step(msec: i32, time: i32) -> f32 {
-    if time <= 0 {
+fn spin_step(msec: i32, elapsed: i32) -> f32 {
+    if elapsed <= 0 {
         1.0
     } else {
-        msec as f32 / time as f32
+        msec as f32 / elapsed as f32
     }
 }
 
@@ -287,7 +287,7 @@ pub fn burst_fire_pending(pm: &Pm, left: bool) -> bool {
     {
         return false;
     }
-    let count = pm.ps.hand(left).shot_count;
+    let count = pm.ps.hand(left).rounds_fired;
     if count == 0 {
         return false;
     }
@@ -302,16 +302,16 @@ pub fn burst_fire_pending(pm: &Pm, left: bool) -> bool {
 pub fn burst_waiting_for_trigger_release(pm: &Pm) -> bool {
     let left = pm.left();
     let h = pm.hand();
-    if (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&h.state)
-        || (state::CRAWL_IN..=state::CRAWL_LEFT).contains(&h.state)
-        || pm.ps.weap_flags & wf::WEAPONS_DISABLED != 0
+    if (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&h.phase)
+        || (state::CRAWL_IN..=state::CRAWL_LEFT).contains(&h.phase)
+        || pm.ps.weapon_state_bits & wf::WEAPONS_DISABLED != 0
     {
         return false;
     }
     let w = pm.hand_weapon();
     let hc = pm.hand_facts().core;
-    let limit = !trigger_pull_pending(pm, left) && shot_limit_reached(pm, w, h.shot_count);
-    let hold = is_thrown(hc.weap_type) && hc.hold_button_to_throw;
+    let limit = !trigger_pull_pending(pm, left) && shot_limit_reached(pm, w, h.rounds_fired);
+    let hold = is_thrown(hc.gun_family_code) && hc.hold_button_to_throw;
     if !(limit || hold) {
         return false;
     }
@@ -330,7 +330,7 @@ pub fn trigger_pull_pending(pm: &Pm, left: bool) -> bool {
     } else {
         wf::PENDING_PULL_RIGHT
     };
-    pm.ps.weap_flags & bit != 0
+    pm.ps.weapon_state_bits & bit != 0
 }
 
 /// PM_GetWeaponFireButton: the button that fires this hand of the held weapon.
@@ -339,10 +339,10 @@ pub fn trigger_pull_pending(pm: &Pm, left: bool) -> bool {
 pub fn fire_button(pm: &Pm, left: bool) -> u32 {
     let c = pm.weapon_facts().core;
     if (pm.env.zombies || !pm.env.dvars.tu5_uav_ads_fix)
-        && is_thrown(c.weap_type)
+        && is_thrown(c.gun_family_code)
         && c.has_detonator
     {
-        return button::ADS;
+        return button::AIM_BIT;
     }
     super::dual::fire_button(c.dual_wield, left, super::dual::last_input_was_pad(pm.cmd))
 }
@@ -358,11 +358,11 @@ pub fn update_pending_trigger_pull(pm: &mut Pm) {
         return;
     }
     let pad = super::dual::last_input_was_pad(pm.cmd);
-    if pm.cmd.pressed(super::dual::fire_button(true, false, pad)) {
-        pm.ps.weap_flags |= wf::PENDING_PULL_RIGHT;
+    if pm.cmd.went_down(super::dual::fire_button(true, false, pad)) {
+        pm.ps.weapon_state_bits |= wf::PENDING_PULL_RIGHT;
     }
-    if pm.cmd.pressed(super::dual::fire_button(true, true, pad)) {
-        pm.ps.weap_flags |= wf::PENDING_PULL_LEFT;
+    if pm.cmd.went_down(super::dual::fire_button(true, true, pad)) {
+        pm.ps.weapon_state_bits |= wf::PENDING_PULL_LEFT;
     }
 }
 
@@ -370,11 +370,11 @@ pub fn update_pending_trigger_pull(pm: &mut Pm) {
 pub fn update_spin(pm: &mut Pm) {
     let wfacts = pm.weapon_facts();
     let f = wfacts.fire;
-    let msec = pm.cmd.msec;
+    let msec = pm.cmd.frame_ms;
     match wfacts.core.fire_type {
         fire_type::MINIGUN => {
             let mut lerp = pm.ps.weapon_spin_lerp;
-            if pm.cmd.held(button::ATTACK | button::ADS) {
+            if pm.cmd.held(button::FIRE_BIT | button::AIM_BIT) {
                 pm.env.e_flags2 |= EF2_SPINNING;
                 lerp += spin_step(msec, f.spin_up_time);
             } else {
@@ -384,12 +384,12 @@ pub fn update_spin(pm: &mut Pm) {
             pm.ps.weapon_spin_lerp = lerp.clamp(0.0, 1.0);
         }
         fire_type::JETGUN => {
-            let rate = if (state::RAISING..=state::DROPPING_ALTSWITCH).contains(&pm.ps.weaponstate)
+            let rate = if (state::RAISING..=state::DROPPING_ALTSWITCH).contains(&pm.ps.gun_phase)
             {
                 pm.env.e_flags2 &= !EF2_SPINNING;
                 0.0
             } else {
-                let on = pm.cmd.held(button::ATTACK) && !overheating(pm, pm.ps.weapon);
+                let on = pm.cmd.held(button::FIRE_BIT) && !overheating(pm, pm.ps.weapon);
                 if on {
                     pm.env.e_flags2 |= EF2_SPINNING;
                 } else {
@@ -409,7 +409,7 @@ pub fn update_spin(pm: &mut Pm) {
 }
 
 fn clear_charge(pm: &mut Pm) {
-    pm.ps.weap_flags &= !wf::CHARGE_SHOT;
+    pm.ps.weapon_state_bits &= !wf::CHARGE_SHOT;
     pm.ps.charge_shot_timer = 0;
     pm.ps.charge_shot_level = 0;
 }
@@ -423,32 +423,32 @@ pub fn update_charge_shot(pm: &mut Pm) {
     let d = pm.env.dvars;
     let clip = pm.ps.ammo_in_clip(pm.facts, pm.ps.weapon);
     let mut most = clip.min(d.bg_charge_shot_max_bullets_in_queue);
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     let busy = (state::RELOADING..=state::RELOAD_QUICK_EMPTY).contains(&s)
         || (state::CRAWL_IN..=state::CRAWL_OUT).contains(&s)
         || s == state::RECHAMBER_START
         || s == state::RECHAMBERING
         || (state::RAISING..=state::DROPPING_ALTSWITCH).contains(&s)
         || (state::DTP_IN..=state::DTP_OUT).contains(&s);
-    if !pm.cmd.held(button::ATTACK) {
+    if !pm.cmd.held(button::FIRE_BIT) {
         return;
     }
-    if !pm.cmd.was_held(button::ATTACK) && clip != 0 && !busy {
-        pm.ps.weap_flags |= wf::CHARGE_SHOT;
+    if !pm.cmd.was_held(button::FIRE_BIT) && clip != 0 && !busy {
+        pm.ps.weapon_state_bits |= wf::CHARGE_SHOT;
         pm.ps.charge_shot_level = 0;
         pm.ps.charge_shot_timer = 0;
         return;
     }
-    if pm.ps.weap_flags & wf::CHARGE_SHOT == 0 || busy {
+    if pm.ps.weapon_state_bits & wf::CHARGE_SHOT == 0 || busy {
         return;
     }
-    pm.ps.charge_shot_timer += pm.cmd.msec;
+    pm.ps.charge_shot_timer += pm.cmd.frame_ms;
     let mut level = pm.ps.charge_shot_timer / d.bg_charge_shot_queue_time + 1;
     let f = wfacts.fire;
-    if wfacts.core.bolt_action && f.shots_before_rechamber != 0 {
+    if wfacts.core.manual_cycle && f.shots_before_rechamber != 0 {
         most = most.min(f.shots_before_rechamber - pm.ps.shots_fired_from_chamber);
     }
-    if pm.env.other_flags & OF_EMP != 0 {
+    if pm.env.secondary_state_bits & OF_EMP != 0 {
         most = most.min(d.bg_charge_shot_max_bullet_queue_on_emp);
     }
     if most <= level {
@@ -457,12 +457,12 @@ pub fn update_charge_shot(pm: &mut Pm) {
             && d.bg_charge_shot_auto_discharge_delay
                 < pm.ps.charge_shot_timer - (most - 1) * d.bg_charge_shot_queue_time
         {
-            pm.add_predictable_event(events::EV_CHARGESHOT_DISCHARGEWEAPON, 0);
+            pm.queue_forecast_happening(events::EV_CHARGESHOT_DISCHARGEWEAPON, 0);
             return clear_charge(pm);
         }
     }
     if pm.ps.charge_shot_level < level {
-        pm.add_predictable_event(
+        pm.queue_forecast_happening(
             events::EV_INC_CHARGESHOT_LEVEL,
             pm.ps.charge_shot_level as u32,
         );
@@ -474,13 +474,31 @@ pub fn update_charge_shot(pm: &mut Pm) {
 fn should_fire_charge_shot(pm: &Pm) -> bool {
     let d = &pm.env.dvars;
     let level = pm.ps.charge_shot_level;
-    let released = !pm.cmd.held(button::ATTACK) && pm.cmd.was_held(button::ATTACK);
+    let released = !pm.cmd.held(button::FIRE_BIT) && pm.cmd.was_held(button::FIRE_BIT);
     let full = level > 1
         && d.bg_charge_shot_fire_when_queue_reaches_max
         && d.bg_charge_shot_max_bullets_in_queue <= level
         && d.bg_charge_shot_auto_fire_delay
             < pm.ps.charge_shot_timer - (level - 1) * d.bg_charge_shot_queue_time;
-    (released || full) && pm.ps.weap_flags & wf::CHARGE_SHOT != 0
+    (released || full) && pm.ps.weapon_state_bits & wf::CHARGE_SHOT != 0
+}
+
+/// G_GetWeaponDefBasedOnNumberOfBullets: the weapon a charge shot of `bullets` (the fire
+/// event's parm) fires: one step down the alt chain per bullet past the first. Any other
+/// weapon fires itself.
+pub fn weapon_for_bullets(facts: &crate::facts::FactsTable, bullets: u32, weapon: u32) -> u32 {
+    let c = facts.get(weapon).core;
+    if c.fire_type != fire_type::CHARGESHOT || c.alt_weapon == 0 {
+        return weapon;
+    }
+    let mut w = weapon;
+    for _ in 1..bullets {
+        let c = facts.get(w).core;
+        if c.carry_slot_kind != crate::facts::inventory::ALTMODE && c.alt_weapon != 0 {
+            w = c.alt_weapon;
+        }
+    }
+    w
 }
 
 /// PM_Weapon_CheckForFuelTime: a fuel-tank gun burns fuel while it fires.
@@ -491,14 +509,14 @@ pub fn check_for_fuel_time(pm: &mut Pm) {
     }
     let mut h = pm.hand();
     if !matches!(
-        h.state,
+        h.phase,
         state::FIRING | state::RECHAMBER_START | state::RECHAMBERING | state::CONT_FIRE_LOOP
     ) {
         return;
     }
     let w = pm.ps.weapon;
     // BO2 adds the frame time here.
-    let msec = pm.cmd.msec;
+    let msec = pm.cmd.frame_ms;
     let Some(held) = pm.ps.held_mut(w) else {
         return;
     };
@@ -506,22 +524,22 @@ pub fn check_for_fuel_time(pm: &mut Pm) {
     if held.fuel_tank_time > f.tank_life_time {
         held.fuel_tank_time = f.tank_life_time;
         pm.ps.set_ammo_in_clip(pm.facts, w, 0);
-        h.state = state::READY;
+        h.phase = state::READY;
         pm.set_hand(h);
     }
 }
 
 fn cont_fire_in(pm: &mut Pm) {
-    pm.ps.weaponstate = state::CONT_FIRE_IN;
-    pm.ps.weapon_time = pm.weapon_facts().fire.cont_fire_in_time;
-    pm.ps.weapon_delay = 0;
+    pm.ps.gun_phase = state::CONT_FIRE_IN;
+    pm.ps.gun_timer_ms = pm.weapon_facts().fire.cont_fire_in_time;
+    pm.ps.weapon_ready_wait = 0;
     base::start_anim(pm, anim::CONT_FIRE_IN, false);
 }
 
 fn cont_fire_out(pm: &mut Pm) {
-    pm.ps.weaponstate = state::CONT_FIRE_OUT;
-    pm.ps.weapon_time = pm.weapon_facts().fire.cont_fire_out_time;
-    pm.ps.weapon_delay = 0;
+    pm.ps.gun_phase = state::CONT_FIRE_OUT;
+    pm.ps.gun_timer_ms = pm.weapon_facts().fire.cont_fire_out_time;
+    pm.ps.weapon_ready_wait = 0;
     base::start_anim(pm, anim::CONT_FIRE_OUT, false);
 }
 
@@ -534,7 +552,7 @@ pub fn check_for_continuous_fire(pm: &mut Pm, r: i32) {
     if pm.env.waterlevel >= WATER_DEEP && pm.env.dvars.player_disable_weapons_in_water {
         return;
     }
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     let firing = matches!(
         s,
         state::FIRING | state::RECHAMBER_START | state::RECHAMBERING
@@ -565,15 +583,15 @@ pub fn check_for_continuous_fire(pm: &mut Pm, r: i32) {
 /// ContinuousFire_State_Loop (state CONT_FIRE_IN finished): the loop runs until the trigger
 /// lets go.
 pub fn continuous_fire_loop(pm: &mut Pm) {
-    pm.ps.weaponstate = state::CONT_FIRE_LOOP;
-    pm.ps.weapon_time = 0;
-    pm.ps.weapon_delay = 0;
+    pm.ps.gun_phase = state::CONT_FIRE_LOOP;
+    pm.ps.gun_timer_ms = 0;
+    pm.ps.weapon_ready_wait = 0;
     base::start_anim(pm, anim::CONT_FIRE_LOOP, false);
 }
 
 /// PM_Weapon_CheckForRechamber: `true` ends the tick.
 pub fn check_for_rechamber(pm: &mut Pm, r: i32) -> bool {
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     if (state::OFFHAND_INIT..=state::OFFHAND_END).contains(&s)
         || (state::DTP_IN..=state::DTP_OUT).contains(&s)
         || (state::RIOTSHIELD_PREPARE..=state::RIOTSHIELD_END).contains(&s)
@@ -581,17 +599,17 @@ pub fn check_for_rechamber(pm: &mut Pm, r: i32) -> bool {
         return false;
     }
     let wfacts = pm.weapon_facts();
-    if !wfacts.core.bolt_action || !needs_rechamber(pm, pm.ps.weapon) {
+    if !wfacts.core.manual_cycle || !needs_rechamber(pm, pm.ps.weapon) {
         return false;
     }
     if s == state::RECHAMBER_START && r != 0 {
         // The bolt is back: the brass comes out.
-        pm.ps.weaponstate = state::RECHAMBERING;
+        pm.ps.gun_phase = state::RECHAMBERING;
         pm.add_event(events::EV_EJECT_BRASS);
-        if pm.ps.weapon_time != 0 {
+        if pm.ps.gun_timer_ms != 0 {
             return true;
         }
-    } else if pm.ps.weapon_time != 0
+    } else if pm.ps.gun_timer_ms != 0
         && (matches!(
             s,
             state::FIRING
@@ -601,29 +619,29 @@ pub fn check_for_rechamber(pm: &mut Pm, r: i32) -> bool {
                 | state::MELEE_INIT
                 | state::MELEE_FIRE
                 | state::MELEE_END
-        ) || pm.ps.weapon_delay != 0)
+        ) || pm.ps.weapon_ready_wait != 0)
     {
         return false;
     }
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     if s == state::RECHAMBERING {
         finish_rechamber(pm);
         return false;
     }
     if s == state::READY || (state::CRAWL_IN..=state::CRAWL_OUT).contains(&s) {
         let f = wfacts.fire;
-        let a = if pm.ps.f_weapon_pos_frac <= ADS_ANIM_FRAC {
-            anim::RECHAMBER
+        let a = if pm.ps.weapon_raise_fraction <= ADS_ANIM_FRAC {
+            anim::BOLT_CYCLE
         } else {
-            anim::ADS_RECHAMBER
+            anim::ADS_BOLT_CYCLE
         };
         base::start_anim(pm, a, false);
-        pm.ps.weaponstate = state::RECHAMBER_START;
-        pm.ps.weapon_time = f.rechamber_time;
+        pm.ps.gun_phase = state::RECHAMBER_START;
+        pm.ps.gun_timer_ms = f.rechamber_time;
         if f.shots_before_rechamber != 0 {
             pm.ps.shots_fired_from_chamber = 0;
         }
-        pm.ps.weapon_delay =
+        pm.ps.weapon_ready_wait =
             if f.rechamber_bolt_time != 0 && f.rechamber_bolt_time < f.rechamber_time {
                 f.rechamber_bolt_time
             } else {
@@ -637,16 +655,16 @@ pub fn check_for_rechamber(pm: &mut Pm, r: i32) -> bool {
 /// PM_Weapon_FinishRechamber.
 pub fn finish_rechamber(pm: &mut Pm) {
     let left = pm.left();
-    let right_playing = pm.ps.weap_anim & !anim::TOGGLE != 0;
+    let right_playing = pm.ps.gun_clip & !anim::TOGGLE != 0;
     let left_playing = pm.ps.weap_anim_left & !anim::TOGGLE != 0;
-    if (right_playing || left) && (left_playing || !left) && pm.env.pm_type < pm_type::DEAD {
-        pm.ps.weap_anim = !pm.ps.weap_anim & anim::TOGGLE;
+    if (right_playing || left) && (left_playing || !left) && pm.env.movement_mode < movement_mode::DEAD {
+        pm.ps.gun_clip = !pm.ps.gun_clip & anim::TOGGLE;
     }
     let w = pm.ps.weapon;
     set_needs_rechamber(pm, w, false);
-    pm.ps.weaponstate = state::READY;
+    pm.ps.gun_phase = state::READY;
     let wfacts = pm.weapon_facts();
-    if wfacts.core.bolt_action && wfacts.fire.shots_before_rechamber != 0 {
+    if wfacts.core.manual_cycle && wfacts.fire.shots_before_rechamber != 0 {
         pm.ps.shots_fired_from_chamber = 0;
     }
     if wfacts.core.fire_type == fire_type::CHARGESHOT {
@@ -668,12 +686,12 @@ fn should_be_firing_owed(pm: &mut Pm, delay_fired: bool, check_only: bool) -> bo
         return false;
     }
     let wfacts = pm.weapon_facts();
-    if wfacts.core.weap_type == weap_type::RIOTSHIELD {
+    if wfacts.core.gun_family_code == gun_family_code::RIOTSHIELD {
         return false;
     }
     let left = pm.left();
     let mut held = pm.cmd.held(fire_button(pm, left));
-    if wfacts.fire.freeze_movement_when_firing && !pm.env.on_ground {
+    if wfacts.fire.freeze_movement_when_firing && !pm.env.grounded_now {
         held = false;
     }
     // In BO2 a gun marked usable in vehicles never fires from the trigger here.
@@ -686,7 +704,7 @@ fn should_be_firing_owed(pm: &mut Pm, delay_fired: bool, check_only: bool) -> bo
         fire_type::CHARGESHOT => held = should_fire_charge_shot(pm),
         _ => {}
     }
-    let chamber_empty = wfacts.core.bolt_action
+    let chamber_empty = wfacts.core.manual_cycle
         && wfacts.fire.shots_before_rechamber != 0
         && needs_rechamber(pm, pm.ps.weapon);
     if !chamber_empty && (held || owed) {
@@ -697,15 +715,15 @@ fn should_be_firing_owed(pm: &mut Pm, delay_fired: bool, check_only: bool) -> bo
     }
     if left && wfacts.core.dual_wield {
         if pm.ps.weaponstate_left == state::FIRING {
-            base::continue_anim(pm, anim::IDLE);
+            base::continue_anim(pm, anim::REST);
         }
         pm.ps.weaponstate_left = state::READY;
         return false;
     }
-    if pm.ps.weaponstate == state::FIRING && !pm.env.mantle_weapon_equipped {
-        base::continue_anim(pm, anim::IDLE);
+    if pm.ps.gun_phase == state::FIRING && !pm.env.mantle_weapon_equipped {
+        base::continue_anim(pm, anim::REST);
     }
-    pm.ps.weaponstate = state::READY;
+    pm.ps.gun_phase = state::READY;
     false
 }
 
@@ -726,12 +744,12 @@ fn check_firing_ammo(pm: &mut Pm) -> bool {
     }
     // A dual-wield left gun spends its partner's spare ammo.
     let stock = pm.ps.ammo_not_in_clip(pm.facts, w);
-    if !hc.fire.no_ads_auto_reload || pm.ps.f_weapon_pos_frac != 1.0 {
+    if !hc.fire.no_ads_auto_reload || pm.ps.weapon_raise_fraction != 1.0 {
         if needed <= stock {
             crate::pm::reload::begin_weapon_reload(pm);
             return false;
         }
-        if !is_thrown(hc.core.weap_type) {
+        if !is_thrown(hc.core.gun_family_code) {
             let ev = if pm.left() {
                 events::EV_NOAMMO_LEFT
             } else {
@@ -742,8 +760,8 @@ fn check_firing_ammo(pm: &mut Pm) -> bool {
     }
     if !pm.env.mantle_weapon_equipped {
         set_needs_rechamber(pm, w, false);
-        base::continue_anim(pm, anim::IDLE);
-        if !is_thrown(hc.core.weap_type) {
+        base::continue_anim(pm, anim::REST);
+        if !is_thrown(hc.core.gun_family_code) {
             let mut h = pm.hand();
             h.time += DRY_FIRE_MS;
             pm.set_hand(h);
@@ -758,23 +776,23 @@ fn start_firing(pm: &mut Pm) {
     let wfacts = pm.facts.get(w);
     let (c, f) = (wfacts.core, wfacts.fire);
     let mut h = pm.hand();
-    if h.state != state::FIRING {
+    if h.phase != state::FIRING {
         pm.ps.intro_shots_fired = 0;
     }
     let mut script = true;
-    if is_thrown(c.weap_type) {
+    if is_thrown(c.gun_family_code) {
         if !pm.delay_fired {
             if pm.ps.ammo_in_clip(pm.facts, w) != 0 {
-                pm.ps.grenade_time_left = f.fuse_time;
-                if pm.env.pm_type < pm_type::DEAD {
-                    pm.ps.weap_anim = anim::start(pm.ps.weap_anim, anim::HOLD_FIRE);
-                    pm.ps.weap_anim_left = anim::start(pm.ps.weap_anim_left, anim::HOLD_FIRE);
+                pm.ps.cook_remaining = f.detonation_delay;
+                if pm.env.movement_mode < movement_mode::DEAD {
+                    pm.ps.gun_clip = anim::start(pm.ps.gun_clip, anim::FIRE_HELD);
+                    pm.ps.weap_anim_left = anim::start(pm.ps.weap_anim_left, anim::FIRE_HELD);
                 }
                 let parm = pm.ps.weapon;
-                pm.add_predictable_event(events::EV_PULLBACK_WEAPON, parm);
+                pm.queue_forecast_happening(events::EV_PULLBACK_WEAPON, parm);
             }
-            pm.ps.weapon_delay = f.hold_fire_time;
-            pm.ps.weapon_time = 0;
+            pm.ps.weapon_ready_wait = f.hold_fire_time;
+            pm.ps.gun_timer_ms = 0;
             pm.server_print("end weapon (start fire)");
             script = false;
         }
@@ -786,26 +804,26 @@ fn start_firing(pm: &mut Pm) {
         } else {
             fire_time(pm, w)
         };
-        if c.bolt_action && f.shots_before_rechamber == 0 {
+        if c.manual_cycle && f.shots_before_rechamber == 0 {
             set_needs_rechamber(pm, w, true);
         }
-        if h.state != state::FIRING && h.state != state::CONT_FIRE_LOOP {
+        if h.phase != state::FIRING && h.phase != state::CONT_FIRE_LOOP {
             h.delay = if pm.env.rapid_fire { 0 } else { f.fire_delay };
-            let kick_bullets = if pm.ps.f_weapon_pos_frac < 1.0 {
+            let kick_bullets = if pm.ps.weapon_raise_fraction < 1.0 {
                 f.hip_kick_reduced_bullets
             } else {
                 f.ads_kick_reduced_bullets
             };
-            pm.ps.weapon_restrict_kick_time = fire_time(pm, w) * kick_bullets + f.fire_delay;
+            pm.ps.gun_lockout_kick_stamp = fire_time(pm, w) * kick_bullets + f.fire_delay;
         }
-        if f.ads_fire_only && c.fire_type != fire_type::MINIGUN {
+        if f.fire_only_when_scoped && c.fire_type != fire_type::MINIGUN {
             // Fire waits until the sights are up.
             let ads_in_ms = 1.0 / (f.oo_pos_anim_length / ads_trans_in_scale(pm, w));
-            let wait = (ads_in_ms * (1.0 - pm.ps.f_weapon_pos_frac)) as i32;
+            let wait = (ads_in_ms * (1.0 - pm.ps.weapon_raise_fraction)) as i32;
             h.delay = h.delay.max(wait);
         }
         if c.guided_missile_type == GUIDED_TV {
-            pm.ps.weap_flags |= wf::TV_GUIDED_START;
+            pm.ps.weapon_state_bits |= wf::TV_GUIDED_START;
         }
         pm.set_hand(h);
         if pm.env.shellshock_anim || !pm.env.view_height_settled {
@@ -817,10 +835,10 @@ fn start_firing(pm: &mut Pm) {
     }
     base::set_prone_override(pm);
     let mut h = pm.hand();
-    if !(state::CONT_FIRE_IN..=state::CONT_FIRE_OUT).contains(&h.state) {
-        h.state = state::FIRING;
+    if !(state::CONT_FIRE_IN..=state::CONT_FIRE_OUT).contains(&h.phase) {
+        h.phase = state::FIRING;
     }
-    if c.bolt_action && f.shots_before_rechamber != 0 {
+    if c.manual_cycle && f.shots_before_rechamber != 0 {
         pm.ps.shots_fired_from_chamber += if c.fire_type == fire_type::CHARGESHOT {
             pm.ps.charge_shot_level
         } else {
@@ -831,18 +849,18 @@ fn start_firing(pm: &mut Pm) {
         }
     }
     if h.delay == 0 && c.fire_type != fire_type::FULLAUTO {
-        h.shot_count = (h.shot_count + 1).min(MAX_SHOT_COUNT);
+        h.rounds_fired = (h.rounds_fired + 1).min(MAX_SHOT_COUNT);
     }
     pm.set_hand(h);
 }
 
 /// PM_Weapon_SetFPSFireAnim: hip or ADS fire anim, last-shot version on an empty clip.
 fn set_fps_fire_anim(pm: &mut Pm) {
-    if pm.ps.weap_anim & !anim::TOGGLE == anim::MANTLE {
+    if pm.ps.gun_clip & !anim::TOGGLE == anim::MANTLE {
         return;
     }
     let empty = clip_empty(pm);
-    let a = match (pm.ps.f_weapon_pos_frac <= ADS_ANIM_FRAC, empty) {
+    let a = match (pm.ps.weapon_raise_fraction <= ADS_ANIM_FRAC, empty) {
         (true, false) => anim::ATTACK,
         (true, true) => anim::ATTACK_LASTSHOT,
         (false, false) => anim::ADS_ATTACK,
@@ -859,9 +877,9 @@ pub const JAM_MS: i32 = 2000;
 /// PM_Weapon_Jam: the gun jams instead of firing (the client's quick-tap roll set
 /// [`button::JAM`]). BO2 writes the right-hand fields whatever hand is running.
 fn jam(pm: &mut Pm) {
-    pm.ps.weaponstate = state::JAMMED;
-    pm.ps.weapon_time = JAM_MS;
-    pm.ps.weapon_delay = JAM_MS;
+    pm.ps.gun_phase = state::JAMMED;
+    pm.ps.gun_timer_ms = JAM_MS;
+    pm.ps.weapon_ready_wait = JAM_MS;
     base::start_anim(pm, anim::JAM, false);
     base::set_prone_override(pm);
     pm.add_event(events::EV_JAM_WEAPON);
@@ -873,32 +891,32 @@ pub fn fire_weapon(pm: &mut Pm) {
     if pm.env.waterlevel >= WATER_DEEP && pm.env.dvars.player_disable_weapons_in_water {
         return;
     }
-    if c.weap_type == weap_type::MELEE {
+    if c.gun_family_code == gun_family_code::CLOSE_COMBAT {
         return;
     }
-    if c.weap_type == weap_type::GRENADE && !allow_plant(pm) {
-        pm.ps.weapon_time = NO_PLANT_MS;
+    if c.gun_family_code == gun_family_code::GRENADE && !allow_plant(pm) {
+        pm.ps.gun_timer_ms = NO_PLANT_MS;
         pm.add_event(events::EV_CANNOTPLANT);
         return;
     }
     if f.overheat && overheating(pm, pm.ps.weapon) {
         return;
     }
-    if c.guided_missile_type == GUIDED_TV && !pm.env.on_ground {
+    if c.guided_missile_type == GUIDED_TV && !pm.env.grounded_now {
         return;
     }
     if !c.unlimited_ammo && !check_firing_ammo(pm) {
         return;
     }
     if c.fire_type == fire_type::CHARGESHOT {
-        pm.ps.weap_flags &= !wf::CHARGE_SHOT;
+        pm.ps.weapon_state_bits &= !wf::CHARGE_SHOT;
         pm.ps.charge_shot_timer = 0;
     }
     start_firing(pm);
     if pm.hand().delay != 0 {
         return;
     }
-    pm.ps.weap_flags &= !(wf::PENDING_PULL_RIGHT | wf::PENDING_PULL_LEFT);
+    pm.ps.weapon_state_bits &= !(wf::PENDING_PULL_RIGHT | wf::PENDING_PULL_LEFT);
     // A lock-on launcher with no lock (or too close, or no headroom) shows the hint and does not
     // shoot; the trigger was still pulled, so the timers above stand.
     if f.require_lockon_to_fire {
@@ -922,7 +940,7 @@ pub fn fire_weapon(pm: &mut Pm) {
     }
     let left = pm.left();
     let hw = pm.hand_weapon();
-    if pm.ps.ammo_in_clip(pm.facts, hw) != 0 && !f.fuel_tank && pm.env.e_flags & EF_NO_AMMO_USE == 0 {
+    if pm.ps.ammo_in_clip(pm.facts, hw) != 0 && !f.fuel_tank && pm.env.ent_bits & EF_NO_AMMO_USE == 0 {
         let need = ammo_required(pm);
         if !left || !c.dual_wield {
             let w = pm.ps.weapon;
@@ -933,20 +951,20 @@ pub fn fire_weapon(pm: &mut Pm) {
             use_ammo(pm, c.dual_wield_weapon, need);
         }
     }
-    if is_thrown(c.weap_type) {
-        pm.ps.weapon_time = fire_time(pm, pm.ps.weapon);
+    if is_thrown(c.gun_family_code) {
+        pm.ps.gun_timer_ms = fire_time(pm, pm.ps.weapon);
     }
     pm.ps.intro_shots_fired = (pm.ps.intro_shots_fired + 1).clamp(0, MAX_INTRO_SHOTS);
-    if !(state::CONT_FIRE_IN..=state::CONT_FIRE_OUT).contains(&pm.ps.weaponstate) {
+    if !(state::CONT_FIRE_IN..=state::CONT_FIRE_OUT).contains(&pm.ps.gun_phase) {
         set_fps_fire_anim(pm);
     }
     if c.guided_missile_type == GUIDED_TV {
-        pm.ps.weap_flags |= wf::TV_GUIDED_FIRED;
+        pm.ps.weapon_state_bits |= wf::TV_GUIDED_FIRED;
     }
     let parm = if c.fire_type == fire_type::CHARGESHOT {
         pm.ps.charge_shot_level as u32
     } else {
-        pm.hand().shot_count
+        pm.hand().rounds_fired
     };
     let ev = match (clip_empty(pm), left) {
         (false, false) => events::EV_FIRE_WEAPON,
@@ -954,9 +972,9 @@ pub fn fire_weapon(pm: &mut Pm) {
         (true, false) => events::EV_FIRE_WEAPON_LASTSHOT,
         (true, true) => events::EV_FIRE_WEAPON_LASTSHOT_LEFT,
     };
-    pm.add_predictable_event(ev, parm);
+    pm.queue_forecast_happening(ev, parm);
     crate::pm::ads::hold_breath_fire(pm);
-    crate::pm::spread::add_firing_aim_spread(pm);
+    crate::pm::spread::widen_cone_on_shot(pm);
     crate::tick::switch_if_empty(pm);
 }
 
@@ -967,7 +985,7 @@ mod tests {
     use crate::env::T6Env;
     use crate::facts::{FactsTable, T6WeaponFacts, fire_type};
     use crate::player::T6WeaponPs;
-    use crate::{anim, events, state, tick};
+    use {crate::anim, crate::events, crate::state, crate::tick};
 
     const GUN: u32 = 1;
 
@@ -981,7 +999,7 @@ mod tests {
     impl Rig {
         fn new(edit: impl FnOnce(&mut T6WeaponFacts)) -> Self {
             let mut f = T6WeaponFacts::default();
-            f.core.clip_size = 30;
+            f.core.magazine_capacity = 30;
             f.core.fire_type = fire_type::FULLAUTO;
             f.fire.fire_time = 100;
             edit(&mut f);
@@ -989,22 +1007,22 @@ mod tests {
             facts.set(GUN, "gun", f);
             let mut ps = T6WeaponPs::default();
             ps.give(GUN);
-            ps.set_clip_slot(GUN, f.core.clip_size);
+            ps.set_clip_slot(GUN, f.core.magazine_capacity);
             ps.set_pool_slot(GUN, 90);
             ps.weapon = GUN;
-            ps.set_ever_had_all(true);
+            ps.mark_all_owned(true);
             Self {
                 ps,
                 env: T6Env {
                     is_server: true,
                     view_height_settled: true,
-                    on_ground: true,
+                    grounded_now: true,
                     plant_spot_ok: true,
                     tac_insert_allowed: true,
                     ..T6Env::default()
                 },
                 cmd: T6Cmd {
-                    msec: 50,
+                    frame_ms: 50,
                     weapon: GUN,
                     ..T6Cmd::default()
                 },
@@ -1014,7 +1032,7 @@ mod tests {
 
         /// One 50 ms tick; the (event, parm) pairs it raised.
         fn step(&mut self) -> Vec<(u16, u32)> {
-            self.cmd.server_time += self.cmd.msec;
+            self.cmd.authority_clock_ms += self.cmd.frame_ms;
             let mut out = tick::pre_weapon(&mut self.ps, &self.cmd, &mut self.env, &self.facts);
             out.append(tick::run(
                 &mut self.ps,
@@ -1022,7 +1040,7 @@ mod tests {
                 &mut self.env,
                 &self.facts,
             ));
-            self.cmd.old_buttons = self.cmd.buttons;
+            self.cmd.last_tick_buttons = self.cmd.buttons;
             out.events.iter().map(|e| (e.id, e.parm)).collect()
         }
 
@@ -1034,11 +1052,11 @@ mod tests {
         }
 
         fn hold(&mut self) {
-            self.cmd.buttons |= button::ATTACK;
+            self.cmd.buttons |= button::FIRE_BIT;
         }
 
         fn release(&mut self) {
-            self.cmd.buttons &= !button::ATTACK;
+            self.cmd.buttons &= !button::FIRE_BIT;
         }
 
         fn clip(&self) -> i32 {
@@ -1053,11 +1071,11 @@ mod tests {
         let shots = r.ticks_with(20, events::EV_FIRE_WEAPON);
         assert_eq!(shots, vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
         assert_eq!(r.clip(), 20);
-        assert_eq!(r.ps.weaponstate, state::FIRING);
+        assert_eq!(r.ps.gun_phase, state::FIRING);
         r.release();
         r.step();
         r.step();
-        assert_eq!(r.ps.weaponstate, state::READY);
+        assert_eq!(r.ps.gun_phase, state::READY);
     }
 
     #[test]
@@ -1118,21 +1136,21 @@ mod tests {
                 delay_fired: false,
             };
             update_pending_trigger_pull(&mut pm);
-            pm.ps.weap_flags & (wf::PENDING_PULL_RIGHT | wf::PENDING_PULL_LEFT)
+            pm.ps.weapon_state_bits & (wf::PENDING_PULL_RIGHT | wf::PENDING_PULL_LEFT)
         };
         // Pad: attack marks the gun's (right) hand.
-        assert_eq!(pending(last_input::GAMEPAD, button::ATTACK), wf::PENDING_PULL_RIGHT);
+        assert_eq!(pending(last_input::GAMEPAD, button::FIRE_BIT), wf::PENDING_PULL_RIGHT);
         // Mouse: a re-click marks only the left hand, which a one-gun burst never reads; a
         // fresh aim press queues it.
-        assert_eq!(pending(last_input::MOUSECLICK, button::ATTACK), wf::PENDING_PULL_LEFT);
-        assert_eq!(pending(last_input::MOUSECLICK, button::ADS), wf::PENDING_PULL_RIGHT);
+        assert_eq!(pending(last_input::MOUSECLICK, button::FIRE_BIT), wf::PENDING_PULL_LEFT);
+        assert_eq!(pending(last_input::MOUSECLICK, button::AIM_BIT), wf::PENDING_PULL_RIGHT);
     }
 
     #[test]
     fn bolt_action_rechambers_then_readies() {
         let mut r = Rig::new(|f| {
             f.core.fire_type = fire_type::SINGLESHOT;
-            f.core.bolt_action = true;
+            f.core.manual_cycle = true;
             f.fire.rechamber_time = 1000;
             f.fire.rechamber_bolt_time = 400;
         });
@@ -1148,7 +1166,7 @@ mod tests {
                 }
             }
             let brass = seen.iter().any(|e| e.1 == events::EV_EJECT_BRASS);
-            if brass && r.ps.weaponstate == state::READY {
+            if brass && r.ps.gun_phase == state::READY {
                 seen.push((i, 0));
                 break;
             }
@@ -1177,8 +1195,8 @@ mod tests {
             ev.iter().any(|e| e.0 == events::EV_FIRE_WEAPON_LASTSHOT),
             "{ev:?}"
         );
-        assert_eq!(anim::number(r.ps.weap_anim), anim::ATTACK_LASTSHOT);
-        assert_eq!(r.ps.weapon_time, 300);
+        assert_eq!(anim::number(r.ps.gun_clip), anim::ATTACK_LASTSHOT);
+        assert_eq!(r.ps.gun_timer_ms, 300);
     }
 
     #[test]
@@ -1189,7 +1207,7 @@ mod tests {
         r.hold();
         let ev = r.step();
         assert!(ev.iter().any(|e| e.0 == events::EV_NOAMMO), "{ev:?}");
-        assert_eq!(r.ps.weapon_time, 500);
+        assert_eq!(r.ps.gun_timer_ms, 500);
     }
 
     #[test]
@@ -1197,7 +1215,7 @@ mod tests {
         let mut r = Rig::new(|f| f.fire.fire_delay = 150);
         r.hold();
         r.step();
-        assert_eq!(r.ps.weapon_restrict_kick_time, 150);
+        assert_eq!(r.ps.gun_lockout_kick_stamp, 150);
         let shots = r.ticks_with(5, events::EV_FIRE_WEAPON);
         assert_eq!(shots.first(), Some(&2), "{shots:?}");
     }
@@ -1226,28 +1244,28 @@ mod tests {
         });
         r.hold();
         r.step();
-        assert_eq!(r.ps.weaponstate, state::CONT_FIRE_IN);
+        assert_eq!(r.ps.gun_phase, state::CONT_FIRE_IN);
         let mut states = Vec::new();
         for _ in 0..10 {
             r.step();
-            states.push(r.ps.weaponstate);
+            states.push(r.ps.gun_phase);
         }
         assert!(states.contains(&state::CONT_FIRE_LOOP), "{states:?}");
         assert!(r.clip() < 30);
         r.release();
         r.step();
-        assert_eq!(r.ps.weaponstate, state::CONT_FIRE_OUT);
+        assert_eq!(r.ps.gun_phase, state::CONT_FIRE_OUT);
         for _ in 0..8 {
             r.step();
         }
-        assert_eq!(r.ps.weaponstate, state::READY);
+        assert_eq!(r.ps.gun_phase, state::READY);
     }
 
     #[test]
     fn charge_shot_queues_while_held_and_fires_on_release() {
         let mut r = Rig::new(|f| f.core.fire_type = fire_type::CHARGESHOT);
         r.hold();
-        let mut fired = Vec::new();
+        let mut fired = Vec::<_>::new();
         for _ in 0..6 {
             fired.extend(r.step());
         }
@@ -1277,14 +1295,14 @@ mod tests {
         ps.give(1);
         ps.give(2);
         ps.weapon = 1;
-        ps.weaponstate = state::READY;
+        ps.gun_phase = state::READY;
         ps.weaponstate_left = state::READY;
         ps.set_clip_slot(1, 12);
         ps.set_clip_slot(2, 0);
         ps.set_pool_slot(1, 25);
         ps.b_run_left_gun = true;
         let cmd = T6Cmd {
-            msec: 16,
+            frame_ms: 16,
             weapon: 1,
             ..T6Cmd::default()
         };
@@ -1314,7 +1332,7 @@ mod tests {
         };
         assert!(!super::check_firing_ammo(&mut pm));
         assert_eq!(pm.ps.weaponstate_left, state::RELOADING);
-        assert_eq!(pm.ps.weaponstate, state::READY);
+        assert_eq!(pm.ps.gun_phase, state::READY);
         let ids: Vec<u16> = out.events.iter().map(|e| e.id).collect();
         assert!(!ids.contains(&events::EV_NOAMMO_LEFT), "{ids:?}");
     }
@@ -1371,22 +1389,22 @@ mod tests {
     #[test]
     fn a_jam_holds_the_gun_two_seconds_without_a_shot() {
         let mut r = Rig::new(|f| f.core.fire_type = fire_type::SINGLESHOT);
-        r.cmd.buttons |= button::ATTACK | button::JAM;
+        r.cmd.buttons |= button::FIRE_BIT | button::JAM;
         let ev = r.step();
         assert!(ev.iter().any(|e| e.0 == events::EV_JAM_WEAPON), "{ev:?}");
         assert!(!ev.iter().any(|e| e.0 == events::EV_FIRE_WEAPON), "{ev:?}");
-        assert_eq!(r.ps.weaponstate, state::JAMMED);
-        assert_eq!(anim::number(r.ps.weap_anim), anim::JAM);
+        assert_eq!(r.ps.gun_phase, state::JAMMED);
+        assert_eq!(anim::number(r.ps.gun_clip), anim::JAM);
         assert_eq!(r.clip(), 30);
         // Let go and tap again inside the two seconds: nothing.
         r.cmd.buttons = 0;
         r.step();
         r.hold();
         assert!(r.ticks_with(38, events::EV_FIRE_WEAPON).is_empty());
-        assert_eq!(r.ps.weaponstate, state::JAMMED);
+        assert_eq!(r.ps.gun_phase, state::JAMMED);
         r.release();
         r.step();
-        assert_eq!(r.ps.weaponstate, state::READY);
+        assert_eq!(r.ps.gun_phase, state::READY);
         r.hold();
         assert_eq!(r.ticks_with(1, events::EV_FIRE_WEAPON), vec![0]);
         assert_eq!(r.clip(), 29);
@@ -1400,7 +1418,7 @@ mod tests {
             r.env.shellshock_anim = shock;
             r.env.view_height_settled = settled;
             r.hold();
-            r.cmd.server_time += r.cmd.msec;
+            r.cmd.authority_clock_ms += r.cmd.frame_ms;
             let mut out = tick::pre_weapon(&mut r.ps, &r.cmd, &mut r.env, &r.facts);
             out.append(tick::run(&mut r.ps, &r.cmd, &mut r.env, &r.facts));
             assert!(out.events.iter().any(|e| e.id == events::EV_FIRE_WEAPON), "shock {shock}");

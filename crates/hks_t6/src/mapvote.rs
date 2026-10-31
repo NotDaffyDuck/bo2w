@@ -9,15 +9,15 @@
 //! BO2's pick: a weighted draw over the playlist's maps, each map's weight
 //! used up as it is drawn and every weight refilled once none is left (a
 //! bag), never the map just played nor the one before it. A new public
-//! party draws NEXT, then PREVIOUS (a second, different map). After a
-//! match PREVIOUS is the map just played and NEXT a new draw. The weights
+//! party draws MINT_COUNTER, then PREVIOUS (a second, different map). After a
+//! match PREVIOUS is the map just played and MINT_COUNTER a new draw. The weights
 //! are in Treyarch's `playlists.info`, not on his disk. PLACEHOLDER: every
 //! map weighs 1, so the bag gives each map once before any comes again.
 //!
-//! The vote is BO2's map voter's: NEXT, PREVIOUS and RANDOM, voted with
+//! The vote is BO2's map voter's: MINT_COUNTER, PREVIOUS and RANDOM, voted with
 //! `xpartyveto 1` / `2` / `3`. Only the party's players vote (bots are not
-//! in the party). The most votes win; ties go NEXT, then RANDOM, then
-//! PREVIOUS; no votes keep NEXT. RANDOM is a new draw that is neither NEXT
+//! in the party). The most votes win; ties go MINT_COUNTER, then RANDOM, then
+//! PREVIOUS; no votes keep MINT_COUNTER. RANDOM is a new draw that is neither MINT_COUNTER
 //! nor PREVIOUS. PREVIOUS cannot win twice running
 //! (`party_sequentialPreviousMapVotingAllowed`, off).
 
@@ -36,7 +36,7 @@ pub fn offered(maps_table: &[Vec<String>], installed: impl Fn(&str) -> bool) -> 
 /// A map's weight in the bag. PLACEHOLDER: `playlists.info`'s weights.
 const WEIGHT: u32 = 1;
 
-/// Combat Training's rotation: the map the next match plays (NEXT), the
+/// Combat Training's rotation: the map the next match plays (MINT_COUNTER), the
 /// one the lobby offers as PREVIOUS, and the bag they are drawn from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rotation {
@@ -51,7 +51,7 @@ pub struct Rotation {
 }
 
 impl Rotation {
-    /// A new public party: NEXT, then PREVIOUS, two different draws
+    /// A new public party: MINT_COUNTER, then PREVIOUS, two different draws
     /// (`seed` any number: the draws' dice).
     pub fn new(maps: Vec<String>, seed: u64) -> Self {
         let left = vec![WEIGHT; maps.len()];
@@ -77,7 +77,7 @@ impl Rotation {
         self.previous.as_deref()
     }
 
-    /// A match starts on `map`: it becomes PREVIOUS, and NEXT is a new draw
+    /// A match starts on `map`: it becomes PREVIOUS, and MINT_COUNTER is a new draw
     /// that is neither `map` nor the map played before it (before any
     /// match, the lobby's other map).
     pub fn play(&mut self, map: &str) {
@@ -90,7 +90,7 @@ impl Rotation {
         self.next = self.draw(&skip);
     }
 
-    /// RANDOM's map: a new draw that is neither NEXT nor PREVIOUS.
+    /// RANDOM's map: a new draw that is neither MINT_COUNTER nor PREVIOUS.
     pub fn random(&mut self) -> Option<String> {
         let (next, previous) = (self.next.clone(), self.previous.clone());
         let skip: Vec<&str> = [next.as_deref(), previous.as_deref()].into_iter().flatten().collect();
@@ -156,8 +156,8 @@ impl Choice {
     }
 }
 
-/// The winner of a vote from its counts (NEXT, PREVIOUS, RANDOM): the
-/// most votes; ties go NEXT, then RANDOM, then PREVIOUS.
+/// The winner of a vote from its counts (MINT_COUNTER, PREVIOUS, RANDOM): the
+/// most votes; ties go MINT_COUNTER, then RANDOM, then PREVIOUS.
 pub fn winner(counts: [u32; 3]) -> Choice {
     let mut best = Choice::Next;
     for c in [Choice::Random, Choice::Previous] {
@@ -199,7 +199,7 @@ impl Vote {
         true
     }
 
-    /// The votes for NEXT, PREVIOUS and RANDOM.
+    /// The votes for MINT_COUNTER, PREVIOUS and RANDOM.
     pub fn counts(&self) -> [u32; 3] {
         let mut n = [0; 3];
         if let Some(c) = self.mine {

@@ -1,74 +1,80 @@
-//! The line of commands waiting to run, and the holds that pace it.
+//! Pending console commands and the pauses that pace them.
 //!
-//! Commands run one per frame, oldest first. Some commands start work that
-//! takes a while (`map`, `spawn`), and a script must not run its next line
-//! until that work is done, so the queue can be held: on a [`Hold`] that the
-//! game ends by reaching some state, on a plain sleep, or on `paused`, which
-//! whoever started the work clears with [`ConsoleDispatch::release`]. A hold
-//! that is not met in [`HOLD_TIMEOUT_SECS`] aborts the script.
+//! One command runs per frame, oldest first. A few commands (`map`, `spawn`)
+//! kick off slow work, and the following script line has to wait for it, so
+//! the queue can be stalled three ways: by a [`Hold`] that ends once the game
+//! reaches a given state, by a plain sleep, or by `command_running`, which the party
+//! that began the work lifts through [`TypedOrderRouter::release`]. A hold
+//! that stays unmet for [`HOLD_TIMEOUT_SECS`] aborts the script.
 
-use std::collections::{HashSet, VecDeque};
+use std::{collections::HashSet, collections::VecDeque};
 
-use bevy::{ecs::system::SystemParam, prelude::*};
-use frame::{AppScreen, HasWorld};
-use net::PresentedSnapshot;
-use render_frontend::prepare::scene::world::WorldScene;
+use bevy::prelude::*;
+use bevy::ecs::system::SystemParam;
+use frame::LevelPresent;
+use net::ShownWorldFrame;
+use render_frontend::prepare::scene::world::LevelStage;
 
-use super::state::{ConsoleSettings, ConsoleState};
-use crate::{ConsoleCommand, ConsoleQueue, registry::ConsoleRegistry};
+use super::state::PromptPanelOptions;
+use super::state::PromptPanelStatus;
+use crate::TypedOrder;
+use crate::OrderInbox;
+use crate::order_book::OrderCatalog;
+use frame::ShellScreen;
 
-/// How long a hold may wait for the game before the script is given up on.
+/// Upper bound on one hold before the script is abandoned.
 pub(super) const HOLD_TIMEOUT_SECS: f32 = 120.0;
 
-/// Commands that start work the next script line has to wait for.
+/// Names of commands whose work the next script line must wait out.
 const SYNC_COMMANDS: [&str; 6] = ["map", "map_restart", "disconnect", "demo", "play", "spawn"];
 
-/// Commands a script may still run after it has been aborted.
+/// Names that still run when a script has been aborted.
 const EXIT_COMMANDS: [&str; 3] = ["quit", "exit", "finish_run"];
 
-#[derive(Resource, Default)]
-pub struct ConsoleCommandQueue(pub VecDeque<ConsoleCommand>);
+#[derive(Default, Resource)]
+pub struct TypedOrderBacklog(pub VecDeque<TypedOrder>);
 
-impl ConsoleCommandQueue {
-    pub fn push_script(&mut self, script: &str) {
-        self.0.extend(ConsoleCommand::parse_script(script));
+impl TypedOrderBacklog {
+    pub fn enqueue_script_text(&mut self, lines: &str) {
+        let parsed = TypedOrder::parse_script(lines);
+        self.0.extend(parsed);
     }
 }
 
-/// The pose a `Hold::Move` waits for the presented snapshot to show.
+/// Target pose for `Hold::Move`, compared against the presented snapshot.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WaitMovePose {
-    pub client: sim::ClientId,
-    pub origin: [f32; 3],
-    pub angles: [f32; 3],
+pub struct AwaitMotionPose {
+    pub who: sim::ClientId,
+    pub spot: [f32; 3],
+    pub facing: [f32; 3],
 }
 
-/// What the queue is waiting for the game to do.
+/// The condition the queue is stalled on.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hold {
-    /// The world is built.
+    /// World geometry has been built.
     World,
-    /// The class menu lets the player spawn. Only [`ConsoleDispatch::end_hold`]
-    /// ends this one.
+    /// Class selection allows the spawn; only [`TypedOrderRouter::end_hold`]
+    /// can end this variant.
     SpawnAdmit,
-    /// The player is in the match.
+    /// The player has entered the match.
     Spawn,
-    /// The map's ambient sound is playing.
+    /// Ambient audio for the map is running.
     Ambient,
-    /// No world is left.
+    /// Nothing of the world remains.
     Torn,
-    /// The presented snapshot shows the pose.
-    Move(WaitMovePose),
-    /// The match has begun.
+    /// The presented snapshot matches the pose.
+    Move(AwaitMotionPose),
+    /// The match has started.
     Playing,
-    /// The client is alive in a life newer than the one given.
+    /// The client is alive in a life newer than the one supplied.
     Alive(sim::ClientId, sim::LifeSequence),
     /// The authority clock reaches the tick.
     Tick(u32),
 }
 
 impl Hold {
-    /// What the log calls the wait.
+    /// Label this wait carries in log lines.
     fn kind(self) -> &'static str {
         match self {
             Self::World => "wait world",
@@ -83,7 +89,7 @@ impl Hold {
         }
     }
 
-    /// What was still missing when the wait ran out.
+    /// Reason reported when the timeout hits.
     fn missing(self) -> &'static str {
         match self {
             Self::World => "spawned=false",
@@ -99,61 +105,65 @@ impl Hold {
     }
 
     fn done_line(self, secs: f32) -> String {
-        let reached = match self {
-            Self::World => "spawned".to_owned(),
-            Self::SpawnAdmit => "admitted".to_owned(),
-            Self::Spawn => "InGame".to_owned(),
-            Self::Ambient => "MapAmbientBooted".to_owned(),
-            Self::Torn => "hold".to_owned(),
-            Self::Move(_) => "presented pose".to_owned(),
-            Self::Playing => "Playing".to_owned(),
-            Self::Alive(..) => "Alive".to_owned(),
-            Self::Tick(until) => format!("tick {until}"),
+        let outcome = if let Self::Tick(until) = self {
+            format!("tick {until}")
+        } else {
+            let word = match self {
+                Self::World => "spawned",
+                Self::SpawnAdmit => "admitted",
+                Self::Spawn => "InGame",
+                Self::Ambient => "MapAmbientBooted",
+                Self::Torn => "hold",
+                Self::Move(_) => "presented pose",
+                Self::Playing => "Playing",
+                Self::Alive(..) => "Alive",
+                Self::Tick(_) => unreachable!(),
+            };
+            word.to_owned()
         };
-        format!("{}: {reached} after {secs:.1}s", self.kind())
+        format!("{}: {outcome} after {secs:.1}s", self.kind())
     }
 }
 
-/// How a hold stands after a frame has passed.
+/// Result of advancing the hold by one frame.
 #[derive(Debug, PartialEq)]
 enum Settled {
-    /// There was no hold.
+    /// No hold was active.
     Free,
-    /// The game reached the state, this many seconds in.
+    /// The condition came true after this many seconds.
     Met(Hold, f32),
-    /// The game did not reach it in time.
+    /// The deadline passed first.
     TimedOut(Hold),
-    /// Still waiting.
+    /// Neither yet.
     Waiting,
 }
 
-#[derive(Resource, Default)]
-pub struct ConsoleDispatch {
-    /// A command is in flight, and the queue stays put until it calls
-    /// [`ConsoleDispatch::release`].
-    pub paused: bool,
-    /// The class `spawn` named, kept for when the class menu lets it through.
-    pub pending_spawn_class: Option<String>,
+#[derive(Default, Resource)]
+pub struct TypedOrderRouter {
+    /// A started command has not finished yet. Nothing else leaves the
+    /// queue until it calls [`TypedOrderRouter::unblock`].
+    pub command_running: bool,
+    /// Class named by `spawn`, remembered until the class menu admits it.
+    pub queued_kit_choice: Option<String>,
     hold: Option<Hold>,
     held_for: f32,
     sleep: f32,
 }
 
-impl ConsoleDispatch {
-    /// A queue with a command in flight, as a sync command leaves it.
+impl TypedOrderRouter {
+    /// What a sync command leaves behind: one command still running.
     #[cfg(test)]
     pub(crate) fn in_flight() -> Self {
-        Self {
-            paused: true,
-            ..Self::default()
-        }
+        let mut busy = Self::default();
+        busy.command_running = true;
+        busy
     }
 
-    /// Holds the queue for `hold`, starting its clock now. A hold already
-    /// there is replaced.
-    pub fn hold(&mut self, hold: Hold) {
-        self.hold = Some(hold);
+    /// Stalls the queue on `hold` and zeroes its timer. Any earlier hold is
+    /// overwritten.
+    pub fn stall(&mut self, hold: Hold) {
         self.held_for = 0.0;
+        self.hold = Some(hold);
     }
 
     pub fn holding(&self) -> Option<Hold> {
@@ -169,260 +179,270 @@ impl ConsoleDispatch {
     }
 
     fn waiting(&self) -> bool {
-        self.paused || self.hold.is_some() || self.sleep > 0.0
+        self.command_running || self.hold.is_some() || self.sleep > 0.0
     }
 
-    /// Lets the queue run again, whatever it was waiting for.
-    pub fn release(&mut self) {
-        self.paused = false;
-        self.hold = None;
-        self.sleep = 0.0;
-        self.pending_spawn_class = None;
+    /// Unblocks the queue whatever was blocking it. Only the hold timer
+    /// survives; the next hold zeroes it anyway.
+    pub fn unblock(&mut self) {
+        let kept = self.held_for;
+        *self = TypedOrderRouter::default();
+        self.held_for = kept;
     }
 
-    /// Lets `dt` seconds pass for the current hold, asking `met` whether the
-    /// game has reached what it waits for.
+    /// Advances the active hold by `dt` seconds, using `met` to ask whether
+    /// the game now satisfies it.
     fn settle(&mut self, dt: f32, met: impl FnOnce(Hold) -> bool) -> Settled {
-        let Some(hold) = self.hold else {
+        let Some(active) = self.hold else {
             return Settled::Free;
         };
-        if met(hold) {
+        if met(active) {
             self.hold = None;
-            return Settled::Met(hold, self.held_for);
+            return Settled::Met(active, self.held_for);
         }
         self.held_for += dt;
-        if self.held_for < HOLD_TIMEOUT_SECS {
-            return Settled::Waiting;
+        if self.held_for >= HOLD_TIMEOUT_SECS {
+            self.hold = None;
+            if matches!(active, Hold::SpawnAdmit) {
+                self.queued_kit_choice = None;
+            }
+            return Settled::TimedOut(active);
         }
-        self.hold = None;
-        if matches!(hold, Hold::SpawnAdmit) {
-            self.pending_spawn_class = None;
-        }
-        Settled::TimedOut(hold)
+        Settled::Waiting
     }
 
-    /// Lets `dt` seconds of the sleep pass. True while it still runs.
+    /// Burns `dt` seconds off the sleep; true if time is still left.
     fn sleeping(&mut self, dt: f32) -> bool {
         self.sleep = (self.sleep - dt).max(0.0);
         self.sleep > 0.0
     }
 }
 
-/// What the game looks like to a command that waits on it.
+/// Read-only window onto the game for commands that wait on it.
 #[derive(SystemParam)]
 pub(super) struct GameView<'w> {
-    scene: Option<Res<'w, WorldScene>>,
-    screen: Option<Res<'w, AppScreen>>,
-    has_world: Option<Res<'w, HasWorld>>,
+    level_stage: Option<Res<'w, LevelStage>>,
+    screen: Option<Res<'w, ShellScreen>>,
+    level_is_up: Option<Res<'w, LevelPresent>>,
     headless: Option<Res<'w, frame::Headless>>,
-    ambient: Option<Res<'w, audio::MapAmbientBooted>>,
-    presented: Option<Res<'w, PresentedSnapshot>>,
-    authority: Option<Res<'w, net::AuthorityWorld>>,
-    clock: Option<Res<'w, net::AuthorityClock>>,
-    local: Option<Res<'w, net::LocalPresentClient>>,
+    ambient: Option<Res<'w, audio::AmbientBedStarted>>,
+    shown_frame: Option<Res<'w, ShownWorldFrame>>,
+    authority: Option<Res<'w, net::HostSimulationWorld>>,
+    clock: Option<Res<'w, net::HostTimeKeeper>>,
+    viewer: Option<Res<'w, net::HostViewClient>>,
 }
 
 impl GameView<'_> {
     fn scene_spawned(&self) -> bool {
-        self.scene.as_ref().is_some_and(|scene| scene.spawned)
+        self.level_stage.as_ref().is_some_and(|scene| scene.spawned)
     }
 
-    fn has_world(&self) -> bool {
-        self.has_world.as_ref().is_some_and(|has| has.0)
+    fn level_is_up(&self) -> bool {
+        self.level_is_up.as_ref().is_some_and(|present| present.0)
     }
 
-    /// A headless run has no scene, so it goes by `HasWorld`.
+    /// A headless run has no scene to spawn; there the level flag is the
+    /// only sign the world is up.
     fn world_up(&self) -> bool {
         if self.headless.is_some() {
-            self.has_world()
+            self.level_is_up()
         } else {
             self.scene_spawned()
         }
     }
 
     fn torn(&self) -> bool {
-        !self.has_world() && !self.scene_spawned()
+        !self.level_is_up() && !self.scene_spawned()
     }
 
     fn in_game(&self) -> bool {
-        self.screen
-            .as_ref()
-            .is_some_and(|screen| matches!(**screen, AppScreen::InGame))
+        self.screen.as_deref() == Some(&ShellScreen::InGame)
     }
 
     fn tick(&self) -> Option<u32> {
-        self.clock.as_ref().map(|clock| clock.tick)
+        self.clock.as_ref().map(|keeper| keeper.tick)
+    }
+
+    /// True once a newer life than `previous` is alive for `client`.
+    fn respawned(&self, player: sim::ClientId, previous: sim::LifeSequence) -> bool {
+        let record = self.authority.as_ref().and_then(|world| world.0.client_meta(player));
+        record.is_some_and(|record| {
+            record.lifecycle == sim::PlayerSessionStage::Alive && record.life_sequence != previous
+        })
     }
 
     fn met(&self, hold: Hold) -> bool {
         match hold {
-            Hold::World => self.world_up(),
             Hold::SpawnAdmit => false,
+            Hold::World => self.world_up(),
             Hold::Spawn => self.in_game(),
-            Hold::Ambient => self.ambient.as_ref().is_some_and(|booted| booted.0),
             Hold::Torn => self.torn(),
-            Hold::Move(pose) => self.presented.as_ref().is_some_and(|presented| {
-                crate::player_cmds::presented_matches_move(presented, pose)
+            Hold::Ambient => self.ambient.as_ref().is_some_and(|booted| booted.0),
+            Hold::Move(target) => self.shown_frame.as_ref().is_some_and(|frame| {
+                crate::player_cmds::presented_matches_move(frame, target)
             }),
             Hold::Playing => self
                 .authority
                 .as_ref()
-                .is_some_and(|world| world.0.phase() == sim::MatchPhase::Playing),
-            Hold::Alive(client, life) => self
-                .authority
-                .as_ref()
-                .and_then(|world| world.0.client_meta(client))
-                .is_some_and(|meta| {
-                    meta.lifecycle == sim::ClientLifecycle::Alive && meta.life_sequence != life
-                }),
+                .is_some_and(|world| world.0.phase() == sim::GameRoundStage::Playing),
+            Hold::Alive(client, previous) => self.respawned(client, previous),
             Hold::Tick(until) => self.tick().is_some_and(|now| tick_reached(now, until)),
         }
     }
 
-    /// The match figures a `mark` line carries, each led by a space; nothing
-    /// when there is no match.
+    /// Match numbers appended to a `mark` line (each preceded by a space);
+    /// empty if no match exists.
     fn mark_facts(&self) -> String {
-        let Some(authority) = self.authority.as_ref() else {
-            return String::new();
+        let Some(authority) = &self.authority else {
+            return String::from("");
         };
         let board = authority.0.clients_scoreboard();
         let alive = board
             .iter()
-            .filter(|(_, meta)| meta.lifecycle == sim::ClientLifecycle::Alive)
+            .filter(|(_id, entry)| entry.lifecycle == sim::PlayerSessionStage::Alive)
             .count();
-        let kills: i32 = board.iter().map(|(_, meta)| meta.kills).sum();
-        let deaths: i32 = board.iter().map(|(_, meta)| meta.deaths).sum();
-        let mut facts = format!(
+        let kills: i32 = board.iter().map(|(_, meta)| meta.frags).sum();
+        let deaths: i32 = board.iter().map(|(_, meta)| meta.died).sum();
+        let mut out = format!(
             " tick={} clients={} alive={alive} kills={kills} deaths={deaths}",
             self.tick().unwrap_or(0),
             board.len()
         );
-        let Some(local) = self.local.as_ref() else {
-            return facts;
+        let Some(local) = &self.viewer else {
+            return out;
         };
-        let meta = authority.0.client_meta(local.0);
-        match meta {
-            Some(meta) => facts.push_str(&format!(
+        match authority.0.client_meta(local.0) {
+            None => out.push_str(" local=absent"),
+            Some(mine) => out.push_str(&format!(
                 " local={:?} local_life={} local_deaths={} local_cmds={} local_moving_cmds={} \
                  local_path={:.1}",
-                meta.lifecycle,
-                meta.life_sequence.0,
-                meta.deaths,
-                meta.input_receipt.applied_cmds,
-                meta.input_receipt.moving_cmds,
-                meta.input_receipt.path_units
+                mine.lifecycle,
+                mine.life_sequence.0,
+                mine.died,
+                mine.input_receipt.applied_cmds,
+                mine.input_receipt.moving_cmds,
+                mine.input_receipt.path_units
             )),
-            None => facts.push_str(" local=absent"),
         }
-        let shown = self
-            .presented
+        let on_screen = self
+            .shown_frame
             .as_ref()
-            .and_then(|presented| presented.alive_player(local.0));
-        if let Some(player) = shown {
-            facts.push_str(&format!(
-                " origin={:.1},{:.1},{:.1} yaw={:.1}",
-                player.origin[0], player.origin[1], player.origin[2], player.viewangles[1]
-            ));
+            .and_then(|frame| frame.living_participant(local.0));
+        if let Some(body) = on_screen {
+            let [x, y, z] = body.origin;
+            let yaw = body.look_angles[1];
+            out += &format!(" origin={x:.1},{y:.1},{z:.1} yaw={yaw:.1}");
         }
-        facts
+        out
     }
 }
 
-/// Whether the wrapping tick counter `now` has got to `until`.
+/// Wrap-safe check that tick counter `now` has caught up with `until`.
 fn tick_reached(now: u32, until: u32) -> bool {
     now.wrapping_sub(until) < u32::MAX / 2
 }
 
-/// Runs the oldest queued command, unless something holds the queue.
+/// Executes the next queued command, if nothing is holding the queue.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_console_queue(
-    time: Res<Time>,
-    registry: Res<ConsoleRegistry>,
-    settings: Res<ConsoleSettings>,
+    clock: Res<Time>,
+    book: Res<OrderCatalog>,
+    settings: Res<PromptPanelOptions>,
     view: GameView<'_>,
-    mut dispatch: ResMut<ConsoleDispatch>,
-    mut queue: ResMut<ConsoleCommandQueue>,
-    mut console: ResMut<ConsoleState>,
-    mut submitted: MessageWriter<ConsoleCommand>,
+    mut router: ResMut<TypedOrderRouter>,
+    mut queue: ResMut<TypedOrderBacklog>,
+    mut panel: ResMut<PromptPanelStatus>,
+    mut submitted: MessageWriter<TypedOrder>,
     mut marks: Local<u64>,
 ) {
-    let capacity = settings.log_capacity;
-    if dispatch.waiting() {
-        if let Some(command) = take_interactive(&mut queue, &["dump", "clip", "screenshot"]) {
-            diag::info!(
-                Console,
-                "fifo: interactive diagnostic `{}` — hold preserved",
-                command.name
-            );
-            submitted.write(command);
-            return;
-        }
-        if let Some(command) = take_interactive(&mut queue, &["quit", "exit", "disconnect"]) {
-            diag::info!(
-                Console,
-                "fifo: interactive jump `{}` — released FIFO hold",
-                command.name
-            );
-            queue.0.push_front(command);
-            dispatch.release();
+    let backlog = settings.backlog_limit;
+    let mut complain = |text: String| {
+        diag::warn!(Console, "{}", text);
+        panel.post_line(text, backlog);
+    };
+
+    if router.waiting() && let Some(jump) = hand_typed_jump(&mut queue) {
+        match jump {
+            QueueJump::Diagnostic(order) => {
+                diag::info!(Console, "fifo: `{}` typed by hand runs now; the hold stays", order.name);
+                submitted.write(order);
+                return;
+            }
+            QueueJump::Leave(order) => {
+                diag::info!(Console, "fifo: `{}` typed by hand jumps the queue and lifts the hold", order.name);
+                queue.0.push_front(order);
+                router.unblock();
+            }
         }
     }
-    if dispatch.paused {
+    if router.command_running {
         return;
     }
-    let dt = time.delta_secs();
-    match dispatch.settle(dt, |hold| view.met(hold)) {
+
+    let dt = clock.delta_secs();
+    match router.settle(dt, |hold| view.met(hold)) {
+        Settled::Free => {}
         Settled::Waiting => return,
         Settled::Met(hold, secs) => diag::info!(Console, "{}", hold.done_line(secs)),
-        Settled::TimedOut(hold) => {
-            let message = abort_script(hold, &mut queue.0);
-            diag::warn!(Console, "{message}");
-            console.echo(message, capacity);
-        }
-        Settled::Free => {}
+        Settled::TimedOut(hold) => complain(abort_script(hold, &mut queue.0)),
     }
-    if dispatch.sleeping(dt) {
+    if router.sleeping(dt) {
         return;
     }
-    let Some(command) = queue.0.pop_front() else {
+
+    let Some(next) = queue.0.pop_front() else {
         return;
     };
-    if registry.resolve(&command.name).is_none() {
-        let message = format!("unknown command `{}`", command.name);
-        diag::warn!(Console, "{message}");
-        console.echo(message, capacity);
+    if book.look_up(&next.name).is_none() {
+        complain(format!("unknown command `{}`", next.name));
         return;
     }
-    match command.name.as_str() {
-        "mark" => run_mark(&command, &mut marks, &view, &mut console, capacity),
-        "wait" => run_wait(&command, &view, &mut dispatch, &mut console, capacity),
-        _ => {
-            begin_sync(&command, &mut dispatch);
-            submitted.write(command);
-        }
+    if next.name == "mark" {
+        run_mark(&next, &mut marks, &view, &mut panel, backlog);
+    } else if next.name == "wait" {
+        run_wait(&next, &view, &mut router, &mut panel, backlog);
+    } else {
+        begin_sync(&next, &mut router);
+        submitted.write(next);
     }
 }
 
-/// Removes and returns the oldest queued command that was typed at the
-/// console and is one of `names`.
-fn take_interactive(queue: &mut ConsoleCommandQueue, names: &[&str]) -> Option<ConsoleCommand> {
-    let at = queue
+/// A hand-typed command allowed to act while the queue is held.
+enum QueueJump {
+    /// Looks at the game without changing it, so it runs at once and the
+    /// hold carries on.
+    Diagnostic(TypedOrder),
+    /// Leaves the game or the match; it goes to the front and the hold ends.
+    Leave(TypedOrder),
+}
+
+fn hand_typed_jump(queue: &mut TypedOrderBacklog) -> Option<QueueJump> {
+    if let Some(order) = take_interactive(queue, &["dump", "clip", "screenshot"]) {
+        return Some(QueueJump::Diagnostic(order));
+    }
+    take_interactive(queue, &["quit", "exit", "disconnect"]).map(QueueJump::Leave)
+}
+
+/// Pulls out the oldest queued command that was typed by hand and whose
+/// name is in `names`.
+fn take_interactive(queue: &mut TypedOrderBacklog, names: &[&str]) -> Option<TypedOrder> {
+    let idx = queue
         .0
         .iter()
-        .position(|command| command.interactive && names.contains(&command.name.as_str()))?;
-    queue.0.remove(at)
+        .position(|cmd| cmd.typed_by_hand && names.contains(&cmd.name.as_str()))?;
+    queue.0.remove(idx)
 }
 
-/// Drops every queued command but the ones that end the run. Returns how many
-/// went and how many stayed.
-fn drop_all_but_exits(queue: &mut VecDeque<ConsoleCommand>) -> (usize, usize) {
-    let before = queue.len();
-    queue.retain(|command| EXIT_COMMANDS.contains(&command.name.as_str()));
-    (before - queue.len(), queue.len())
+/// Clears the queue except for exit commands; yields (dropped, kept).
+fn drop_all_but_exits(queue: &mut VecDeque<TypedOrder>) -> (usize, usize) {
+    let total = queue.len();
+    queue.retain(|cmd| EXIT_COMMANDS.contains(&cmd.name.as_str()));
+    let kept = queue.len();
+    (total - kept, kept)
 }
 
-/// Gives up on the script because `hold` never ended. Returns what to say.
-fn abort_script(hold: Hold, queue: &mut VecDeque<ConsoleCommand>) -> String {
+/// Abandons the script after `hold` timed out; returns the log message.
+fn abort_script(hold: Hold, queue: &mut VecDeque<TypedOrder>) -> String {
     let (dropped, kept) = drop_all_but_exits(queue);
     format!(
         "{}: timed out after {HOLD_TIMEOUT_SECS:.0}s ({}) — script aborted, {dropped} queued \
@@ -432,235 +452,238 @@ fn abort_script(hold: Hold, queue: &mut VecDeque<ConsoleCommand>) -> String {
     )
 }
 
-/// Pauses the queue for a command that starts work the script has to wait
-/// for, unless it was sent to the background with `&`.
-fn begin_sync(command: &ConsoleCommand, dispatch: &mut ConsoleDispatch) {
+/// Stalls the queue for commands that start slow work, unless the command
+/// was backgrounded with `&`.
+fn begin_sync(command: &TypedOrder, router: &mut TypedOrderRouter) {
     let name = command.name.as_str();
     if !SYNC_COMMANDS.contains(&name) {
         return;
     }
-    if command.background {
-        diag::info!(Console, "{name} &: async — FIFO not blocked");
+    let backgrounded = command.detached;
+    if backgrounded {
+        diag::info!(Console, "{name} &: async — runs without blocking the FIFO");
         return;
     }
-    match name {
-        "disconnect" => {
-            dispatch.paused = true;
-            dispatch.hold(Hold::Torn);
-            diag::info!(Console, "disconnect: sync until torn hold");
-        }
-        "spawn" => {}
-        _ => {
-            dispatch.paused = true;
-            dispatch.hold(Hold::World);
-            diag::info!(Console, "{name}: sync until scene.spawned");
-        }
-    }
+    // `spawn` sets up its own hold once the class menu has answered.
+    let (hold, reached) = match name {
+        "spawn" => return,
+        "disconnect" => (Hold::Torn, "torn hold"),
+        _ => (Hold::World, "scene.spawned"),
+    };
+    router.command_running = true;
+    router.stall(hold);
+    diag::info!(Console, "{name}: sync until {reached}");
 }
 
-/// A label `mark` accepts: letters, digits, `_`, `.` and `-`.
+/// Whether `label` is acceptable to `mark`: letters, digits, `_`, `.`, `-`.
 fn valid_mark_label(label: &str) -> bool {
-    !label.is_empty()
-        && label
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    let allowed = |c: char| c.is_ascii_alphanumeric() || "_.-".contains(c);
+    !label.is_empty() && label.chars().all(allowed)
 }
 
-/// ` name=<mebibytes>`, or nothing when the figure is not known.
+/// ` name=<MiB>` when the size is known, otherwise an empty string.
 fn mib_field(name: &str, bytes: Option<u64>) -> String {
     match bytes {
-        Some(bytes) => format!(" {name}={}", bytes >> 20),
-        None => String::new(),
+        Some(total) => format!(" {name}={}", total / (1 << 20)),
+        None => String::from(""),
     }
 }
 
-/// `mark <label>`: writes one line of process and match figures, for a
-/// benchmark to find in the log.
+const MARK_USAGE: &str = "usage: mark <label> (letters, digits, _, ., -)";
+
+/// `mark <label>`: one line of process and match numbers that benchmark
+/// tooling reads back out of stdout and the log. Its layout is fixed.
 fn run_mark(
-    command: &ConsoleCommand,
+    command: &TypedOrder,
     marks: &mut u64,
     view: &GameView<'_>,
-    console: &mut ConsoleState,
-    capacity: usize,
+    panel: &mut PromptPanelStatus,
+    room: usize,
 ) {
-    let label = match command.args.as_slice() {
-        [label] if valid_mark_label(label) => label,
-        _ => {
-            console.echo("usage: mark <label> (letters, digits, _, ., -)", capacity);
-            return;
-        }
+    let label = match command.words.as_slice() {
+        [only] if valid_mark_label(only) => only,
+        _ => return panel.post_line(MARK_USAGE, room),
     };
     *marks += 1;
-    let line = format!(
-        "benchmark-mark: pid={} seq={} ns={} label={label}{}{}{}",
-        std::process::id(),
-        *marks,
-        diag::process_elapsed_ns(),
-        mib_field("rss_mib", asset_transport::process_resident_bytes()),
-        mib_field("heap_mib", diag::process_live_heap_bytes()),
-        view.mark_facts()
-    );
-    diag::info!(Console, "{line}");
-    println!("{line}");
-    console.echo(line, capacity);
+    let seq = *marks;
+    let pid = std::process::id();
+    let ns = diag::process_elapsed_ns();
+    let rss = mib_field("rss_mib", asset_transport::working_set_size());
+    let heap = mib_field("heap_mib", diag::heap_bytes_in_use());
+    let facts = view.mark_facts();
+    let record = format!("benchmark-mark: pid={pid} seq={seq} ns={ns} label={label}{rss}{heap}{facts}");
+    diag::info!(Console, "{record}");
+    println!("{record}");
+    panel.post_line(record, room);
 }
 
-/// The longest `wait <seconds>` runs.
+/// Ceiling for `wait <seconds>`.
 const MAX_WAIT_SECS: f32 = 120.0;
 
-/// What a `wait` command asks for.
+/// What a `wait` line asks the queue to do.
 #[derive(Debug)]
 enum Wait {
-    Seconds(f32),
+    /// Sleep this many seconds.
+    Pause(f32),
+    /// Hold for this many authority ticks.
     Ticks(u32),
+    /// Hold until the game reaches a state.
     Until(Hold),
 }
 
-/// `wait world|spawn|torn|ambient`, `wait <n>t` or `wait <seconds>[s]`.
+/// Sleep used when `wait` has no argument or one that isn't a number.
+const DEFAULT_WAIT_SECS: f32 = 1.0;
+
+/// Reads `wait world|spawn|torn|ambient`, `wait <n>t` and `wait <secs>[s]`,
+/// ignoring case.
 fn parse_wait(args: &[String]) -> Wait {
-    let Some(first) = args.first().map(|arg| arg.to_ascii_lowercase()) else {
-        return Wait::Seconds(1.0);
+    let word = match args.first() {
+        Some(first) => first.to_ascii_lowercase(),
+        None => return Wait::Pause(DEFAULT_WAIT_SECS),
     };
-    match first.as_str() {
-        "world" => return Wait::Until(Hold::World),
-        "spawn" => return Wait::Until(Hold::Spawn),
-        "torn" => return Wait::Until(Hold::Torn),
-        "ambient" => return Wait::Until(Hold::Ambient),
-        _ => {}
+    let state = [
+        ("world", Hold::World),
+        ("spawn", Hold::Spawn),
+        ("torn", Hold::Torn),
+        ("ambient", Hold::Ambient),
+    ]
+    .iter()
+    .find_map(|&(name, hold)| (name == word).then_some(hold));
+    if let Some(hold) = state {
+        return Wait::Until(hold);
     }
-    if let Some(ticks) = first
-        .strip_suffix('t')
-        .and_then(|digits| digits.parse::<u32>().ok())
-    {
+    let tick_count = word.strip_suffix('t').map(str::parse::<u32>);
+    if let Some(Ok(ticks)) = tick_count {
         return Wait::Ticks(ticks);
     }
-    let secs = first
+    let secs = word
         .trim_end_matches('s')
-        .parse::<f32>()
+        .parse()
         .ok()
-        .filter(|secs| secs.is_finite())
-        .unwrap_or(1.0);
-    Wait::Seconds(secs.clamp(0.0, MAX_WAIT_SECS))
+        .filter(|secs: &f32| secs.is_finite())
+        .unwrap_or(DEFAULT_WAIT_SECS);
+    Wait::Pause(secs.clamp(0.0, MAX_WAIT_SECS))
 }
 
-/// What the log says when `wait <what>` finds the game already there, and
-/// when it has to hold.
-fn wait_text(hold: Hold) -> (&'static str, &'static str) {
+/// Log wording for `wait <what>`: first when the game is already there,
+/// second when a hold begins.
+fn wait_text(hold: Hold) -> [&'static str; 2] {
     match hold {
-        Hold::World => ("already spawned", "until scene.spawned"),
-        Hold::Spawn => ("already InGame", "until AppScreen::InGame"),
-        Hold::Torn => ("already hold", "until HasWorld=0 and scene.spawned=0"),
-        Hold::Ambient => ("already MapAmbientBooted", "until MapAmbientBooted"),
-        _ => ("already reached", "until reached"),
+        Hold::World => ["already spawned", "until scene.spawned"],
+        Hold::Spawn => ["already InGame", "until AppScreen::InGame"],
+        Hold::Torn => ["already hold", "until HasWorld=0 and scene.spawned=0"],
+        Hold::Ambient => ["already MapAmbientBooted", "until MapAmbientBooted"],
+        _ => ["already reached", "until reached"],
     }
 }
 
 fn run_wait(
-    command: &ConsoleCommand,
+    command: &TypedOrder,
     view: &GameView<'_>,
-    dispatch: &mut ConsoleDispatch,
-    console: &mut ConsoleState,
-    capacity: usize,
+    router: &mut TypedOrderRouter,
+    panel: &mut PromptPanelStatus,
+    room: usize,
 ) {
-    match parse_wait(&command.args) {
-        Wait::Seconds(secs) => {
-            dispatch.sleep_for(secs);
-            diag::info!(Console, "wait: {secs:.1}s");
+    match parse_wait(&command.words) {
+        Wait::Pause(secs) => {
+            router.sleep_for(secs);
+            diag::info!(Console, "wait: {:.1}s", secs);
         }
         Wait::Ticks(ticks) => match view.tick() {
             Some(now) => {
-                dispatch.hold(Hold::Tick(now.wrapping_add(ticks)));
+                router.stall(Hold::Tick(now.wrapping_add(ticks)));
                 diag::info!(Console, "wait: {ticks} ticks from tick {now}");
             }
             None => {
-                let message = format!("wait: {ticks}t needs an authority clock; not holding");
-                diag::warn!(Console, "{message}");
-                console.echo(message, capacity);
+                let refusal = format!("wait: {ticks}t needs an authority clock; not holding");
+                diag::warn!(Console, "{}", refusal);
+                panel.post_line(refusal, room);
             }
         },
         Wait::Until(hold) => {
-            let (already, until) = wait_text(hold);
-            if view.met(hold) {
-                diag::info!(Console, "{}: {already}", hold.kind());
-            } else {
-                dispatch.hold(hold);
-                diag::info!(Console, "{}: {until}", hold.kind());
+            let [already, until] = wait_text(hold);
+            let already_there = view.met(hold);
+            if !already_there {
+                router.stall(hold);
             }
+            let note = if already_there { already } else { until };
+            diag::info!(Console, "{}: {note}", hold.kind());
         }
     }
 }
 
-/// Moves the commands the process was started with into the queue.
+/// Transfers the commands the process launched with into the live queue.
 pub(super) fn drain_startup_queue(
-    mut startup: ResMut<ConsoleQueue>,
-    mut queue: ResMut<ConsoleCommandQueue>,
+    mut startup: ResMut<OrderInbox>,
+    mut queue: ResMut<TypedOrderBacklog>,
 ) {
-    queue.0.extend(startup.drain());
+    let launched = startup.drain();
+    queue.0.extend(launched);
 }
 
-/// Commands the menus run: kept apart from the queue so that they never wait
-/// behind a script.
+/// Commands issued by menus, kept apart from the main queue so they never
+/// queue up behind a script.
 #[derive(Default)]
 pub(super) struct MenuScript {
-    pending: VecDeque<ConsoleCommand>,
+    pending: VecDeque<TypedOrder>,
     delay: f32,
-    /// Command names already reported as unsupported.
+    /// Names of commands already warned about as unsupported.
     reported: HashSet<String>,
 }
 
-/// How long a menu script's `wait` pauses it.
+/// Pause length requested by a menu script's `wait`.
 fn menu_delay(args: &[String]) -> f32 {
-    args.first()
-        .and_then(|secs| secs.trim_end_matches('s').parse().ok())
-        .unwrap_or(0.0)
+    let Some(first) = args.first() else {
+        return 0.0;
+    };
+    first.trim_end_matches('s').parse().unwrap_or(0.0)
 }
 
-/// Runs what menus ask for with `exec`. Each command goes out as if typed in
-/// the background, and the ones the console does not know are skipped.
+/// Runs what menus submit through `exec`. Each command is sent as a typed,
+/// backgrounded one; commands the console lacks are skipped.
 pub(super) fn run_menu_commands(
-    time: Res<Time>,
-    registry: Res<ConsoleRegistry>,
+    clock: Res<Time>,
+    book: Res<OrderCatalog>,
     mut incoming: MessageReader<frame::UiExecCommand>,
     mut script: Local<MenuScript>,
-    mut submitted: MessageWriter<ConsoleCommand>,
+    mut submitted: MessageWriter<TypedOrder>,
 ) {
-    for exec in incoming.read() {
-        script
-            .pending
-            .extend(ConsoleCommand::parse_script(&exec.text));
+    for request in incoming.read() {
+        let parsed = TypedOrder::parse_script(&request.text);
+        script.pending.extend(parsed);
     }
     if script.delay > 0.0 {
-        script.delay = (script.delay - time.delta_secs()).max(0.0);
+        script.delay = (script.delay - clock.delta_secs()).max(0.0);
         return;
     }
-    while let Some(mut command) = script.pending.pop_front() {
-        if command.name.eq_ignore_ascii_case("wait") {
-            script.delay = menu_delay(&command.args);
+    while let Some(mut cmd) = script.pending.pop_front() {
+        if cmd.name.eq_ignore_ascii_case("wait") {
+            script.delay = menu_delay(&cmd.words);
             break;
         }
-        if registry.resolve(&command.name).is_none() {
-            if script.reported.insert(command.name.clone()) {
-                diag::warn!(Ui, "menu: unsupported engine command `{}`", command.name);
+        if book.look_up(&cmd.name).is_none() {
+            if script.reported.insert(cmd.name.clone()) {
+                diag::warn!(Ui, "menu: unsupported engine command `{}`", cmd.name);
             }
             continue;
         }
-        command.interactive = true;
-        command.background = true;
-        submitted.write(command);
+        cmd.typed_by_hand = true;
+        cmd.detached = true;
+        submitted.write(cmd);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::app::queue::*;
 
-    fn command(line: &str, interactive: bool) -> ConsoleCommand {
-        let mut command = ConsoleCommand::parse(line).expect("a command");
-        command.interactive = interactive;
+    fn command(line: &str, typed_by_hand: bool) -> TypedOrder {
+        let mut command = TypedOrder::parse(line).expect("a command");
+        command.typed_by_hand = typed_by_hand;
         command
     }
 
-    fn queue_of(lines: &[&str]) -> VecDeque<ConsoleCommand> {
+    fn queue_of(lines: &[&str]) -> VecDeque<TypedOrder> {
         lines.iter().map(|line| command(line, false)).collect()
     }
 
@@ -670,17 +693,17 @@ mod tests {
 
     #[test]
     fn wait_defaults_to_one_second() {
-        assert!(matches!(parse_wait(&[]), Wait::Seconds(s) if s == 1.0));
-        assert!(matches!(parse_wait(&args(&["soon"])), Wait::Seconds(s) if s == 1.0));
-        assert!(matches!(parse_wait(&args(&["nan"])), Wait::Seconds(s) if s == 1.0));
+        assert!(matches!(parse_wait(&[]), Wait::Pause(s) if s == 1.0));
+        assert!(matches!(parse_wait(&args(&["soon"])), Wait::Pause(s) if s == 1.0));
+        assert!(matches!(parse_wait(&args(&["nan"])), Wait::Pause(s) if s == 1.0));
     }
 
     #[test]
     fn wait_reads_seconds_with_or_without_the_unit() {
-        assert!(matches!(parse_wait(&args(&["2.5s"])), Wait::Seconds(s) if s == 2.5));
-        assert!(matches!(parse_wait(&args(&["3S"])), Wait::Seconds(s) if s == 3.0));
-        assert!(matches!(parse_wait(&args(&["500"])), Wait::Seconds(s) if s == MAX_WAIT_SECS));
-        assert!(matches!(parse_wait(&args(&["-4"])), Wait::Seconds(s) if s == 0.0));
+        assert!(matches!(parse_wait(&args(&["2.5s"])), Wait::Pause(s) if s == 2.5));
+        assert!(matches!(parse_wait(&args(&["3S"])), Wait::Pause(s) if s == 3.0));
+        assert!(matches!(parse_wait(&args(&["500"])), Wait::Pause(s) if s == MAX_WAIT_SECS));
+        assert!(matches!(parse_wait(&args(&["-4"])), Wait::Pause(s) if s == 0.0));
     }
 
     #[test]
@@ -738,7 +761,7 @@ mod tests {
 
     #[test]
     fn only_typed_commands_of_the_asked_names_jump_the_queue() {
-        let mut queue = ConsoleCommandQueue::default();
+        let mut queue = TypedOrderBacklog::default();
         queue.0.push_back(command("quit", false));
         queue.0.push_back(command("map mp_nuketown_2020", true));
         queue.0.push_back(command("dump", true));
@@ -763,141 +786,133 @@ mod tests {
     fn the_abort_message_names_the_wait_and_what_was_missing() {
         let mut queue = queue_of(&["wait 1", "quit"]);
         let message = abort_script(Hold::Playing, &mut queue);
-        assert_eq!(
-            message,
-            "wait playing: timed out after 120s (match phase still not Playing) — script \
-             aborted, 1 queued commands dropped, kept exit=1"
-        );
+        let expected = "wait playing: timed out after 120s (match phase still not Playing) — script \
+         aborted, 1 queued commands dropped, kept exit=1";
+        assert_eq!(message, expected);
     }
 
     #[test]
     fn a_background_map_does_not_block_the_queue() {
-        let mut dispatch = ConsoleDispatch::default();
+        let mut router = TypedOrderRouter::default();
         let mut map = command("map mp_nuketown_2020", false);
-        map.background = true;
-        begin_sync(&map, &mut dispatch);
-        assert!(!dispatch.waiting());
-        begin_sync(&command("map mp_nuketown_2020", false), &mut dispatch);
-        assert!(dispatch.paused);
-        assert!(matches!(dispatch.holding(), Some(Hold::World)));
+        map.detached = true;
+        begin_sync(&map, &mut router);
+        assert!(!router.waiting());
+        begin_sync(&command("map mp_nuketown_2020", false), &mut router);
+        assert!(router.command_running);
+        assert!(matches!(router.holding(), Some(Hold::World)));
     }
 
     #[test]
     fn disconnect_waits_for_the_world_to_go_and_spawn_waits_for_nothing() {
-        let mut dispatch = ConsoleDispatch::default();
-        begin_sync(&command("spawn", false), &mut dispatch);
-        assert!(!dispatch.waiting());
-        begin_sync(&command("disconnect", false), &mut dispatch);
-        assert!(dispatch.paused);
-        assert!(matches!(dispatch.holding(), Some(Hold::Torn)));
+        let mut router = TypedOrderRouter::default();
+        begin_sync(&command("spawn", false), &mut router);
+        assert!(!router.waiting());
+        begin_sync(&command("disconnect", false), &mut router);
+        assert!(router.command_running);
+        assert!(matches!(router.holding(), Some(Hold::Torn)));
     }
 
     #[test]
     fn an_ordinary_command_does_not_hold_the_queue() {
-        let mut dispatch = ConsoleDispatch::default();
-        begin_sync(&command("echo hi", false), &mut dispatch);
-        assert!(!dispatch.waiting());
+        let mut router = TypedOrderRouter::default();
+        begin_sync(&command("echo hi", false), &mut router);
+        assert!(!router.waiting());
     }
 
     #[test]
     fn a_new_hold_replaces_the_old_one_and_restarts_its_clock() {
-        let mut dispatch = ConsoleDispatch::default();
-        dispatch.hold(Hold::Spawn);
-        assert_eq!(dispatch.settle(30.0, |_| false), Settled::Waiting);
-        dispatch.hold(Hold::Ambient);
-        assert!(matches!(dispatch.holding(), Some(Hold::Ambient)));
+        let mut router = TypedOrderRouter::default();
+        router.stall(Hold::Spawn);
+        assert_eq!(router.settle(30.0, |_| false), Settled::Waiting);
+        router.stall(Hold::Ambient);
+        assert!(matches!(router.holding(), Some(Hold::Ambient)));
         assert!(matches!(
-            dispatch.settle(1.0, |hold| matches!(hold, Hold::Ambient)),
+            router.settle(1.0, |hold| matches!(hold, Hold::Ambient)),
             Settled::Met(Hold::Ambient, secs) if secs == 0.0
         ));
-        assert!(dispatch.holding().is_none());
+        assert!(router.holding().is_none());
     }
 
     #[test]
     fn a_met_hold_reports_how_long_it_waited() {
-        let mut dispatch = ConsoleDispatch::default();
-        assert_eq!(dispatch.settle(1.0, |_| true), Settled::Free);
-        dispatch.hold(Hold::Spawn);
-        assert_eq!(dispatch.settle(0.5, |_| false), Settled::Waiting);
-        assert_eq!(dispatch.settle(0.5, |_| false), Settled::Waiting);
+        let mut router = TypedOrderRouter::default();
+        assert_eq!(router.settle(1.0, |_| true), Settled::Free);
+        router.stall(Hold::Spawn);
+        assert_eq!(router.settle(0.5, |_| false), Settled::Waiting);
+        assert_eq!(router.settle(0.5, |_| false), Settled::Waiting);
         assert!(matches!(
-            dispatch.settle(0.5, |_| true),
+            router.settle(0.5, |_| true),
             Settled::Met(Hold::Spawn, secs) if secs == 1.0
         ));
     }
 
     #[test]
     fn a_hold_times_out_after_two_minutes() {
-        let mut dispatch = ConsoleDispatch::default();
-        dispatch.hold(Hold::Playing);
-        assert_eq!(dispatch.settle(119.0, |_| false), Settled::Waiting);
+        let mut router = TypedOrderRouter::default();
+        router.stall(Hold::Playing);
+        assert_eq!(router.settle(119.0, |_| false), Settled::Waiting);
         assert!(matches!(
-            dispatch.settle(1.0, |_| false),
+            router.settle(1.0, |_| false),
             Settled::TimedOut(Hold::Playing)
         ));
-        assert!(dispatch.holding().is_none());
+        assert!(router.holding().is_none());
     }
 
     #[test]
     fn a_spawn_that_never_gets_through_forgets_its_class() {
-        let mut dispatch = ConsoleDispatch {
-            pending_spawn_class: Some("assault".to_owned()),
-            ..ConsoleDispatch::default()
+        let mut router = TypedOrderRouter {
+            queued_kit_choice: Some("assault".to_owned()),
+            ..TypedOrderRouter::default()
         };
-        dispatch.hold(Hold::SpawnAdmit);
+        router.stall(Hold::SpawnAdmit);
         assert!(matches!(
-            dispatch.settle(HOLD_TIMEOUT_SECS, |_| false),
+            router.settle(HOLD_TIMEOUT_SECS, |_| false),
             Settled::TimedOut(Hold::SpawnAdmit)
         ));
-        assert_eq!(dispatch.pending_spawn_class, None);
+        assert_eq!(router.queued_kit_choice, None);
     }
 
     #[test]
     fn release_lets_everything_go() {
-        let mut dispatch = ConsoleDispatch {
-            paused: true,
-            pending_spawn_class: Some("smg".to_owned()),
+        let mut router = TypedOrderRouter {
+            command_running: true,
+            queued_kit_choice: Some("smg".to_owned()),
             ..Default::default()
         };
-        dispatch.hold(Hold::World);
-        dispatch.sleep_for(5.0);
-        assert!(dispatch.waiting());
-        dispatch.release();
-        assert!(!dispatch.waiting());
-        assert_eq!(dispatch.pending_spawn_class, None);
+        router.stall(Hold::World);
+        router.sleep_for(5.0);
+        assert!(router.waiting());
+        router.unblock();
+        assert!(!router.waiting());
+        assert_eq!(router.queued_kit_choice, None);
     }
 
     #[test]
     fn a_sleep_ends_on_the_frame_it_runs_out() {
-        let mut dispatch = ConsoleDispatch::default();
-        assert!(!dispatch.sleeping(0.1));
-        dispatch.sleep_for(1.0);
-        assert!(dispatch.waiting());
-        assert!(dispatch.sleeping(0.5));
-        assert!(!dispatch.sleeping(0.5));
-        assert!(!dispatch.waiting());
+        let mut router = TypedOrderRouter::default();
+        assert!(!router.sleeping(0.1));
+        router.sleep_for(1.0);
+        assert!(router.waiting());
+        assert!(router.sleeping(0.5));
+        assert!(!router.sleeping(0.5));
+        assert!(!router.waiting());
     }
 
     #[test]
     fn a_finished_wait_reads_back_what_was_reached() {
-        assert_eq!(
-            Hold::Tick(7).done_line(2.0),
-            "wait ticks: tick 7 after 2.0s"
-        );
-        assert_eq!(
-            Hold::World.done_line(0.04),
-            "wait world: spawned after 0.0s"
-        );
-        assert_eq!(
-            Hold::Alive(sim::ClientId(0), sim::LifeSequence(1)).done_line(1.5),
-            "force_spawn: Alive after 1.5s"
-        );
+        let expected = "wait ticks: tick 7 after 2.0s";
+        assert_eq!(Hold::Tick(7).done_line(2.0), expected);
+        let expected = "wait world: spawned after 0.0s";
+        assert_eq!(Hold::World.done_line(0.04), expected);
+        let expected = "force_spawn: Alive after 1.5s";
+        assert_eq!(Hold::Alive(sim::ClientId(0), sim::LifeSequence(1)).done_line(1.5), expected);
     }
 
     #[test]
     fn a_script_pushed_to_the_queue_keeps_its_order() {
-        let mut queue = ConsoleCommandQueue::default();
-        queue.push_script("map a; wait 1; quit");
+        let mut queue = TypedOrderBacklog::default();
+        queue.enqueue_script_text("map a; wait 1; quit");
         let names: Vec<_> = queue.0.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["map", "wait", "quit"]);
     }

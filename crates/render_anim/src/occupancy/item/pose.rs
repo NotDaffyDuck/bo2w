@@ -3,138 +3,131 @@ use super::*;
 /// Bind-poses a composition's models into drawable surfaces.
 pub(super) fn pose_composition(
     composition: &ItemComposition,
-    catalog: &asset_model::WorldWeaponCatalog,
-    skin_entries: &[dpvs_t6::SceneEntSkinEntry],
+    catalog: &asset_model::LevelWeaponRoster,
+    skins: &[dpvs_t6::EntitySkinSlotRecord],
 ) -> Option<ItemPosedAsset> {
     let wanted = 1 + composition.attachments.len();
     let mut skels = Vec::with_capacity(wanted);
     let mut models = Vec::with_capacity(wanted);
-    for index in std::iter::once(&composition.model).chain(&composition.attachments) {
-        let Some(entry) = catalog.get_at(index.order()) else {
+    for index in std::iter::once(&composition.mdl).chain(&composition.attachments) {
+        let Some(entry) = catalog.at_row(index.order()) else {
             break;
         };
-        skels.push(&*entry.skel);
+        skels.push(&*entry.bone_rig);
         models.push(*index);
     }
     if skels.len() != wanted {
         return None;
     }
-    let state = xmodel_runtime::DObjSemanticState::bind_pose(composition.name.clone(), 1, 1);
-    let request = state.resolve_request(|_| None).ok()?;
-    let (surfaces, _) = pose_script_dobj_with_materials(
-        None,
-        &skels,
-        &composition.dobj,
-        &request,
-        None,
-        skin_entries,
-    )?;
+    let state = xmodel_runtime::RigPoseRecord::neutral_pose(composition.name.clone(), 1, 1);
+    let request = state.look_up_pose_query(|_| None).ok()?;
+    let (surfaces, _) =
+        pose_script_skeleton_and_materials(None, &skels, &composition.dobj, &request, None, skins)?;
+    let key = composition.key.clone();
     Some(ItemPosedAsset {
-        key: composition.key.clone(),
-        models,
         surfaces,
+        models,
+        key,
     })
 }
 
 pub(super) fn pose_items(
-    occupancy: Res<ItemOccupancy>,
-    world_weapons: Option<Res<assets::PreparedWorldWeapons>>,
-    gfx: Res<HostGfxScene>,
-    mut product: ResMut<ItemPoseProduct>,
+    item_occupancy: Res<ItemRows>,
+    prepared_world: Option<Res<assets::ReadiedWorldWeapons>>,
+    host_gfx: Res<HostVisualStage>,
+    mut out: ResMut<ItemPosed>,
 ) {
     let _slow = SlowGuard::new("pose_items");
-    product.owners.clear();
-    if world_weapons.as_ref().is_some_and(|w| w.is_changed()) {
-        product.assets.clear();
+    out.owners.clear();
+    if prepared_world.as_ref().is_some_and(|fresh| fresh.is_changed()) {
+        out.assets.clear();
     }
-    let Some(catalog) = world_weapons
+    let loaded = prepared_world
         .as_ref()
-        .map(|prepared| &prepared.0)
-        .filter(|catalog| !catalog.is_empty())
-    else {
-        product.assets.clear();
+        .map(|prepared_in| &prepared_in.0)
+        .filter(|loaded| !loaded.is_empty());
+    let Some(catalog) = loaded else {
+        out.assets.clear();
         return;
     };
-    for row in &occupancy.rows {
-        let entnum = u32::try_from(row.entnum).unwrap_or(0);
-        let slot = scene_slot(&gfx.scene, entnum);
-        if slot.hidden {
+    for row in item_occupancy.rows.iter() {
+        let entnum = u32::try_from(row.entnum).unwrap_or_default();
+        let slot = scene_slot(&host_gfx.scene, entnum);
+        let visible_in = !slot.concealed;
+        if !visible_in {
             continue;
         }
-        let known = product
+        let known = out
             .assets
             .iter()
             .position(|posed| posed.key == row.composition.key);
-        let asset_index = match known {
-            Some(index) => index,
-            None => {
-                let Some(posed) = pose_composition(&row.composition, catalog, slot.skin_entries)
-                else {
-                    continue;
-                };
-                product.assets.push(posed);
-                product.assets.len() - 1
-            }
+        let draw_asset_slot = if let Some(index) = known {
+            index
+        } else {
+            let Some(posed) = pose_composition(&row.composition, catalog, slot.skin_jobs)
+            else {
+                continue;
+            };
+            out.assets.push(posed);
+            out.assets.len() - 1
         };
-        product.owners.push(ItemPosedOwner {
-            asset_index,
-            slot: row.slot,
-            entnum,
-            origin: row.origin,
-            angles: row.angles,
-            name: row.composition.name.clone(),
-            model: row.composition.model,
-            lighting_origin: row.lighting_origin,
+        let origin = row.pos;
+        let angles = row.angs;
+        let illum_origin = row.illum_origin;
+        let (name, model) = (row.composition.name.clone(), row.composition.mdl);
+        out.owners.push(ItemPosedOwner {
+            spot: origin,
+            rot: angles,
+            illum_origin,
+            name,
+            mdl: model,
+            ent_num: entnum,
+            draw_asset_slot,
+            ix: row.seat,
         });
     }
 }
 
 /// Empties the draw plan but keeps its revision counters, advancing them
 /// first when `advance` is set.
-pub(super) fn restart_plan(plan: &mut ItemDrawPlan, advance: bool) {
-    let (revision, generation) = if advance {
-        (
-            plan.revision.wrapping_add(1),
-            plan.generation.wrapping_add(1),
-        )
-    } else {
-        (plan.revision, plan.generation)
+pub(super) fn restart_plan(draw_plan: &mut PickupPaintPlan, advance: bool) {
+    let step = u64::from(advance);
+    *draw_plan = PickupPaintPlan {
+        plan_rev: draw_plan.plan_rev.wrapping_add(step),
+        generation: draw_plan.generation.wrapping_add(step),
+        ..Default::default()
     };
-    *plan = ItemDrawPlan::default();
-    plan.revision = revision;
-    plan.generation = generation;
 }
 
 /// Adds a posed composition's surfaces to the plan, returning where they sit.
 pub(super) fn plan_asset(
-    plan: &mut ItemDrawPlan,
-    posed: &ItemPosedAsset,
-    catalog: &asset_model::WorldWeaponCatalog,
-    tess: &TessMaterials,
+    draw_plan: &mut PickupPaintPlan,
+    posed_in: &ItemPosedAsset,
+    catalog: &asset_model::LevelWeaponRoster,
+    tess: &StitchMaterials,
     model_materials: &PreparedModelMaterials,
 ) -> Option<usize> {
-    if let Some(found) = plan.assets.iter().position(|a| a.model == posed.key) {
-        return Some(found);
+    let existing_in = draw_plan.assets.iter().position(|a| a.xmodel_name == posed_in.key);
+    if existing_in.is_some() {
+        return existing_in;
     }
-    let materials: Vec<Option<SmodelPassMaterial>> = posed
+    let mats = posed_in
         .surfaces
         .iter()
-        .map(|surface| {
-            let entry = catalog.get_at(posed.models.get(usize::from(surface.model))?.order())?;
-            let name = entry.material_present_name(surface.surface_index)?;
-            model_materials.material(&tess.catalog, name).cloned()
+        .map(|piece| {
+            let entry = catalog.at_row(posed_in.models.get(usize::from(piece.mdl))?.order())?;
+            let name = entry.material_name_of(piece.surface_slot_number)?;
+            model_materials.mat(&tess.catalog, name).cloned()
         })
-        .collect();
-    if materials.iter().all(Option::is_none) {
+        .collect::<Vec<Option<PropPassMaterial>>>();
+    if mats.iter().flatten().next().is_none() {
         return None;
     }
-    let surfaces = append_item_surfaces(plan, &posed.surfaces, &materials);
-    if surfaces.is_empty() {
-        return None;
-    }
-    plan.assets.push(ItemAssetDraw {
-        model: posed.key.clone(),
-        surfaces,
-    });
-    Some(plan.assets.len() - 1)
+    let surfaces = push_pickup_surfaces(draw_plan, &posed_in.surfaces, &mats);
+    let landing = draw_plan.assets.len();
+    (!surfaces.is_empty()).then(|| {
+        let model = posed_in.key.clone();
+        draw_plan.assets.push(PickupMeshPaint { surf_list: surfaces, xmodel_name: model });
+        landing
+    })
 }

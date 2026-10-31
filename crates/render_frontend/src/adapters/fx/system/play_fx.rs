@@ -6,13 +6,12 @@
 //! snapshot it arrived with, and says how to play it in its simulation flags.
 
 use bevy::prelude::*;
-use entity_t6::event as ev;
-use fx::{FxBoltOrientation, FxBoltTarget, PlayResult, axis_from_hit_normal};
-use net::LastAdoptedSnapshot;
-use render_fx::{PresentedVehicleFx, PresentedVehicleFxRow};
+use entity_t6::event;
+use fx::{AttachPointFrame, EffectBoltTarget, PlaybackResult, basis_off_contact_facing};
+use net::NewestTakenSnapshot;
 
-use super::stage::FxStage;
-use crate::adapters::anim::fpv_present::FpvBoltTargets;
+use super::stage::{FxStage, Pose};
+use crate::adapters::motion::gun_present::AttachTagGoals;
 
 /// Played on the viewmodel's `tag_target` of the player's own gun (the Hunter
 /// Killer's lock light).
@@ -62,128 +61,121 @@ fn request(flags: u8, up_given: bool) -> Request {
 }
 
 /// The frame an effect is played in. The event carries the way it points; a
-/// `playfx` that also gave an up carries that in `up_hint` (the wall buys'
+/// `playfx` that also gave an up carries that in `hint` (the wall buys'
 /// chalk), and the frame is built from the two. Without one the effect lies on
 /// the surface the direction is the normal of.
-fn frame(direction: [f32; 3], up_hint: [f32; 3]) -> [[f32; 3]; 3] {
-    let forward = if direction == [0.0; 3] {
-        [0.0, 0.0, 1.0]
-    } else {
-        direction
-    };
-    if up_hint == [0.0; 3] {
-        return axis_from_hit_normal(forward);
+fn frame(direction: Vec3, hint: Vec3) -> [[f32; 3]; 3] {
+    let forward = if direction == Vec3::ZERO { Vec3::Z } else { direction };
+    if hint == Vec3::ZERO {
+        return basis_off_contact_facing(forward.to_array());
     }
-    let forward = Vec3::from_array(fx_t6::runtime::vec3_normalize(forward));
-    let hint = Vec3::from_array(up_hint);
+    let forward = Vec3::from_array(fx_t6::runtime::vec3_normalize(forward.to_array()));
     // The hint with its share along the forward direction taken out.
     let up = Vec3::from_array(fx_t6::runtime::vec3_normalize(
         (hint - forward * hint.dot(forward)).to_array(),
     ));
-    [
-        forward.to_array(),
-        up.cross(forward).to_array(),
-        up.to_array(),
-    ]
-}
-
-/// How the vehicle table logs the outcome, for the scorestreak code that waits
-/// on it.
-fn outcome_label(played: Option<PlayResult>) -> &'static str {
-    match played {
-        Some(PlayResult::PlayedReleased { .. } | PlayResult::Held { .. }) => "spawned",
-        Some(PlayResult::Failed(_)) | None => "miss_def",
-    }
+    Pose::axes_from(forward, up)
 }
 
 pub(super) fn play_fx(
-    play: On<net::EntityPlayFx>,
-    adopted: Option<Res<LastAdoptedSnapshot>>,
-    mut presented: ResMut<PresentedVehicleFx>,
-    own_gun: Res<FpvBoltTargets>,
+    fx_play: On<net::EffectAt>,
+    adopted: Option<Res<NewestTakenSnapshot>>,
+    own_gun: Res<AttachTagGoals>,
     mut stage: FxStage,
+    // bo2zm: the effects held in the world (def name, spot, handle).
+    mut held_world: Local<Vec<(String, [f32; 3], u16)>>,
 ) {
     // The Sensor Grenade's lasers are beams (sensor_laser.rs), not effects.
-    if play.event.event.0 == ev::ours::SENSOR_LASER {
+    if fx_play.event.event.0 == event::ours::SENSOR_LASER {
         return;
     }
     let Some(mut stagehand) = stage.playback() else {
         return;
     };
-    let payload = play.event.payload;
-    let owner = (payload.correlation != 0).then_some(payload.correlation);
-    let index = u8::try_from(payload.event_parm).unwrap_or(0);
-    let Some(effect) = adopted
-        .as_deref()
-        .and_then(|snapshot| snapshot.effect_name(index))
-    else {
-        if let Some(owner) = owner {
-            presented.by_id.insert(
-                owner,
-                PresentedVehicleFxRow {
-                    fx_spawn: Some("miss_cs"),
-                    fx_spawn_def: None,
-                },
-            );
-        }
+    let body_data = fx_play.event.payload;
+    let named = adopted.as_deref().and_then(|snapshot| {
+        let index = u8::try_from(body_data.event_parm).unwrap_or(0);
+        snapshot.effect_label(index)
+    });
+    let Some(effect) = named else {
         return;
     };
     let name = stagehand.defs().map_fx_name(effect);
-    let axis = frame(payload.direction, payload.origin2);
-    let up_given = payload.origin2 != [0.0; 3];
-    let bone = (payload.number as u32, u16::from(payload.surf_type));
+    let axis = frame(Vec3::from_array(body_data.direction), Vec3::from_array(body_data.origin2));
+    let up_given = body_data.origin2 != [0.0; 3];
+    let (dobj, bone) = (body_data.number as u32, u16::from(body_data.surf_type));
 
-    let played = match request(payload.simulation_flags, up_given) {
+    let played = match request(body_data.wall_pass_bits, up_given) {
         Request::OnViewModel { take_off } => {
             // Nothing when the gun in his hands has no such tag.
-            let Some(target) = own_gun.target[0] else {
-                return;
-            };
-            if take_off {
-                if let Some(def) = name.resolve(stagehand.defs()) {
-                    stagehand.host().stop_bolted(&def.name, target.dobj, target.bone);
+            if let Some(goal) = own_gun.target[0] {
+                match (take_off, name.settle(stagehand.defs())) {
+                    (false, _) => {
+                        stagehand.bolted_by_name(name, goal);
+                    }
+                    (true, Some(def)) => {
+                        stagehand.host().stop_bolted(&def.name, goal.dobj, goal.bone);
+                    }
+                    (true, None) => {}
                 }
-            } else {
-                stagehand.bolted_by_name(name, target);
             }
             return;
         }
         Request::TakeOffBone { at_once } => {
-            if let Some(def) = name.resolve(stagehand.defs()) {
-                if at_once {
-                    stagehand.host().kill_bolted(&def.name, bone.0, bone.1);
+            if let Some(def) = name.settle(stagehand.defs()) {
+                if dobj == fx_t6::runtime::FX_ENTITYNUM_WORLD {
+                    // bo2zm: BO2's stopfx on a held world effect (Buried's "?"
+                    // chalk when its wall buy is built).
+                    let at = body_data.origin;
+                    let host = stagehand.host();
+                    held_world.retain(|(held, origin, handle)| {
+                        let here =
+                            *held == def.name && (0..3).all(|i| (origin[i] - at[i]).abs() < 1.0);
+                        if here
+                            && host
+                                .bin_of_ticket(*handle)
+                                .is_some_and(|e| e.definition_name == def.name)
+                        {
+                            host.stop_owned(*handle);
+                        }
+                        !here
+                    });
+                } else if at_once {
+                    stagehand.host().kill_bolted(&def.name, dobj, bone);
                 } else {
-                    stagehand.host().stop_bolted(&def.name, bone.0, bone.1);
+                    stagehand.host().stop_bolted(&def.name, dobj, bone);
                 }
             }
             return;
         }
         Request::OnBone => stagehand.bolted_by_name(
             name,
-            FxBoltTarget {
-                dobj: bone.0,
-                bone: bone.1,
-                centity_teleport: false,
-                orientation: FxBoltOrientation {
-                    origin: payload.origin,
+            EffectBoltTarget {
+                dobj,
+                bone,
+                client_actor_teleport: false,
+                orientation: AttachPointFrame {
+                    origin: body_data.origin,
                     axis,
                 },
             },
         ),
-        Request::InWorld { kept: false } => stagehand.oriented(name, payload.origin, axis),
+        Request::InWorld { kept: false } => {
+            stagehand.oriented(name, Pose { anchor: body_data.origin, turn: axis })
+        }
         Request::InWorld { kept: true } => {
             let now = stagehand.now();
-            stagehand.spawned(name, payload.origin, axis, now)
+            stagehand.spawned(name, Pose { anchor: body_data.origin, turn: axis }, now)
         }
     };
-    if let Some(owner) = owner {
-        presented.by_id.insert(
-            owner,
-            PresentedVehicleFxRow {
-                fx_spawn: Some(outcome_label(played)),
-                fx_spawn_def: Some(effect.to_owned()),
-            },
-        );
+    // bo2zm: remember a held world effect, so a later stopfx at its spot can end it.
+    if let Some(PlaybackResult::Kept { handle }) = played
+        && dobj == fx_t6::runtime::FX_ENTITYNUM_WORLD
+        && let Some(def) = name.settle(stagehand.defs())
+    {
+        let host = stagehand.host();
+        held_world.retain(|(held, _, h)| host.bin_of_ticket(*h).is_some_and(|e| e.definition_name == *held));
+        held_world.push((def.name.clone(), body_data.origin, handle));
     }
 }
 
@@ -240,19 +232,18 @@ mod tests {
 
     #[test]
     fn without_a_direction_the_effect_points_straight_up() {
-        assert_eq!(frame([0.0; 3], [0.0; 3]), axis_from_hit_normal([0.0, 0.0, 1.0]));
+        assert_eq!(frame(Vec3::ZERO, Vec3::ZERO), basis_off_contact_facing([0.0, 0.0, 1.0]));
     }
 
     #[test]
     fn with_no_up_given_the_effect_lies_on_the_surface() {
-        let normal = [0.0, 1.0, 0.0];
-        assert_eq!(frame(normal, [0.0; 3]), axis_from_hit_normal(normal));
+        assert_eq!(frame(Vec3::Y, Vec3::ZERO), basis_off_contact_facing([0.0, 1.0, 0.0]));
     }
 
     #[test]
     fn a_given_up_is_made_square_with_the_direction() {
         // Forward along x; an up leaning half into x is straightened to z.
-        let [forward, left, up] = frame([2.0, 0.0, 0.0], [1.0, 0.0, 3.0]);
+        let [forward, left, up] = frame(Vec3::new(2.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 3.0));
         let near = |got: [f32; 3], want: [f32; 3]| {
             Vec3::from(got).distance(Vec3::from(want)) < 1.0e-6
         };
@@ -264,7 +255,7 @@ mod tests {
 
     #[test]
     fn the_given_frame_stays_orthonormal() {
-        let [f, l, u] = frame([0.3, -0.8, 0.5], [0.1, 0.2, 0.9]);
+        let [f, l, u] = frame(Vec3::new(0.3, -0.8, 0.5), Vec3::new(0.1, 0.2, 0.9));
         let (f, l, u) = (Vec3::from(f), Vec3::from(l), Vec3::from(u));
         for v in [f, l, u] {
             assert!((v.length() - 1.0).abs() < 1.0e-5, "{v:?}");
@@ -272,12 +263,6 @@ mod tests {
         assert!(f.dot(l).abs() < 1.0e-5);
         assert!(f.dot(u).abs() < 1.0e-5);
         assert!(l.dot(u).abs() < 1.0e-5);
-    }
-
-    #[test]
-    fn the_vehicle_table_hears_whether_the_effect_started() {
-        assert_eq!(outcome_label(Some(PlayResult::Held { handle: 1 })), "spawned");
-        assert_eq!(outcome_label(None), "miss_def");
     }
 
     #[test]

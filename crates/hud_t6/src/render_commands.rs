@@ -79,7 +79,7 @@ pub fn is_critical(id: u8) -> bool {
 
 /// The per-frame command list (BO2 GfxCmdArray). Buffer size and warn size are runtime values.
 #[derive(Debug)]
-pub struct GfxRenderCommandBuf<'a> {
+pub struct PaintQueueBytes<'a> {
     pub buf: &'a mut [u8],
     pub used_total: u32,
     pub used_critical: u32,
@@ -93,7 +93,7 @@ pub struct GfxRenderCommandBuf<'a> {
     pub size_warned: bool,
 }
 
-impl<'a> GfxRenderCommandBuf<'a> {
+impl<'a> PaintQueueBytes<'a> {
     #[must_use]
     pub fn new(buf: &'a mut [u8], warn_size: u32) -> Self {
         let byte_size = u32::try_from(buf.len()).unwrap_or(u32::MAX);
@@ -121,36 +121,43 @@ impl<'a> GfxRenderCommandBuf<'a> {
         }
     }
 
+    /// Where a command of `bytes` with this id would start, if it may be written.
+    fn admit(&self, id: u8, bytes: u32) -> Option<u32> {
+        let well_formed = id < RC_COUNT && bytes.is_multiple_of(4) && bytes <= u32::from(u16::MAX);
+        if !well_formed || bytes >= self.byte_size {
+            return None;
+        }
+        if bytes <= self.space_for(id) {
+            return Some(self.used_total);
+        }
+        debug_assert!(!is_critical(id), "critical render command {id} does not fit");
+        None
+    }
+
     /// R_GetCommandBuffer: reserve `bytes` for command `id`, write its header and return the whole
     /// command slice. A noncritical command that does not fit is dropped (None, last cleared).
     pub fn get_command_buffer(&mut self, id: u8, bytes: u32) -> Option<&mut [u8]> {
         debug_assert!(id < RC_COUNT, "render command id {id} out of range");
         debug_assert!(bytes.is_multiple_of(4) && bytes >= GFX_CMD_HEADER_SIZE);
-        if id >= RC_COUNT || !bytes.is_multiple_of(4) || bytes > u32::from(u16::MAX) || bytes >= self.byte_size
-        {
-            self.last = None;
-            return None;
-        }
-        if bytes > self.space_for(id) {
-            debug_assert!(!is_critical(id), "critical render command {id} does not fit");
-            self.last = None;
-            return None;
-        }
-        let off = self.used_total;
-        self.used_total += bytes;
+        self.last = self.admit(id, bytes);
+        let start = self.last?;
+        let end = start + bytes;
+        self.used_total = end;
         if is_critical(id) {
             self.used_critical += bytes;
-            self.critical_warned |= self.used_critical > GFX_RENDER_CMD_CRITICAL_WARN;
+            if self.used_critical > GFX_RENDER_CMD_CRITICAL_WARN {
+                self.critical_warned = true;
+            }
         }
-        self.size_warned |= self.warn_size != 0 && self.used_total > self.warn_size;
-        self.last = Some(off);
-        let cmd = &mut self.buf[off as usize..(off + bytes) as usize];
-        cmd[0..2].copy_from_slice(&(bytes as u16).to_le_bytes());
-        cmd[2] = id;
-        cmd[3] = self.ui3d;
-        Some(cmd)
+        if self.warn_size != 0 && end > self.warn_size {
+            self.size_warned = true;
+        }
+        let ui3d = self.ui3d;
+        let command = &mut self.buf[start as usize..end as usize];
+        let [low, high] = (bytes as u16).to_le_bytes();
+        command[..4].copy_from_slice(&[low, high, id, ui3d]);
+        Some(command)
     }
-
     /// R_AddCmdEndOfList.
     pub fn add_end_of_list(&mut self) -> bool {
         self.get_command_buffer(RC_END_OF_LIST, RC_END_OF_LIST_SIZE).is_some()
@@ -158,7 +165,7 @@ impl<'a> GfxRenderCommandBuf<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GfxCmdView<'a> {
+pub struct PaintCameraSetup<'a> {
     pub id: u8,
     pub ui3d: u8,
     pub size: u16,
@@ -167,28 +174,28 @@ pub struct GfxCmdView<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GfxCmdWalkRefuse {
-    TruncatedHeader { offset: u32 },
-    SizeBelowHeader { offset: u32, size: u16 },
-    SlicePastUsed { offset: u32, size: u16 },
-    BadId { offset: u32, id: u8 },
+pub enum PaintQueueScanAbort {
+    CutShortPreamble { at: u32 },
+    LengthUnderPreamble { at: u32, span: u16 },
+    SpanBeyondFill { at: u32, span: u16 },
+    BadId { at: u32, id: u8 },
 }
 
 /// RB_ExecuteRenderCommandsLoop's walk: stops at END_OF_LIST. With no ui3d filter only commands whose
 /// ui3d byte is 0 are yielded; with a filter only those with the high bit set and that window index.
 /// `used` bounds the walk as a safety net (BO2 relies on the terminator alone).
-pub struct GfxCmdWalk<'a> {
-    buf: &'a [u8],
+pub struct PaintQueueScan<'a> {
+    queue: &'a [u8],
     used: u32,
-    off: u32,
+    cursor: u32,
     filter: Option<u8>,
 }
 
-impl<'a> GfxCmdWalk<'a> {
+impl<'a> PaintQueueScan<'a> {
     #[must_use]
-    pub fn new(buf: &'a [u8], used: u32, ui3d_filter: Option<u8>) -> Self {
-        let used = used.min(u32::try_from(buf.len()).unwrap_or(u32::MAX));
-        Self { buf, used, off: 0, filter: ui3d_filter }
+    pub fn new(queue: &'a [u8], used: u32, ui3d_filter: Option<u8>) -> Self {
+        let used = used.min(u32::try_from(queue.len()).unwrap_or(u32::MAX));
+        Self { queue, used, cursor: 0, filter: ui3d_filter }
     }
 
     fn runs(&self, ui3d: u8) -> bool {
@@ -199,53 +206,62 @@ impl<'a> GfxCmdWalk<'a> {
     }
 }
 
-impl<'a> Iterator for GfxCmdWalk<'a> {
-    type Item = Result<GfxCmdView<'a>, GfxCmdWalkRefuse>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.off >= self.used {
-                return None;
-            }
-            let offset = self.off;
-            let start = offset as usize;
-            let fail = |s: &mut Self, e| {
-                s.off = s.used;
-                Some(Err(e))
-            };
-            if self.used - offset < GFX_CMD_HEADER_SIZE {
-                return fail(self, GfxCmdWalkRefuse::TruncatedHeader { offset });
-            }
-            let size = u16::from_le_bytes([self.buf[start], self.buf[start + 1]]);
-            let id = self.buf[start + 2];
-            let ui3d = self.buf[start + 3];
-            if id == RC_END_OF_LIST {
-                self.off = self.used;
-                return None;
-            }
-            if id >= RC_COUNT {
-                return fail(self, GfxCmdWalkRefuse::BadId { offset, id });
-            }
-            if u32::from(size) < GFX_CMD_HEADER_SIZE {
-                return fail(self, GfxCmdWalkRefuse::SizeBelowHeader { offset, size });
-            }
-            let end = offset + u32::from(size);
-            if end > self.used {
-                return fail(self, GfxCmdWalkRefuse::SlicePastUsed { offset, size });
-            }
-            self.off = end;
-            if !self.runs(ui3d) {
-                continue;
-            }
-            let bytes = &self.buf[start..end as usize];
-            return Some(Ok(GfxCmdView { id, ui3d, size, offset, bytes }));
+impl<'a> PaintQueueScan<'a> {
+    /// Reads and checks the command at byte `at`: its size, id and ui3d byte,
+    /// or None at the end of the list.
+    fn command_at(&self, at: u32) -> Option<Result<(u16, u8, u8), PaintQueueScanAbort>> {
+        if self.used - at < GFX_CMD_HEADER_SIZE {
+            return Some(Err(PaintQueueScanAbort::CutShortPreamble { at }));
         }
+        let idx = at as usize;
+        let [low, high, id, ui3d] = [self.queue[idx], self.queue[idx + 1], self.queue[idx + 2], self.queue[idx + 3]];
+        let span = u16::from_le_bytes([low, high]);
+        let refused = if id == RC_END_OF_LIST {
+            return None;
+        } else if id >= RC_COUNT {
+            PaintQueueScanAbort::BadId { at, id }
+        } else if u32::from(span) < GFX_CMD_HEADER_SIZE {
+            PaintQueueScanAbort::LengthUnderPreamble { at, span }
+        } else if at + u32::from(span) > self.used {
+            PaintQueueScanAbort::SpanBeyondFill { at, span }
+        } else {
+            return Some(Ok((span, id, ui3d)));
+        };
+        Some(Err(refused))
     }
 }
 
+impl<'a> Iterator for PaintQueueScan<'a> {
+    type Item = Result<PaintCameraSetup<'a>, PaintQueueScanAbort>;
+
+    fn next(&mut self) -> Option<Result<PaintCameraSetup<'a>, PaintQueueScanAbort>> {
+        while self.cursor < self.used {
+            let here = self.cursor;
+            // The end of the list, or a buffer that stops making sense, ends the walk for good.
+            let (span, id, ui3d) = match self.command_at(here) {
+                Some(Ok(header)) => header,
+                Some(Err(refused)) => {
+                    self.cursor = self.used;
+                    return Some(Err(refused));
+                }
+                None => {
+                    self.cursor = self.used;
+                    return None;
+                }
+            };
+            let stop = here + u32::from(span);
+            self.cursor = stop;
+            if self.runs(ui3d) {
+                let bytes = &self.queue[here as usize..stop as usize];
+                return Some(Ok(PaintCameraSetup { id, ui3d, size: span, offset: here, bytes }));
+            }
+        }
+        None
+    }
+}
 #[must_use]
-pub fn walk_render_commands(buf: &[u8], used: u32, ui3d_filter: Option<u8>) -> GfxCmdWalk<'_> {
-    GfxCmdWalk::new(buf, used, ui3d_filter)
+pub fn walk_render_commands(buf: &[u8], used: u32, ui3d_filter: Option<u8>) -> PaintQueueScan<'_> {
+    PaintQueueScan::new(buf, used, ui3d_filter)
 }
 
 #[cfg(test)]
@@ -257,7 +273,7 @@ mod tests {
     #[test]
     fn header_layout_and_critical_split() {
         let mut mem = [0u8; 0x4000];
-        let mut b = GfxRenderCommandBuf::new(&mut mem, 0);
+        let mut b = PaintQueueBytes::new(&mut mem, 0);
         let cmd = b.get_command_buffer(RC_SET_VIEWPORT, RC_SET_VIEWPORT_SIZE).unwrap();
         assert_eq!(&cmd[0..4], &[0x14, 0, RC_SET_VIEWPORT, 0]);
         assert_eq!(b.used_critical, 0x14);
@@ -272,7 +288,7 @@ mod tests {
     #[test]
     fn noncritical_respects_reserve_that_shrinks_with_critical_use() {
         let mut mem = [0u8; 0x3000];
-        let mut b = GfxRenderCommandBuf::new(&mut mem, 0);
+        let mut b = PaintQueueBytes::new(&mut mem, 0);
         // 0x3000 - 0x2000 = 0x1000 bytes for noncritical commands.
         assert_eq!(b.space_for(RC_STRETCH_PIC), 0x1000);
         assert!(b.get_command_buffer(RC_DRAW_TEXT_2D, 0x1000).is_some());
@@ -287,7 +303,7 @@ mod tests {
     #[test]
     fn warnings_never_refuse() {
         let mut mem = [0u8; 0x8000];
-        let mut b = GfxRenderCommandBuf::new(&mut mem, 0x100);
+        let mut b = PaintQueueBytes::new(&mut mem, 0x100);
         assert!(b.get_command_buffer(RC_CLEAR_SCREEN, 0x1f00).is_some());
         assert!(b.critical_warned);
         assert!(b.size_warned);
@@ -296,7 +312,7 @@ mod tests {
     #[test]
     fn walk_stops_at_end_and_filters_ui3d() {
         let mut mem = [0u8; 0x4000];
-        let mut b = GfxRenderCommandBuf::new(&mut mem, 0);
+        let mut b = PaintQueueBytes::new(&mut mem, 0);
         b.get_command_buffer(RC_SET_SCISSOR, RC_SET_SCISSOR_SIZE).unwrap();
         b.ui3d = ui3d_byte(Some(2));
         b.get_command_buffer(RC_STRETCH_PIC, 0x30).unwrap();
@@ -321,10 +337,10 @@ mod tests {
         let mut mem = [0u8; 16];
         mem[0..4].copy_from_slice(&[2, 0, RC_STRETCH_PIC, 0]);
         let r: alloc::vec::Vec<_> = walk_render_commands(&mem, 16, None).collect();
-        assert_eq!(r, [Err(GfxCmdWalkRefuse::SizeBelowHeader { offset: 0, size: 2 })]);
+        assert_eq!(r, [Err(PaintQueueScanAbort::LengthUnderPreamble { at: 0, span: 2 })]);
         mem[0..4].copy_from_slice(&[4, 0, 40, 0]);
         let r: alloc::vec::Vec<_> = walk_render_commands(&mem, 16, None).collect();
-        assert_eq!(r, [Err(GfxCmdWalkRefuse::BadId { offset: 0, id: 40 })]);
+        assert_eq!(r, [Err(PaintQueueScanAbort::BadId { at: 0, id: 40 })]);
         assert_eq!(rc_draw_quadlist_2d_size(2), 0xac);
     }
 }

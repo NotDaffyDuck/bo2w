@@ -20,8 +20,8 @@
 //! (CM_GetWaterForce) comes only from "undertow_volume" entities, which no
 //! multiplayer map has, so there is none.
 
-use crate::bridge::{AirMoveContext, Bo2Lunge, MoveBounds, Pml, accelerate, step_slide_move};
-use playerstate_t6::game::{PlayerState, UserCmd};
+use crate::bridge::{AirborneStepArgs, Bo2Lunge, HullExtents, TickLocals, accelerate, step_slide_move};
+use playerstate_t6::game::{AvatarState, InputCommand};
 
 use crate::gjk::Bo2Collision;
 use crate::movement_dir::set_movement_dir;
@@ -70,8 +70,8 @@ pub fn water_level(height: f32, feet_z: f32) -> i32 {
 }
 
 /// PM_SetWaterLevel: how deep the player stands this frame.
-pub(crate) fn set_water_level<C: Bo2Collision>(ps: &mut PlayerState, collision: &C) {
-    ps.waterlevel = water_level(collision.water_height(ps.origin), ps.origin[2]);
+pub(crate) fn set_water_level<C: Bo2Collision>(avatar: &mut AvatarState, solids: &C) {
+    avatar.waterlevel = water_level(solids.water_height(avatar.origin), avatar.origin[2]);
 }
 
 /// The float's speed for a script's movement scale (negative: sinking).
@@ -85,9 +85,9 @@ fn float_speed(move_speed_scale: f32) -> f32 {
 }
 
 /// The swim's acceleration for a frame this long.
-fn swim_accel(frametime: f32) -> f32 {
-    if frametime < 1.0 / 120.0 {
-        SWIM_ACCEL * (3.0 - frametime * 240.0).clamp(1.0, 3.0)
+fn swim_accel(step_millis_elapsed: f32) -> f32 {
+    if step_millis_elapsed < 1.0 / 120.0 {
+        SWIM_ACCEL * (3.0 - step_millis_elapsed * 240.0).clamp(1.0, 3.0)
     } else {
         SWIM_ACCEL
     }
@@ -96,70 +96,71 @@ fn swim_accel(frametime: f32) -> f32 {
 /// PM_SwimMove. Returns a stair step's height for the camera.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn swim_move<C: Bo2Collision>(
-    ps: &mut PlayerState,
-    pml: &mut Pml,
-    cmd: &UserCmd,
-    context: AirMoveContext,
-    bounds: MoveBounds,
-    collision: &C,
+    avatar: &mut AvatarState,
+    tick_vars: &mut TickLocals,
+    ucmd: &InputCommand,
+    frame_ctx: AirborneStepArgs,
+    bounds: HullExtents,
+    solids: &C,
     zombies: bool,
     lunge: Option<Bo2Lunge>,
 ) -> f32 {
-    crate::friction::friction(ps, pml, true, lunge);
+    crate::ground_drag::friction(avatar, tick_vars, true, lunge);
 
     let scale =
-        crate::air::cmd_scale(ps, cmd, context.player_spectate_speed_scale) * WATER_SPEED_SCALE;
-    let accel = swim_accel(pml.frametime);
+        crate::air::cmd_scale(avatar, ucmd, frame_ctx.observer_pace_ratio) * WATER_SPEED_SCALE;
+    let speed_up_rate = swim_accel(tick_vars.step_millis_elapsed);
 
     // Along the view, up and down too; at level 4 not up.
-    let (f, r) = (cmd.forwardmove as f32, cmd.rightmove as f32);
-    let mut wishvel = [0, 1, 2].map(|i| pml.forward[i] * f + pml.right[i] * r);
-    if ps.waterlevel == SWIM_LEVEL && wishvel[2] >= 0.0 {
+    let (f, r) = (ucmd.thrust_ahead as f32, ucmd.thrust_lateral as f32);
+    let mut wishvel = [0, 1, 2].map(|i| tick_vars.fwd_axis[i] * f + tick_vars.right_axis[i] * r);
+    if avatar.waterlevel == SWIM_LEVEL && wishvel[2] >= 0.0 {
         wishvel[2] = 0.0;
     }
     let len = libm::sqrtf(wishvel[0] * wishvel[0] + wishvel[1] * wishvel[1] + wishvel[2] * wishvel[2]);
-    let wishspeed = len * scale;
+    let intended_pace = len * scale;
     let divisor = if len > 0.0 { len } else { 1.0 };
-    let wishdir = wishvel.map(|v| v / divisor);
+    let intended_heading = wishvel.map(|v| v / divisor);
 
     // Deep, with no key held, the water lifts (or sinks) the player.
-    if ps.waterlevel > SWIM_LEVEL && cmd.forwardmove == 0 && cmd.rightmove == 0 {
-        let mut speed = float_speed(ps.move_speed_scale_multiplier);
+    if avatar.waterlevel > SWIM_LEVEL && ucmd.thrust_ahead == 0 && ucmd.thrust_lateral == 0 {
+        let mut speed = float_speed(avatar.run_speed_modifier);
         let mut dir = [0.0, 0.0, 1.0];
         if speed < 0.0 {
             dir[2] = -1.0;
             speed = -speed;
         }
-        accelerate(ps, pml, &dir, speed, accel);
+        accelerate(avatar, tick_vars, &dir, speed, speed_up_rate);
     }
-    accelerate(ps, pml, &wishdir, wishspeed, accel);
+    accelerate(avatar, tick_vars, &intended_heading, intended_pace, speed_up_rate);
 
-    pml.walking = 0;
-    pml.ground_plane = 0;
-    let step = if collision.gjk_on() {
+    tick_vars.walking = 0;
+    tick_vars.standing_on_floor = 0;
+    let HullExtents { lo_corner: hull_lo, hi_corner: hull_hi, .. } = bounds;
+    let step = if solids.gjk_on() {
         crate::gjk::step::step_slide_move(
-            ps,
-            pml,
-            collision,
-            bounds.mins,
-            bounds.maxs,
-            bounds.tracemask,
+            avatar,
+            tick_vars,
+            solids,
+            hull_lo,
+            hull_hi,
+            bounds.collide_filter,
             false,
             zombies,
         )
     } else {
         step_slide_move(
-            ps,
-            pml,
-            collision,
-            bounds.mins,
-            bounds.maxs,
-            bounds.tracemask,
+            avatar,
+            tick_vars,
+            solids,
+            hull_lo,
+            hull_hi,
+            bounds.collide_filter,
             None,
             zombies,
         )
     };
-    set_movement_dir(ps, pml, cmd);
+    set_movement_dir(avatar, tick_vars, ucmd);
     step
 }
 
@@ -167,25 +168,25 @@ pub(crate) fn swim_move<C: Bo2Collision>(
 /// the level (waist deep 1.7 times, `player_waistWaterFrictionScale`); off
 /// the ground the water does not slow the player. Added to the frame's other
 /// slowing.
-pub(crate) fn friction_drop(ps: &PlayerState, pml: &Pml, speed: f32) -> f32 {
+pub(crate) fn friction_drop(avatar: &AvatarState, tick_vars: &TickLocals, speed: f32) -> f32 {
     /// How hard each level grips (level 2 is the waist's own scale).
     const LEVEL_SCALE: [f32; 7] = [0.0, 1.0, 2.0, 2.0, 3.0, 3.0, 3.0];
     const WAIST_SCALE: f32 = 1.7;
-    if ps.waterlevel == 0 || pml.walking == 0 {
+    if avatar.waterlevel == 0 || tick_vars.walking == 0 {
         return 0.0;
     }
-    let scale = if ps.waterlevel == 2 {
+    let scale = if avatar.waterlevel == 2 {
         WAIST_SCALE
     } else {
-        LEVEL_SCALE[ps.waterlevel.clamp(0, 6) as usize]
+        LEVEL_SCALE[avatar.waterlevel.clamp(0, 6) as usize]
     };
-    crate::friction::GROUND_FRICTION * speed * scale * pml.frametime
+    crate::ground_drag::GROUND_FRICTION * speed * scale * tick_vars.step_millis_elapsed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{CollisionBackend, GroundTraceInput};
+    use crate::bridge::{SolidProbe, SweepAsk};
     use trace_t6::Trace;
 
     #[test]
@@ -242,107 +243,104 @@ mod tests {
         }
     }
 
-    impl CollisionBackend for Pool {
-        fn trace(&self, _input: GroundTraceInput) -> Trace {
-            Trace {
-                fraction: 1.0,
-                ..Trace::default()
-            }
+    impl SolidProbe for Pool {
+        fn trace(&self, _input: SweepAsk) -> Trace {
+            Trace::new()
         }
     }
 
-    fn air() -> AirMoveContext {
-        AirMoveContext {
-            player_spectate_speed_scale: 1.0,
-            shellshock_gravity_scale: 1.0,
-            shellshock_gravity_bias: 0.0,
+    fn air() -> AirborneStepArgs {
+        AirborneStepArgs {
+            observer_pace_ratio: 1.0,
+            concussed_fall_ratio: 1.0,
+            concussed_fall_offset: 0.0,
         }
     }
 
-    fn bounds() -> MoveBounds {
-        MoveBounds {
-            mins: [-15.0, -15.0, 0.0],
-            maxs: [15.0, 15.0, 70.0],
-            tracemask: 0x0281_0011,
+    fn bounds() -> HullExtents {
+        HullExtents {
+            lo_corner: [-15.0_f32, -15.0, 0.0],
+            hi_corner: [15.0_f32, 15.0, 70.0],
+            collide_filter: 0x0281_0011,
         }
     }
 
-    fn swimmer(level: i32) -> PlayerState {
-        let mut ps = PlayerState::ZERO;
-        ps.speed = 190;
-        ps.gravity = 800;
-        ps.move_speed_scale_multiplier = 1.0;
-        ps.waterlevel = level;
-        ps
+    fn swimmer(level: i32) -> AvatarState {
+        let mut avatar = AvatarState::ZERO;
+        avatar.speed = 190;
+        avatar.gravity = 800_i32;
+        avatar.run_speed_modifier = 1.0;
+        avatar.waterlevel = level;
+        avatar
     }
 
     #[test]
     fn the_level_is_read_at_the_feet() {
-        let mut ps = swimmer(0);
-        ps.origin = [0.0, 0.0, -50.0];
-        set_water_level(&mut ps, &Pool { surface: 0.0 });
-        assert_eq!(ps.waterlevel, 4);
+        let mut avatar = swimmer(0);
+        avatar.origin = [0.0, 0.0, -50.0];
+        set_water_level(&mut avatar, &Pool { surface: 0.0 });
+        assert_eq!(avatar.waterlevel, 4);
     }
 
     #[test]
     fn deep_and_still_the_water_lifts() {
-        let mut ps = swimmer(5);
-        let mut pml = crate::testing::pml(false);
-        let cmd = UserCmd::default();
-        swim_move(&mut ps, &mut pml, &cmd, air(), bounds(), &Pool { surface: 1000.0 }, false, None);
+        let mut avatar = swimmer(5);
+        let mut tick_vars = crate::testing::tick_vars(false);
+        let ucmd = InputCommand::default();
+        swim_move(&mut avatar, &mut tick_vars, &ucmd, air(), bounds(), &Pool { surface: 1000.0 }, false, None);
         // No gravity; the float's 10 a second at acceleration 2.
-        assert!((ps.velocity[2] - 10.0).abs() < 1e-4, "{:?}", ps.velocity);
+        assert!((avatar.velocity[2] - 10.0).abs() < 1e-4, "{:?}", avatar.velocity);
         // At level 4 nothing lifts, and nothing pulls down.
-        let mut ps = swimmer(4);
-        swim_move(&mut ps, &mut pml, &cmd, air(), bounds(), &Pool { surface: 1000.0 }, false, None);
-        assert_eq!(ps.velocity, [0.0; 3]);
+        let mut avatar = swimmer(4);
+        swim_move(&mut avatar, &mut tick_vars, &ucmd, air(), bounds(), &Pool { surface: 1000.0 }, false, None);
+        assert_eq!(avatar.velocity, [0.0; 3]);
     }
 
     #[test]
     fn the_keys_swim_along_the_view_but_not_up_at_four() {
-        let cmd = UserCmd {
-            forwardmove: 127,
-            ..UserCmd::default()
+        let ucmd = InputCommand {
+            thrust_ahead: 127,
+            ..InputCommand::default()
         };
         // Looking 45 degrees up.
         let h = libm::sqrtf(0.5);
-        let mut pml = crate::testing::pml(false);
-        pml.forward = [h, 0.0, h];
-        let mut ps = swimmer(5);
-        swim_move(&mut ps, &mut pml, &cmd, air(), bounds(), &Pool { surface: 1000.0 }, false, None);
+        let mut tick_vars = crate::testing::tick_vars(false);
+        tick_vars.fwd_axis = [h, 0.0, h];
+        let mut avatar = swimmer(5);
+        swim_move(&mut avatar, &mut tick_vars, &ucmd, air(), bounds(), &Pool { surface: 1000.0 }, false, None);
         // 190 x 1.3 wished; the push is 0.05 x 2 x that a frame.
         let push = 0.05 * 2.0 * 190.0 * 1.3;
-        assert!((ps.velocity[0] - push * h).abs() < 1e-2, "{:?}", ps.velocity);
-        assert!((ps.velocity[2] - push * h).abs() < 1e-2, "{:?}", ps.velocity);
-        assert_eq!(pml.walking, 0);
+        assert!((avatar.velocity[0] - push * h).abs() < 1e-2, "{:?}", avatar.velocity);
+        assert!((avatar.velocity[2] - push * h).abs() < 1e-2, "{:?}", avatar.velocity);
+        assert_eq!(tick_vars.walking, 0);
 
-        let mut pml = crate::testing::pml(false);
-        pml.forward = [h, 0.0, h];
-        let mut ps = swimmer(4);
-        swim_move(&mut ps, &mut pml, &cmd, air(), bounds(), &Pool { surface: 1000.0 }, false, None);
+        let mut tick_vars = crate::testing::tick_vars(false);
+        tick_vars.fwd_axis = [h, 0.0, h];
+        let mut avatar = swimmer(4);
+        swim_move(&mut avatar, &mut tick_vars, &ucmd, air(), bounds(), &Pool { surface: 1000.0 }, false, None);
         // The wish is measured after the clamp: only the level part pushes.
-        assert!((ps.velocity[0] - push * h).abs() < 1e-2, "{:?}", ps.velocity);
-        assert_eq!(ps.velocity[2], 0.0);
+        assert!((avatar.velocity[0] - push * h).abs() < 1e-2, "{:?}", avatar.velocity);
+        assert_eq!(avatar.velocity[2], 0.0);
         // Down still goes down at four.
-        let mut pml = crate::testing::pml(false);
-        pml.forward = [h, 0.0, -h];
-        let mut ps = swimmer(4);
-        swim_move(&mut ps, &mut pml, &cmd, air(), bounds(), &Pool { surface: 1000.0 }, false, None);
-        assert!(ps.velocity[2] < -1.0, "{:?}", ps.velocity);
+        let mut tick_vars = crate::testing::tick_vars(false);
+        tick_vars.fwd_axis = [h, 0.0, -h];
+        let mut avatar = swimmer(4);
+        swim_move(&mut avatar, &mut tick_vars, &ucmd, air(), bounds(), &Pool { surface: 1000.0 }, false, None);
+        assert!(avatar.velocity[2] < -1.0, "{:?}", avatar.velocity);
     }
 
     #[test]
     fn standing_in_water_grips_by_the_level() {
-        let pml = crate::testing::pml(true);
-        let mut ps = swimmer(1);
-        assert!((friction_drop(&ps, &pml, 100.0) - 5.5 * 100.0 * 0.05).abs() < 1e-4);
-        ps.waterlevel = 2;
-        assert!((friction_drop(&ps, &pml, 100.0) - 5.5 * 100.0 * 1.7 * 0.05).abs() < 1e-3);
-        ps.waterlevel = 3;
-        assert!((friction_drop(&ps, &pml, 100.0) - 5.5 * 100.0 * 2.0 * 0.05).abs() < 1e-3);
-        ps.waterlevel = 6;
-        assert!((friction_drop(&ps, &pml, 100.0) - 5.5 * 100.0 * 3.0 * 0.05).abs() < 1e-3);
+        let tick_vars = crate::testing::tick_vars(true);
+        let mut avatar = swimmer(1);
+        assert!((friction_drop(&avatar, &tick_vars, 100.0) - 5.5 * 100.0 * 0.05).abs() < 1e-4);
+        avatar.waterlevel = 2;
+        assert!((friction_drop(&avatar, &tick_vars, 100.0) - 5.5 * 100.0 * 1.7 * 0.05).abs() < 1e-3);
+        avatar.waterlevel = 3;
+        assert!((friction_drop(&avatar, &tick_vars, 100.0) - 5.5 * 100.0 * 2.0 * 0.05).abs() < 1e-3);
+        avatar.waterlevel = 6;
+        assert!((friction_drop(&avatar, &tick_vars, 100.0) - 5.5 * 100.0 * 3.0 * 0.05).abs() < 1e-3);
         // Off the ground the water does not slow.
-        assert_eq!(friction_drop(&ps, &crate::testing::pml(false), 100.0), 0.0);
+        assert_eq!(friction_drop(&avatar, &crate::testing::tick_vars(false), 100.0), 0.0);
     }
 }

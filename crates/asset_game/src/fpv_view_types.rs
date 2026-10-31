@@ -3,16 +3,16 @@
 
 use std::sync::Arc;
 
-use xmodel_runtime::{DObj, DObjError};
+use xmodel_runtime::{PosedSkeleton, SkeletonBuildFault};
 
-use crate::FpvMeshIndex;
+use crate::FpvMeshSlot;
 
 /// What a joined model is to the view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FpvPartRole {
     Hands,
     Gun,
-    Attachment,
+    AddOn,
     Rocket,
     Knife,
 }
@@ -20,10 +20,10 @@ pub enum FpvPartRole {
 /// One model inside the joined skeleton.
 #[derive(Clone, Debug)]
 pub struct FpvAssemblyPart {
-    pub model: FpvMeshIndex,
+    pub mdl: FpvMeshSlot,
     pub role: FpvPartRole,
     /// Where this model's bones start in the joined skeleton.
-    pub bone_base: usize,
+    pub joint_start_offset: usize,
     /// Surfaces hidden by an attachment, as part-bit words (guns only).
     pub hide: Option<[u32; 5]>,
 }
@@ -32,11 +32,11 @@ pub struct FpvAssemblyPart {
 /// has no such bone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FpvAssemblyTags {
-    pub flash: Option<u16>,
-    pub flash_silenced: Option<u16>,
-    pub brass: Option<u16>,
-    pub knife: Option<u16>,
-    pub laser: Option<u16>,
+    pub muzzle_bone: Option<u16>,
+    pub muzzle_flash_suppressed: Option<u16>,
+    pub eject_bone: Option<u16>,
+    pub blade_bone: Option<u16>,
+    pub beam_bone: Option<u16>,
     pub tracker_screen: [Option<u16>; 3],
     pub tracker_light: Option<u16>,
     /// The flash and brass bones of a second gun that hangs on the arms.
@@ -47,13 +47,17 @@ pub struct FpvAssemblyTags {
     pub target: Option<u16>,
     /// `tag_hud`: the plane the Target Finder's diamonds are projected through.
     pub hud: Option<u16>,
+    /// bo2zm: the arms' wrists (`j_wrist_le`, `j_wrist_ri`) and gun tag
+    /// (`tag_weapon`), where Mob's Afterlife hangs its ghost glow.
+    pub wrist: [Option<u16>; 2],
+    pub weapon: Option<u16>,
 }
 
 /// A weapon view's models, joined.
 #[derive(Debug)]
 pub struct FpvAssembly {
-    pub dobj: DObj,
-    pub parts: Vec<FpvAssemblyPart>,
+    pub joint_tree: PosedSkeleton,
+    pub pieces: Vec<FpvAssemblyPart>,
     pub view_bone: usize,
     pub camera_bone: Option<usize>,
     /// Bones of the arms and the gun together: the span a paired animation
@@ -68,7 +72,7 @@ pub struct FpvAssembly {
 #[derive(Debug)]
 pub enum FpvAssemblyError {
     Catalog(&'static str),
-    Skeleton(DObjError),
+    Skeleton(SkeletonBuildFault),
     NoTagView,
 }
 
@@ -85,14 +89,14 @@ impl core::fmt::Display for FpvAssemblyError {
 /// What makes two views the same view, so one assembly can serve both.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FpvAssemblyKey {
-    pub hands: FpvMeshIndex,
-    pub gun: FpvMeshIndex,
-    pub attachments: Vec<FpvMeshIndex>,
+    pub hands: FpvMeshSlot,
+    pub gun: FpvMeshSlot,
+    pub attachments: Vec<FpvMeshSlot>,
     /// Each attachment's root placement as raw bits (rotation, translation).
     pub attachment_binds: Vec<Option<([u32; 4], [u32; 3])>>,
-    pub rocket: Option<FpvMeshIndex>,
-    pub knife: Option<FpvMeshIndex>,
-    pub hide_tags: Vec<String>,
+    pub rocket: Option<FpvMeshSlot>,
+    pub knife: Option<FpvMeshSlot>,
+    pub concealed_bones: Vec<String>,
 }
 
 /// The views one side of the player's weapon can show.

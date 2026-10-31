@@ -1,65 +1,66 @@
-use crate::decl_table as decl;
-use fastfile_t5::vertex_decl as t5;
+use crate::decl_table::{VertexElemType, VERTEX_STREAM_SLOT_COUNT, VertexStreamArrangement, destination_usage, origin_layout, stream_extent};
+use fastfile_t5::vtx_formats::STREAM_SLOT_PLANS;
+use fastfile_t5::vtx_formats::TARGET_USE_LOOKUP;
 
 /// Which vertex format table a draw reads its layout from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum VertexLayoutFamily {
+pub enum VertexFormatLineage {
     #[default]
     Fallback,
     T5,
 }
 
 /// Per-vertex bytes in the second stream of a T5 world surface.
-pub const T5_WORLD_LAYER_HOST_STRIDE: usize = 40;
+pub const LEGACY_WORLD_LAYER_VERTEX_BYTES: usize = 40;
 
 const T5_SOURCE_COUNT: usize = 10;
 
-impl VertexLayoutFamily {
-    pub fn source_count(self) -> usize {
+impl VertexFormatLineage {
+    pub fn input_source_total(self) -> usize {
         match self {
-            Self::Fallback => decl::STREAM_SOURCE_COUNT,
+            Self::Fallback => VERTEX_STREAM_SLOT_COUNT,
             Self::T5 => T5_SOURCE_COUNT,
         }
     }
 
-    pub fn destination_usage(self, dest: u8) -> Option<(u8, u8)> {
+    pub fn write_target_usage(self, write_target: u8) -> Option<(u8, u8)> {
         match self {
-            Self::Fallback => decl::destination_usage(dest),
-            Self::T5 => {
-                let &[usage, index] = t5::DESTINATION_USAGE_TABLE.get(usize::from(dest))?;
+            Self::Fallback => destination_usage(write_target),
+            VertexFormatLineage::T5 => {
+                let &[usage, index] = TARGET_USE_LOOKUP.get(usize::from(write_target))?;
                 Some((usage, index))
             }
         }
     }
 
-    pub fn source_layout(self, vertex_type: u8, source: u8) -> Option<decl::StreamSourceLayout> {
+    pub fn origin_layout(self, vertex_format_code: u8, source: u8) -> Option<VertexStreamArrangement> {
         match self {
-            Self::Fallback => decl::source_layout(vertex_type, source),
-            Self::T5 => {
-                let row = t5::SOURCE_LAYOUT_TABLE.get(usize::from(vertex_type))?;
-                let &[stream, offset, raw] = row.get(usize::from(source))?;
-                if stream == 255 {
+            Self::Fallback => origin_layout(vertex_format_code, source),
+            VertexFormatLineage::T5 => {
+                let row = STREAM_SLOT_PLANS.get(usize::from(vertex_format_code))?;
+                let &[strm, offset, raw] = row.get(usize::from(source))?;
+                if strm == 255 {
                     return None;
                 }
-                Some(decl::StreamSourceLayout {
-                    stream,
+                Some(VertexStreamArrangement {
+                    stream: strm,
                     offset,
-                    decl_type: decl::D3dDeclType::from_raw(raw),
+                    decl_type: VertexElemType::from_raw(raw),
                 })
             }
         }
     }
 
-    /// Bytes per vertex that the host keeps in `stream` for this vertex type.
-    pub fn host_stream_stride(self, vertex_type: u8, stream: u8) -> Option<u16> {
+    /// Bytes per vertex that the host keeps in stream `lane_no` for this vertex type.
+    pub fn host_stride_bytes(self, vertex_format_code: u8, lane_no: u8) -> Option<u16> {
         match self {
-            Self::Fallback => decl::stream_extent(vertex_type, stream),
-            Self::T5 if stream == 1 && (2..=13).contains(&vertex_type) => {
-                Some(T5_WORLD_LAYER_HOST_STRIDE as u16)
+            Self::Fallback => stream_extent(vertex_format_code, lane_no),
+            Self::T5 if lane_no == 1 && (2..=13).contains(&vertex_format_code) => {
+                Some(LEGACY_WORLD_LAYER_VERTEX_BYTES as u16)
             }
             Self::T5 => (0..T5_SOURCE_COUNT as u8)
-                .filter_map(|source| self.source_layout(vertex_type, source))
-                .filter(|layout| layout.stream == stream)
+                .filter_map(|source| self.origin_layout(vertex_format_code, source))
+                .filter(|layout| layout.stream == lane_no)
                 .filter_map(|layout| {
                     let size = layout.decl_type.byte_len()?;
                     Some(u16::from(layout.offset) + u16::from(size))

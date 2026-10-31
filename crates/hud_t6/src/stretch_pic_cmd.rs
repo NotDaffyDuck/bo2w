@@ -1,7 +1,7 @@
 //! BO2 stretch pic command (scratch/hud-facts/stretch_pic_cmd.md): the 0x30-byte id-11 command, RGBA
 //! colour packing, the 2D material checks and the tess quad it draws.
 
-use crate::render_commands::{GfxRenderCommandBuf, RC_STRETCH_PIC};
+use crate::render_commands::{PaintQueueBytes, RC_STRETCH_PIC};
 
 pub const GFX_CMD_STRETCH_PIC_SIZE: u32 = 0x30;
 pub const GFX_CMD_STRETCH_PIC_MATERIAL: usize = 4;
@@ -61,11 +61,11 @@ pub enum Material2dReject {
 /// material. A rejection is returned so the caller can print BO2's "set materialType to 2d" warning.
 #[must_use]
 pub fn pick_2d_material(
-    material: u32,
+    asked: u32,
     check: Material2dCheck,
     default_material: u32,
 ) -> (u32, Option<Material2dReject>) {
-    if material == 0 {
+    if asked == 0 {
         return (default_material, None);
     }
     let reject = if check.fogable {
@@ -77,12 +77,12 @@ pub fn pick_2d_material(
     } else {
         None
     };
-    (if reject.is_some() { default_material } else { material }, reject)
+    (if reject.is_some() { default_material } else { asked }, reject)
 }
 
 /// Arguments in real (already placed) pixels. `material` is the handle after pick_2d_material.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GfxCmdStretchPicArgs {
+pub struct PaintScaledImageParams {
     pub material: u32,
     pub x: f32,
     pub y: f32,
@@ -97,7 +97,7 @@ pub struct GfxCmdStretchPicArgs {
 
 /// The decoded command.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GfxCmdStretchPic {
+pub struct PaintScaledImage {
     pub material: u32,
     pub x: f32,
     pub y: f32,
@@ -108,55 +108,55 @@ pub struct GfxCmdStretchPic {
     pub t0: f32,
     pub s1: f32,
     pub t1: f32,
-    pub color_rgba: u32,
+    pub tint_rgba: u32,
 }
 
-fn put_f32(cmd: &mut [u8], at: usize, v: f32) {
+fn write_real32(cmd: &mut [u8], at: usize, v: f32) {
     cmd[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-fn get_u32(cmd: &[u8], at: usize) -> u32 {
+fn read_word32(cmd: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([cmd[at], cmd[at + 1], cmd[at + 2], cmd[at + 3]])
 }
 
 fn get_f32(cmd: &[u8], at: usize) -> f32 {
-    f32::from_bits(get_u32(cmd, at))
+    f32::from_bits(read_word32(cmd, at))
 }
 
 /// R_AddCmdDrawStretchPicW: queue one pic with vertex W `w0`. False when the noncritical command was
 /// dropped (nothing drawn).
-pub fn add_cmd_draw_stretch_pic_w(cmds: &mut GfxRenderCommandBuf<'_>, a: &GfxCmdStretchPicArgs, w0: f32) -> bool {
+pub fn add_cmd_draw_stretch_pic_w(cmds: &mut PaintQueueBytes<'_>, a: &PaintScaledImageParams, w0: f32) -> bool {
     let Some(cmd) = cmds.get_command_buffer(RC_STRETCH_PIC, GFX_CMD_STRETCH_PIC_SIZE) else {
         return false;
     };
     cmd[GFX_CMD_STRETCH_PIC_MATERIAL..GFX_CMD_STRETCH_PIC_MATERIAL + 4].copy_from_slice(&a.material.to_le_bytes());
-    put_f32(cmd, GFX_CMD_STRETCH_PIC_X, a.x);
-    put_f32(cmd, GFX_CMD_STRETCH_PIC_Y, a.y);
-    put_f32(cmd, GFX_CMD_STRETCH_PIC_W0, w0);
-    put_f32(cmd, GFX_CMD_STRETCH_PIC_W, a.w);
-    put_f32(cmd, GFX_CMD_STRETCH_PIC_H, a.h);
-    put_f32(cmd, GFX_CMD_STRETCH_PIC_S0, a.s0);
-    put_f32(cmd, GFX_CMD_STRETCH_PIC_T0, a.t0);
-    put_f32(cmd, GFX_CMD_STRETCH_PIC_S1, a.s1);
-    put_f32(cmd, GFX_CMD_STRETCH_PIC_T1, a.t1);
+    write_real32(cmd, GFX_CMD_STRETCH_PIC_X, a.x);
+    write_real32(cmd, GFX_CMD_STRETCH_PIC_Y, a.y);
+    write_real32(cmd, GFX_CMD_STRETCH_PIC_W0, w0);
+    write_real32(cmd, GFX_CMD_STRETCH_PIC_W, a.w);
+    write_real32(cmd, GFX_CMD_STRETCH_PIC_H, a.h);
+    write_real32(cmd, GFX_CMD_STRETCH_PIC_S0, a.s0);
+    write_real32(cmd, GFX_CMD_STRETCH_PIC_T0, a.t0);
+    write_real32(cmd, GFX_CMD_STRETCH_PIC_S1, a.s1);
+    write_real32(cmd, GFX_CMD_STRETCH_PIC_T1, a.t1);
     let c = convert_color_to_bytes(a.color);
     cmd[GFX_CMD_STRETCH_PIC_COLOR..GFX_CMD_STRETCH_PIC_COLOR + 4].copy_from_slice(&c.to_le_bytes());
     true
 }
 
 /// R_AddCmdDrawStretchPic: the plain variant, w0 = 1.0.
-pub fn add_cmd_draw_stretch_pic(cmds: &mut GfxRenderCommandBuf<'_>, a: &GfxCmdStretchPicArgs) -> bool {
+pub fn add_cmd_draw_stretch_pic(cmds: &mut PaintQueueBytes<'_>, a: &PaintScaledImageParams) -> bool {
     add_cmd_draw_stretch_pic_w(cmds, a, 1.0)
 }
 
 /// Decode a whole id-11 command (header included).
 #[must_use]
-pub fn parse_gfx_cmd_stretch_pic(cmd: &[u8]) -> Option<GfxCmdStretchPic> {
+pub fn parse_gfx_cmd_stretch_pic(cmd: &[u8]) -> Option<PaintScaledImage> {
     if cmd.len() < GFX_CMD_STRETCH_PIC_SIZE as usize || cmd[2] != RC_STRETCH_PIC {
         return None;
     }
-    Some(GfxCmdStretchPic {
-        material: get_u32(cmd, GFX_CMD_STRETCH_PIC_MATERIAL),
+    Some(PaintScaledImage {
+        material: read_word32(cmd, GFX_CMD_STRETCH_PIC_MATERIAL),
         x: get_f32(cmd, GFX_CMD_STRETCH_PIC_X),
         y: get_f32(cmd, GFX_CMD_STRETCH_PIC_Y),
         w0: get_f32(cmd, GFX_CMD_STRETCH_PIC_W0),
@@ -166,54 +166,56 @@ pub fn parse_gfx_cmd_stretch_pic(cmd: &[u8]) -> Option<GfxCmdStretchPic> {
         t0: get_f32(cmd, GFX_CMD_STRETCH_PIC_T0),
         s1: get_f32(cmd, GFX_CMD_STRETCH_PIC_S1),
         t1: get_f32(cmd, GFX_CMD_STRETCH_PIC_T1),
-        color_rgba: get_u32(cmd, GFX_CMD_STRETCH_PIC_COLOR),
+        tint_rgba: read_word32(cmd, GFX_CMD_STRETCH_PIC_COLOR),
     })
 }
 
-pub const GFX_TESS_VERTEX_STRIDE: usize = 0x20;
+pub const OVERLAY_CORNER_BYTES: usize = 0x20;
 /// Packed normal of every 2D vertex.
 pub const GFX_TESS_2D_PACKED_NORMAL: u32 = 0x3ffe_7f7f;
 /// Quad indices relative to the quad's first vertex.
-pub const RB_DRAW_STRETCH_PIC_INDICES: [u16; 6] = [3, 0, 2, 2, 0, 1];
+pub const RB_DRAW_STRETCH_PIC_INDICES: [u16; 6] = {
+    let (a, b, c, d) = (0, 1, 2, 3);
+    [d, a, c, c, a, b]
+};
 
 /// One 2D tess vertex: xyz (z = 0) and w, colour, st, packed normal.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GfxTessVertex2d {
-    pub xyzw: [f32; 4],
+pub struct OverlayCorner2d {
+    pub quad: [f32; 4],
     pub color: u32,
-    pub texcoord: [f32; 2],
-    pub packed_normal: u32,
+    pub uv_semantic: [f32; 2],
+    pub squeezed_facing: u32,
 }
 
-impl GfxTessVertex2d {
+impl OverlayCorner2d {
     #[must_use]
-    pub fn to_bytes(&self) -> [u8; GFX_TESS_VERTEX_STRIDE] {
-        let mut out = [0u8; GFX_TESS_VERTEX_STRIDE];
-        for (i, v) in self.xyzw.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    pub fn to_bytes(&self) -> [u8; OVERLAY_CORNER_BYTES] {
+        let [x, y, z, w] = self.quad.map(f32::to_bits);
+        let [s, t] = self.uv_semantic.map(f32::to_bits);
+        let words = [x, y, z, w, self.color, s, t, self.squeezed_facing];
+        let mut packed = [0; OVERLAY_CORNER_BYTES];
+        for (slot, word) in packed.chunks_exact_mut(4).zip(words) {
+            slot.copy_from_slice(&word.to_le_bytes());
         }
-        out[16..20].copy_from_slice(&self.color.to_le_bytes());
-        out[20..24].copy_from_slice(&self.texcoord[0].to_le_bytes());
-        out[24..28].copy_from_slice(&self.texcoord[1].to_le_bytes());
-        out[28..32].copy_from_slice(&self.packed_normal.to_le_bytes());
-        out
+        packed
     }
 }
 
 #[must_use]
-pub fn set_vertex_2d(x: f32, y: f32, w0: f32, s: f32, t: f32, color: u32) -> GfxTessVertex2d {
-    GfxTessVertex2d { xyzw: [x, y, 0.0, w0], color, texcoord: [s, t], packed_normal: GFX_TESS_2D_PACKED_NORMAL }
+pub fn set_vertex_2d(x: f32, y: f32, w0: f32, s: f32, t: f32, color: u32) -> OverlayCorner2d {
+    OverlayCorner2d { quad: [x, y, 0.0, w0], color, uv_semantic: [s, t], squeezed_facing: GFX_TESS_2D_PACKED_NORMAL }
 }
 
 /// RB_DrawStretchPic corners: v0 top-left, v1 top-right, v2 bottom-right, v3 bottom-left.
 #[must_use]
-pub fn draw_stretch_pic_quad(p: &GfxCmdStretchPic) -> [GfxTessVertex2d; 4] {
+pub fn draw_stretch_pic_quad(p: &PaintScaledImage) -> [OverlayCorner2d; 4] {
     let (x1, y1) = (p.x + p.w, p.y + p.h);
     [
-        set_vertex_2d(p.x, p.y, p.w0, p.s0, p.t0, p.color_rgba),
-        set_vertex_2d(x1, p.y, p.w0, p.s1, p.t0, p.color_rgba),
-        set_vertex_2d(x1, y1, p.w0, p.s1, p.t1, p.color_rgba),
-        set_vertex_2d(p.x, y1, p.w0, p.s0, p.t1, p.color_rgba),
+        set_vertex_2d(p.x, p.y, p.w0, p.s0, p.t0, p.tint_rgba),
+        set_vertex_2d(x1, p.y, p.w0, p.s1, p.t0, p.tint_rgba),
+        set_vertex_2d(x1, y1, p.w0, p.s1, p.t1, p.tint_rgba),
+        set_vertex_2d(p.x, y1, p.w0, p.s0, p.t1, p.tint_rgba),
     ]
 }
 
@@ -227,8 +229,8 @@ pub fn quad_indices(vertex_count: u32) -> [u16; 6] {
 /// RB_CheckTessOverflow: true when one more quad does not fit and the surface must end and restart
 /// with the same material. BO2's limits are not in the facts, so the caller passes its own.
 #[must_use]
-pub fn tess_quad_overflows(vertex_count: u32, index_count: u32, max_vertices: u32, max_indices: u32) -> bool {
-    vertex_count + 4 > max_vertices || index_count + 6 > max_indices
+pub fn tess_quad_overflows(verts: u32, indices: u32, vert_cap: u32, index_cap: u32) -> bool {
+    verts + 4 > vert_cap || indices + 6 > index_cap
 }
 
 #[cfg(test)]
@@ -257,8 +259,10 @@ mod tests {
     #[test]
     fn command_round_trip() {
         let mut mem = [0u8; 0x4000];
-        let mut b = GfxRenderCommandBuf::new(&mut mem, 0);
-        let a = GfxCmdStretchPicArgs {
+        let mut b = PaintQueueBytes::new(&mut mem, 0);
+        let mut tint = [1.0f32; 4];
+        tint[3] = 0.5;
+        let a = PaintScaledImageParams {
             material: 7,
             x: 10.0,
             y: 20.0,
@@ -268,7 +272,7 @@ mod tests {
             t0: 0.0,
             s1: 1.0,
             t1: 1.0,
-            color: [1.0, 1.0, 1.0, 0.5],
+            color: tint,
         };
         assert!(add_cmd_draw_stretch_pic(&mut b, &a));
         assert_eq!(b.used_total, 0x30);
@@ -276,10 +280,10 @@ mod tests {
         assert_eq!(p.material, 7);
         assert_eq!(p.w0, 1.0);
         assert_eq!((p.x, p.y, p.w, p.h), (10.0, 20.0, 30.0, 40.0));
-        assert_eq!(p.color_rgba, 0x7fff_ffff);
+        assert_eq!(p.tint_rgba, 0x7fff_ffff);
         let q = draw_stretch_pic_quad(&p);
-        assert_eq!(q[1].xyzw, [40.0, 20.0, 0.0, 1.0]);
-        assert_eq!(q[3].texcoord, [0.0, 1.0]);
+        assert_eq!(q[1].quad, [40.0, 20.0, 0.0, 1.0]);
+        assert_eq!(q[3].uv_semantic, [0.0, 1.0]);
         let bytes = q[2].to_bytes();
         assert_eq!(&bytes[28..32], &GFX_TESS_2D_PACKED_NORMAL.to_le_bytes());
         assert_eq!(quad_indices(0x1_0004), [7, 4, 6, 6, 4, 5]);
@@ -288,8 +292,9 @@ mod tests {
     #[test]
     fn dropped_when_noncritical_space_is_gone() {
         let mut mem = [0u8; 0x2020];
-        let mut b = GfxRenderCommandBuf::new(&mut mem, 0);
-        let a = GfxCmdStretchPicArgs {
+        let mut b = PaintQueueBytes::new(&mut mem, 0);
+        let white = [1.0f32; 4];
+        let a = PaintScaledImageParams {
             material: 1,
             x: 0.0,
             y: 0.0,
@@ -299,7 +304,7 @@ mod tests {
             t0: 0.0,
             s1: 1.0,
             t1: 1.0,
-            color: [1.0; 4],
+            color: white,
         };
         assert!(!add_cmd_draw_stretch_pic(&mut b, &a));
         assert!(tess_quad_overflows(0x3fe, 0, 0x400, 0x600));

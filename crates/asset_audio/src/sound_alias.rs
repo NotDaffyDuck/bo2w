@@ -3,7 +3,7 @@
 
 /// A falloff curve: gain against distance, as (distance, gain) knots.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct CapturedSndCurve {
+pub struct SnapshotAudioCurve {
     pub name: String,
     pub knots: Vec<(f32, f32)>,
 }
@@ -15,36 +15,36 @@ pub struct CapturedSndCurve {
 pub struct LoadedClipSlot;
 
 impl LoadedClipSlot {
-    pub fn bound_index(self) -> Option<usize> {
+    pub fn extent_position(self) -> Option<usize> {
         None
     }
 }
 
 /// One variant of an alias.
 #[derive(Clone, Debug, Default)]
-pub struct CapturedAlias {
+pub struct SnapshotSoundAlias {
     /// An alias played over this one's own clip.
-    pub secondary: Option<String>,
+    pub layered_alias: Option<String>,
     pub loaded: LoadedClipSlot,
     /// The bank file path and the entry id (eight hex digits) the clip
     /// streams from; `None` when no bank holds it.
     pub streamed: Option<(String, String)>,
-    pub file_name: Option<String>,
-    pub vol_min: f32,
-    pub vol_max: f32,
-    pub pitch_min: f32,
-    pub pitch_max: f32,
-    pub dist_min: f32,
-    pub dist_max: f32,
-    pub flags: Option<u32>,
+    pub clip_file: Option<String>,
+    pub volume_low: f32,
+    pub volume_high: f32,
+    pub pitch_lower_bound: f32,
+    pub pitch_upper_bound: f32,
+    pub reach_lower: f32,
+    pub reach_upper: f32,
+    pub alias_bits: Option<u32>,
     /// Chance weight among the alias's variants, 0 to 1.
-    pub probability: f32,
-    pub volume_falloff: Option<CapturedSndCurve>,
+    pub chance_weight: f32,
+    pub volume_falloff: Option<SnapshotAudioCurve>,
     /// The curve the volume follows inside the variant's minimum distance.
-    pub near_falloff: Option<CapturedSndCurve>,
+    pub near_falloff: Option<SnapshotAudioCurve>,
     pub voice_priority: Option<VoicePriority>,
-    pub limit_count: Option<u8>,
-    pub entity_limit_count: Option<u8>,
+    pub cap_total: Option<u8>,
+    pub actor_cap_total: Option<u8>,
     /// The menu volume this variant answers to: 0 effects, 1 music, 2 voice,
     /// 3 interface, 4 cinematic.
     pub menu_category: Option<u8>,
@@ -53,20 +53,22 @@ pub struct CapturedAlias {
     /// The duck (by id) this variant starts while it plays.
     pub duck: Option<u32>,
     /// The duck group this variant is turned down in, an index into
-    /// `SoundCatalog::duck_groups`.
+    /// `AudioRoster::duck_groups`.
     pub duck_group: Option<u8>,
+    /// bo2zm: how much of the sound goes to the room's echo (0..1).
+    pub reverb_send: f32,
 }
 
 /// One alias and its variants.
 #[derive(Clone, Debug, Default)]
-pub struct CapturedSound {
+pub struct SnapshotSoundEntry {
     pub name: String,
-    pub aliases: Vec<CapturedAlias>,
+    pub aliases: Vec<SnapshotSoundAlias>,
 }
 
-impl CapturedSound {
+impl SnapshotSoundEntry {
     /// The entity channel a variant plays on. Alias rows carry none yet.
-    pub fn ent_channel(&self, _variant: usize) -> Option<u32> {
+    pub fn channel_of_row(&self, _variant: usize) -> Option<u32> {
         None
     }
 }
@@ -94,17 +96,17 @@ pub struct SndMaster {
 
 /// A duck: while it is on, each duck group is turned down toward its
 /// `attenuation` (1 leaves it alone) and low-passed toward its `filter`,
-/// fading in over `fade_in` seconds and out over `fade_out`.
+/// fading in over `ease_on` seconds and out over `ease_off`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SndDuck {
     pub name: String,
     pub id: u32,
-    pub fade_in: f32,
-    pub fade_out: f32,
+    pub ease_on: f32,
+    pub ease_off: f32,
     pub start_delay: f32,
     /// Inches; above zero the duck weakens with the listener's distance from
     /// its sound.
-    pub distance: f32,
+    pub fade_range: f32,
     /// Seconds; zero lasts as long as its sound plays.
     pub length: f32,
     pub update_while_paused: bool,
@@ -121,22 +123,24 @@ pub struct StereoPan {
 }
 
 impl StereoPan {
-    /// The gains for a row's front, back, left and right weights. Stereo
+    /// The gains for a row's weights, in the order front, back, left, right. Stereo
     /// output has no centre or LFE speaker, so a row that feeds only those
     /// comes out silent.
-    pub fn from_pan(front: f32, back: f32, left: f32, right: f32) -> Self {
-        let total = front + back;
-        let (mono, stereo) = (total.clamp(0.0, 1.0), total / 2.0);
+    pub fn from_weights(weights: [f32; 4]) -> Self {
+        let [front, back, left, right] = weights;
+        // Both gain pairs are the speaker weights times one scale each.
+        let scaled = |scale: f32| [left * scale, right * scale];
+        let reach = front + back;
         Self {
-            mono: [left * mono, right * mono],
-            stereo: [left * stereo, right * stereo],
+            mono: scaled(reach.clamp(0.0, 1.0)),
+            stereo: scaled(reach * 0.5),
         }
     }
 
     /// (left, right) for a clip of `channels` channels.
     pub fn gains(&self, channels: u16) -> (f32, f32) {
-        let pair = if channels > 1 { self.stereo } else { self.mono };
-        (pair[0], pair[1])
+        let [l, r] = [self.mono, self.stereo][usize::from(channels > 1)];
+        (l, r)
     }
 }
 
@@ -150,21 +154,20 @@ pub struct VoicePriority {
 }
 
 impl VoicePriority {
-    /// The priority at `distance` inches; no distance counts as inaudible.
-    pub fn evaluate(&self, distance: Option<f32>) -> f32 {
-        let audible = match distance {
-            Some(d) if self.distance_max > 0.0 => 1.0 - (d / self.distance_max).clamp(0.0, 1.0),
+    /// The priority `range` inches away; no range counts as inaudible.
+    pub fn priority_for(&self, range: Option<f32>) -> f32 {
+        let closeness = match range {
+            Some(away) if self.distance_max > 0.0 => (1.0 - away / self.distance_max).clamp(0.0, 1.0),
             _ => 0.0,
         };
-        let [lo, hi] = self.thresholds.map(|t| f32::from(t) / 255.0);
-        let [floor, ceil] = self.values.map(f32::from);
-        if audible <= lo {
-            floor
-        } else if audible >= hi {
-            ceil
-        } else {
-            floor + (ceil - floor) * (audible - lo) / (hi - lo)
-        }
+        let [from, to] = self.thresholds.map(|edge| f32::from(edge) / 255.0);
+        let [bottom, top] = self.values.map(f32::from);
+        // How far along the ramp: a ramp with no width steps at its start.
+        let along = match to - from {
+            width if width > 0.0 => ((closeness - from) / width).clamp(0.0, 1.0),
+            _ => f32::from(closeness > from),
+        };
+        bottom + (top - bottom) * along
     }
 }
 
@@ -172,44 +175,63 @@ impl VoicePriority {
 mod tests {
     use super::*;
 
+    fn gains_of(pan: [f32; 4], channels: u16) -> (f32, f32) {
+        StereoPan::from_weights(pan).gains(channels)
+    }
+
+    fn priority_at(thresholds: [u8; 2], values: [u8; 2], range: f32, distance: Option<f32>) -> f32 {
+        VoicePriority {
+            thresholds,
+            values,
+            distance_max: range,
+        }
+        .priority_for(distance)
+    }
+
     #[test]
     fn pans_follow_the_clip_width() {
-        let front = StereoPan::from_pan(1.0, 0.0, 1.0, 1.0);
-        assert_eq!(front.gains(1), (1.0, 1.0));
-        assert_eq!(front.gains(2), (0.5, 0.5));
-        let quad = StereoPan::from_pan(1.0, 1.0, 1.0, 1.0);
-        assert_eq!(quad.gains(1), (1.0, 1.0));
-        assert_eq!(quad.gains(2), (1.0, 1.0));
-        assert_eq!(StereoPan::from_pan(1.0, 0.0, 0.0, 1.0).gains(1), (0.0, 1.0));
-        assert_eq!(StereoPan::from_pan(0.0, 0.0, 0.0, 0.0).gains(2), (0.0, 0.0));
+        let cases = [
+            ([1.0, 0.0, 1.0, 1.0], 1, (1.0, 1.0)),
+            ([1.0, 0.0, 1.0, 1.0], 2, (0.5, 0.5)),
+            ([1.0, 1.0, 1.0, 1.0], 1, (1.0, 1.0)),
+            ([1.0, 1.0, 1.0, 1.0], 2, (1.0, 1.0)),
+            ([1.0, 0.0, 0.0, 1.0], 1, (0.0, 1.0)),
+            ([0.0, 0.0, 0.0, 0.0], 2, (0.0, 0.0)),
+        ];
+        for (pan, channels, want) in cases {
+            assert_eq!(
+                gains_of(pan, channels),
+                want,
+                "pan {pan:?} on {channels} channels"
+            );
+        }
     }
 
     #[test]
     fn priority_rises_between_the_thresholds() {
-        let priority = VoicePriority {
-            thresholds: [0, 255],
-            values: [10, 20],
-            distance_max: 100.0,
-        };
-        assert_eq!(priority.evaluate(None), 10.0);
-        assert_eq!(priority.evaluate(Some(100.0)), 10.0);
-        assert_eq!(priority.evaluate(Some(0.0)), 20.0);
-        assert!((priority.evaluate(Some(50.0)) - 15.0).abs() < 1e-4);
+        let at = |distance| priority_at([0, 255], [10, 20], 100.0, distance);
+        assert_eq!(
+            [at(None), at(Some(100.0)), at(Some(0.0))],
+            [10.0, 10.0, 20.0]
+        );
+        assert!((at(Some(50.0)) - 15.0).abs() < 1e-4);
     }
 
     #[test]
     fn priority_without_a_range_is_the_floor() {
-        let priority = VoicePriority {
-            thresholds: [128, 255],
-            values: [3, 9],
-            distance_max: 0.0,
-        };
-        assert_eq!(priority.evaluate(Some(1.0)), 3.0);
+        assert_eq!(priority_at([128, 255], [3, 9], 0.0, Some(1.0)), 3.0);
+    }
+
+    #[test]
+    fn a_ramp_with_no_width_steps_once() {
+        let at = |distance| priority_at([128, 128], [3, 9], 100.0, Some(distance));
+        assert_eq!([at(90.0), at(10.0)], [3.0, 9.0]);
     }
 
     #[test]
     fn the_loaded_slot_is_always_empty() {
-        assert_eq!(CapturedAlias::default().loaded.bound_index(), None);
-        assert_eq!(CapturedSound::default().ent_channel(0), None);
+        assert_eq!(SnapshotSoundAlias::default().loaded.extent_position(), None);
+        assert_eq!(SnapshotSoundEntry::default().channel_of_row(0), None);
     }
 }
+

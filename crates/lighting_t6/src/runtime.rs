@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, RwLock};
 pub struct T6PointLight {
     pub light: [f32; 3],
     pub primary: u8,
-    pub visibility: f32,
+    pub seen_share: f32,
 }
 
 /// Whether the segment between two points is clear for a grid sight check
@@ -21,15 +21,15 @@ pub struct T6PointLight {
 pub type SightCheck = Arc<dyn Fn([f32; 3], [f32; 3]) -> bool + Send + Sync>;
 
 pub struct T6LightSampler {
-    pub grid: Option<crate::OwnedLightGrid>,
+    pub grid: Option<crate::DetachedLightGrid>,
     /// Grid bounds in cells (x, y at 32 units, z at 64), for the in-grid
     /// test the props use.
-    pub mins: [u16; 3],
-    pub maxs: [u16; 3],
+    pub low: [u16; 3],
+    pub high: [u16; 3],
     /// Sky volumes: bounds, base light, primary light and visibility.
     pub sky: Vec<([f32; 3], [f32; 3], [f32; 3], u8, u8)>,
     pub scale: f32,
-    pub sun_primary: u8,
+    pub sunlight_primary_flag_index: u8,
     /// bo2zm M3 fix list 1: the map's collision, for the grid's sight
     /// checks: a grid point marked "needs trace" counts only when it can be
     /// seen from the lit point (BO2's R_LightGridLookup); without them a
@@ -63,11 +63,11 @@ impl T6LightSampler {
     /// (R_ExtrapolateLightingAtPoint, from the lookup's default entry).
     /// Before, such a point got no light at all: BO2's animated vines high on
     /// Castaway's cliff and the seagulls over its sea drew black.
-    fn extrapolated(&self, index: u32) -> T6PointLight {
+    fn predicted_ahead(&self, index: u32) -> T6PointLight {
         let Some(row) = self
             .grid
             .as_ref()
-            .and_then(|g| g.view().colors_row(index).map(|r| [r[0], r[1], r[2]]))
+            .and_then(|g| g.view().colour_samples_at(index).map(|r| [r[0], r[1], r[2]]))
         else {
             return T6PointLight::default();
         };
@@ -76,8 +76,8 @@ impl T6LightSampler {
                 let v = f32::from(b) / 255.0;
                 v * v * 32.0 * self.scale
             }),
-            primary: self.sun_primary,
-            visibility: 1.0,
+            primary: self.sunlight_primary_flag_index,
+            seen_share: 1.0,
         }
     }
 
@@ -87,14 +87,14 @@ impl T6LightSampler {
             (p[1].floor() as i32).wrapping_add(0x20000) >> 5,
             (p[2].floor() as i32).wrapping_add(0x20000) >> 6,
         ];
-        (0..3).all(|a| cell[a] >= i32::from(self.mins[a]) && cell[a] <= i32::from(self.maxs[a]))
+        (0..3).all(|a| cell[a] >= i32::from(self.low[a]) && cell[a] <= i32::from(self.high[a]))
     }
 
     /// The light at `pos` (with sight checks: once per 8-unit cell, read at
     /// its centre).
     pub fn at(&self, pos: [f32; 3]) -> T6PointLight {
         if self.sight.is_none() {
-            return self.sample(pos);
+            return self.light_at(pos);
         }
         let key = pos.map(|v| (v / 8.0).floor() as i32);
         if let Ok(cache) = self.cache.lock()
@@ -103,7 +103,7 @@ impl T6LightSampler {
             return *hit;
         }
         let centre = key.map(|k| k as f32 * 8.0 + 4.0);
-        let lit = self.sample(centre);
+        let lit = self.light_at(centre);
         if let Ok(mut cache) = self.cache.lock() {
             if cache.len() > 16_384 {
                 cache.clear();
@@ -113,29 +113,29 @@ impl T6LightSampler {
         lit
     }
 
-    fn sample(&self, pos: [f32; 3]) -> T6PointLight {
-        if !self.in_grid(pos) {
+    fn light_at(&self, where_at: [f32; 3]) -> T6PointLight {
+        if !self.in_grid(where_at) {
             if let Some(v) = self
                 .sky
                 .iter()
-                .find(|v| (0..3).all(|a| pos[a] >= v.0[a] && pos[a] <= v.1[a]))
+                .find(|v| (0..3).all(|a| where_at[a] >= v.0[a] && where_at[a] <= v.1[a]))
             {
                 // (A volume's colour set is in the grid's units: the
                 // props outside the grid take it times the same scale.)
                 return T6PointLight {
                     light: v.2.map(|c| c * self.scale),
                     primary: v.3,
-                    visibility: f32::from(v.4) / 255.0,
+                    seen_share: f32::from(v.4) / 255.0,
                 };
             }
-            return self.extrapolated(1);
+            return self.predicted_ahead(1);
         }
         let Some(grid) = self.grid.as_ref() else {
             return T6PointLight::default();
         };
         let sampled = match self.sight.as_deref() {
-            Some(clear) => crate::sample_light_grid_with_sight(&grid.view(), pos, Some(&clear)),
-            None => crate::sample_light_grid(&grid.view(), pos),
+            Some(clear) => crate::grid_sample_with_line_of_sight(&grid.view(), where_at, Some(&clear)),
+            None => crate::probe_light_cells(&grid.view(), where_at),
         }
         .ok();
         // No corner of the grid answers here (above or beside its columns):
@@ -143,12 +143,12 @@ impl T6LightSampler {
         // (BO's R_ExtrapolateLightingAtPoint).
         if let Some(s) = sampled
             .as_ref()
-            .filter(|s| s.path == crate::LightGridAtPointPath::MissingUseIndex)
+            .filter(|s| s.path == crate::GridProbeFallbackBranch::UnassignedUseSlot)
         {
             return T6PointLight {
                 light: crate::t6_sampled_light(s).map(|c| c * self.scale),
-                primary: self.sun_primary,
-                visibility: 1.0,
+                primary: self.sunlight_primary_flag_index,
+                seen_share: 1.0,
             };
         }
         let light = sampled
@@ -159,24 +159,21 @@ impl T6LightSampler {
         let primary = sampled
             .as_ref()
             .and_then(|s| {
-                let mut best: Option<(u8, f32)> = None;
-                let mut totals: Vec<(u8, f32)> = Vec::new();
-                for i in 0..8 {
-                    if let Some(p) = s.corner_primaries[i] {
-                        match totals.iter_mut().find(|t| t.0 == p) {
-                            Some(t) => t.1 += s.weights[i],
-                            None => totals.push((p, s.weights[i])),
+                // Each light's summed weight, the lights in the order the
+                // corners first name them; a tie keeps the earlier light.
+                let mut order: Vec<u8> = Vec::new();
+                let mut share = [0.0f32; 256];
+                for (light, w) in s.corner_dominant_lights.iter().zip(s.mix) {
+                    if let Some(p) = *light {
+                        if !order.contains(&p) {
+                            order.push(p);
                         }
+                        share[usize::from(p)] += w;
                     }
                 }
-                for t in totals {
-                    if best.is_none_or(|b| t.1 > b.1) {
-                        best = Some(t);
-                    }
-                }
-                best.map(|b| b.0)
+                order.into_iter().reduce(|a, b| if share[usize::from(b)] > share[usize::from(a)] { b } else { a })
             })
-            .unwrap_or(self.sun_primary);
+            .unwrap_or(self.sunlight_primary_flag_index);
         let visibility = sampled
             .as_ref()
             .and_then(|s| crate::t6_sampled_visibility(s, primary))
@@ -184,7 +181,7 @@ impl T6LightSampler {
         T6PointLight {
             light,
             primary,
-            visibility,
+            seen_share: visibility,
         }
     }
 }
@@ -225,18 +222,18 @@ pub fn t6_lightmap_generation() -> u64 {
 impl T6LightmapPage {
     /// One texel channel set, filtered as the GPU's linear sampler with
     /// clamped edges does.
-    fn bilinear(&self, u: f32, v: f32) -> [f32; 4] {
+    fn bilinear(&self, u: f32, val: f32) -> [f32; 4] {
         let (w, h) = (self.width as i64, self.height as i64);
         let x = u * self.width as f32 - 0.5;
-        let y = v * self.height as f32 - 0.5;
+        let y = val * self.height as f32 - 0.5;
         let (x0, y0) = (x.floor(), y.floor());
         let (fx, fy) = (x - x0, y - y0);
         let texel = |xi: i64, yi: i64| -> [f32; 4] {
             let xi = xi.clamp(0, w - 1) as usize;
             let yi = yi.clamp(0, h - 1) as usize;
-            let at = (yi * self.width as usize + xi) * 4;
+            let place = (yi * self.width as usize + xi) * 4;
             self.rgba
-                .get(at..at + 4)
+                .get(place..place + 4)
                 .map_or([0.0; 4], |p| [0, 1, 2, 3].map(|c| f32::from(p[c]) / 255.0))
         };
         let (xi, yi) = (x0 as i64, y0 as i64);
@@ -258,10 +255,10 @@ impl T6LightmapPage {
 /// (one page's u, v) for normal `n`: base + directional * saturate(N.dir),
 /// and the baked visibility of the surface's primary light. `None` when the
 /// map has no such lightmap.
-pub fn t6_lightmap_light(index: u8, uv: [f32; 2], n: [f32; 3]) -> Option<([f32; 3], f32)> {
-    let (base, directional, ndl, vis) = t6_lightmap_parts(index, uv, n)?;
-    let light = [0, 1, 2].map(|c| base[c] + directional[c] * ndl);
-    Some((light, vis))
+pub fn t6_lightmap_light(light_no: u8, uv: [f32; 2], num: [f32; 3]) -> Option<([f32; 3], f32)> {
+    let (flat_light, aimed_light, ndl, seen) = t6_lightmap_parts(light_no, uv, num)?;
+    let light = [0, 1, 2].map(|c| flat_light[c] + aimed_light[c] * ndl);
+    Some((light, seen))
 }
 
 /// The lightmap's parts at a point: base light, directional light, the
@@ -279,9 +276,9 @@ pub fn t6_lightmap_parts(
     let p2 = page.bilinear(uv[0], v + 2.0 / 3.0);
     let dir = [p2[0] * 2.0 - 1.0, p2[1] * 2.0 - 1.0, p2[2] * 2.0 - 1.0];
     let ndl = (dir[0] * n[0] + dir[1] * n[1] + dir[2] * n[2]).clamp(0.0, 1.0);
-    let base = [0, 1, 2].map(|c| p0[c] / (p0[3] + 0.000001));
-    let directional = [0, 1, 2].map(|c| p1[c] / (p1[3] + 0.000001));
-    Some((base, directional, ndl, p2[3]))
+    let flat_light = [0, 1, 2].map(|c| p0[c] / (p0[3] + 0.000001));
+    let aimed_light = [0, 1, 2].map(|c| p1[c] / (p1[3] + 0.000001));
+    Some((flat_light, aimed_light, ndl, p2[3]))
 }
 
 /// bo2zm: the world's reflection probe origins, for what moves (the

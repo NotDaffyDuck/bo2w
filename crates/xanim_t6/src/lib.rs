@@ -10,48 +10,49 @@
 //! - [`fired_notes`]: which notetracks one update fires, with the synthetic
 //!   "end";
 //! - [`rel_delta_trans`]: the root-motion move over one update;
-//! - [`AnimClip`]: one XAnimParts decoded for playback ([`AnimClip::from_parts`]),
+//! - [`SkeletalClip`]: one XAnimParts decoded for playback ([`SkeletalClip::from_parts`]),
 //!   built on the pieces above;
-//! - [`XAnimTreeRuntime`]: a tree of clips with goal weights and rates, stepped
+//! - [`AnimGraphInstance`]: a tree of clips with goal weights and rates, stepped
 //!   per frame;
 //! - [`DObjAnim`]: a clip's tracks mapped onto a DObj's parts, and the anims
 //!   blended into its local pose;
-//! - [`pose_dobj`] / [`DObjAnimRuntime`]: a DObj posed from its tree's active
+//! - [`pose_dobj`] / [`SkeletonAnimState`]: a DObj posed from its tree's active
 //!   leaves, and the model collision built from that pose;
 //! - [`DObjSemanticState`]: a DObj's models and anim tree described by name.
 
-mod clip;
+mod cut;
 mod delta;
 mod dobj_anim;
-mod dobj_runtime;
+mod skel_reuse;
 mod notes;
-mod retained;
+mod kept_pose;
 mod sample;
-mod semantic;
+mod pose_desc;
 mod time;
 mod tree;
 
-pub use clip::{
-    AnimClip, ClipError, ClipNotify, FrameIndices, Keyed, RawDeltaTrans, RawXAnimParts, Rotation,
-    SampledTrack, Track, Translation,
+pub use cut::{
+    SkeletalClip, ClipLoadFault, ClipEventMark, KeyframeIds, TimedValue, StoredRootMotion, StoredClipParts, Rotation,
+    EvaluatedChannel, Track, RootShift,
 };
 pub use delta::*;
-pub use dobj_anim::{AnimInstance, DObjAnim};
-pub use dobj_runtime::{DObjAnimRuntime, DObjReuseKey, model_token, reuse_matches};
+pub use dobj_anim::{ClipPlayback, DObjAnim};
+pub use skel_reuse::{SkeletonAnimState, SkeletonCacheKey, model_token, reuse_matches};
 pub use notes::*;
-pub use retained::{
-    BoneCollision, CollSurfCollision, CollTri, CollisionBone, CollmapBox, DObjPoseRequest,
-    MaterializeError, ModelCollmap, RetainedModelCapability, collision_bone_from_local_box,
-    collision_dobj_with_controller, collision_models, collision_models_with_controller, pose_dobj,
-    pose_dobj_with_controller,
+pub use kept_pose::{
+    BoneHitShape, SurfaceHitMesh, HitTriangle, HitShapeBone, CollmapBox, ModelPoseQuery,
+    RebuildFault, ModelCollmap, KeptModelAbility, collision_bone_from_local_box,
+    hit_skeleton_with_aim, hit_shape_models, hit_shape_models_with_aim, pose_dobj,
+    pose_skeleton_with_aim,
 };
 pub use sample::*;
-pub use semantic::{
-    DObjCompositionDescriptor, DObjModelDescriptor, DObjSemanticState, SemanticResolveError,
-    XAnimSemanticNode, XAnimSemanticNodeKind, XAnimTreeSnapshot,
+pub use pose_desc::{
+    RigLayout, RigMeshEntry, DObjRagdoll, RigPoseRecord,
+    RoleLookupFault, TagOffset, GraphNodeRecord, AnimGraphRole,
+    GraphCapture,
 };
 pub use time::*;
 pub use tree::{
-    XAnimNodeDefinition, XAnimNodeId, XAnimNodeKind, XAnimNodeState, XAnimTreeDefinition,
-    XAnimTreeError, XAnimTreeRuntime,
+    AnimGraphNodeSpec, GraphSlot, AnimGraphNodeType, NodeClock, AnimGraphBlueprint,
+    AnimGraphFault, AnimGraphInstance,
 };

@@ -11,6 +11,11 @@ use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::string::String;
 
+/// Mouse input at its usual strength.
+const FULL_FEEL: f32 = 1.0;
+/// No turn-rate cap.
+const NO_CAP: f32 = 0.0;
+
 /// ShockViewTypes (bg_shock_screenType).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
@@ -26,8 +31,8 @@ pub const SCREEN_BLEND_NONE: i32 = ShockViewType::None as i32;
 
 impl ShockViewType {
     #[must_use]
-    pub fn from_i32(value: i32) -> Option<Self> {
-        match value {
+    pub fn from_i32(code: i32) -> Option<Self> {
+        match code {
             0 => Some(Self::Blurred),
             1 => Some(Self::Flashed),
             2 => Some(Self::None),
@@ -86,7 +91,7 @@ pub const MAX_SHELLSHOCKS: usize = 15;
 pub const CS_SHELLSHOCKS: usize = 0x7fa;
 /// ShellShock() takes 0..60 seconds.
 pub const SHELLSHOCK_SECONDS_MAX: f32 = 60.0;
-/// pm_flags bit set on a living player when shocked.
+/// movement_state_bits bit set on a living player when shocked.
 pub const PMF_SHELLSHOCKED: u32 = 0x10000;
 /// Perk bit that scales a shock by perk_shellShockReduction (server side).
 pub const PERK_SHELLSHOCK_REDUCTION: u32 = 0x38;
@@ -127,7 +132,7 @@ pub struct ShellshockScreenBlend {
 /// parms.view: the camera kick.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShellshockView {
-    pub fade_ms: i32,
+    pub fade_for_ms: i32,
     /// Phase per ms: 0.001 / bg_shock_viewKickPeriod.
     pub kick_rate: f32,
     pub kick_radius: f32,
@@ -136,17 +141,17 @@ pub struct ShellshockView {
 /// parms.lookControl.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShellshockLookControl {
-    pub affect: bool,
-    pub fade_ms: i32,
-    pub sensitivity: f32,
-    pub max_pitch_speed: f32,
-    pub max_yaw_speed: f32,
+    pub touches: bool,
+    pub fade_for_ms: i32,
+    pub touchiness: f32,
+    pub pitch_cap: f32,
+    pub yaw_cap: f32,
 }
 
 /// parms.sound, times in ms.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShellshockSound {
-    pub affect: bool,
+    pub touches: bool,
     pub loop_alias: String,
     pub loop_silent_alias: String,
     pub end_alias: String,
@@ -201,12 +206,12 @@ impl Default for ShellshockParms {
                 kind: ShockViewType::Blurred,
             },
             view: ShellshockView {
-                fade_ms: VIEW_KICK_FADE_MS,
+                fade_for_ms: VIEW_KICK_FADE_MS,
                 kick_rate: view_kick_rate(period),
                 kick_radius: BG_SHOCK_VIEW_KICK_RADIUS_DEFAULT,
             },
             sound: ShellshockSound {
-                affect: BG_SHOCK_SOUND_DEFAULT,
+                touches: BG_SHOCK_SOUND_DEFAULT,
                 loop_alias: BG_SHOCK_SOUND_LOOP_DEFAULT.to_owned(),
                 loop_silent_alias: BG_SHOCK_SOUND_LOOP_SILENT_DEFAULT.to_owned(),
                 end_alias: BG_SHOCK_SOUND_END_DEFAULT.to_owned(),
@@ -222,15 +227,15 @@ impl Default for ShellshockParms {
                 snapshot: BG_SHOCK_SOUND_SNAPSHOT_DEFAULT.to_owned(),
             },
             look_control: ShellshockLookControl {
-                affect: BG_SHOCK_LOOK_CONTROL_DEFAULT,
-                fade_ms: ms(BG_SHOCK_LOOK_CONTROL_FADE_TIME_DEFAULT),
-                sensitivity: BG_SHOCK_LOOK_CONTROL_MOUSE_SENSITIVITY_SCALE_DEFAULT,
-                max_pitch_speed: BG_SHOCK_LOOK_CONTROL_MAX_PITCH_SPEED_DEFAULT,
-                max_yaw_speed: BG_SHOCK_LOOK_CONTROL_MAX_YAW_SPEED_DEFAULT,
+                touches: BG_SHOCK_LOOK_CONTROL_DEFAULT,
+                fade_for_ms: ms(BG_SHOCK_LOOK_CONTROL_FADE_TIME_DEFAULT),
+                touchiness: BG_SHOCK_LOOK_CONTROL_MOUSE_SENSITIVITY_SCALE_DEFAULT,
+                pitch_cap: BG_SHOCK_LOOK_CONTROL_MAX_PITCH_SPEED_DEFAULT,
+                yaw_cap: BG_SHOCK_LOOK_CONTROL_MAX_YAW_SPEED_DEFAULT,
             },
             movement_scale: BG_SHOCK_MOVEMENT_DEFAULT,
             animation: BG_SHOCK_ANIMATION_DEFAULT,
-            vision_set: ShellshockVisionSet { name: String::new(), in_ms: 0, out_ms: 0 },
+            vision_set: ShellshockVisionSet { in_ms: 0, out_ms: 0, name: String::default() },
         }
     }
 }
@@ -248,14 +253,14 @@ impl ShellshockParms {
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut p = Self::default();
         let mut period = BG_SHOCK_VIEW_KICK_PERIOD_DEFAULT;
-        for line in text.lines() {
-            let Some((key, value)) = line.trim().split_once(char::is_whitespace) else { continue };
-            let Some(name) = key.to_ascii_lowercase().strip_prefix("bg_shock_").map(str::to_owned) else {
+        for row in text.lines().map(str::trim) {
+            let Some((dvar, raw)) = row.split_once(char::is_whitespace) else { continue };
+            let Some(name) = dvar.to_ascii_lowercase().strip_prefix("bg_shock_").map(str::to_owned) else {
                 continue;
             };
-            let value = value.trim().trim_matches('"');
+            let value = raw.trim().trim_matches('"');
             let number = || -> Result<f32, String> {
-                value.parse::<f32>().map_err(|_| format!("{key} \"{value}\" is not a number"))
+                value.parse::<f32>().map_err(|_| format!("{dvar} \"{value}\" is not a number"))
             };
             let flag = || number().map(|v| v != 0.0);
             match name.as_str() {
@@ -264,7 +269,7 @@ impl ShellshockParms {
                         "blurred" => ShockViewType::Blurred,
                         "flashed" => ShockViewType::Flashed,
                         "none" => ShockViewType::None,
-                        other => return Err(format!("{key} \"{other}\" is not blurred, flashed or none")),
+                        other => return Err(format!("{dvar} \"{other}\" is not blurred, flashed or none")),
                     };
                 }
                 "screenblurblendtime" => p.screen_blend.blurred_effect_ms = ms(number()?),
@@ -275,17 +280,17 @@ impl ShellshockParms {
                 "viewkickradius" => p.view.kick_radius = number()?,
                 // Registered, but parms.view.fadeTime stays VIEW_KICK_FADE_MS.
                 "viewkickfadetime" => {}
-                "lookcontrol" => p.look_control.affect = flag()?,
-                "lookcontrol_maxpitchspeed" => p.look_control.max_pitch_speed = number()?,
-                "lookcontrol_maxyawspeed" => p.look_control.max_yaw_speed = number()?,
-                "lookcontrol_mousesensitivityscale" => p.look_control.sensitivity = number()?,
-                "lookcontrol_fadetime" => p.look_control.fade_ms = ms(number()?),
+                "lookcontrol" => p.look_control.touches = flag()?,
+                "lookcontrol_maxpitchspeed" => p.look_control.pitch_cap = number()?,
+                "lookcontrol_maxyawspeed" => p.look_control.yaw_cap = number()?,
+                "lookcontrol_mousesensitivityscale" => p.look_control.touchiness = number()?,
+                "lookcontrol_fadetime" => p.look_control.fade_for_ms = ms(number()?),
                 "movement" => p.movement_scale = number()?,
                 "animation" => p.animation = flag()?,
                 "visionset_name" => p.vision_set.name = value.to_owned(),
                 "visionset_intime" => p.vision_set.in_ms = ms(number()?),
                 "visionset_outtime" => p.vision_set.out_ms = ms(number()?),
-                "sound" => p.sound.affect = flag()?,
+                "sound" => p.sound.touches = flag()?,
                 "soundloop" => p.sound.loop_alias = value.to_owned(),
                 "soundloopsilent" => p.sound.loop_silent_alias = value.to_owned(),
                 "soundend" => p.sound.end_alias = value.to_owned(),
@@ -314,15 +319,15 @@ impl ShellshockParms {
 /// startTime != 0 and cg.time - startTime >= 0, remaining = startTime - cg.time + duration (ms,
 /// not clamped; users test < 1). None when the shock has not started.
 #[must_use]
-pub fn shellshock_remaining_ms(cg_time: i32, start_time: i32, duration: i32) -> Option<i32> {
-    (start_time != 0 && cg_time.wrapping_sub(start_time) >= 0)
-        .then(|| start_time.wrapping_sub(cg_time).wrapping_add(duration))
+pub fn shellshock_left_ms(scene_clock_ms: i32, began: i32, lasts: i32) -> Option<i32> {
+    (began != 0 && scene_clock_ms.wrapping_sub(began) >= 0)
+        .then(|| began.wrapping_sub(scene_clock_ms).wrapping_add(lasts))
 }
 
 /// CG_Flashbanged: time left and the shock is FLASHED (a BLURRED stun is not). No startTime test.
 #[must_use]
-pub fn cg_flashbanged(cg_time: i32, start_time: i32, duration: i32, kind: ShockViewType) -> bool {
-    start_time.wrapping_sub(cg_time).wrapping_add(duration) > 0 && kind == ShockViewType::Flashed
+pub fn cg_flashbanged(scene_clock_ms: i32, began: i32, lasts: i32, kind: ShockViewType) -> bool {
+    began.wrapping_sub(scene_clock_ms).wrapping_add(lasts) > 0 && kind == ShockViewType::Flashed
 }
 
 /// CG_Flared: not immune (perk 0x1a on the player or his viewmodel weapon) and the snapshot
@@ -360,8 +365,8 @@ pub fn shellshock_flash_fade(x: f32) -> f32 {
 
 /// One fade time's linear fraction: 1 while remaining >= fade, else remaining / fade.
 #[must_use]
-pub fn shellshock_fade_fraction(remaining_ms: i32, fade_ms: i32) -> f32 {
-    if remaining_ms >= fade_ms { 1.0 } else { remaining_ms as f32 / fade_ms as f32 }
+pub fn shellshock_fade_fraction(ms_to_go: i32, fade_ms: i32) -> f32 {
+    if ms_to_go >= fade_ms { 1.0 } else { ms_to_go as f32 / fade_ms as f32 }
 }
 
 /// What the FLASHED draw does this frame.
@@ -378,21 +383,21 @@ pub enum FlashDraw {
 /// The FLASHED draw: needs startTime != 0, duration > 0 and time left.
 #[must_use]
 pub fn shellshock_flash_draw(
-    start_time: i32,
-    duration: i32,
-    remaining_ms: i32,
+    began_at: i32,
+    length_ms: i32,
+    ms_to_go: i32,
     blend: &ShellshockScreenBlend,
     has_saved_screen: bool,
 ) -> FlashDraw {
-    if start_time == 0 || duration <= 0 || remaining_ms <= 0 {
+    if began_at == 0 || length_ms <= 0 || ms_to_go <= 0 {
         return FlashDraw::Clear;
     }
     if !has_saved_screen {
         return FlashDraw::SaveScreen;
     }
     FlashDraw::Blend {
-        whiteout: shellshock_flash_fade(shellshock_fade_fraction(remaining_ms, blend.flash_white_fade_ms)),
-        screengrab: shellshock_flash_fade(shellshock_fade_fraction(remaining_ms, blend.flash_shot_fade_ms)),
+        whiteout: shellshock_flash_fade(shellshock_fade_fraction(ms_to_go, blend.flash_white_fade_ms)),
+        screengrab: shellshock_flash_fade(shellshock_fade_fraction(ms_to_go, blend.flash_shot_fade_ms)),
     }
 }
 
@@ -407,9 +412,9 @@ pub fn flashed_vertex_color(whiteout: f32, screengrab: f32) -> [u8; 4] {
 
 /// The BLURRED draw's blend time: blurredEffectTime, shortened in the last blurredFadeTime ms.
 #[must_use]
-pub fn shellshock_blur_effect_ms(remaining_ms: i32, blend: &ShellshockScreenBlend) -> i32 {
-    if remaining_ms < blend.blurred_fade_ms {
-        libm::roundf(remaining_ms as f32 / blend.blurred_fade_ms as f32 * blend.blurred_effect_ms as f32) as i32
+pub fn shellshock_blur_effect_ms(ms_to_go: i32, blend: &ShellshockScreenBlend) -> i32 {
+    if ms_to_go < blend.blurred_fade_ms {
+        libm::roundf(ms_to_go as f32 / blend.blurred_fade_ms as f32 * blend.blurred_effect_ms as f32) as i32
     } else {
         blend.blurred_effect_ms
     }
@@ -418,44 +423,44 @@ pub fn shellshock_blur_effect_ms(remaining_ms: i32, blend: &ShellshockScreenBlen
 /// Look control this frame: shellshock.sensitivity and the CL_CapTurnRate caps (0 = no cap).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShellshockLook {
-    pub sensitivity: f32,
-    pub max_pitch_speed: f32,
-    pub max_yaw_speed: f32,
+    pub touchiness: f32,
+    pub pitch_cap: f32,
+    pub yaw_cap: f32,
 }
 
 /// Look control ended: sensitivity 1, caps cleared.
 pub const SHELLSHOCK_LOOK_ENDED: ShellshockLook =
-    ShellshockLook { sensitivity: 1.0, max_pitch_speed: 0.0, max_yaw_speed: 0.0 };
+    ShellshockLook { touchiness: FULL_FEEL, pitch_cap: NO_CAP, yaw_cap: NO_CAP };
 
 /// Look control from the time left: full inside the fade window's start, then the sensitivity
 /// eases back to 1 and the caps loosen (divided by the fade).
 #[must_use]
-pub fn shellshock_look_control(remaining_ms: Option<i32>, look: &ShellshockLookControl) -> ShellshockLook {
-    let Some(remaining) = remaining_ms.filter(|_| look.affect) else { return SHELLSHOCK_LOOK_ENDED };
-    let fade = if remaining < look.fade_ms {
-        if remaining < 1 {
+pub fn shellshock_look_control(ms_to_go: Option<i32>, look: &ShellshockLookControl) -> ShellshockLook {
+    let Some(remaining) = ms_to_go.filter(|_| look.touches) else { return SHELLSHOCK_LOOK_ENDED };
+    let fade = if remaining < look.fade_for_ms {
+        if remaining <= 0 {
             return SHELLSHOCK_LOOK_ENDED;
         }
-        remaining as f32 / look.fade_ms as f32
+        remaining as f32 / look.fade_for_ms as f32
     } else {
         1.0
     };
-    let sensitivity = if fade == 1.0 { look.sensitivity } else { (look.sensitivity - 1.0) * fade + 1.0 };
+    let sensitivity = if fade == 1.0 { look.touchiness } else { (look.touchiness - 1.0) * fade + 1.0 };
     ShellshockLook {
-        sensitivity,
-        max_pitch_speed: look.max_pitch_speed / fade,
-        max_yaw_speed: look.max_yaw_speed / fade,
+        touchiness: sensitivity,
+        pitch_cap: look.pitch_cap / fade,
+        yaw_cap: look.yaw_cap / fade,
     }
 }
 
 /// The camera kick's amplitude: smoothstep(min(1, remaining / view.fadeTime)) * kickRadius;
 /// None (viewDelta cleared) once remaining < 1.
 #[must_use]
-pub fn shellshock_kick_amplitude(remaining_ms: i32, view: &ShellshockView) -> Option<f32> {
-    if remaining_ms < 1 {
+pub fn shellshock_kick_amplitude(ms_to_go: i32, view: &ShellshockView) -> Option<f32> {
+    if ms_to_go < 1 {
         return None;
     }
-    let x = (remaining_ms as f32 / view.fade_ms as f32).min(1.0);
+    let x = (ms_to_go as f32 / view.fade_for_ms as f32).min(1.0);
     Some(x * x * (3.0 - 2.0 * x) * view.kick_radius)
 }
 
@@ -463,9 +468,9 @@ pub fn shellshock_kick_amplitude(remaining_ms: i32, view: &ShellshockView) -> Op
 /// interpolates cubically through the table from there.
 /// TODO(fact): the table's contents and the exact cubic weights are not in the facts.
 #[must_use]
-pub fn shellshock_kick_phase(elapsed_ms: i32, duration: i32, view: &ShellshockView) -> (f32, usize) {
+pub fn shellshock_kick_phase(elapsed_ms: i32, lasts: i32, view: &ShellshockView) -> (f32, usize) {
     let phase = elapsed_ms as f32 * view.kick_rate;
-    let index = duration
+    let index = lasts
         .wrapping_mul(PERTURBATION_DURATION_STRIDE)
         .wrapping_add(libm::floorf(phase) as i32)
         & (PERTURBATION_COUNT as i32 - 1);
@@ -498,18 +503,17 @@ pub fn flashbang_distance_fraction(distance: f32, max_radius: f32, min_radius: f
 
 /// The "flashbang" notify's percent_angle: (dot(view forward, unit eye-to-blast) + 1) / 2.
 #[must_use]
-pub fn flashbang_angle_fraction(view_forward: [f32; 3], eye_to_blast_unit: [f32; 3]) -> f32 {
-    let dot = view_forward[0] * eye_to_blast_unit[0]
-        + view_forward[1] * eye_to_blast_unit[1]
-        + view_forward[2] * eye_to_blast_unit[2];
-    (dot + 1.0) * 0.5
+pub fn flashbang_angle_fraction(eye_forward: [f32; 3], eye_to_blast_unit: [f32; 3]) -> f32 {
+    let [fx, fy, fz] = eye_forward;
+    let facing = fx * eye_to_blast_unit[0] + fy * eye_to_blast_unit[1] + fz * eye_to_blast_unit[2];
+    0.5 * (facing + 1.0)
 }
 
 /// Damage flash amount while cg.time is before its end: |(end - time) * kick * 0.002|, at most 5.
 #[must_use]
-pub fn damage_flash_amount(cg_time: i32, end_time: i32, kick: f32) -> Option<f32> {
-    (cg_time < end_time)
-        .then(|| ((end_time - cg_time) as f32 * kick * DAMAGE_FLASH_KICK_SCALE).abs().min(DAMAGE_FLASH_AMOUNT_MAX))
+pub fn damage_flash_amount(scene_clock_ms: i32, finish_stamp: i32, kick: f32) -> Option<f32> {
+    (scene_clock_ms < finish_stamp)
+        .then(|| ((finish_stamp - scene_clock_ms) as f32 * kick * DAMAGE_FLASH_KICK_SCALE).abs().min(DAMAGE_FLASH_AMOUNT_MAX))
 }
 
 /// Damage flash colour: (0.2, 0, 0) at alpha amount * 0.2 * 0.7.
@@ -572,15 +576,15 @@ bg_shock_visionset_outTime "3.5"
         assert_eq!(f.screen_blend.flash_white_fade_ms, 3500);
         assert_eq!(f.movement_scale, 0.8);
         assert_eq!(f.sound.end_alias, "");
-        assert!(!f.animation && !f.look_control.affect);
-        assert_eq!(f.view.fade_ms, VIEW_KICK_FADE_MS);
+        assert!(!f.animation && !f.look_control.touches);
+        assert_eq!(f.view.fade_for_ms, VIEW_KICK_FADE_MS);
         assert!((f.view.kick_rate - 0.001 / 0.75).abs() < 1e-9);
         // Lines the file leaves out keep the defaults.
         assert_eq!(f.screen_blend.blurred_effect_ms, 400);
         assert_eq!(f.sound.loop_silent_alias, BG_SHOCK_SOUND_LOOP_SILENT_DEFAULT);
         let c = ShellshockParms::parse(CONCUSSION).unwrap();
-        assert!(c.look_control.affect && c.animation);
-        assert_eq!(c.look_control.max_yaw_speed, 22.0);
+        assert!(c.look_control.touches && c.animation);
+        assert_eq!(c.look_control.yaw_cap, 22.0);
         assert_eq!(c.vision_set.name, "concussion_grenade");
         assert_eq!(c.vision_set.out_ms, 3500);
         assert!(ShellshockParms::parse("bg_shock_screenType \"sparkly\"").is_err());
@@ -589,9 +593,9 @@ bg_shock_visionset_outTime "3.5"
 
     #[test]
     fn remaining_and_flashbanged() {
-        assert_eq!(shellshock_remaining_ms(1500, 1000, 2000), Some(1500));
-        assert_eq!(shellshock_remaining_ms(900, 1000, 2000), None);
-        assert_eq!(shellshock_remaining_ms(1500, 0, 2000), None);
+        assert_eq!(shellshock_left_ms(1500, 1000, 2000), Some(1500));
+        assert_eq!(shellshock_left_ms(900, 1000, 2000), None);
+        assert_eq!(shellshock_left_ms(1500, 0, 2000), None);
         assert!(cg_flashbanged(1500, 1000, 2000, ShockViewType::Flashed));
         assert!(!cg_flashbanged(1500, 1000, 2000, ShockViewType::Blurred));
         assert!(!cg_flashbanged(3000, 1000, 2000, ShockViewType::Flashed));
@@ -636,9 +640,9 @@ bg_shock_visionset_outTime "3.5"
     fn look_control_eases_out() {
         let look = ShellshockParms::parse(CONCUSSION).unwrap().look_control;
         let full = shellshock_look_control(Some(5000), &look);
-        assert_eq!(full, ShellshockLook { sensitivity: 0.1, max_pitch_speed: 22.0, max_yaw_speed: 22.0 });
+        assert_eq!(full, ShellshockLook { touchiness: 0.1, pitch_cap: 22.0, yaw_cap: 22.0 });
         let half = shellshock_look_control(Some(1000), &look);
-        assert!((half.sensitivity - 0.55).abs() < 1e-5 && half.max_yaw_speed == 44.0);
+        assert!((half.touchiness - 0.55).abs() < 1e-5 && half.yaw_cap == 44.0);
         assert_eq!(shellshock_look_control(Some(0), &look), SHELLSHOCK_LOOK_ENDED);
         assert_eq!(shellshock_look_control(None, &look), SHELLSHOCK_LOOK_ENDED);
         let off = ShellshockParms::parse(FLASHBANG).unwrap().look_control;

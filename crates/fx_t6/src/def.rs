@@ -1,13 +1,13 @@
 //! Reads a BO2 FxElemDef (292 bytes) and its FxElemAtlas from the zone's
 //! bytes, at fastfile_t6's offsets.
 
-use fastfile_t6::layout::{FxElemAtlas as a, FxElemDef as e};
+use fastfile_t6::layout::{FxElemAtlas, FxElemDef};
 
-use crate::elem_type::FxElemType;
+use crate::look_kind::ParticleShape;
 
-pub const FX_ELEM_DEF_SIZE: usize = e::SIZE;
+pub const FX_ELEM_DEF_SIZE: usize = FxElemDef::SIZE;
 
-pub const FX_ELEM_ATLAS_SIZE: usize = a::SIZE;
+pub const FX_ELEM_ATLAS_SIZE: usize = FxElemAtlas::SIZE;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FxFloatRange {
@@ -36,7 +36,7 @@ impl FxElemAtlasT6 {
     /// The entry count is the low byte (measured: 516 = 4 entries on a 2x2
     /// atlas).
     #[inline]
-    pub fn entry_count(&self) -> u8 {
+    pub fn entry_tally(&self) -> u8 {
         self.entry_count_and_index_range as u8
     }
 }
@@ -50,37 +50,33 @@ pub struct FxElemDefT6<'a> {
 impl<'a> FxElemDefT6<'a> {
     /// None when fewer than 292 bytes are given.
     pub fn new(raw: &'a [u8]) -> Option<Self> {
-        raw.get(..e::SIZE).map(|raw| Self { raw })
+        raw.get(..FxElemDef::SIZE).map(|raw| Self { raw })
     }
 
     #[inline]
-    fn u8(&self, off: usize) -> u8 {
-        self.raw[off]
+    fn u8(&self, at: usize) -> u8 {
+        self.raw[at]
     }
 
     #[inline]
-    fn u16(&self, off: usize) -> u16 {
-        u16::from_le_bytes([self.raw[off], self.raw[off + 1]])
+    fn u16(&self, at: usize) -> u16 {
+        u16::from_le_bytes([self.raw[at], self.raw[at + 1]])
     }
 
     #[inline]
-    fn u32(&self, off: usize) -> u32 {
-        u32::from_le_bytes([
-            self.raw[off],
-            self.raw[off + 1],
-            self.raw[off + 2],
-            self.raw[off + 3],
-        ])
+    fn u32(&self, at: usize) -> u32 {
+        let low = u32::from(self.u16(at));
+        low | u32::from(self.u16(at + 2)) << 16
     }
 
     #[inline]
-    fn i32(&self, off: usize) -> i32 {
-        self.u32(off) as i32
+    fn i32(&self, at: usize) -> i32 {
+        self.u32(at) as i32
     }
 
     #[inline]
-    fn f32(&self, off: usize) -> f32 {
-        f32::from_bits(self.u32(off))
+    fn f32(&self, at: usize) -> f32 {
+        f32::from_bits(self.u32(at))
     }
 
     #[inline]
@@ -114,162 +110,162 @@ impl<'a> FxElemDefT6<'a> {
     }
 
     pub fn flags(&self) -> u32 {
-        self.u32(e::flags)
+        self.u32(FxElemDef::flags)
     }
 
     /// The spawn union read as looping: (interval msec, count).
     pub fn spawn_looping(&self) -> (i32, i32) {
-        (self.i32(e::spawn), self.i32(e::spawn + 4))
+        (self.i32(FxElemDef::spawn), self.i32(FxElemDef::spawn + 4))
     }
 
     /// The spawn union read as one-shot: the count range.
     pub fn spawn_one_shot(&self) -> FxIntRange {
-        self.int_range(e::spawn)
+        self.int_range(FxElemDef::spawn)
     }
 
-    pub fn spawn_range(&self) -> FxFloatRange {
-        self.float_range(e::spawnRange)
+    pub fn birth_span(&self) -> FxFloatRange {
+        self.float_range(FxElemDef::spawnRange)
     }
 
-    pub fn fade_in_range(&self) -> FxFloatRange {
-        self.float_range(e::fadeInRange)
+    pub fn appear_blend_reach(&self) -> FxFloatRange {
+        self.float_range(FxElemDef::fadeInRange)
     }
 
-    pub fn fade_out_range(&self) -> FxFloatRange {
-        self.float_range(e::fadeOutRange)
+    pub fn vanish_blend_reach(&self) -> FxFloatRange {
+        self.float_range(FxElemDef::fadeOutRange)
     }
 
-    pub fn spawn_frustum_cull_radius(&self) -> f32 {
-        self.f32(e::spawnFrustumCullRadius)
+    pub fn birth_view_reject_reach(&self) -> f32 {
+        self.f32(FxElemDef::spawnFrustumCullRadius)
     }
 
-    pub fn spawn_delay_msec(&self) -> FxIntRange {
-        self.int_range(e::spawnDelayMsec)
+    pub fn birth_wait_ms(&self) -> FxIntRange {
+        self.int_range(FxElemDef::spawnDelayMsec)
     }
 
-    pub fn life_span_msec(&self) -> FxIntRange {
-        self.int_range(e::lifeSpanMsec)
+    pub fn lifespan_window_ms(&self) -> FxIntRange {
+        self.int_range(FxElemDef::lifeSpanMsec)
     }
 
-    pub fn spawn_origin(&self) -> [FxFloatRange; 3] {
-        self.range3(e::spawnOrigin)
+    pub fn birth_point(&self) -> [FxFloatRange; 3] {
+        self.range3(FxElemDef::spawnOrigin)
     }
 
-    pub fn spawn_offset_radius(&self) -> FxFloatRange {
-        self.float_range(e::spawnOffsetRadius)
+    pub fn birth_ring_reach(&self) -> FxFloatRange {
+        self.float_range(FxElemDef::spawnOffsetRadius)
     }
 
-    pub fn spawn_offset_height(&self) -> FxFloatRange {
-        self.float_range(e::spawnOffsetHeight)
+    pub fn birth_lift(&self) -> FxFloatRange {
+        self.float_range(FxElemDef::spawnOffsetHeight)
     }
 
-    pub fn spawn_angles(&self) -> [FxFloatRange; 3] {
-        self.range3(e::spawnAngles)
+    pub fn birth_orientation(&self) -> [FxFloatRange; 3] {
+        self.range3(FxElemDef::spawnAngles)
     }
 
-    pub fn angular_velocity(&self) -> [FxFloatRange; 3] {
-        self.range3(e::angularVelocity)
+    pub fn twirl_rate(&self) -> [FxFloatRange; 3] {
+        self.range3(FxElemDef::angularVelocity)
     }
 
-    pub fn initial_rotation(&self) -> FxFloatRange {
-        self.float_range(e::initialRotation)
+    pub fn birth_spin_angle(&self) -> FxFloatRange {
+        self.float_range(FxElemDef::initialRotation)
     }
 
     /// The packed rotation axis, decoded at draw with flag 0x800000.
     // BO2 unknown: the packing (see facts/QUESTIONS.md); the raw word is given.
     pub fn rotation_axis_packed(&self) -> u32 {
-        self.u32(e::rotationAxis)
+        self.u32(FxElemDef::rotationAxis)
     }
 
     pub fn gravity(&self) -> FxFloatRange {
-        self.float_range(e::gravity)
+        self.float_range(FxElemDef::gravity)
     }
 
-    pub fn reflection_factor(&self) -> FxFloatRange {
-        self.float_range(e::reflectionFactor)
+    pub fn mirror_strength(&self) -> FxFloatRange {
+        self.float_range(FxElemDef::reflectionFactor)
     }
 
     pub fn atlas(&self) -> FxElemAtlasT6 {
-        let o = e::atlas;
+        let o = FxElemDef::atlas;
         FxElemAtlasT6 {
-            behavior: self.u8(o + a::behavior),
-            index: self.u8(o + a::index),
-            fps: self.u8(o + a::fps),
-            loop_count: self.u8(o + a::loopCount),
-            col_index_bits: self.u8(o + a::colIndexBits),
-            row_index_bits: self.u8(o + a::rowIndexBits),
-            entry_count_and_index_range: self.u16(o + a::entryCountAndIndexRange),
+            behavior: self.u8(o + FxElemAtlas::behavior),
+            index: self.u8(o + FxElemAtlas::index),
+            fps: self.u8(o + FxElemAtlas::fps),
+            loop_count: self.u8(o + FxElemAtlas::loopCount),
+            col_index_bits: self.u8(o + FxElemAtlas::colIndexBits),
+            row_index_bits: self.u8(o + FxElemAtlas::rowIndexBits),
+            entry_count_and_index_range: self.u16(o + FxElemAtlas::entryCountAndIndexRange),
         }
     }
 
     pub fn wind_influence(&self) -> f32 {
-        self.f32(e::windInfluence)
+        self.f32(FxElemDef::windInfluence)
     }
 
     pub fn elem_type_raw(&self) -> u8 {
-        self.u8(e::elemType)
+        self.u8(FxElemDef::elemType)
     }
 
-    pub fn elem_type(&self) -> Option<FxElemType> {
-        FxElemType::from_u8(self.elem_type_raw())
+    pub fn elem_type(&self) -> Option<ParticleShape> {
+        ParticleShape::from_u8(self.elem_type_raw())
     }
 
-    pub fn visual_count(&self) -> u8 {
-        self.u8(e::visualCount)
+    pub fn look_variant_total(&self) -> u8 {
+        self.u8(FxElemDef::visualCount)
     }
 
-    pub fn vel_interval_count(&self) -> u8 {
-        self.u8(e::velIntervalCount)
+    pub fn speed_keyframe_total(&self) -> u8 {
+        self.u8(FxElemDef::velIntervalCount)
     }
 
-    pub fn vis_state_interval_count(&self) -> u8 {
-        self.u8(e::visStateIntervalCount)
+    pub fn look_keyframe_total(&self) -> u8 {
+        self.u8(FxElemDef::visStateIntervalCount)
     }
 
-    pub fn coll_mins(&self) -> [f32; 3] {
-        self.vec3(e::collMins)
+    pub fn bounce_box_bottom(&self) -> [f32; 3] {
+        self.vec3(FxElemDef::collMins)
     }
 
-    pub fn coll_maxs(&self) -> [f32; 3] {
-        self.vec3(e::collMaxs)
+    pub fn bounce_box_top(&self) -> [f32; 3] {
+        self.vec3(FxElemDef::collMaxs)
     }
 
-    pub fn emit_dist(&self) -> FxFloatRange {
-        self.float_range(e::emitDist)
+    pub fn emission_spacing(&self) -> FxFloatRange {
+        self.float_range(FxElemDef::emitDist)
     }
 
-    pub fn emit_dist_variance(&self) -> FxFloatRange {
-        self.float_range(e::emitDistVariance)
+    pub fn emission_spacing_spread(&self) -> FxFloatRange {
+        self.float_range(FxElemDef::emitDistVariance)
     }
 
-    pub fn sort_order(&self) -> u8 {
-        self.u8(e::sortOrder)
+    pub fn paint_rank(&self) -> u8 {
+        self.u8(FxElemDef::sortOrder)
     }
 
-    pub fn lighting_frac(&self) -> u8 {
-        self.u8(e::lightingFrac)
+    pub fn shading_blend(&self) -> u8 {
+        self.u8(FxElemDef::lightingFrac)
     }
 
     // The four wind and fade fields are 2 bytes each in the layout; read
     // unsigned.
     pub fn alpha_fade_time_msec(&self) -> u16 {
-        self.u16(e::alphaFadeTimeMsec)
+        self.u16(FxElemDef::alphaFadeTimeMsec)
     }
 
     pub fn max_wind_strength(&self) -> u16 {
-        self.u16(e::maxWindStrength)
+        self.u16(FxElemDef::maxWindStrength)
     }
 
     pub fn spawn_interval_at_max_wind(&self) -> u16 {
-        self.u16(e::spawnIntervalAtMaxWind)
+        self.u16(FxElemDef::spawnIntervalAtMaxWind)
     }
 
     pub fn lifespan_at_max_wind(&self) -> u16 {
-        self.u16(e::lifespanAtMaxWind)
+        self.u16(FxElemDef::lifespanAtMaxWind)
     }
 
     pub fn billboard_pivot(&self) -> [f32; 2] {
-        [self.f32(e::billboardPivot), self.f32(e::billboardPivot + 4)]
+        [self.f32(FxElemDef::billboardPivot), self.f32(FxElemDef::billboardPivot + 4)]
     }
 }
 
@@ -277,8 +273,8 @@ impl<'a> FxElemDefT6<'a> {
 mod tests {
     use super::*;
 
-    fn put(raw: &mut [u8], off: usize, bytes: &[u8]) {
-        raw[off..off + bytes.len()].copy_from_slice(bytes);
+    fn put(raw: &mut [u8], off: usize, buf: &[u8]) {
+        raw[off..off + buf.len()].copy_from_slice(buf);
     }
 
     #[test]
@@ -290,34 +286,34 @@ mod tests {
     #[test]
     fn reads_fields_at_bo2_offsets() {
         let mut raw = [0u8; FX_ELEM_DEF_SIZE];
-        put(&mut raw, e::flags, &0x8000_0400u32.to_le_bytes());
-        put(&mut raw, e::lifeSpanMsec, &500i32.to_le_bytes());
-        put(&mut raw, e::lifeSpanMsec + 4, &250i32.to_le_bytes());
-        put(&mut raw, e::gravity + 4, &1.5f32.to_le_bytes());
-        put(&mut raw, e::spawnAngles + 16, &(-2.0f32).to_le_bytes());
+        put(&mut raw, FxElemDef::flags, &0x8000_0400u32.to_le_bytes());
+        put(&mut raw, FxElemDef::lifeSpanMsec, &500i32.to_le_bytes());
+        put(&mut raw, FxElemDef::lifeSpanMsec + 4, &250i32.to_le_bytes());
+        put(&mut raw, FxElemDef::gravity + 4, &1.5f32.to_le_bytes());
+        put(&mut raw, FxElemDef::spawnAngles + 16, &(-2.0f32).to_le_bytes());
         put(
             &mut raw,
-            e::atlas + a::entryCountAndIndexRange,
+            FxElemDef::atlas + FxElemAtlas::entryCountAndIndexRange,
             &516u16.to_le_bytes(),
         );
-        raw[e::elemType] = 4;
-        raw[e::sortOrder] = 9;
-        put(&mut raw, e::lifespanAtMaxWind, &1200u16.to_le_bytes());
-        put(&mut raw, e::billboardPivot + 4, &0.25f32.to_le_bytes());
+        raw[FxElemDef::elemType] = 4;
+        raw[FxElemDef::sortOrder] = 9;
+        put(&mut raw, FxElemDef::lifespanAtMaxWind, &1200u16.to_le_bytes());
+        put(&mut raw, FxElemDef::billboardPivot + 4, &0.25f32.to_le_bytes());
         let d = FxElemDefT6::new(&raw).unwrap();
         assert_eq!(d.flags(), 0x8000_0400);
         assert_eq!(
-            d.life_span_msec(),
+            d.lifespan_window_ms(),
             FxIntRange {
                 base: 500,
                 amplitude: 250
             }
         );
         assert_eq!(d.gravity().amplitude, 1.5);
-        assert_eq!(d.spawn_angles()[2].base, -2.0);
-        assert_eq!(d.atlas().entry_count(), 4);
-        assert_eq!(d.elem_type(), Some(FxElemType::Line));
-        assert_eq!(d.sort_order(), 9);
+        assert_eq!(d.birth_orientation()[2].base, -2.0);
+        assert_eq!(d.atlas().entry_tally(), 4);
+        assert_eq!(d.elem_type(), Some(ParticleShape::Line));
+        assert_eq!(d.paint_rank(), 9);
         assert_eq!(d.lifespan_at_max_wind(), 1200);
         assert_eq!(d.billboard_pivot(), [0.0, 0.25]);
     }

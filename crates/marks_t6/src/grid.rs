@@ -1,7 +1,7 @@
 //! BO2's mark density limit: world marks are bucketed into 20-unit cells, and a new
 //! mark is refused when its cell already holds 8. MW2 has no such limit.
 
-use crate::FX_MARKS_LIMIT;
+use crate::DECAL_POOL_CAPACITY;
 
 /// Cell size is 20 units on every axis (position times 0.05, floored).
 pub const FX_MARKS_GRID_CELL_SCALE: f32 = 0.05;
@@ -53,9 +53,9 @@ pub const fn marks_grid_hash_from_cell(cell: FxMarksGridCell) -> usize {
 #[derive(Clone, Debug)]
 pub struct FxMarksGrid {
     heads: [u16; FX_MARKS_GRID_BUCKETS],
-    cells: [FxMarksGridCell; FX_MARKS_LIMIT as usize],
-    counts: [u16; FX_MARKS_LIMIT as usize],
-    next: [u16; FX_MARKS_LIMIT as usize],
+    cells: [FxMarksGridCell; DECAL_POOL_CAPACITY as usize],
+    counts: [u16; DECAL_POOL_CAPACITY as usize],
+    next: [u16; DECAL_POOL_CAPACITY as usize],
     len: u16,
     pending_msec: i32,
 }
@@ -70,9 +70,9 @@ impl FxMarksGrid {
     pub const fn new() -> Self {
         Self {
             heads: [ENTRY_NONE; FX_MARKS_GRID_BUCKETS],
-            cells: [FxMarksGridCell { x: 0, y: 0, z: 0 }; FX_MARKS_LIMIT as usize],
-            counts: [0; FX_MARKS_LIMIT as usize],
-            next: [ENTRY_NONE; FX_MARKS_LIMIT as usize],
+            cells: [FxMarksGridCell { x: 0, y: 0, z: 0 }; DECAL_POOL_CAPACITY as usize],
+            counts: [0; DECAL_POOL_CAPACITY as usize],
+            next: [ENTRY_NONE; DECAL_POOL_CAPACITY as usize],
             len: 0,
             pending_msec: 0,
         }
@@ -127,8 +127,8 @@ impl FxMarksGrid {
     }
 
     /// Adds a frame's time; true when the grid is due a rebuild.
-    pub fn advance(&mut self, frame_msec: i32) -> bool {
-        self.pending_msec = self.pending_msec.saturating_add(frame_msec.max(0));
+    pub fn advance(&mut self, tick_span_ms: i32) -> bool {
+        self.pending_msec = self.pending_msec.saturating_add(tick_span_ms.max(0));
         if self.pending_msec < FX_MARKS_GRID_UPDATE_MSEC {
             return false;
         }

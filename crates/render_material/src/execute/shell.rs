@@ -1,233 +1,218 @@
-//! The pass list a draw reuses between frames (the shell) and the per-draw
-//! executable bound on top of it.
+//! A material's reusable plan and the per-draw lane sets bound onto it.
+//!
+//! The plan holds everything about a technique's passes that does not depend
+//! on the frame (ports, states, local banks, argument belts). The code lanes
+//! do depend on the live code sources, so each execution owns its own and
+//! refills them in place when it is pointed at a plan again.
 
 use std::sync::{Arc, OnceLock};
 
 use super::build::{check_pass_state, fill_pass_code};
-use super::lanes::{
-    PackedCodeConstantLane, PackedCodeConstants, PackedCodeSamplerLane, PackedCodeSamplers,
-};
-use super::refusal::MaterialRefusal;
-use super::resolve::{MaterialDrawKey, resolve_material_technique};
+use super::lanes::{CodeConstantBundle, CompactEngineSamplers};
+use super::refusal::MaterialExecutionDenial;
+use super::resolve::{SurfaceSortKeyPair, select_material_technique};
 use crate::prepared::{
-    GfxPassStateBits, PackedLocalBanks, PackedLocalSamplers, PreparedArgBelts,
-    PreparedMaterialTable,
+    VisualPassStateBits, LocalSamplerBanks, LocalSamplerBundle, PreparedParamStrips,
+    StagedMaterialTable,
 };
-use crate::{CodeSourceLookup, PortId, RuntimeMaterialCatalog, RuntimeShaderPair, SetupArm, TechType};
+use crate::{EngineValueSource, ShaderPortKey, LiveMaterialLedger, LiveShaderPair, SetupVariantBranch, MethodType};
 
-/// What a pass keeps between draws: everything except the code lanes, which
-/// are rebuilt from the live code sources.
+/// One pass of a plan.
 #[derive(Clone, Debug)]
-pub struct StablePassShell {
-    pub pass_index: u8,
-    pub port: PortId,
-    pub shader_pair: RuntimeShaderPair,
-    pub state: GfxPassStateBits,
-    pub local_banks: Option<Arc<PackedLocalBanks>>,
-    pub local_samplers: Option<Arc<PackedLocalSamplers>>,
-    pub belts: Arc<PreparedArgBelts>,
+pub struct PassPlan {
+    pub technique_pass_ordinal: u8,
+    pub port: ShaderPortKey,
+    pub stage_program_duo: LiveShaderPair,
+    pub state: VisualPassStateBits,
+    pub local_banks: Option<Arc<LocalSamplerBanks>>,
+    pub local_samplers: Option<Arc<LocalSamplerBundle>>,
+    pub belts: Arc<PreparedParamStrips>,
 }
 
+/// The frame-independent part of a material execution.
 #[derive(Clone, Debug)]
-pub struct StableMaterialShell {
-    pub tech_type: TechType,
-    pub arm: SetupArm,
-    pub vertex_type: u8,
-    pub passes: Vec<StablePassShell>,
+pub struct MaterialPlan {
+    pub shading_technique_kind: MethodType,
+    pub arm: SetupVariantBranch,
+    pub vertex_format_code: u8,
+    pub passes: Vec<PassPlan>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutablePass {
-    pub pass_index: u8,
-    pub port: PortId,
-    pub shader_pair: RuntimeShaderPair,
-    pub state: GfxPassStateBits,
-    pub local_banks: Option<Arc<PackedLocalBanks>>,
-    pub local_samplers: Option<Arc<PackedLocalSamplers>>,
-    pub code_constants: PackedCodeConstants,
-    pub code_samplers: PackedCodeSamplers,
+impl MaterialPlan {
+    fn empty() -> Self {
+        Self {
+            shading_technique_kind: MethodType(0),
+            arm: SetupVariantBranch::Generic,
+            vertex_format_code: 0,
+            passes: Vec::default(),
+        }
+    }
 }
 
+/// The code constants and samplers one pass reads from the live sources.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodeLanes {
+    pub constants: CodeConstantBundle,
+    pub samplers: CompactEngineSamplers,
+}
+
+impl CodeLanes {
+    fn drop_rows(&mut self) {
+        self.constants.lanes.clear();
+        self.samplers.lanes.clear();
+    }
+}
+
+/// A pass of a plan together with the lanes bound to it.
 #[derive(Clone, Copy, Debug)]
-pub struct ExecutablePassView<'a> {
-    pub pass_index: u8,
-    pub port: PortId,
-    pub shader_pair: RuntimeShaderPair,
-    pub state: GfxPassStateBits,
-    pub local_banks: Option<&'a Arc<PackedLocalBanks>>,
-    pub local_samplers: Option<&'a Arc<PackedLocalSamplers>>,
-    pub code_constants: &'a [PackedCodeConstantLane],
-    pub code_samplers: &'a [PackedCodeSamplerLane],
-    pub code_constant_id: u64,
-    pub code_sampler_id: u64,
+pub struct BoundPass<'a> {
+    pub plan: &'a PassPlan,
+    pub lanes: &'a CodeLanes,
 }
 
-impl ExecutablePass {
-    pub fn view(&self) -> ExecutablePassView<'_> {
-        ExecutablePassView {
-            pass_index: self.pass_index,
-            port: self.port,
-            shader_pair: self.shader_pair,
-            state: self.state,
-            local_banks: self.local_banks.as_ref(),
-            local_samplers: self.local_samplers.as_ref(),
-            code_constants: &self.code_constants.lanes,
-            code_samplers: &self.code_samplers.lanes,
-            code_constant_id: self.code_constants.id,
-            code_sampler_id: self.code_samplers.id,
-        }
+impl<'a> BoundPass<'a> {
+    pub fn technique_pass_ordinal(&self) -> u8 {
+        self.plan.technique_pass_ordinal
     }
-}
 
-impl StablePassShell {
-    pub fn bind<'a>(
-        &'a self,
-        constants: &'a PackedCodeConstants,
-        samplers: &'a PackedCodeSamplers,
-    ) -> ExecutablePassView<'a> {
-        ExecutablePassView {
-            pass_index: self.pass_index,
-            port: self.port,
-            shader_pair: self.shader_pair,
-            state: self.state,
-            local_banks: self.local_banks.as_ref(),
-            local_samplers: self.local_samplers.as_ref(),
-            code_constants: &constants.lanes,
-            code_samplers: &samplers.lanes,
-            code_constant_id: constants.id,
-            code_sampler_id: samplers.id,
-        }
+    pub fn port(&self) -> ShaderPortKey {
+        self.plan.port
+    }
+
+    pub fn stage_program_duo(&self) -> LiveShaderPair {
+        self.plan.stage_program_duo
+    }
+
+    pub fn state(&self) -> VisualPassStateBits {
+        self.plan.state
+    }
+
+    pub fn local_banks(&self) -> Option<&'a Arc<LocalSamplerBanks>> {
+        self.plan.local_banks.as_ref()
+    }
+
+    pub fn local_samplers(&self) -> Option<&'a Arc<LocalSamplerBundle>> {
+        self.plan.local_samplers.as_ref()
+    }
+
+    pub fn constants(&self) -> &'a CodeConstantBundle {
+        &self.lanes.constants
+    }
+
+    pub fn samplers(&self) -> &'a CompactEngineSamplers {
+        &self.lanes.samplers
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct MaterialExecution {
-    pub tech_type: TechType,
-    pub arm: SetupArm,
-    pub vertex_type: u8,
-    shell: Arc<StableMaterialShell>,
-    code_constants: Vec<PackedCodeConstants>,
-    code_samplers: Vec<PackedCodeSamplers>,
+pub struct MaterialRunPlan {
+    plan: Arc<MaterialPlan>,
+    lanes: Vec<CodeLanes>,
 }
 
-impl MaterialExecution {
-    pub(super) fn from_parts(
-        shell: StableMaterialShell,
-        code_constants: Vec<PackedCodeConstants>,
-        code_samplers: Vec<PackedCodeSamplers>,
-    ) -> Self {
+impl MaterialRunPlan {
+    pub(super) fn from_parts(plan: MaterialPlan, lanes: Vec<CodeLanes>) -> Self {
         Self {
-            tech_type: shell.tech_type,
-            arm: shell.arm,
-            vertex_type: shell.vertex_type,
-            shell: Arc::new(shell),
-            code_constants,
-            code_samplers,
+            plan: Arc::new(plan),
+            lanes,
         }
     }
 
-    /// An execution with no passes, for slots that are filled in later.
-    pub fn vacant() -> Self {
-        static EMPTY: OnceLock<Arc<StableMaterialShell>> = OnceLock::new();
-        let shell = EMPTY.get_or_init(|| {
-            Arc::new(StableMaterialShell {
-                tech_type: TechType(0),
-                arm: SetupArm::Generic,
-                vertex_type: 0,
-                passes: Vec::new(),
-            })
-        });
+    /// An execution that has no passes yet, for slots filled in later.
+    pub fn blank() -> Self {
+        static NOTHING: OnceLock<Arc<MaterialPlan>> = OnceLock::new();
         Self {
-            tech_type: TechType(0),
-            arm: SetupArm::Generic,
-            vertex_type: 0,
-            shell: Arc::clone(shell),
-            code_constants: Vec::new(),
-            code_samplers: Vec::new(),
+            plan: Arc::clone(NOTHING.get_or_init(|| Arc::new(MaterialPlan::empty()))),
+            lanes: Vec::default(),
         }
     }
 
-    pub fn pass_count(&self) -> usize {
-        self.shell.passes.len()
+    pub fn shading_technique_kind(&self) -> MethodType {
+        self.plan.shading_technique_kind
     }
 
-    /// Drops the lane rows but keeps the pass list, so a later rebind only
-    /// refills them.
+    pub fn arm(&self) -> SetupVariantBranch {
+        self.plan.arm
+    }
+
+    pub fn vertex_format_code(&self) -> u8 {
+        self.plan.vertex_format_code
+    }
+
+    pub fn stage_total(&self) -> usize {
+        self.plan.passes.len()
+    }
+
+    pub fn plan(&self) -> &Arc<MaterialPlan> {
+        &self.plan
+    }
+
+    pub fn lanes(&self) -> &[CodeLanes] {
+        &self.lanes
+    }
+
+    /// Empties every lane set but keeps the passes, so pointing the execution
+    /// at a plan again only has to refill them.
     pub fn release_code_rows(&mut self) {
-        self.code_constants
-            .iter_mut()
-            .for_each(|constants| constants.lanes.clear());
-        self.code_samplers
-            .iter_mut()
-            .for_each(|samplers| samplers.lanes.clear());
+        self.lanes.iter_mut().for_each(CodeLanes::drop_rows);
     }
 
-    pub fn shell_arc(&self) -> &Arc<StableMaterialShell> {
-        &self.shell
+    pub fn pass_at(&self, index: usize) -> Option<BoundPass<'_>> {
+        Some(BoundPass {
+            plan: self.plan.passes.get(index)?,
+            lanes: self.lanes.get(index)?,
+        })
     }
 
-    pub fn code_constants(&self) -> &[PackedCodeConstants] {
-        &self.code_constants
+    pub fn iter_passes(&self) -> impl Iterator<Item = BoundPass<'_>> {
+        self.plan
+            .passes
+            .iter()
+            .zip(&self.lanes)
+            .map(|(plan, lanes)| BoundPass { plan, lanes })
     }
 
-    pub fn pass(&self, index: usize) -> Option<ExecutablePassView<'_>> {
-        Some(self.shell.passes.get(index)?.bind(
-            self.code_constants.get(index)?,
-            self.code_samplers.get(index)?,
-        ))
-    }
-
-    pub fn iter_passes(&self) -> impl Iterator<Item = ExecutablePassView<'_>> + '_ {
-        (0..self.pass_count()).filter_map(|index| self.pass(index))
-    }
-
-    /// Points this execution at `shell` and refills every pass's code lanes
-    /// from `code_sources`, reusing the lane buffers it already owns.
-    pub fn rebind_into(
+    /// Adopts `plan` and refills each pass's lanes from `engine_sources`,
+    /// keeping the lane buffers this execution already has.
+    pub fn reattach_onto(
         &mut self,
-        shell: &Arc<StableMaterialShell>,
-        code_sources: &impl CodeSourceLookup,
-    ) -> Result<(), MaterialRefusal> {
-        self.tech_type = shell.tech_type;
-        self.arm = shell.arm;
-        self.vertex_type = shell.vertex_type;
-        if !Arc::ptr_eq(&self.shell, shell) {
-            self.shell = Arc::clone(shell);
+        plan: &Arc<MaterialPlan>,
+        engine_sources: &impl EngineValueSource,
+    ) -> Result<(), MaterialExecutionDenial> {
+        if !Arc::ptr_eq(&self.plan, plan) {
+            self.plan = Arc::clone(plan);
         }
-        let wanted = shell.passes.len();
-        self.code_constants.resize_with(wanted, Default::default);
-        self.code_samplers.resize_with(wanted, Default::default);
-        let lanes = self.code_constants.iter_mut().zip(&mut self.code_samplers);
-        for (pass, (constants, samplers)) in shell.passes.iter().zip(lanes) {
-            check_pass_state(pass.pass_index, pass.state)?;
-            fill_pass_code(&pass.belts, code_sources, pass.pass_index, constants, samplers)?;
+        self.lanes.resize_with(plan.passes.len(), CodeLanes::default);
+        for (pass, lanes) in plan.passes.iter().zip(&mut self.lanes) {
+            check_pass_state(pass.technique_pass_ordinal, pass.state)?;
+            fill_pass_code(&pass.belts, engine_sources, pass.technique_pass_ordinal, lanes)?;
         }
         Ok(())
     }
 }
 
-/// Copies out the shell behind `execution` if it still matches what the
-/// catalog and prepared table would build for this draw.
-pub fn capture_stable_shell(
-    catalog: &RuntimeMaterialCatalog,
-    prepared: &PreparedMaterialTable,
-    key: MaterialDrawKey,
-    tech_type: TechType,
-    _vertex_type: u8,
-    execution: &MaterialExecution,
-) -> Option<StableMaterialShell> {
-    let (material, technique) = resolve_material_technique(catalog, key, tech_type).ok()?;
-    let prepared_tech = prepared.technique(material.asset_id, tech_type)?;
-    let passes = execution.pass_count();
-    (passes == technique.passes.len() && passes == prepared_tech.passes.len())
-        .then(|| (**execution.shell_arc()).clone())
+/// The plan behind `execution`, copied out, provided the catalog and the
+/// prepared table still describe the same number of passes for this draw.
+pub fn capture_plan(
+    catalog: &LiveMaterialLedger,
+    prepared: &StagedMaterialTable,
+    key: SurfaceSortKeyPair,
+    shading_technique_kind: MethodType,
+    execution: &MaterialRunPlan,
+) -> Option<MaterialPlan> {
+    let (picked, technique) = select_material_technique(catalog, key, shading_technique_kind).ok()?;
+    let prepared_tech = prepared.recipe_for(picked.asset_id, shading_technique_kind)?;
+    let wanted = execution.stage_total();
+    let agrees = wanted == technique.passes.len() && wanted == prepared_tech.passes.len();
+    agrees.then(|| MaterialPlan::clone(execution.plan()))
 }
 
-pub fn rebind_stable_material(
-    shell: &StableMaterialShell,
-    code_sources: &impl CodeSourceLookup,
-) -> Result<MaterialExecution, MaterialRefusal> {
-    let mut execution = MaterialExecution::vacant();
-    execution.rebind_into(&Arc::new(shell.clone()), code_sources)?;
-    Ok(execution)
+/// A fresh execution for `plan`, with its lanes filled from `engine_sources`.
+pub fn execute_plan(
+    plan: &MaterialPlan,
+    engine_sources: &impl EngineValueSource,
+) -> Result<MaterialRunPlan, MaterialExecutionDenial> {
+    let mut run = MaterialRunPlan::blank();
+    run.reattach_onto(&Arc::new(plan.clone()), engine_sources)?;
+    Ok(run)
 }

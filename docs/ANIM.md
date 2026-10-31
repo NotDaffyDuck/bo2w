@@ -1,47 +1,54 @@
-# Animation: what lives where
+# Animation: who owns what
 
-Three floors, deliberately different: the **curve facts** (pure mathematics),
-the **runtime tree** (pose state) and **who picked which clip** (the game).
+Animation is split into three layers on purpose: the **curve facts** (pure
+maths), the **runtime tree** (pose state), and **which clip the game chose**.
 
-## The facts floor — `xanim_t6`, `dobj_t6`, `anim_t6`
+## Facts: `xanim_t6`, `dobj_t6`, `anim_t6`
 
-`anim_iw4` was deleted 10-21. Its last piece, MW2's 10-bit packed
-`legsAnim` / `torsoAnim` (9-bit index, `0x200` restart bit), gave way to
-`anim_t6`'s packed value: the animation's number (table index + 1, 0 = none)
-in `0x0fff` and a `0x1000` restart bit (`T6_ANIM_INDEX_MASK` /
-`T6_ANIM_TOGGLE`). Curve and pose facts are in `xanim_t6`, the DObj hide bits
-in `dobj_t6`.
+The older Modern Warfare 2 packed `legsAnim` / `torsoAnim` (9-bit index plus a `0x200`
+restart bit) is gone; the last crate holding it was deleted on 10-21. Its
+replacement in `anim_t6` packs the animation number (table index + 1, 0 meaning
+none) into `0x0fff` and a restart toggle into `0x1000`
+(`T6_ANIM_INDEX_MASK` / `T6_ANIM_TOGGLE`). Curve and pose facts sit in
+`xanim_t6`, and the DObj hide bits in `dobj_t6`.
 
-## `xmodel_runtime` — a runtime without Bevy and without ECS
+## The runtime tree: `xanim_t6` behind `xmodel_runtime`
 
-A pure evaluator, used by **both** the authority **and** the client:
+It is a plain evaluator with no Bevy and no ECS, used by the authority and the
+client alike. `xmodel_runtime` is the one door both sides use (it re-exports the
+pieces and adds the T5 destructible definitions).
 
-* `XAnimTreeDefinition` (the immutable hierarchy) + `XAnimTreeRuntime` (state;
-  leaf time normalized into `[0,1]`, `update` is the per-leaf advance);
-* `DObjAnimRuntime` — `update` / `pose_request` / `compose`; DObj reuse is
-  equality of `(eType, model*)`, not "always a fresh one";
-* `RetainedModelCapability` — pose, `XBoneInfo`, collSurf/collTris for hitscan;
-* `build_body_head_weapon_dobj` — body + head on `j_spine4` + weapon on its tag.
+* `XAnimTreeDefinition` is the immutable hierarchy; `XAnimTreeRuntime` is its
+  state. Leaf time is normalised into `[0,1]` and `update` advances each leaf.
+* `DObjAnimRuntime` offers `update`, `pose_request` and `compose`. A DObj is
+  reused when `(eType, model*)` is unchanged, not rebuilt every time.
+* `RetainedModelCapability` provides the pose, the per-bone info and the
+  collSurf/collTris used for hitscan.
+* `build_body_head_weapon_dobj` (in `dobj_t6`) assembles body, head on
+  `j_spine4`, and weapon on its tag.
 
-A missing clip **never** turns into the bind pose; additive nodes are a typed
-gap, not "ordinary blending".
+A missing clip never falls back to the bind pose, and additive nodes are
+reported as a typed gap rather than treated as ordinary blending.
 
-## Who picks the clip
+## Who chooses the clip
 
-* `sim` — `player_anim_script.rs`, `mantle_xanim.rs`, `anim_script_gap.rs`:
-  what animation the player is in, and it travels into the snapshot as
-  semantics, not as a tree;
-* `assets` — `XAnimParts` → owning clips;
-* `render_frontend/adapters/anim/` + `render_anim` — the viewmodel (`fpv*.rs`,
-  `viewmodel_controller.rs`), third person (`third_person.rs`, `remote_body.rs`),
-  kick and sway (`view_kick.rs`, `view_sway.rs`), items and projectiles.
-  FPV actions come from the presented `weapAnim`, **never** from the
-  keyboard; the identity of the FPV mesh is
-  `weapon_iw4::get_viewmodel_weapon_index`.
-  The FPV consumer reads `PreparedFpv` only, never the weapon registry: views,
-  rigs and material bindings are built before Ready; an equip picks one, and a
-  mandatory material that failed is a refusal naming model, surface and
-  material. Remote kits (`PreparedRemoteKits`: models, hide bits, shared DObj)
-  and dropped items are composed at install, not on first sight.
+* `sim` (`t6_playeranim.rs`, `mantle_xanim/`, `t6_viewmodel.rs`) decides which
+  animation a player is in; the choice reaches the snapshot as semantics, not as
+  a tree.
+* `assets` turns `XAnimParts` into owning clips.
+* `render_anim` (`src/anim/`) covers the viewmodel (`fpv*.rs`,
+  the viewmodel controller), remote bodies (`remote_body.rs`), view sway and
+  kick (`view_sway.rs`, `view_kick_state/`); `src/occupancy/` covers third
+  person, items and projectiles, and `render_frontend/adapters/anim/` the debris
+  and dynamic entities.
+  First-person actions come from the presented `weapAnim`, never from the
+  keyboard, and the identity of the first-person mesh is
+  `get_viewmodel_weapon_index` in `playerstate_t6`.
+  The first-person consumer reads `PreparedFpv` alone and never the weapon
+  registry: views, rigs and material bindings are built before Ready, an equip
+  selects one, and a failed mandatory material is refused with the model,
+  surface and material named. Remote kits (`PreparedRemoteKits`: models, hide
+  bits, shared DObj) and dropped items are composed at install time rather than
+  on first sight.
 
-To watch it live: `BO2MP_PERF=1` / [`PERF.md`](PERF.md).
+For live observation see [`PERF.md`](PERF.md).

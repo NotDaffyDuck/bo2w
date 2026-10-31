@@ -12,7 +12,7 @@
 //! - [`pickup`]: BO2's dropped-gun rules (throw down, ammo leech, pickup).
 //! - [`vehicle_heat`]: a vehicle gun's heat (the VTOL Warship's rocket reload).
 //! - [`asset_slots`]: the catalog's viewmodel anim slots and which one a BO2 anim plays.
-//! - [`combat_facts`], [`ammo_table`], [`spread`], [`kick`], [`sway`], [`placement`], [`view_bob`],
+//! - [`combat_facts`], [`ammo_table`], [`kick`], [`sway`], [`placement`], [`view_bob`],
 //!   [`viewweapon`], [`ads_allow`], [`ads_overlay`], [`melee_trace`], [`dual_mag`], [`fire_type`]:
 //!   the gun code moved in from the old MW2 crate (TODO(fact) where it still reads MW2 numbers,
 //!   [`ps_flags`]).
@@ -47,7 +47,6 @@ pub mod ps_flags;
 pub mod recoil;
 pub mod reload;
 pub mod script;
-pub mod spread;
 pub mod state;
 pub mod surface;
 pub mod sway;
@@ -60,4 +59,4 @@ pub mod vehicle_heat;
 pub mod view_bob;
 pub mod viewmodel;
 pub mod viewweapon;
-mod weap_anim;
+mod gun_anim;

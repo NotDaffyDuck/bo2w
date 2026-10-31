@@ -32,13 +32,64 @@ fn mip_bytes(format: u32, w: u32, h: u32) -> Option<usize> {
     })
 }
 
+/// A block-compressed picture (DXT1 / DXT3 / DXT5), cut off at the edges.
+fn decode_blocks(format: u32, src: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let block_len = if format == 13 || format == 20 { 8 } else { 16 };
+    let across = w.div_ceil(4);
+    let mut pixels = vec![0u8; w * h * 4];
+    let mut cell = [0u8; 64];
+    for (n, block) in src.chunks_exact(block_len).take(across * h.div_ceil(4)).enumerate() {
+        match format {
+            14 => bcdec_rs::bc2(block, &mut cell, 16),
+            15 => bcdec_rs::bc3(block, &mut cell, 16),
+            _ => bcdec_rs::bc1(block, &mut cell, 16),
+        }
+        let (x0, y0) = (n % across * 4, n / across * 4);
+        let run = 4.min(w - x0) * 4;
+        for (ty, row) in cell.chunks_exact(16).enumerate().take_while(|(ty, _)| y0 + ty < h) {
+            let d = ((y0 + ty) * w + x0) * 4;
+            pixels[d..d + run].copy_from_slice(&row[..run]);
+        }
+    }
+    pixels
+}
+
+/// Uncompressed formats: bytes a pixel, then for each of R,G,B,A which
+/// source byte it comes from (4 stands for a full 255).
+fn packed_layout(format: u32) -> Option<(usize, [usize; 4])> {
+    Some(match format {
+        0 => (4, [0, 1, 2, 3]),
+        1 => (4, [3, 2, 1, 0]),
+        2 | 9 => (3, [0, 1, 2, 4]),
+        3 | 10 => (3, [2, 1, 0, 4]),
+        11 => (4, [1, 2, 3, 0]),
+        12 => (4, [2, 1, 0, 3]),
+        16 => (4, [2, 1, 0, 4]),
+        5 => (1, [0, 0, 0, 4]),
+        8 => (1, [4, 4, 4, 0]),
+        6 => (2, [0, 0, 0, 1]),
+        _ => return None,
+    })
+}
+
+fn decode_packed(format: u32, src: &[u8]) -> Option<Vec<u8>> {
+    let (bytes, taps) = packed_layout(format)?;
+    let mut out = Vec::with_capacity(src.len() / bytes * 4);
+    for px in src.chunks_exact(bytes) {
+        let mut seen = [255u8; 5];
+        seen[..bytes].copy_from_slice(px);
+        out.extend(taps.map(|t| seen[t]));
+    }
+    Some(out)
+}
+
 /// Decodes a VTF file.
 pub fn decode(data: &[u8]) -> Option<Rgba> {
     if data.get(0..4)? != b"VTF\0" {
         return None;
     }
     let minor = u32_at(data, 8)?;
-    let header = u32_at(data, 12)? as usize;
+    let header = u32_at(data, 12).map(|n| n as usize)?;
     let width = u32::from(u16_at(data, 16)?);
     let height = u32::from(u16_at(data, 18)?);
     let flags = u32_at(data, 20)?;
@@ -78,52 +129,45 @@ pub fn decode(data: &[u8]) -> Option<Rgba> {
     let size = mip_bytes(format, width, height)?;
     let src = data.get(at..at + size)?;
     let (w, h) = (width as usize, height as usize);
-    let mut pixels = vec![0u8; w * h * 4];
-    match format {
-        13 | 14 | 15 | 20 => {
-            let mut tile = [0u8; 64];
-            let block = if matches!(format, 13 | 20) { 8 } else { 16 };
-            for by in 0..h.div_ceil(4) {
-                for bx in 0..w.div_ceil(4) {
-                    let o = (by * w.div_ceil(4) + bx) * block;
-                    let b = &src[o..o + block];
-                    match format {
-                        14 => bcdec_rs::bc2(b, &mut tile, 16),
-                        15 => bcdec_rs::bc3(b, &mut tile, 16),
-                        _ => bcdec_rs::bc1(b, &mut tile, 16),
-                    }
-                    for y in 0..4 {
-                        for x in 0..4 {
-                            let (px, py) = (bx * 4 + x, by * 4 + y);
-                            if px < w && py < h {
-                                let d = (py * w + px) * 4;
-                                let s = (y * 4 + x) * 4;
-                                pixels[d..d + 4].copy_from_slice(&tile[s..s + 4]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        _ => {
-            for i in 0..w * h {
-                let p = &mut pixels[i * 4..i * 4 + 4];
-                let rgba: [u8; 4] = match format {
-                    0 => src[i * 4..i * 4 + 4].try_into().ok()?,
-                    1 => [src[i * 4 + 3], src[i * 4 + 2], src[i * 4 + 1], src[i * 4]],
-                    2 | 9 => [src[i * 3], src[i * 3 + 1], src[i * 3 + 2], 255],
-                    3 | 10 => [src[i * 3 + 2], src[i * 3 + 1], src[i * 3], 255],
-                    11 => [src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3], src[i * 4]],
-                    12 => [src[i * 4 + 2], src[i * 4 + 1], src[i * 4], src[i * 4 + 3]],
-                    16 => [src[i * 4 + 2], src[i * 4 + 1], src[i * 4], 255],
-                    5 => [src[i], src[i], src[i], 255],
-                    8 => [255, 255, 255, src[i]],
-                    6 => [src[i * 2], src[i * 2], src[i * 2], src[i * 2 + 1]],
-                    _ => return None,
-                };
-                p.copy_from_slice(&rgba);
-            }
-        }
+    let rgba = match format {
+        13..=15 | 20 => decode_blocks(format, src, w, h),
+        _ => decode_packed(format, src)?,
+    };
+    Some(Rgba { width, height, pixels: rgba })
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
     }
-    Some(Rgba { width, height, pixels })
+
+    /// A one-mip VTF 7.1 of `w`x`h` in `format` with a repeatable payload.
+    fn vtf(format: u32, w: u16, h: u16) -> Vec<u8> {
+        let mut d = vec![0u8; 64];
+        d[0..4].copy_from_slice(b"VTF\0");
+        d[8..12].copy_from_slice(&1u32.to_le_bytes());
+        d[12..16].copy_from_slice(&64u32.to_le_bytes());
+        d[16..18].copy_from_slice(&w.to_le_bytes());
+        d[18..20].copy_from_slice(&h.to_le_bytes());
+        d[24..26].copy_from_slice(&1u16.to_le_bytes());
+        d[52..56].copy_from_slice(&format.to_le_bytes());
+        d[56] = 1;
+        d[57..61].copy_from_slice(&u32::MAX.to_le_bytes());
+        let size = mip_bytes(format, u32::from(w), u32::from(h)).unwrap();
+        d.extend((0..size).map(|i| (i as u32).wrapping_mul(37).wrapping_add(11) as u8));
+        d
+    }
+
+    #[test]
+    fn every_format_decodes_to_the_same_pixels() {
+        let got: Vec<(u32, u64)> = [0u32, 1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 20]
+            .into_iter()
+            .map(|f| (f, fnv(&decode(&vtf(f, 7, 5)).unwrap().pixels)))
+            .collect();
+        assert_eq!(got, vec![(0, 2315460490112276049), (1, 16814089722942423345), (2, 6853058693281578637), (3, 16464835995279100945), (5, 15849491509099224258), (6, 7038011954907754164), (8, 8742150901380183774), (9, 6853058693281578637), (10, 16464835995279100945), (11, 13852234630005815853), (12, 8178616560417763481), (13, 9615194535043858083), (14, 16363378864778755043), (15, 6140524213402932635), (16, 16200869752498453346), (20, 9615194535043858083)]);
+        assert!(decode(&vtf(4, 7, 5)).is_none());
+    }
 }

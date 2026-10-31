@@ -2,13 +2,13 @@
 //! shortcuts, the weapon and turret ADS zoom blends, and the half-angle tangents.
 //! Facts: scratch/hud-facts/fov.md.
 
-pub const CG_FOV_DEFAULT: f32 = 65.0;
+pub const STOCK_VIEW_CONE_DEGREES: f32 = 65.0;
 pub const CG_FOV_RANGE: (f32, f32) = (1.0, 160.0);
 
-pub const CG_FOV_SCALE_DEFAULT: f32 = 1.0;
+pub const STOCK_VIEW_CONE_RATIO: f32 = 1.0;
 pub const CG_FOV_SCALE_RANGE: (f32, f32) = (0.2, 2.0);
 
-pub const CG_FOV_MIN_DEFAULT: f32 = 10.0;
+pub const STOCK_VIEW_CONE_FLOOR: f32 = 10.0;
 
 pub const CG_FOV_EXTRA_CAM_DEFAULT: f32 = 30.0;
 
@@ -42,8 +42,8 @@ pub const OTHER_FLAGS_DEFAULT_FOV: u32 = 2;
 /// Vehicle entity flag that makes its cameraFOV apply.
 pub const VEHICLE_FLAG_CAMERA_FOV: u32 = 2;
 
-const DEG2RAD: f32 = core::f32::consts::PI / 180.0;
-const RAD2DEG: f32 = 180.0 / core::f32::consts::PI;
+const RADIANS_PER_ARC_DEGREE: f32 = core::f32::consts::PI / 180.0;
+const DEGREES_PER_RADIAN: f32 = 180.0 / core::f32::consts::PI;
 
 /// A weapon's three ADS zoom fovs and its zoom-in / zoom-out fractions.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -133,13 +133,13 @@ pub fn turret_view_fov(turret_ads: bool, zoom: &AdsZoom, pos_frac: f32, to_ads: 
 #[must_use]
 pub fn should_default_view_fov(
     demo_camera: bool,
-    e_flags: u32,
-    other_flags: u32,
+    entity_bits: u32,
+    secondary_state_bits: u32,
     third_person_for_model: bool,
 ) -> bool {
     demo_camera
-        || ((e_flags & EFLAGS_NO_DEFAULT_FOV) == 0
-            && (other_flags & OTHER_FLAGS_DEFAULT_FOV) != 0
+        || ((entity_bits & EFLAGS_NO_DEFAULT_FOV) == 0
+            && (secondary_state_bits & OTHER_FLAGS_DEFAULT_FOV) != 0
             && third_person_for_model)
 }
 
@@ -154,7 +154,7 @@ pub struct VehicleFov {
 /// Everything the view fov reads.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewFovInputs {
-    pub cg_fov: f32,
+    pub view_fov: f32,
     pub cg_fov_scale: f32,
     pub cg_fov_min: f32,
     pub cg_fov_default: f32,
@@ -163,8 +163,8 @@ pub struct ViewFovInputs {
     pub missile_cam: bool,
     pub shoutcaster_model_view: bool,
     pub default_view: bool,
-    pub link_flags: u32,
-    pub e_flags: u32,
+    pub attach_bits: u32,
+    pub ent_bits: u32,
     pub e_flags2: u32,
     pub has_weapon: bool,
     pub zoom: AdsZoom,
@@ -180,17 +180,17 @@ pub struct ViewFovInputs {
 impl Default for ViewFovInputs {
     fn default() -> Self {
         Self {
-            cg_fov: CG_FOV_DEFAULT,
-            cg_fov_scale: CG_FOV_SCALE_DEFAULT,
-            cg_fov_min: CG_FOV_MIN_DEFAULT,
-            cg_fov_default: CG_FOV_DEFAULT,
+            view_fov: STOCK_VIEW_CONE_DEGREES,
+            cg_fov_scale: STOCK_VIEW_CONE_RATIO,
+            cg_fov_min: STOCK_VIEW_CONE_FLOOR,
+            cg_fov_default: STOCK_VIEW_CONE_DEGREES,
             cg_missile_fov: CG_MISSILE_FOV_DEFAULT,
             toggle_style: 0,
             missile_cam: false,
             shoutcaster_model_view: false,
             default_view: false,
-            link_flags: 0,
-            e_flags: 0,
+            attach_bits: 0,
+            ent_bits: 0,
             e_flags2: 0,
             has_weapon: false,
             zoom: AdsZoom::default(),
@@ -210,24 +210,24 @@ pub fn view_fov(i: &ViewFovInputs) -> f32 {
         return i.cg_missile_fov;
     }
     let skip_turret = (i.e_flags2 & EFLAGS2_NO_TURRET_FOV) != 0;
-    if (i.link_flags & LINK_FLAG_FORCE_ADS_ZOOM) != 0 && i.has_weapon && !skip_turret {
+    if (i.attach_bits & LINK_FLAG_FORCE_ADS_ZOOM) != 0 && i.has_weapon && !skip_turret {
         let fov = i.zoom.fov[0];
         if i.pos_frac <= 0.0 || fov <= 0.0 {
             return FORCED_ADS_FALLBACK_FOV;
         }
         return fov;
     }
-    if i.shoutcaster_model_view && (i.e_flags & EFLAGS_SHOUTCASTER_DEFAULT) != 0 {
+    if i.shoutcaster_model_view && (i.ent_bits & EFLAGS_SHOUTCASTER_DEFAULT) != 0 {
         return i.cg_fov_default;
     }
     if i.default_view {
-        return i.cg_fov;
+        return i.view_fov;
     }
     let weapon = |base: f32| {
         weapon_view_fov(base, &i.zoom, i.zoom_select, i.toggle_style, i.pos_frac, i.to_ads)
     };
-    let mut fov = weapon(i.cg_fov);
-    if (i.e_flags & EFLAGS_TURRET) != 0
+    let mut fov = weapon(i.view_fov);
+    if (i.ent_bits & EFLAGS_TURRET) != 0
         && !skip_turret
         && let Some((ads, zoom)) = i.turret
     {
@@ -251,21 +251,21 @@ pub fn view_fov(i: &ViewFovInputs) -> f32 {
 /// (tan half fov X, tan half fov Y) for a horizontal-ish fov. Landscape (or unset) aspect scales Y by
 /// 0.75 and X by 0.75 * aspect; portrait keeps X and divides Y by the aspect.
 #[must_use]
-pub fn tan_half_fov(fov_deg: f32, view_aspect: f32) -> (f32, f32) {
-    let t = libm::tanf(fov_deg * DEG2RAD * 0.5);
-    if view_aspect >= 1.0 || view_aspect <= 0.0 {
+pub fn fov_half_tan(fov_deg: f32, aspect: f32) -> (f32, f32) {
+    let t = libm::tanf(fov_deg * RADIANS_PER_ARC_DEGREE * 0.5);
+    if aspect >= 1.0 || aspect <= 0.0 {
         let y = t * TAN_HALF_FOV_Y_SCALE;
-        (y * view_aspect, y)
+        (y * aspect, y)
     } else {
-        (t, t / view_aspect)
+        (t, t / aspect)
     }
 }
 
 /// Vertical fov in degrees for a landscape view.
 #[must_use]
 pub fn vertical_fov_deg(fov_deg: f32) -> f32 {
-    let tan_half_y = libm::tanf(fov_deg * DEG2RAD * 0.5) * TAN_HALF_FOV_Y_SCALE;
-    2.0 * libm::atanf(tan_half_y) * RAD2DEG
+    let vertical_cone_slope = libm::tanf(fov_deg * RADIANS_PER_ARC_DEGREE * 0.5) * TAN_HALF_FOV_Y_SCALE;
+    2.0 * libm::atanf(vertical_cone_slope) * DEGREES_PER_RADIAN
 }
 
 /// Split screen with two local clients and no forced fullscreen halves tan half fov X.
@@ -281,7 +281,7 @@ pub fn dual_play_tan_x(tan_x: f32, dual_play_enable: bool, local_clients: u32, f
 /// Mouse zoom sensitivity: tan(fov / 2) over tan(cg_fov / 2).
 #[must_use]
 pub fn zoom_sensitivity(fov_deg: f32, cg_fov: f32) -> f32 {
-    libm::tanf(fov_deg * DEG2RAD * 0.5) / libm::tanf(cg_fov * DEG2RAD * 0.5)
+    libm::tanf(fov_deg * RADIANS_PER_ARC_DEGREE * 0.5) / libm::tanf(cg_fov * RADIANS_PER_ARC_DEGREE * 0.5)
 }
 
 #[cfg(test)]
@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(view_fov(&ViewFovInputs { missile_cam: true, ..base }), 15.0);
         assert_eq!(view_fov(&ViewFovInputs { default_view: true, ..base }), 65.0);
         let forced = ViewFovInputs {
-            link_flags: LINK_FLAG_FORCE_ADS_ZOOM,
+            attach_bits: LINK_FLAG_FORCE_ADS_ZOOM,
             has_weapon: true,
             zoom: zoom(),
             ..base
@@ -336,7 +336,7 @@ mod tests {
         let ads = ViewFovInputs { zoom: zoom(), zoom_select: 2, pos_frac: 1.0, to_ads: true, ..ViewFovInputs::default() };
         assert_eq!(view_fov(&ads), 40.0);
         assert_eq!(view_fov(&ViewFovInputs { cg_fov_scale: 0.2, ..ads }), 10.0);
-        let turret = ViewFovInputs { e_flags: 0x100, turret: Some((false, zoom())), ..ads };
+        let turret = ViewFovInputs { ent_bits: 0x100, turret: Some((false, zoom())), ..ads };
         assert_eq!(view_fov(&turret), 55.0);
         let turret_ads = ViewFovInputs { turret: Some((true, zoom())), ..turret };
         assert_eq!(view_fov(&turret_ads), 40.0);
@@ -364,10 +364,10 @@ mod tests {
 
     #[test]
     fn tangents_landscape_and_portrait() {
-        let (x, y) = tan_half_fov(90.0, 16.0 / 9.0);
+        let (x, y) = fov_half_tan(90.0, 16.0 / 9.0);
         assert!((y - 0.75).abs() < 1e-5);
         assert!((x - 0.75 * 16.0 / 9.0).abs() < 1e-5);
-        let (x, y) = tan_half_fov(90.0, 0.5);
+        let (x, y) = fov_half_tan(90.0, 0.5);
         assert!((x - 1.0).abs() < 1e-5);
         assert!((y - 2.0).abs() < 1e-5);
         assert!((zoom_sensitivity(65.0, 65.0) - 1.0).abs() < 1e-6);

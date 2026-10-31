@@ -6,29 +6,36 @@
 //! group per list.
 
 /// Buckets per level of detail.
-pub const SMODEL_BUCKET_STRIDE: i32 = 4;
+pub const STATIC_BUCKET_KIND_SPAN: i32 = 4;
 /// Kind: drawn rigid, with one transform for the whole model.
-pub const SMODEL_BUCKET_RIGID: i32 = 0;
+pub const STATIC_BUCKET_KIND_FIXED_MESH: i32 = 0;
 /// Kind: drawn skinned, vertex by vertex.
-pub const SMODEL_BUCKET_SKINNED: i32 = 1;
+pub const STATIC_BUCKET_KIND_BONE_DRIVEN: i32 = 1;
 /// Kind: drawn from the static model cache.
-pub const SMODEL_BUCKET_CACHED: i32 = 2;
+pub const STATIC_BUCKET_KIND_CACHED: i32 = 2;
 /// Kind: the cached surface was re-tessellated into the frame's own buffer.
-pub const SMODEL_BUCKET_PRETESS: i32 = 3;
+pub const STATIC_BUCKET_KIND_PRESPLIT: i32 = 3;
 
 /// How many lists there are.
-pub const SMODEL_BUCKET_LIST_N: usize = 16;
+pub const PROP_BUCKET_LIST_COUNT: usize = 16;
 /// How many entries one list holds before it must be flushed.
-pub const SMODEL_BUCKET_CAP: usize = 0x80;
+pub const STATIC_MODEL_BUCKET_CAPACITY: usize = 0x80;
 
 /// How a static-model surface is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SmodelSurfPath {
+pub enum PropFacetPath {
     Rigid,
     Skinned,
     Cached,
     Pretess,
 }
+
+/// The paths in bucket-kind order: kind `n` of a level of detail is `KIND_PATHS[n]`.
+const KIND_PATHS: [PropFacetPath; 4] =
+    [PropFacetPath::Rigid, PropFacetPath::Skinned, PropFacetPath::Cached, PropFacetPath::Pretess];
+
+/// The top bit of an active-bucket mask: bucket 0.
+const FIRST_BUCKET_BIT: u32 = 1 << 31;
 
 /// The surface-type number the lit-technique tables use for a draw path.
 ///
@@ -36,40 +43,31 @@ pub enum SmodelSurfPath {
 /// pre-tessellated kinds borrow the numbers the lit-technique rows were
 /// authored against.
 #[must_use]
-pub const fn smodel_surf_type(path: SmodelSurfPath) -> u8 {
-    match path {
-        SmodelSurfPath::Rigid => 2,
-        SmodelSurfPath::Pretess => 3,
-        SmodelSurfPath::Cached => 4,
-        SmodelSurfPath::Skinned => 5,
-    }
+pub const fn prop_facet_kind(path: PropFacetPath) -> u8 {
+    // Indexed by kind: rigid, skinned, cached, pretess.
+    const SURF_TYPES: [u8; 4] = [2, 5, 4, 3];
+    SURF_TYPES[path as usize]
 }
 
 /// The path a bucket's surfaces start out on. The pre-tessellated kind is only
 /// ever a destination, so it has no source.
-fn bucket_source_path(bucket: usize) -> Option<SmodelSurfPath> {
-    match bucket % SMODEL_BUCKET_STRIDE as usize {
-        0 => Some(SmodelSurfPath::Rigid),
-        1 => Some(SmodelSurfPath::Skinned),
-        2 => Some(SmodelSurfPath::Cached),
-        _ => None,
-    }
+fn bucket_source_path(bucket: usize) -> Option<PropFacetPath> {
+    let path = KIND_PATHS[bucket % KIND_PATHS.len()];
+    (path != PropFacetPath::Pretess).then_some(path)
 }
 
 /// Where a surface ends up: a cached surface that was re-tessellated moves to
 /// the pre-tessellated path, anything else stays where it was.
 #[must_use]
-pub fn smodel_dest_path(source: SmodelSurfPath, cached_pretess_succeeded: bool) -> SmodelSurfPath {
-    match source {
-        SmodelSurfPath::Cached if cached_pretess_succeeded => SmodelSurfPath::Pretess,
-        other => other,
-    }
+pub fn smodel_dest_path(source: PropFacetPath, cached_pretess_succeeded: bool) -> PropFacetPath {
+    let moves = cached_pretess_succeeded && source == PropFacetPath::Cached;
+    if moves { PropFacetPath::Pretess } else { source }
 }
 
 /// A level of detail is rigid when none of its surfaces carry skin weights.
 #[must_use]
-pub fn smodel_lod_is_rigid(skin_flags: &[u8]) -> bool {
-    skin_flags.iter().all(|&flag| flag == 0)
+pub fn prop_lod_rigid(skin_flags: &[u8]) -> bool {
+    !skin_flags.iter().any(|&flag| flag != 0)
 }
 
 /// The bucket for one surface of one level of detail.
@@ -80,42 +78,38 @@ pub fn smodel_lod_is_rigid(skin_flags: &[u8]) -> bool {
 #[must_use]
 pub fn add_static_model_surf_to_bucket(
     lod: i32,
-    smc_enable: bool,
-    draw_inst_lighting_nonzero: bool,
+    prop_cache_enable: bool,
+    inst_lit: bool,
     lod_smc_flag: u8,
-    cache_index: u16,
-    lod_is_rigid: bool,
+    cache_slot_no: u16,
+    rigid_detail: bool,
 ) -> i32 {
-    let kind = if smc_enable && draw_inst_lighting_nonzero && lod_smc_flag != 0 && cache_index != 0
-    {
-        SMODEL_BUCKET_CACHED
-    } else if lod_is_rigid {
-        SMODEL_BUCKET_RIGID
-    } else {
-        SMODEL_BUCKET_SKINNED
+    let cacheable = [prop_cache_enable, inst_lit, lod_smc_flag != 0, cache_slot_no != 0];
+    let kind = match (cacheable.iter().all(|&ok| ok), rigid_detail) {
+        (true, _) => STATIC_BUCKET_KIND_CACHED,
+        (false, true) => STATIC_BUCKET_KIND_FIXED_MESH,
+        (false, false) => STATIC_BUCKET_KIND_BONE_DRIVEN,
     };
-    lod * SMODEL_BUCKET_STRIDE + kind
+    kind + STATIC_BUCKET_KIND_SPAN * lod
 }
 
 /// The sixteen bucket lists and how full each one is.
 #[derive(Clone, Copy, Debug)]
-pub struct SmodelSurfBucketLists {
-    pub ids: [[u16; SMODEL_BUCKET_CAP]; SMODEL_BUCKET_LIST_N],
-    pub count: [i32; SMODEL_BUCKET_LIST_N],
+pub struct PropFacetBucketLists {
+    pub members: [[u16; STATIC_MODEL_BUCKET_CAPACITY]; PROP_BUCKET_LIST_COUNT],
+    pub filled: [i32; PROP_BUCKET_LIST_COUNT],
 }
 
-impl Default for SmodelSurfBucketLists {
+impl Default for PropFacetBucketLists {
     fn default() -> Self {
-        Self {
-            ids: [[0; SMODEL_BUCKET_CAP]; SMODEL_BUCKET_LIST_N],
-            count: [0; SMODEL_BUCKET_LIST_N],
-        }
+        let empty = [0u16; STATIC_MODEL_BUCKET_CAPACITY];
+        Self { filled: [0; PROP_BUCKET_LIST_COUNT], members: [empty; PROP_BUCKET_LIST_COUNT] }
     }
 }
 
 /// What a push did to its list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SmodelBucketPush {
+pub enum StaticModelBucketInsertResult {
     /// Stored; there is still room.
     Stored,
     /// Stored, and the list is now full and should be flushed.
@@ -125,101 +119,87 @@ pub enum SmodelBucketPush {
 /// What a bucket's list holds: the cache index for the cache kind (the cache
 /// owns the vertices), the static model's own index for every other kind.
 #[must_use]
-pub fn smodel_bucket_store_payload(bucket: i32, smodel_index: u16, cache_index: u16) -> u16 {
-    if bucket & (SMODEL_BUCKET_STRIDE - 1) == SMODEL_BUCKET_CACHED {
-        cache_index
-    } else {
-        smodel_index
+pub fn smodel_bucket_store_payload(bucket: i32, prop_index: u16, cache_slot_no: u16) -> u16 {
+    let kind = bucket.rem_euclid(STATIC_BUCKET_KIND_SPAN);
+    match kind {
+        STATIC_BUCKET_KIND_CACHED => cache_slot_no,
+        _ => prop_index,
     }
 }
 
 /// Appends to a bucket's list. `None` when the bucket does not exist or its
 /// list was already full.
 #[must_use]
-pub fn smodel_surf_bucket_push(
-    lists: &mut SmodelSurfBucketLists,
-    bucket: i32,
-    payload: u16,
-) -> Option<SmodelBucketPush> {
-    let bucket = usize::try_from(bucket)
-        .ok()
-        .filter(|&b| b < SMODEL_BUCKET_LIST_N)?;
-    let used = usize::try_from(lists.count[bucket])
-        .ok()
-        .filter(|&n| n < SMODEL_BUCKET_CAP)?;
-    lists.ids[bucket][used] = payload;
-    lists.count[bucket] += 1;
-    let full = used + 1 == SMODEL_BUCKET_CAP;
-    Some(if full {
-        SmodelBucketPush::Full
-    } else {
-        SmodelBucketPush::Stored
-    })
+pub fn push_prop_facet(
+    lists: &mut PropFacetBucketLists,
+    bin_no: i32,
+    member: u16,
+) -> Option<StaticModelBucketInsertResult> {
+    let list = usize::try_from(bin_no).ok()?;
+    let filled = lists.filled.get_mut(list)?;
+    let slot = lists.members[list].get_mut(usize::try_from(*filled).ok()?)?;
+    *slot = member;
+    *filled += 1;
+    let now_full = *filled as usize == STATIC_MODEL_BUCKET_CAPACITY;
+    Some(if now_full { StaticModelBucketInsertResult::Full } else { StaticModelBucketInsertResult::Stored })
 }
 
 /// One bucket's worth of surfaces, copied out of the lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SmodelConsumedBucket {
-    pub bucket: u8,
+pub struct StaticModelSpentBucket {
+    pub bin: u8,
     pub lod: u8,
-    pub source: SmodelSurfPath,
+    pub source: PropFacetPath,
     pub count: u16,
-    pub ids: [u16; SMODEL_BUCKET_CAP],
+    pub members: [u16; STATIC_MODEL_BUCKET_CAPACITY],
 }
 
 /// A bucket's bit in an active-bucket mask; bucket 0 is the top bit.
 #[must_use]
 pub const fn smodel_bucket_mask(bucket: u8) -> Option<u32> {
-    if (bucket as usize) < SMODEL_BUCKET_LIST_N {
-        Some(0x8000_0000 >> bucket)
-    } else {
-        None
+    match bucket as usize {
+        b if b < PROP_BUCKET_LIST_COUNT => Some(FIRST_BUCKET_BIT >> b),
+        _ => None,
     }
 }
 
-/// Drains the lists named by `active_mask` into `out`, in bucket order, and
+/// Drains the lists named by `live_bins` into `out`, in bucket order, and
 /// returns how many were written. Empty lists and the pre-tessellated kind are
 /// skipped; each drained list is reset.
-pub fn smodel_bucket_lists_consume(
-    lists: &mut SmodelSurfBucketLists,
-    active_mask: u32,
-    out: &mut [Option<SmodelConsumedBucket>; SMODEL_BUCKET_LIST_N],
+pub fn static_bucket_lists_drain(
+    lists: &mut PropFacetBucketLists,
+    live_bins: u32,
+    out: &mut [Option<StaticModelSpentBucket>; PROP_BUCKET_LIST_COUNT],
 ) -> usize {
-    out.fill(None);
-    let mut written = 0;
-    for bucket in 0..SMODEL_BUCKET_LIST_N {
-        if active_mask & (0x8000_0000 >> bucket) == 0 {
-            continue;
-        }
-        let Some(source) = bucket_source_path(bucket) else {
+    let stride = STATIC_BUCKET_KIND_SPAN as usize;
+    let mut taken = Vec::with_capacity(PROP_BUCKET_LIST_COUNT);
+    for bin_no in (0..PROP_BUCKET_LIST_COUNT).filter(|&b| live_bins & (FIRST_BUCKET_BIT >> b) != 0) {
+        let filled = lists.filled[bin_no];
+        let (Some(source), Ok(len @ 1..=STATIC_MODEL_BUCKET_CAPACITY)) = (bucket_source_path(bin_no), usize::try_from(filled)) else {
             continue;
         };
-        let Some(count) = usize::try_from(lists.count[bucket])
-            .ok()
-            .filter(|n| (1..=SMODEL_BUCKET_CAP).contains(n))
-        else {
-            continue;
-        };
-        let mut ids = [0u16; SMODEL_BUCKET_CAP];
-        ids[..count].copy_from_slice(&lists.ids[bucket][..count]);
-        out[written] = Some(SmodelConsumedBucket {
-            bucket: bucket as u8,
-            lod: (bucket / SMODEL_BUCKET_STRIDE as usize) as u8,
+        let mut members = [0u16; STATIC_MODEL_BUCKET_CAPACITY];
+        members[..len].copy_from_slice(&lists.members[bin_no][..len]);
+        lists.filled[bin_no] = 0;
+        taken.push(StaticModelSpentBucket {
+            bin: bin_no as u8,
+            lod: (bin_no / stride) as u8,
             source,
-            count: count as u16,
-            ids,
+            count: len as u16,
+            members,
         });
-        written += 1;
-        lists.count[bucket] = 0;
     }
+    let written = taken.len();
+    let mut fresh = taken.into_iter().map(Some).chain(std::iter::repeat(None));
+    out.iter_mut().for_each(|place| *place = fresh.next().flatten());
     written
 }
 
 /// Whether a surface's material casts into the sun shadow: either of the top
 /// two bits of its shadow byte.
 #[must_use]
-pub const fn smodel_surf_sun_shadow_emits(material_shadow_byte: u8) -> bool {
-    material_shadow_byte & 0xc0 != 0
+pub const fn prop_facet_casts_sun(material_shadow_byte: u8) -> bool {
+    material_shadow_byte >> 6 != 0
 }
 
 #[cfg(test)]
@@ -228,167 +208,124 @@ mod tests {
 
     #[test]
     fn each_path_has_its_own_surface_type() {
-        assert_eq!(smodel_surf_type(SmodelSurfPath::Rigid), 2);
-        assert_eq!(smodel_surf_type(SmodelSurfPath::Pretess), 3);
-        assert_eq!(smodel_surf_type(SmodelSurfPath::Cached), 4);
-        assert_eq!(smodel_surf_type(SmodelSurfPath::Skinned), 5);
+        let types = KIND_PATHS.map(prop_facet_kind);
+        assert_eq!(types, [2, 5, 4, 3]);
     }
 
     #[test]
     fn only_a_retessellated_cached_surface_changes_path() {
-        use SmodelSurfPath::*;
+        use PropFacetPath::*;
         assert_eq!(smodel_dest_path(Cached, true), Pretess);
         assert_eq!(smodel_dest_path(Cached, false), Cached);
-        for path in [Rigid, Skinned, Pretess] {
-            assert_eq!(smodel_dest_path(path, true), path);
-            assert_eq!(smodel_dest_path(path, false), path);
+        for (path, done) in [Rigid, Skinned, Pretess].into_iter().flat_map(|p| [(p, true), (p, false)]) {
+            assert_eq!(smodel_dest_path(path, done), path);
         }
     }
 
     #[test]
     fn a_lod_is_rigid_only_when_no_surface_is_skinned() {
-        assert!(smodel_lod_is_rigid(&[]));
-        assert!(smodel_lod_is_rigid(&[0, 0, 0]));
-        assert!(!smodel_lod_is_rigid(&[0, 1, 0]));
+        assert!(prop_lod_rigid(&[]) && prop_lod_rigid(&[0, 0, 0]));
+        assert!(!prop_lod_rigid(&[0, 1, 0]));
     }
 
     #[test]
     fn a_cached_surface_needs_every_condition() {
-        let bucket = |enable, lit, flag, index, rigid| {
-            add_static_model_surf_to_bucket(2, enable, lit, flag, index, rigid)
-        };
-        assert_eq!(bucket(true, true, 1, 9, true), 2 * 4 + SMODEL_BUCKET_CACHED);
-        assert_eq!(bucket(false, true, 1, 9, true), 2 * 4 + SMODEL_BUCKET_RIGID);
-        assert_eq!(bucket(true, false, 1, 9, true), 2 * 4 + SMODEL_BUCKET_RIGID);
-        assert_eq!(bucket(true, true, 0, 9, true), 2 * 4 + SMODEL_BUCKET_RIGID);
-        assert_eq!(bucket(true, true, 1, 0, true), 2 * 4 + SMODEL_BUCKET_RIGID);
+        let lod2 = |enable, lit, flag, index| add_static_model_surf_to_bucket(2, enable, lit, flag, index, true);
+        assert_eq!(lod2(true, true, 1, 9), 8 + STATIC_BUCKET_KIND_CACHED);
+        let missing_one = [lod2(false, true, 1, 9), lod2(true, false, 1, 9), lod2(true, true, 0, 9), lod2(true, true, 1, 0)];
+        assert_eq!(missing_one, [8 + STATIC_BUCKET_KIND_FIXED_MESH; 4]);
     }
 
     #[test]
     fn an_uncached_surface_is_skinned_unless_the_lod_is_rigid() {
-        assert_eq!(
-            add_static_model_surf_to_bucket(1, false, false, 0, 0, false),
-            4 + SMODEL_BUCKET_SKINNED
-        );
-        assert_eq!(
-            add_static_model_surf_to_bucket(3, false, false, 0, 0, true),
-            12 + SMODEL_BUCKET_RIGID
-        );
+        assert_eq!(add_static_model_surf_to_bucket(1, false, false, 0, 0, false), 4 + STATIC_BUCKET_KIND_BONE_DRIVEN);
+        assert_eq!(add_static_model_surf_to_bucket(3, false, false, 0, 0, true), 12 + STATIC_BUCKET_KIND_FIXED_MESH);
     }
 
     #[test]
     fn the_cache_bucket_stores_the_cache_index_and_the_rest_the_model() {
-        assert_eq!(smodel_bucket_store_payload(2, 70, 900), 900);
-        assert_eq!(smodel_bucket_store_payload(6, 70, 900), 900);
-        assert_eq!(smodel_bucket_store_payload(0, 70, 900), 70);
-        assert_eq!(smodel_bucket_store_payload(1, 70, 900), 70);
-        assert_eq!(smodel_bucket_store_payload(3, 70, 900), 70);
+        let stored = [2, 6, 0, 1, 3].map(|bucket| smodel_bucket_store_payload(bucket, 70, 900));
+        assert_eq!(stored, [900, 900, 70, 70, 70]);
     }
 
     #[test]
     fn pushing_fills_a_list_until_it_reports_full() {
-        let mut lists = SmodelSurfBucketLists::default();
-        for i in 0..SMODEL_BUCKET_CAP - 1 {
-            assert_eq!(
-                smodel_surf_bucket_push(&mut lists, 5, i as u16),
-                Some(SmodelBucketPush::Stored)
-            );
+        let mut lists = PropFacetBucketLists::default();
+        for i in 0..STATIC_MODEL_BUCKET_CAPACITY as u16 - 1 {
+            assert_eq!(push_prop_facet(&mut lists, 5, i), Some(StaticModelBucketInsertResult::Stored));
         }
-        assert_eq!(
-            smodel_surf_bucket_push(&mut lists, 5, 999),
-            Some(SmodelBucketPush::Full)
-        );
-        assert_eq!(lists.count[5], SMODEL_BUCKET_CAP as i32);
-        assert_eq!(lists.ids[5][SMODEL_BUCKET_CAP - 1], 999);
-        assert_eq!(smodel_surf_bucket_push(&mut lists, 5, 1), None);
-        assert_eq!(lists.count[5], SMODEL_BUCKET_CAP as i32);
+        assert_eq!(push_prop_facet(&mut lists, 5, 999), Some(StaticModelBucketInsertResult::Full));
+        assert_eq!(lists.filled[5], STATIC_MODEL_BUCKET_CAPACITY as i32);
+        assert_eq!(lists.members[5][STATIC_MODEL_BUCKET_CAPACITY - 1], 999);
+        assert_eq!(push_prop_facet(&mut lists, 5, 1), None);
+        assert_eq!(lists.filled[5], STATIC_MODEL_BUCKET_CAPACITY as i32);
     }
 
     #[test]
     fn a_bucket_that_does_not_exist_takes_nothing() {
-        let mut lists = SmodelSurfBucketLists::default();
-        assert_eq!(smodel_surf_bucket_push(&mut lists, -1, 1), None);
-        assert_eq!(smodel_surf_bucket_push(&mut lists, 16, 1), None);
-        assert_eq!(lists.count, [0; SMODEL_BUCKET_LIST_N]);
+        let mut lists = PropFacetBucketLists::default();
+        assert_eq!([-1, 16].map(|b| push_prop_facet(&mut lists, b, 1)), [None, None]);
+        assert_eq!(lists.filled, [0; PROP_BUCKET_LIST_COUNT]);
     }
 
     #[test]
     fn bucket_masks_run_from_the_top_bit() {
-        assert_eq!(smodel_bucket_mask(0), Some(0x8000_0000));
-        assert_eq!(smodel_bucket_mask(15), Some(0x0001_0000));
-        assert_eq!(smodel_bucket_mask(16), None);
+        assert_eq!([0, 15, 16].map(smodel_bucket_mask), [Some(0x8000_0000), Some(0x0001_0000), None]);
+    }
+
+    fn mask_of(buckets: &[u8]) -> u32 {
+        buckets.iter().filter_map(|&b| smodel_bucket_mask(b)).fold(0, |m, bit| m | bit)
     }
 
     #[test]
     fn consuming_copies_active_lists_in_order_and_resets_them() {
-        let mut lists = SmodelSurfBucketLists::default();
-        smodel_surf_bucket_push(&mut lists, 9, 41).unwrap();
-        smodel_surf_bucket_push(&mut lists, 9, 42).unwrap();
-        smodel_surf_bucket_push(&mut lists, 2, 7).unwrap();
-        let mask = smodel_bucket_mask(2).unwrap() | smodel_bucket_mask(9).unwrap();
-        let mut out = [None; SMODEL_BUCKET_LIST_N];
-        assert_eq!(smodel_bucket_lists_consume(&mut lists, mask, &mut out), 2);
+        let mut lists = PropFacetBucketLists::default();
+        for (list_no, ident) in [(9, 41), (9, 42), (2, 7)] {
+            push_prop_facet(&mut lists, list_no, ident).unwrap();
+        }
+        let mut dest = [None; PROP_BUCKET_LIST_COUNT];
+        assert_eq!(static_bucket_lists_drain(&mut lists, mask_of(&[2, 9]), &mut dest), 2);
 
-        let first = out[0].unwrap();
-        assert_eq!((first.bucket, first.lod, first.count), (2, 0, 1));
-        assert_eq!(first.source, SmodelSurfPath::Cached);
-        assert_eq!(first.ids[0], 7);
+        let first = dest[0].unwrap();
+        assert_eq!((first.bin, first.lod, first.count, first.source), (2, 0, 1, PropFacetPath::Cached));
+        assert_eq!(first.members[0], 7);
 
-        let second = out[1].unwrap();
-        assert_eq!((second.bucket, second.lod, second.count), (9, 2, 2));
-        assert_eq!(second.source, SmodelSurfPath::Skinned);
-        assert_eq!(&second.ids[..2], &[41, 42]);
+        let second = dest[1].unwrap();
+        assert_eq!((second.bin, second.lod, second.count, second.source), (9, 2, 2, PropFacetPath::Skinned));
+        assert_eq!(&second.members[..2], &[41, 42]);
 
-        assert!(out[2..].iter().all(Option::is_none));
-        assert_eq!(lists.count[2], 0);
-        assert_eq!(lists.count[9], 0);
+        assert!(dest[2..].iter().all(Option::is_none));
+        assert_eq!((lists.filled[2], lists.filled[9]), (0, 0));
     }
 
     #[test]
     fn consuming_leaves_inactive_and_pretess_lists_alone() {
-        let mut lists = SmodelSurfBucketLists::default();
-        smodel_surf_bucket_push(&mut lists, 3, 1).unwrap();
-        smodel_surf_bucket_push(&mut lists, 4, 2).unwrap();
-        let mut out = [None; SMODEL_BUCKET_LIST_N];
+        let mut lists = PropFacetBucketLists::default();
+        push_prop_facet(&mut lists, 3, 1).unwrap();
+        push_prop_facet(&mut lists, 4, 2).unwrap();
+        let mut dest = [None; PROP_BUCKET_LIST_COUNT];
         let everything = u32::from(u16::MAX) << 16;
-        assert_eq!(
-            smodel_bucket_lists_consume(
-                &mut lists,
-                everything & !smodel_bucket_mask(4).unwrap(),
-                &mut out
-            ),
-            0
-        );
-        assert_eq!(lists.count[3], 1);
-        assert_eq!(lists.count[4], 1);
-        assert_eq!(
-            smodel_bucket_lists_consume(&mut lists, everything, &mut out),
-            1
-        );
-        assert_eq!(out[0].unwrap().bucket, 4);
-        assert_eq!(lists.count[3], 1);
+        let all_but_4 = everything & !mask_of(&[4]);
+        assert_eq!(static_bucket_lists_drain(&mut lists, all_but_4, &mut dest), 0);
+        assert_eq!((lists.filled[3], lists.filled[4]), (1, 1));
+        assert_eq!(static_bucket_lists_drain(&mut lists, everything, &mut dest), 1);
+        assert_eq!(dest[0].unwrap().bin, 4);
+        assert_eq!(lists.filled[3], 1);
     }
 
     #[test]
     fn consuming_clears_what_the_output_held_before() {
-        let mut lists = SmodelSurfBucketLists::default();
-        let mut out = [None; SMODEL_BUCKET_LIST_N];
-        smodel_surf_bucket_push(&mut lists, 0, 5).unwrap();
-        smodel_bucket_lists_consume(&mut lists, 0xffff_0000, &mut out);
-        assert!(out[0].is_some());
-        assert_eq!(
-            smodel_bucket_lists_consume(&mut lists, 0xffff_0000, &mut out),
-            0
-        );
-        assert!(out.iter().all(Option::is_none));
+        let mut lists = PropFacetBucketLists::default();
+        let mut dest = [None; PROP_BUCKET_LIST_COUNT];
+        push_prop_facet(&mut lists, 0, 5).unwrap();
+        static_bucket_lists_drain(&mut lists, 0xffff_0000, &mut dest);
+        assert!(dest[0].is_some());
+        assert_eq!(static_bucket_lists_drain(&mut lists, 0xffff_0000, &mut dest), 0);
+        assert!(dest.iter().all(Option::is_none));
     }
 
     #[test]
     fn the_sun_shadow_needs_one_of_the_top_two_bits() {
-        assert!(smodel_surf_sun_shadow_emits(0x40));
-        assert!(smodel_surf_sun_shadow_emits(0x80));
-        assert!(smodel_surf_sun_shadow_emits(0xc0));
-        assert!(!smodel_surf_sun_shadow_emits(0x3f));
-        assert!(!smodel_surf_sun_shadow_emits(0));
+        assert_eq!([0x40, 0x80, 0xc0, 0x3f, 0].map(prop_facet_casts_sun), [true, true, true, false, false]);
     }
 }

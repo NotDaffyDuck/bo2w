@@ -3,45 +3,50 @@
 
 use core::f32::consts::{FRAC_PI_2, PI, TAU};
 
-use game_math::{angle_vectors, get_lean_fraction, vect_to_angles};
+use game_math::{euler_basis, lean_amount, dir_to_euler};
 
-use crate::placement::{
-    PMF_DIVE_ANY, VIEWHEIGHT_TARGET_CROUCH, VIEWHEIGHT_TARGET_PRONE, WEAPON_BOB_AMPLITUDE_BASE,
-    WEAPON_BOB_AMPLITUDE_ROLL, WEAPON_BOB_LAG, WEAPON_BOB_UP_PHASE, WEAPON_IDLE_PITCH_FREQ,
-    WEAPON_IDLE_SIN_SCALE, WEAPON_IDLE_YAW_FREQ, WeaponIdleInputs, WeaponPlacementPsInputs,
-    idle_clock_step, idle_e_flags, step_idle_factor, weapon_bob_ads_attenuation,
+use crate::env::perk;
+use super::placement::{
+    PMF_DIVE_ANY, EYE_LEVEL_CROUCHED, EYE_LEVEL_LYING, SWING_AMP_BASE,
+    SWING_AMP_ROLL, SWING_DELAY, SWING_RISE_PHASE, REST_PITCH_HZ,
+    GUN_REST_WAVE_FACTOR, REST_YAW_HZ, GunRestDriftFeed, GunPosePlayerFeed,
+    idle_clock_step, idle_e_flags, step_idle_factor, swing_damp_aimed,
     weapon_idle_amount_speed,
 };
-use crate::ps_flags::pm_flags;
+use crate::ps_flags::{ent_bit, movement_state_bits};
 
 /// Hits report this yaw and pitch byte when they have no direction.
-pub const VIEW_DAMAGE_UNDIRECTED: u32 = 255;
+pub const HIT_FLINCH_NO_DIRECTION: u32 = 255;
 
 /// The gap the feet are lifted off the ground by the landing dip.
-pub const VIEW_ORG_BOB_Z_MIN_OFS: f32 = 8.0;
+pub const CAMERA_SWAY_LOWEST_DROP: f32 = 8.0;
 
 /// How much of the camera's landing dip the gun takes.
-pub const VIEWWEAPON_LAND_SCALE: f32 = 0.25;
-
-/// `perks[0]` bits: Lightweight (shrinks the MW2 head bob), Toughness (shrinks the BO2 flinch).
-pub const PERK_LIGHTWEIGHT_VIEW_BOB_BIT: u32 = 0x0100_0000;
-pub const PERK_BULLETFLINCH: u32 = 1 << 5;
+pub const VIEWMODEL_TOUCHDOWN_FACTOR: f32 = 0.25;
 
 /// The `e_flags` bits that put the player on a turret or in a vehicle.
-pub const EFLAGS_TURRET_VEHICLE: u32 = 0xc00;
+pub const EFLAGS_TURRET_VEHICLE: u32 = ent_bit::TURRET_MASK | ent_bit::IN_VEHICLE;
 
 /// bo2zm: from this water level up the player swims.
 pub const SWIM_WATER_LEVEL: i32 = 4;
 
 /// The widest the head bob swings.
 const BOB_MAX: f32 = 8.0;
-/// Head bob swing (side, up) per unit of speed for each way of moving.
-const AMP_STANDING: [f32; 2] = [0.007, 0.007];
-const AMP_STANDING_ADS: [f32; 2] = [0.007, 0.007];
-const AMP_DUCKED: [f32; 2] = [0.0075, 0.0075];
-const AMP_DUCKED_ADS: [f32; 2] = [0.0075, 0.0075];
-const AMP_PRONE: [f32; 2] = [0.02, 0.005];
-const AMP_SPRINTING: [f32; 2] = [0.02, 0.014];
+/// Head bob swing (side, up) per unit of speed for each way of moving. Standing
+/// and ducked hold two: from the hip, then aiming down the sights.
+struct HeadSwings {
+    standing: [[f32; 2]; 2],
+    ducked: [[f32; 2]; 2],
+    prone: [f32; 2],
+    sprinting: [f32; 2],
+}
+
+const HEAD_SWINGS: HeadSwings = HeadSwings {
+    standing: [[0.007, 0.007], [0.007, 0.007]],
+    ducked: [[0.0075, 0.0075], [0.0075, 0.0075]],
+    prone: [0.02, 0.005],
+    sprinting: [0.02, 0.014],
+};
 /// bo2zm: Black Ops' head bob when prone (bg_viewBobAmplitudeProne).
 const AMP_PRONE_BO2: [f32; 2] = [0.08, 0.04];
 /// bo2zm: Black Ops II's head bob through a dive, in the air and sliding
@@ -94,14 +99,15 @@ const FLINCH_ADS_HALF: f32 = 0.5;
 
 /// What the head bob reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ViewOrgBobInputs {
+pub struct CameraHeightSwayFeed {
     /// The step counter: 0..=255 for half a turn of the bob.
-    pub bob_cycle: u8,
-    pub xyspeed: f32,
-    pub view_height_target: i32,
-    pub pm_flags: u32,
-    pub weapon_pos_frac: f32,
-    pub perks0: u32,
+    pub sway_phase: u8,
+    pub ground_velocity: f32,
+    pub eye_height_goal: i32,
+    pub movement_state_bits: u32,
+    pub gun_raise_share: f32,
+    /// The player's two perk words (Lightweight shrinks the legacy head bob).
+    pub perks: [u32; 2],
     /// bo2zm: Black Ops II camera rules (prone bob, no Lightweight shrink).
     pub bo2: bool,
     /// bo2zm: how deep in water the player stands (0 to 6).
@@ -110,80 +116,81 @@ pub struct ViewOrgBobInputs {
 
 /// The head's bob, up (`vertical`) and across (`horizontal`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ViewOrgBob {
+pub struct CameraHeightSway {
     pub vertical: f32,
     pub horizontal: f32,
 }
 
 /// What the camera angles read.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ViewAngleBobInputs {
-    pub org: ViewOrgBobInputs,
-    pub e_flags: u32,
-    pub overlay_reticle: i32,
+pub struct CameraTiltSwayFeed {
+    pub org: CameraHeightSwayFeed,
+    pub ent_bits: u32,
+    pub hud_crosshair_layer: i32,
     pub ads_bob_factor: f32,
     pub ads_view_bob_mult: f32,
     pub time: i32,
-    pub damage_time: i32,
-    pub v_dmg_pitch: f32,
-    pub v_dmg_roll: f32,
-    pub aim_down_sight: bool,
-    pub idle: WeaponIdleInputs,
-    pub frametime: f32,
-    pub hold_breath_scale: f32,
-    pub weap_idle_time: i32,
-    pub view_last_idle_factor: f32,
+    pub hurt_stamp_ms: i32,
+    pub hurt_kick_pitch: f32,
+    pub hurt_kick_roll: f32,
+    pub scoped_aiming: bool,
+    pub idle: GunRestDriftFeed,
+    pub step_millis_elapsed: f32,
+    pub steady_aim_factor: f32,
+    pub gun_idle_clock: i32,
+    pub view_prev_sway_ratio: f32,
 }
 
 /// The turn the camera gets, and the scope drift's clock to carry to the next frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ViewAngleBob {
+pub struct CameraTiltSway {
     pub pitch: f32,
     pub yaw: f32,
     pub roll: f32,
-    pub cam_idle_pitch: f32,
-    pub cam_idle_yaw: f32,
-    pub weap_idle_time: i32,
-    pub view_last_idle_factor: f32,
+    pub camera_rest_nod: f32,
+    pub camera_rest_turn: f32,
+    pub gun_idle_clock: i32,
+    pub view_prev_sway_ratio: f32,
 }
 
 /// A hit's kick: the pitch and roll it gives the view.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ViewDamageFeedback {
-    pub v_dmg_pitch: f32,
-    pub v_dmg_roll: f32,
+pub struct HitFlinchResponse {
+    pub hurt_kick_pitch: f32,
+    pub hurt_kick_roll: f32,
 }
 
 /// The bob cycle of the head: where in the step the player is, in radians.
-fn head_cycle(bob_cycle: u8) -> f32 {
-    let half_turns = (f32::from(bob_cycle) / 255.0) * PI;
+fn head_cycle(sway_phase: u8) -> f32 {
+    let half_turns = (f32::from(sway_phase) / 255.0) * PI;
     half_turns + half_turns + TAU
 }
 
 /// How wide the head swings along `axis` (`SIDE` or `UP`).
-fn head_amplitude(org: ViewOrgBobInputs, axis: usize) -> f32 {
+fn head_amplitude(org: CameraHeightSwayFeed, axis: usize) -> f32 {
     let bo2 = org.bo2;
     if bo2 && org.waterlevel >= SWIM_WATER_LEVEL {
         return AMP_SWIMMING[axis].min(BOB_MAX);
     }
-    let ads = org.weapon_pos_frac;
-    let scale = if bo2 && org.pm_flags & PMF_DIVE_ANY != 0 {
+    let ads = org.gun_raise_share;
+    let hip_to_aim = |[hip, aim]: [[f32; 2]; 2]| (1.0 - ads) * hip[axis] + ads * aim[axis];
+    let scale = if bo2 && org.movement_state_bits & PMF_DIVE_ANY != 0 {
         AMP_DTP[axis]
-    } else if org.view_height_target == VIEWHEIGHT_TARGET_PRONE {
+    } else if org.eye_height_goal == EYE_LEVEL_LYING {
         if bo2 {
             AMP_PRONE_BO2[axis]
         } else {
-            AMP_PRONE[axis]
+            HEAD_SWINGS.prone[axis]
         }
-    } else if org.view_height_target == VIEWHEIGHT_TARGET_CROUCH {
-        (1.0 - ads) * AMP_DUCKED[axis] + ads * AMP_DUCKED_ADS[axis]
-    } else if org.pm_flags & pm_flags::SPRINTING == 0 {
-        (1.0 - ads) * AMP_STANDING[axis] + ads * AMP_STANDING_ADS[axis]
+    } else if org.eye_height_goal == EYE_LEVEL_CROUCHED {
+        hip_to_aim(HEAD_SWINGS.ducked)
+    } else if org.movement_state_bits & movement_state_bits::SPRINTING == 0 {
+        hip_to_aim(HEAD_SWINGS.standing)
     } else {
-        AMP_SPRINTING[axis]
+        HEAD_SWINGS.sprinting[axis]
     };
-    let mut amp = scale * org.xyspeed;
-    if !bo2 && org.perks0 & PERK_LIGHTWEIGHT_VIEW_BOB_BIT != 0 {
+    let mut amp = scale * org.ground_velocity;
+    if !bo2 && perk::held(org.perks, perk::MOVEFASTER) {
         amp *= LIGHTWEIGHT_SCALE;
     }
     if amp > BOB_MAX {
@@ -193,230 +200,228 @@ fn head_amplitude(org: ViewOrgBobInputs, axis: usize) -> f32 {
 }
 
 /// The head's up and down bob at `cycle`.
-fn bob_up(cycle: f32, org: ViewOrgBobInputs) -> f32 {
+fn bob_up(cycle: f32, org: CameraHeightSwayFeed) -> f32 {
     (libm::sinf(cycle * 4.0 + FRAC_PI_2) * 0.2 + libm::sinf(cycle + cycle))
         * 0.75
         * head_amplitude(org, UP)
 }
 
 /// The head's side to side bob at `cycle`.
-fn bob_side(cycle: f32, org: ViewOrgBobInputs) -> f32 {
+fn bob_side(cycle: f32, org: CameraHeightSwayFeed) -> f32 {
     libm::sinf(cycle) * head_amplitude(org, SIDE)
 }
 
 /// The height of a fall, from the speed the player touched down at. None without gravity,
 /// or when the two heights cannot be joined by a fall.
-pub fn crash_land_fall_height(
-    gravity: i32,
-    previous_origin_z: f32,
-    origin_z: f32,
-    previous_velocity_z: f32,
-) -> Option<f32> {
-    if gravity == 0 {
+pub fn hard_landing_drop(grav: i32, prev_z: f32, now_z: f32, prev_vz: f32) -> Option<f32> {
+    if grav == 0 {
         return None;
     }
-    let dropped = previous_origin_z - origin_z;
-    let vel = previous_velocity_z;
-    let accel = -(gravity as f32);
-    let half_accel = accel * 0.5;
-    let discriminant = vel * vel - 4.0 * half_accel * dropped;
-    if discriminant < 0.0 {
+    let drop_h = prev_z - now_z;
+    let vz = prev_vz;
+    let acc = -(grav as f32);
+    let half_acc = acc * 0.5;
+    let under_root = vz * vz - 4.0 * half_acc * drop_h;
+    if under_root < 0.0 {
         return None;
     }
-    let two_a = half_accel * 2.0;
-    if two_a == 0.0 {
+    let twice_half = half_acc * 2.0;
+    if twice_half == 0.0 {
         return None;
     }
-    let fall_time = (-vel - libm::sqrtf(discriminant)) / two_a;
-    let touchdown_speed = (fall_time * accel + vel) * -1.0;
-    Some((touchdown_speed * touchdown_speed) / ((gravity as f32) * 2.0))
+    let air_time = (-vz - libm::sqrtf(under_root)) / twice_half;
+    let hit_speed = (air_time * acc + vz) * -1.0;
+    Some((hit_speed * hit_speed) / ((grav as f32) * 2.0))
 }
 
 /// How many steps the view dips on touching down from `fall_height`. BO2 drops the
 /// fraction where MW2 rounds.
-pub fn crash_land_view_dip(fall_height: f32, bo2: bool) -> i32 {
-    if !(fall_height > LAND_DIP_FALL_IN) {
+pub fn crash_land_view_dip(fall_in: f32, bo2: bool) -> i32 {
+    if !(fall_in > LAND_DIP_FALL_IN) {
         return 0;
     }
-    let raw = (fall_height - LAND_DIP_FALL_IN) / LAND_DIP_SPAN_IN * LAND_DIP_SCALE + LAND_DIP_SCALE;
-    let steps = if bo2 {
-        raw as i32
+    let dip_raw = (fall_in - LAND_DIP_FALL_IN) / LAND_DIP_SPAN_IN * LAND_DIP_SCALE + LAND_DIP_SCALE;
+    let dip_steps = if bo2 {
+        dip_raw as i32
     } else {
-        libm::roundf(raw) as i32
+        libm::roundf(dip_raw) as i32
     };
-    if steps > LAND_DIP_MAX {
+    if dip_steps > LAND_DIP_MAX {
         LAND_DIP_MAX
-    } else if steps < 0 {
+    } else if dip_steps < 0 {
         0
     } else {
-        steps
+        dip_steps
     }
 }
 
 /// How far into its dip the view is `delta_ms` after the landing: 0 to 1 and back to 0. None
 /// before the touchdown and once it is over.
-fn land_weight(delta_ms: f32) -> Option<f32> {
-    if !(delta_ms > 0.0) {
+fn land_weight(since_ms: f32) -> Option<f32> {
+    if !(since_ms > 0.0) {
         return None;
     }
-    if delta_ms < LAND_DEFLECT_MS {
-        return Some(delta_ms / LAND_DEFLECT_MS);
+    if since_ms < LAND_DEFLECT_MS {
+        return Some(since_ms / LAND_DEFLECT_MS);
     }
-    if delta_ms >= LAND_END_MS {
+    if since_ms >= LAND_END_MS {
         return None;
     }
-    Some(1.0 - (delta_ms - LAND_DEFLECT_MS) / LAND_RETURN_MS)
+    Some(1.0 - (since_ms - LAND_DEFLECT_MS) / LAND_RETURN_MS)
 }
 
-/// The view's drop `delta_ms` after a landing that dips `land_change`.
-pub fn land_origin_z(delta_ms: f32, land_change: f32) -> f32 {
-    land_weight(delta_ms).map_or(0.0, |weight| weight * land_change)
+/// The view's drop `delta_ms` after a landing that dips `touchdown_dip`.
+pub fn land_origin_z(since_ms: f32, dip_amount: f32) -> f32 {
+    land_weight(since_ms).map_or(0.0, |w| w * dip_amount)
 }
 
-/// The gun's drop `delta_ms` after a landing that dips the view `land_change`.
-pub fn viewweapon_land_origin_z(delta_ms: i32, land_change: f32) -> f32 {
-    let deflect = LAND_DEFLECT_MS as i32;
-    let end = LAND_END_MS as i32;
-    if delta_ms < deflect {
-        return land_change * VIEWWEAPON_LAND_SCALE * (delta_ms as f32) / LAND_DEFLECT_MS;
+/// The gun's drop `delta_ms` after a landing that dips the view `touchdown_dip`.
+pub fn viewweapon_land_origin_z(since_ms: i32, dip_amount: f32) -> f32 {
+    let deflect_ms = LAND_DEFLECT_MS as i32;
+    let end_ms = LAND_END_MS as i32;
+    if since_ms < deflect_ms {
+        return dip_amount * VIEWMODEL_TOUCHDOWN_FACTOR * (since_ms as f32) / LAND_DEFLECT_MS;
     }
-    if delta_ms < end {
-        return land_change * VIEWWEAPON_LAND_SCALE * ((end - delta_ms) as f32) / LAND_RETURN_MS;
+    if since_ms < end_ms {
+        return dip_amount * VIEWMODEL_TOUCHDOWN_FACTOR * ((end_ms - since_ms) as f32) / LAND_RETURN_MS;
     }
     0.0
 }
 
 /// The head's bob: none standing still, but a BO2 swimmer bobs treading water.
-pub fn view_org_bob(inputs: ViewOrgBobInputs) -> ViewOrgBob {
-    let swimming = inputs.bo2 && inputs.waterlevel >= SWIM_WATER_LEVEL;
-    if !(inputs.xyspeed > 0.0) && !swimming {
-        return ViewOrgBob::default();
+pub fn view_org_bob(head: CameraHeightSwayFeed) -> CameraHeightSway {
+    let treading = head.bo2 && head.waterlevel >= SWIM_WATER_LEVEL;
+    if !(head.ground_velocity > 0.0) && !treading {
+        return CameraHeightSway::default();
     }
-    let cycle = head_cycle(inputs.bob_cycle);
-    ViewOrgBob {
-        vertical: bob_up(cycle, inputs),
-        horizontal: bob_side(cycle, inputs),
+    let head_phase = head_cycle(head.sway_phase);
+    CameraHeightSway {
+        vertical: bob_up(head_phase, head),
+        horizontal: bob_side(head_phase, head),
     }
 }
 
-fn with_speed(org: ViewOrgBobInputs, xyspeed: f32) -> ViewOrgBobInputs {
-    ViewOrgBobInputs { xyspeed, ..org }
+fn with_speed(head: CameraHeightSwayFeed, speed_in: f32) -> CameraHeightSwayFeed {
+    CameraHeightSwayFeed {
+        ground_velocity: speed_in,
+        ..head
+    }
 }
 
 /// Adds the gun's own bob to the camera as the scope comes up, so the scope bobs with it.
-fn add_overlay_bob(angles: &mut ViewAngleBob, inputs: ViewAngleBobInputs) {
-    if inputs.overlay_reticle == 0 {
+fn add_overlay_bob(cam: &mut CameraTiltSway, frame: CameraTiltSwayFeed) {
+    if frame.hud_crosshair_layer == 0 {
         return;
     }
-    let cycle = head_cycle(inputs.org.bob_cycle) + TAU + WEAPON_BOB_LAG * PI;
-    let speed = WEAPON_BOB_AMPLITUDE_BASE * inputs.org.xyspeed;
-    let at_speed = with_speed(inputs.org, speed);
-    let mut pitch = -bob_up(cycle, at_speed);
-    let mut yaw = -bob_side(cycle, at_speed);
-    let mut roll = bob_side(
-        cycle - WEAPON_BOB_UP_PHASE,
-        with_speed(inputs.org, WEAPON_BOB_AMPLITUDE_ROLL * speed),
+    let phase = head_cycle(frame.org.sway_phase) + TAU + SWING_DELAY * PI;
+    let scope_speed = SWING_AMP_BASE * frame.org.ground_velocity;
+    let scaled_in = with_speed(frame.org, scope_speed);
+    let mut p_bob = -bob_up(phase, scaled_in);
+    let mut y_bob = -bob_side(phase, scaled_in);
+    let mut r_bob = bob_side(
+        phase - SWING_RISE_PHASE,
+        with_speed(frame.org, SWING_AMP_ROLL * scope_speed),
     );
     // The scope only ever rolls one way: a roll the other way is none.
-    if !(roll <= 0.0) {
-        roll = 0.0;
+    if !(r_bob <= 0.0) {
+        r_bob = 0.0;
     }
-    let frac = inputs.org.weapon_pos_frac;
-    if frac != 0.0 {
-        let keep = weapon_bob_ads_attenuation(frac, inputs.ads_bob_factor);
-        pitch *= keep;
-        yaw *= keep;
-        roll *= keep;
+    let ads = frame.org.gun_raise_share;
+    if ads != 0.0 {
+        let kept = swing_damp_aimed(ads, frame.ads_bob_factor);
+        p_bob *= kept;
+        y_bob *= kept;
+        r_bob *= kept;
     }
-    angles.pitch += frac * pitch;
-    angles.yaw += frac * yaw;
-    angles.roll += frac * roll;
+    cam.pitch += ads * p_bob;
+    cam.yaw += ads * y_bob;
+    cam.roll += ads * r_bob;
 }
 
 /// Takes the head's bob off the camera as the sights come up, by the weapon's own factor.
-fn take_ads_bob(angles: &mut ViewAngleBob, inputs: ViewAngleBobInputs) {
-    let frac = inputs.org.weapon_pos_frac;
-    if !(frac > 0.0) || inputs.e_flags & EFLAGS_TURRET_VEHICLE != 0 {
+fn take_ads_bob(cam: &mut CameraTiltSway, frame: CameraTiltSwayFeed) {
+    let ads = frame.org.gun_raise_share;
+    if !(ads > 0.0) || frame.ent_bits & EFLAGS_TURRET_VEHICLE != 0 {
         return;
     }
-    if !(inputs.ads_view_bob_mult > 0.0) {
+    if !(frame.ads_view_bob_mult > 0.0) {
         return;
     }
-    let scale = inputs.ads_view_bob_mult * frac;
-    let cycle = head_cycle(inputs.org.bob_cycle);
-    angles.pitch -= bob_up(cycle, inputs.org) * scale;
-    angles.yaw -= bob_side(cycle, inputs.org) * scale;
+    let cut = frame.ads_view_bob_mult * ads;
+    let phase = head_cycle(frame.org.sway_phase);
+    cam.pitch -= bob_up(phase, frame.org) * cut;
+    cam.yaw -= bob_side(phase, frame.org) * cut;
 }
 
 /// MW2's flinch size for `damage_count`, at least `kick_min`.
-fn kick_size(damage_count: i32, kick_min: f32) -> f32 {
-    let scaled = damage_count as f32 * KICK_SCALE;
-    if scaled < kick_min {
-        kick_min
-    } else if scaled > KICK_MAX {
+fn kick_size(dmg_count: i32, min_kick: f32) -> f32 {
+    let raw_kick = dmg_count as f32 * KICK_SCALE;
+    if raw_kick < min_kick {
+        min_kick
+    } else if raw_kick > KICK_MAX {
         KICK_MAX
     } else {
-        scaled
+        raw_kick
     }
 }
 
 /// How far a hit's travel direction (as bytes) points along the view's forward and right.
-fn hit_along_view(yaw_byte: u32, pitch_byte: u32, viewangles: [f32; 3]) -> (f32, f32) {
-    let pitch = (pitch_byte as f32 / DIRECTION_BYTE_MAX) * FULL_TURN_DEGREES;
-    let yaw = (yaw_byte as f32 / DIRECTION_BYTE_MAX) * FULL_TURN_DEGREES;
-    let (dir, _, _) = angle_vectors([pitch, yaw, 0.0]);
-    let (forward, right, _) = angle_vectors(viewangles);
-    let side = dir[0] * right[0] + dir[1] * right[1] + dir[2] * right[2];
-    let ahead = dir[0] * forward[0] + dir[1] * forward[1] + dir[2] * forward[2];
-    (ahead, side)
+fn hit_along_view(look_ang: [f32; 3], yaw_b: u32, pitch_b: u32) -> (f32, f32) {
+    let hit_pitch = (pitch_b as f32 / DIRECTION_BYTE_MAX) * FULL_TURN_DEGREES;
+    let hit_yaw = (yaw_b as f32 / DIRECTION_BYTE_MAX) * FULL_TURN_DEGREES;
+    let (hit_dir, _, _) = euler_basis([hit_pitch, hit_yaw, 0.0]);
+    let (camera_ahead, view_rgt, _) = euler_basis(look_ang);
+    let across = hit_dir[0] * view_rgt[0] + hit_dir[1] * view_rgt[1] + hit_dir[2] * view_rgt[2];
+    let along = hit_dir[0] * camera_ahead[0] + hit_dir[1] * camera_ahead[1] + hit_dir[2] * camera_ahead[2];
+    (along, across)
 }
 
 /// MW2's flinch from a hit's travel direction, with the smallest flinch given
 /// (`KICK_MIN_BO2` for Black Ops II).
 fn damage_kick_with_min(
-    yaw_byte: u32,
-    pitch_byte: u32,
-    damage_count: i32,
-    viewangles: [f32; 3],
-    kick_min: f32,
-) -> ViewDamageFeedback {
-    let kick = kick_size(damage_count, kick_min);
-    if yaw_byte == VIEW_DAMAGE_UNDIRECTED && pitch_byte == VIEW_DAMAGE_UNDIRECTED {
-        return ViewDamageFeedback {
-            v_dmg_pitch: -kick,
-            v_dmg_roll: 0.0,
+    yaw_b: u32,
+    pitch_b: u32,
+    dmg_count: i32,
+    view_ang: [f32; 3],
+    min_kick: f32,
+) -> HitFlinchResponse {
+    let flinch = kick_size(dmg_count, min_kick);
+    if yaw_b == HIT_FLINCH_NO_DIRECTION && pitch_b == HIT_FLINCH_NO_DIRECTION {
+        return HitFlinchResponse {
+            hurt_kick_pitch: -flinch,
+            hurt_kick_roll: 0.0,
         };
     }
-    let (ahead, side) = hit_along_view(yaw_byte, pitch_byte, viewangles);
-    ViewDamageFeedback {
-        v_dmg_pitch: kick * ahead,
-        v_dmg_roll: -kick * side,
+    let (along, across) = hit_along_view(view_ang, yaw_b, pitch_b);
+    HitFlinchResponse {
+        hurt_kick_pitch: flinch * along,
+        hurt_kick_roll: -flinch * across,
     }
 }
 
 /// MW2's flinch from a hit's travel direction (yaw and pitch bytes; 255/255 for none).
 pub fn damage_feedback_kick(
-    yaw_byte: u32,
-    pitch_byte: u32,
-    damage_count: i32,
-    viewangles: [f32; 3],
-) -> ViewDamageFeedback {
-    damage_kick_with_min(yaw_byte, pitch_byte, damage_count, viewangles, KICK_MIN)
+    yaw_b: u32,
+    pitch_b: u32,
+    dmg_count: i32,
+    view_ang: [f32; 3],
+) -> HitFlinchResponse {
+    damage_kick_with_min(yaw_b, pitch_b, dmg_count, view_ang, KICK_MIN)
 }
 
 /// bo2zm: Black Ops II's hit flinch size: 0.175 a percent of health, a quarter of that
 /// with Toughness, kept between 0.5 and 90 degrees.
-fn kick_size_bo2(damage_count: i32, bullet_flinch: bool) -> f32 {
-    let mut kick = damage_count as f32 * KICK_SCALE_BO2;
-    if bullet_flinch {
-        kick *= KICK_TOUGHNESS_SHARE;
+fn kick_size_bo2(dmg_count: i32, toughness: bool) -> f32 {
+    let mut flinch = dmg_count as f32 * KICK_SCALE_BO2;
+    if toughness {
+        flinch *= KICK_TOUGHNESS_SHARE;
     }
-    if kick < KICK_MIN_BO2 {
+    if flinch < KICK_MIN_BO2 {
         KICK_MIN_BO2
-    } else if kick > KICK_MAX {
+    } else if flinch > KICK_MAX {
         KICK_MAX
     } else {
-        kick
+        flinch
     }
 }
 
@@ -424,26 +429,26 @@ fn kick_size_bo2(damage_count: i32, bullet_flinch: bool) -> f32 {
 /// 255/255 = no direction: the view tips up. 0/0 keeps the last flinch's angles (None);
 /// the flinch still restarts. The roll leans the other way from MW2's.
 pub fn damage_feedback_kick_bo2(
-    yaw_byte: u32,
-    pitch_byte: u32,
-    damage_count: i32,
-    viewangles: [f32; 3],
-    bullet_flinch: bool,
-) -> Option<ViewDamageFeedback> {
-    let kick = kick_size_bo2(damage_count, bullet_flinch);
-    if yaw_byte == VIEW_DAMAGE_UNDIRECTED && pitch_byte == VIEW_DAMAGE_UNDIRECTED {
-        return Some(ViewDamageFeedback {
-            v_dmg_pitch: -kick,
-            v_dmg_roll: 0.0,
+    yaw_b: u32,
+    pitch_b: u32,
+    dmg_count: i32,
+    view_ang: [f32; 3],
+    toughness: bool,
+) -> Option<HitFlinchResponse> {
+    let flinch = kick_size_bo2(dmg_count, toughness);
+    if yaw_b == HIT_FLINCH_NO_DIRECTION && pitch_b == HIT_FLINCH_NO_DIRECTION {
+        return Some(HitFlinchResponse {
+            hurt_kick_pitch: -flinch,
+            hurt_kick_roll: 0.0,
         });
     }
-    if yaw_byte == 0 && pitch_byte == 0 {
+    if yaw_b == 0 && pitch_b == 0 {
         return None;
     }
-    let (ahead, side) = hit_along_view(yaw_byte, pitch_byte, viewangles);
-    Some(ViewDamageFeedback {
-        v_dmg_pitch: kick * ahead,
-        v_dmg_roll: kick * side,
+    let (along, across) = hit_along_view(view_ang, yaw_b, pitch_b);
+    Some(HitFlinchResponse {
+        hurt_kick_pitch: flinch * along,
+        hurt_kick_roll: flinch * across,
     })
 }
 
@@ -451,117 +456,116 @@ pub fn damage_feedback_kick_bo2(
 /// percent (at most 127), and the last hit's travel direction as yaw and pitch bytes
 /// (255/255 with no direction). None when there is nothing to send.
 pub fn damage_feedback_bo2(
-    blood: i32,
-    max_health: i32,
-    dir: Option<[f32; 3]>,
+    hp_lost: i32,
+    hp_max: i32,
+    hit_dir: Option<[f32; 3]>,
 ) -> Option<(i32, u32, u32)> {
-    if blood < 1 || max_health < 1 {
+    if hp_lost < 1 || hp_max < 1 {
         return None;
     }
-    let count = (blood.saturating_mul(100) / max_health).min(DAMAGE_COUNT_MAX_BO2);
-    let Some(dir) = dir else {
-        return Some((count, VIEW_DAMAGE_UNDIRECTED, VIEW_DAMAGE_UNDIRECTED));
+    let pct = (hp_lost.saturating_mul(100) / hp_max).min(DAMAGE_COUNT_MAX_BO2);
+    let Some(hit_dir) = hit_dir else {
+        return Some((pct, HIT_FLINCH_NO_DIRECTION, HIT_FLINCH_NO_DIRECTION));
     };
-    let angles = vect_to_angles(dir);
-    let to_byte =
-        |angle: f32| ((angle * DEGREES_TO_TURNS * DIRECTION_BYTE_TURN) as i32 as u32) & 0xff;
-    Some((count, to_byte(angles[1]), to_byte(angles[0])))
+    let dir_ang = dir_to_euler(hit_dir);
+    let as_byte = |deg: f32| ((deg * DEGREES_TO_TURNS * DIRECTION_BYTE_TURN) as i32 as u32) & 0xff;
+    Some((pct, as_byte(dir_ang[1]), as_byte(dir_ang[0])))
 }
 
 /// Adds the flinch of the last hit to the camera: out fast, back slowly.
-fn add_flinch(angles: &mut ViewAngleBob, inputs: ViewAngleBobInputs) {
-    if inputs.damage_time == 0 {
+fn add_flinch(cam: &mut CameraTiltSway, frame: CameraTiltSwayFeed) {
+    if frame.hurt_stamp_ms == 0 {
         return;
     }
-    let frac = inputs.org.weapon_pos_frac;
-    let mut factor = 1.0 - frac * FLINCH_ADS_HALF;
-    if frac != 0.0 && inputs.overlay_reticle != 0 {
-        factor = (frac * FLINCH_ADS_HALF + 1.0) * factor;
+    let ads = frame.org.gun_raise_share;
+    let mut stretch = 1.0 - ads * FLINCH_ADS_HALF;
+    if ads != 0.0 && frame.hud_crosshair_layer != 0 {
+        stretch = (ads * FLINCH_ADS_HALF + 1.0) * stretch;
     }
-    let delta = inputs.time.wrapping_sub(inputs.damage_time) as f32;
-    let weight = if delta < FLINCH_DEFLECT_MS {
-        get_lean_fraction(delta / FLINCH_DEFLECT_MS)
+    let since = frame.time.wrapping_sub(frame.hurt_stamp_ms) as f32;
+    let w = if since < FLINCH_DEFLECT_MS {
+        lean_amount(since / FLINCH_DEFLECT_MS)
     } else {
-        let left = 1.0 - (delta - FLINCH_DEFLECT_MS) / FLINCH_RETURN_MS;
-        if !(left > 0.0) {
+        let back_left = 1.0 - (since - FLINCH_DEFLECT_MS) / FLINCH_RETURN_MS;
+        if !(back_left > 0.0) {
             return;
         }
-        1.0 - get_lean_fraction(1.0 - left)
+        1.0 - lean_amount(1.0 - back_left)
     };
-    let scale = weight * factor;
-    angles.pitch += scale * inputs.v_dmg_pitch;
-    angles.roll += scale * inputs.v_dmg_roll;
+    let kick_k = w * stretch;
+    cam.pitch += kick_k * frame.hurt_kick_pitch;
+    cam.roll += kick_k * frame.hurt_kick_roll;
 }
 
 /// The camera's turn from the last hit alone.
-pub fn view_damage_angles(inputs: ViewAngleBobInputs) -> ViewAngleBob {
-    let mut angles = ViewAngleBob::default();
-    add_flinch(&mut angles, inputs);
-    angles
+pub fn view_damage_angles(frame: CameraTiltSwayFeed) -> CameraTiltSway {
+    let mut cam = CameraTiltSway::default();
+    add_flinch(&mut cam, frame);
+    cam
 }
 
 /// Runs the scope's drift on and adds it to the camera.
-fn add_camera_idle(angles: &mut ViewAngleBob, inputs: ViewAngleBobInputs) {
-    let frac = inputs.org.weapon_pos_frac;
-    if inputs.overlay_reticle == 0 || frac == 0.0 {
+fn add_camera_idle(cam: &mut CameraTiltSway, frame: CameraTiltSwayFeed) {
+    let ads = frame.org.gun_raise_share;
+    if frame.hud_crosshair_layer == 0 || ads == 0.0 {
         return;
     }
-    let ps = WeaponPlacementPsInputs {
-        e_flags: inputs.e_flags,
-        weapon_pos_frac: frac,
-        aim_down_sight: inputs.aim_down_sight,
-        overlay_reticle: inputs.overlay_reticle,
-        ..WeaponPlacementPsInputs::default()
+    let view_ps = GunPosePlayerFeed {
+        ent_bits: frame.ent_bits,
+        gun_raise_share: ads,
+        scoped_aiming: frame.scoped_aiming,
+        hud_crosshair_layer: frame.hud_crosshair_layer,
+        ..Default::default()
     };
-    let (amount, speed) = weapon_idle_amount_speed(ps, inputs.idle);
+    let (drift_amt, drift_spd) = weapon_idle_amount_speed(view_ps, frame.idle);
     // bo2mp: holding the breath slows the scope's drift in time as well as in size (Black Ops'
     // view idle: the time step is scaled by `holdBreathScale`).
-    angles.weap_idle_time = angles.weap_idle_time.wrapping_add(idle_clock_step(
-        inputs.hold_breath_scale * speed,
-        inputs.frametime,
+    cam.gun_idle_clock = cam.gun_idle_clock.wrapping_add(idle_clock_step(
+        frame.steady_aim_factor * drift_spd,
+        frame.step_millis_elapsed,
     ));
-    angles.view_last_idle_factor = step_idle_factor(
-        angles.view_last_idle_factor,
-        idle_e_flags(inputs.e_flags, inputs.org.pm_flags),
-        inputs.idle,
-        inputs.frametime,
+    cam.view_prev_sway_ratio = step_idle_factor(
+        cam.view_prev_sway_ratio,
+        idle_e_flags(frame.ent_bits, frame.org.movement_state_bits),
+        frame.idle,
+        frame.step_millis_elapsed,
     );
 
-    let scale = angles.view_last_idle_factor
-        * amount
-        * frac
-        * inputs.hold_breath_scale
-        * WEAPON_IDLE_SIN_SCALE;
-    let t = angles.weap_idle_time as f32;
-    let yaw = libm::sinf(t * WEAPON_IDLE_YAW_FREQ) * scale;
-    let pitch = libm::sinf(t * WEAPON_IDLE_PITCH_FREQ) * scale;
-    angles.cam_idle_yaw = yaw;
-    angles.cam_idle_pitch = pitch;
-    angles.yaw += yaw;
-    angles.pitch += pitch;
+    let strength = cam.view_prev_sway_ratio
+        * drift_amt
+        * ads
+        * frame.steady_aim_factor
+        * GUN_REST_WAVE_FACTOR;
+    let clock = cam.gun_idle_clock as f32;
+    let idle_yaw = libm::sinf(clock * REST_YAW_HZ) * strength;
+    let idle_pitch = libm::sinf(clock * REST_PITCH_HZ) * strength;
+    cam.camera_rest_turn = idle_yaw;
+    cam.camera_rest_nod = idle_pitch;
+    cam.yaw += idle_yaw;
+    cam.pitch += idle_pitch;
 }
 
 /// The camera's turn for the frame: the flinch, the scope's drift and the bob.
-pub fn view_angle_bob(inputs: ViewAngleBobInputs) -> ViewAngleBob {
-    let mut angles = ViewAngleBob {
-        weap_idle_time: inputs.weap_idle_time,
-        view_last_idle_factor: inputs.view_last_idle_factor,
-        ..ViewAngleBob::default()
+pub fn view_angle_bob(frame: CameraTiltSwayFeed) -> CameraTiltSway {
+    let mut cam = CameraTiltSway {
+        gun_idle_clock: frame.gun_idle_clock,
+        view_prev_sway_ratio: frame.view_prev_sway_ratio,
+        ..Default::default()
     };
-    add_flinch(&mut angles, inputs);
-    add_camera_idle(&mut angles, inputs);
-    add_overlay_bob(&mut angles, inputs);
-    take_ads_bob(&mut angles, inputs);
-    angles
+    add_flinch(&mut cam, frame);
+    add_camera_idle(&mut cam, frame);
+    add_overlay_bob(&mut cam, frame);
+    take_ads_bob(&mut cam, frame);
+    cam
 }
 
 /// bo2mp: the walk bob part of [`view_angle_bob`] alone (the scope's bob and the ADS bob,
 /// pitch / yaw / roll), for a caller that puts in its own or moves it into the aim.
-pub fn view_walk_bob_angles(inputs: ViewAngleBobInputs) -> [f32; 3] {
-    let mut angles = ViewAngleBob::default();
-    add_overlay_bob(&mut angles, inputs);
-    take_ads_bob(&mut angles, inputs);
-    [angles.pitch, angles.yaw, angles.roll]
+pub fn view_walk_bob_angles(frame: CameraTiltSwayFeed) -> [f32; 3] {
+    let mut cam = CameraTiltSway::default();
+    add_overlay_bob(&mut cam, frame);
+    take_ads_bob(&mut cam, frame);
+    [cam.pitch, cam.yaw, cam.roll]
 }
 
 #[cfg(test)]
@@ -569,17 +573,17 @@ mod tests {
     use super::*;
 
     /// Peak of the side to side sway.
-    fn side_peak(org: ViewOrgBobInputs) -> f32 {
+    fn side_peak(org: CameraHeightSwayFeed) -> f32 {
         bob_side(FRAC_PI_2, org)
     }
 
-    fn prone(bo2: bool, perks0: u32) -> ViewOrgBobInputs {
-        ViewOrgBobInputs {
-            xyspeed: 20.0,
-            view_height_target: 0x0b,
-            perks0,
+    fn prone(bo2: bool, perks: [u32; 2]) -> CameraHeightSwayFeed {
+        CameraHeightSwayFeed {
+            ground_velocity: 20.0,
+            eye_height_goal: 0x0b,
+            perks,
             bo2,
-            ..ViewOrgBobInputs::default()
+            ..CameraHeightSwayFeed::default()
         }
     }
 
@@ -600,17 +604,17 @@ mod tests {
     fn a_hit_rolls_the_view_the_way_bo2_does() {
         // Looking along +x; a hit travelling +y (yaw byte 64, about 90.4).
         let hit = damage_feedback_kick_bo2(64, 0, 40, [0.0; 3], false).unwrap();
-        assert!((hit.v_dmg_roll + 7.0).abs() < 0.01, "{hit:?}");
-        assert!(hit.v_dmg_pitch.abs() < 0.1, "{hit:?}");
+        assert!((hit.hurt_kick_roll + 7.0).abs() < 0.01, "{hit:?}");
+        assert!(hit.hurt_kick_pitch.abs() < 0.1, "{hit:?}");
         // MW2 rolls the other way.
         let mw2 = damage_feedback_kick(64, 0, 35, [0.0; 3]);
-        assert!(mw2.v_dmg_roll > 6.9, "{mw2:?}");
+        assert!(mw2.hurt_kick_roll > 6.9, "{mw2:?}");
         // A hit travelling the way he looks (yaw byte 0, pitch byte 1).
         let ahead = damage_feedback_kick_bo2(0, 1, 40, [0.0; 3], false).unwrap();
-        assert!((ahead.v_dmg_pitch - 7.0).abs() < 0.01, "{ahead:?}");
+        assert!((ahead.hurt_kick_pitch - 7.0).abs() < 0.01, "{ahead:?}");
         // No direction: the view tips up by the whole flinch.
         let none = damage_feedback_kick_bo2(255, 255, 40, [0.0; 3], true).unwrap();
-        assert_eq!((none.v_dmg_pitch, none.v_dmg_roll), (-1.75, 0.0));
+        assert_eq!((none.hurt_kick_pitch, none.hurt_kick_roll), (-1.75, 0.0));
         // 0/0 keeps the last flinch's angles.
         assert_eq!(damage_feedback_kick_bo2(0, 0, 40, [0.0; 3], false), None);
     }
@@ -640,16 +644,16 @@ mod tests {
     fn small_hits_flinch_less_in_bo2() {
         let hit = |min| {
             damage_kick_with_min(
-                VIEW_DAMAGE_UNDIRECTED,
-                VIEW_DAMAGE_UNDIRECTED,
+                HIT_FLINCH_NO_DIRECTION,
+                HIT_FLINCH_NO_DIRECTION,
                 10,
                 [0.0; 3],
                 min,
             )
         };
         // 10 damage x 0.2 = 2: Black Ops keeps 2, MW2 raises it to 5.
-        assert_eq!(hit(KICK_MIN_BO2).v_dmg_pitch, -2.0);
-        assert_eq!(hit(KICK_MIN).v_dmg_pitch, -5.0);
+        assert_eq!(hit(KICK_MIN_BO2).hurt_kick_pitch, -2.0);
+        assert_eq!(hit(KICK_MIN).hurt_kick_pitch, -5.0);
     }
 
     #[test]
@@ -663,11 +667,11 @@ mod tests {
 
     #[test]
     fn a_fall_from_rest_lands_from_the_height_it_fell() {
-        let height = crash_land_fall_height(800, 100.0, 0.0, 0.0).unwrap();
+        let height = hard_landing_drop(800, 100.0, 0.0, 0.0).unwrap();
         assert!((height - 100.0).abs() < 1e-3, "{height}");
-        assert_eq!(crash_land_fall_height(0, 100.0, 0.0, 0.0), None);
+        assert_eq!(hard_landing_drop(0, 100.0, 0.0, 0.0), None);
         // Rising faster than it can ever come down from: no such fall.
-        assert_eq!(crash_land_fall_height(800, 0.0, 100.0, 0.0), None);
+        assert_eq!(hard_landing_drop(800, 0.0, 100.0, 0.0), None);
     }
 
     #[test]
@@ -684,46 +688,52 @@ mod tests {
 
     #[test]
     fn prone_head_bob_is_black_ops_size() {
-        assert!((side_peak(prone(true, 0)) - 0.08 * 20.0).abs() < 1e-4);
-        assert!((side_peak(prone(false, 0)) - 0.02 * 20.0).abs() < 1e-4);
+        assert!((side_peak(prone(true, [0; 2])) - 0.08 * 20.0).abs() < 1e-4);
+        assert!((side_peak(prone(false, [0; 2])) - 0.02 * 20.0).abs() < 1e-4);
     }
 
     #[test]
     fn a_swimmer_bobs_by_its_own_amount_at_any_speed() {
-        let swim = |bo2, xyspeed| ViewOrgBobInputs {
+        let swim = |bo2, ground_velocity| CameraHeightSwayFeed {
             waterlevel: 4,
-            xyspeed,
-            ..prone(bo2, 0)
+            ground_velocity,
+            ..prone(bo2, [0; 2])
         };
         assert!((side_peak(swim(true, 20.0)) - 3.0).abs() < 1e-4);
         assert!((side_peak(swim(true, 200.0)) - 3.0).abs() < 1e-4);
         // MW2 has no swimming.
         assert!((side_peak(swim(false, 20.0)) - 0.02 * 20.0).abs() < 1e-4);
         // Treading water still bobs; standing still on land does not.
-        let still = ViewOrgBobInputs {
-            bob_cycle: 64,
+        let still = CameraHeightSwayFeed {
+            sway_phase: 64,
             ..swim(true, 0.0)
         };
         assert!(view_org_bob(still).vertical != 0.0);
-        let dry = ViewOrgBobInputs {
+        let dry = CameraHeightSwayFeed {
             waterlevel: 3,
             ..still
         };
-        assert_eq!(view_org_bob(dry), ViewOrgBob::default());
+        assert_eq!(view_org_bob(dry), CameraHeightSway::default());
     }
 
     #[test]
     fn lightweight_does_not_shrink_the_bo2_head_bob() {
-        let lw = PERK_LIGHTWEIGHT_VIEW_BOB_BIT;
-        assert_eq!(side_peak(prone(true, lw)), side_peak(prone(true, 0)));
-        assert!(side_peak(prone(false, lw)) < side_peak(prone(false, 0)));
+        // Move-faster is perk 40: bit 8 of the second word.
+        let lw = [0, 1 << 8];
+        assert_eq!(side_peak(prone(true, lw)), side_peak(prone(true, [0; 2])));
+        assert!(side_peak(prone(false, lw)) < side_peak(prone(false, [0; 2])));
+        // The first word's bit 8 is another perk.
+        assert_eq!(
+            side_peak(prone(false, [1 << 8, 0])),
+            side_peak(prone(false, [0; 2]))
+        );
     }
 
     #[test]
     fn a_dive_bobs_the_dive_amount_in_bo2_only() {
-        let dive = |bo2| ViewOrgBobInputs {
-            pm_flags: PMF_DIVE_ANY,
-            ..prone(bo2, 0)
+        let dive = |bo2| CameraHeightSwayFeed {
+            movement_state_bits: PMF_DIVE_ANY,
+            ..prone(bo2, [0; 2])
         };
         assert!((side_peak(dive(true)) - 0.002 * 20.0).abs() < 1e-5);
         assert!((side_peak(dive(false)) - 0.02 * 20.0).abs() < 1e-4);
@@ -731,80 +741,80 @@ mod tests {
 
     #[test]
     fn the_flinch_goes_out_fast_and_is_gone_after_half_a_second() {
-        let hit = |time| ViewAngleBobInputs {
+        let hit = |time| CameraTiltSwayFeed {
             time,
-            damage_time: 1000,
-            v_dmg_pitch: 4.0,
-            v_dmg_roll: -2.0,
-            ..ViewAngleBobInputs::default()
+            hurt_stamp_ms: 1000,
+            hurt_kick_pitch: 4.0,
+            hurt_kick_roll: -2.0,
+            ..Default::default()
         };
-        let none = view_damage_angles(ViewAngleBobInputs::default());
-        assert_eq!(none, ViewAngleBob::default());
+        let none = view_damage_angles(CameraTiltSwayFeed::default());
+        assert_eq!(none, CameraTiltSway::default());
         let early = view_damage_angles(hit(1050));
         assert!((early.pitch - 0.75 * 4.0).abs() < 1e-6 && (early.roll + 0.75 * 2.0).abs() < 1e-6);
         let peak = view_damage_angles(hit(1100));
         assert!((peak.pitch - 4.0).abs() < 1e-6);
-        assert_eq!(view_damage_angles(hit(1500)), ViewAngleBob::default());
+        assert_eq!(view_damage_angles(hit(1500)), CameraTiltSway::default());
     }
 
     #[test]
     fn the_scope_drifts_only_while_the_sights_are_up_and_slows_with_the_breath() {
-        let scoped = |hold_breath_scale| ViewAngleBobInputs {
-            org: ViewOrgBobInputs {
-                weapon_pos_frac: 1.0,
-                ..ViewOrgBobInputs::default()
+        let scoped = |steady_aim_factor| CameraTiltSwayFeed {
+            org: CameraHeightSwayFeed {
+                gun_raise_share: 1.0,
+                ..CameraHeightSwayFeed::default()
             },
-            overlay_reticle: 1,
-            aim_down_sight: true,
-            idle: WeaponIdleInputs {
+            hud_crosshair_layer: 1,
+            scoped_aiming: true,
+            idle: GunRestDriftFeed {
                 ads_idle_amount: 10.0,
                 ads_idle_speed: 1.0,
-                ..WeaponIdleInputs::default()
+                ..GunRestDriftFeed::default()
             },
-            frametime: 0.05,
-            hold_breath_scale,
-            view_last_idle_factor: 1.0,
-            ..ViewAngleBobInputs::default()
+            step_millis_elapsed: 0.05,
+            steady_aim_factor,
+            view_prev_sway_ratio: 1.0,
+            ..Default::default()
         };
         let free = view_angle_bob(scoped(1.0));
-        assert_eq!(free.weap_idle_time, 50);
+        assert_eq!(free.gun_idle_clock, 50);
         assert!(
-            free.cam_idle_yaw > 0.0 && free.cam_idle_pitch > 0.0,
+            free.camera_rest_turn > 0.0 && free.camera_rest_nod > 0.0,
             "{free:?}"
         );
-        assert_eq!(view_angle_bob(scoped(0.5)).weap_idle_time, 25);
+        assert_eq!(view_angle_bob(scoped(0.5)).gun_idle_clock, 25);
 
-        let hip = ViewAngleBobInputs {
-            overlay_reticle: 0,
+        let hip = CameraTiltSwayFeed {
+            hud_crosshair_layer: 0,
             ..scoped(1.0)
         };
         let out = view_angle_bob(hip);
         assert_eq!(
-            (out.cam_idle_yaw, out.cam_idle_pitch, out.weap_idle_time),
+            (out.camera_rest_turn, out.camera_rest_nod, out.gun_idle_clock),
             (0.0, 0.0, 0)
         );
     }
 
     #[test]
     fn the_ads_bob_is_taken_off_the_camera_unless_on_a_turret() {
-        let moving = ViewAngleBobInputs {
-            org: ViewOrgBobInputs {
-                bob_cycle: 40,
-                xyspeed: 200.0,
-                weapon_pos_frac: 1.0,
-                ..ViewOrgBobInputs::default()
+        let moving = CameraTiltSwayFeed {
+            org: CameraHeightSwayFeed {
+                sway_phase: 40,
+                ground_velocity: 200.0,
+                gun_raise_share: 1.0,
+                ..CameraHeightSwayFeed::default()
             },
             ads_view_bob_mult: 0.5,
-            ..ViewAngleBobInputs::default()
+            ..Default::default()
         };
         let [pitch, yaw, _] = view_walk_bob_angles(moving);
         assert!(pitch != 0.0 && yaw != 0.0);
-        let turret = ViewAngleBobInputs {
-            e_flags: EFLAGS_TURRET_VEHICLE,
+        let turret = CameraTiltSwayFeed {
+            ent_bits: EFLAGS_TURRET_VEHICLE,
             ..moving
         };
         assert_eq!(view_walk_bob_angles(turret), [0.0; 3]);
-        let no_mult = ViewAngleBobInputs {
+        let no_mult = CameraTiltSwayFeed {
             ads_view_bob_mult: 0.0,
             ..moving
         };

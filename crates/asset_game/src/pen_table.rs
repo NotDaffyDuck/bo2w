@@ -1,6 +1,6 @@
 //! The bullet penetration depths, read from the multiplayer raw file.
 
-use weapon_t6::penetration::{PenetrationDepthTable, split_pen_key_in};
+use weapon_t6::penetration::{BulletPierceDepthChart, split_pen_key_in};
 use weapon_t6::surface::T6_SURFACE_TYPE_NAMES;
 
 /// The word the raw file starts with.
@@ -11,14 +11,14 @@ const HEADER_WORD: &str = "BULLET_PEN_TABLE";
 /// Padding zeros after the text are ignored. A missing header word, a key
 /// that names no surface, a dangling key or a depth that is not a number all
 /// reject the whole file, and the error says which.
-pub fn parse_pen_table_t6(data: &[u8]) -> Result<PenetrationDepthTable, &'static str> {
+pub fn parse_pen_table_t6(data: &[u8]) -> Result<BulletPierceDepthChart, &'static str> {
     let end = data.iter().rposition(|&byte| byte != 0).map_or(0, |last| last + 1);
     let text = core::str::from_utf8(&data[..end]).map_err(|_| "not text")?;
     let body = text
         .trim()
         .strip_prefix(HEADER_WORD)
         .ok_or("no header word")?;
-    let mut table = PenetrationDepthTable::empty();
+    let mut table = BulletPierceDepthChart::empty();
     let mut tokens = body.split('\\').filter(|token| !token.is_empty());
     while let Some(key) = tokens.next() {
         let depth: f32 = tokens
@@ -26,9 +26,9 @@ pub fn parse_pen_table_t6(data: &[u8]) -> Result<PenetrationDepthTable, &'static
             .ok_or("key without a depth")?
             .parse()
             .map_err(|_| "depth is not a number")?;
-        let (penetrate_type, surface) =
+        let (wall_pierce_class, surface) =
             split_pen_key_in(key, &T6_SURFACE_TYPE_NAMES).ok_or("key names no surface")?;
-        table.set_depth(penetrate_type, surface, depth);
+        table.put_depth(wall_pierce_class, surface, depth);
     }
     Ok(table)
 }

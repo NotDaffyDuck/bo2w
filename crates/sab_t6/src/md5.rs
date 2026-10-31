@@ -65,38 +65,41 @@ impl Md5 {
         self.state[3] = self.state[3].wrapping_add(d);
     }
 
-    pub fn update(&mut self, mut data: &[u8]) {
-        self.length = self.length.wrapping_add(data.len() as u64);
+    pub fn feed_bytes(&mut self, input: &[u8]) {
+        self.length = self.length.wrapping_add(input.len() as u64);
+        let mut rest = input;
         if self.buffered > 0 {
-            let take = (64 - self.buffered).min(data.len());
-            self.buffer[self.buffered..self.buffered + take].copy_from_slice(&data[..take]);
-            self.buffered += take;
-            data = &data[take..];
+            // Top up the partial block first; it runs once it holds 64 bytes.
+            let (head, tail) = rest.split_at((64 - self.buffered).min(rest.len()));
+            self.buffer[self.buffered..][..head.len()].copy_from_slice(head);
+            self.buffered += head.len();
+            rest = tail;
             if self.buffered == 64 {
-                let b = self.buffer;
-                self.block(&b);
+                let full = self.buffer;
+                self.block(&full);
                 self.buffered = 0;
             }
         }
-        while data.len() >= 64 {
-            let mut b = [0u8; 64];
-            b.copy_from_slice(&data[..64]);
-            self.block(&b);
-            data = &data[64..];
+        let mut whole = rest.chunks_exact(64);
+        for chunk in whole.by_ref() {
+            let mut full = [0u8; 64];
+            full.copy_from_slice(chunk);
+            self.block(&full);
         }
-        if !data.is_empty() {
-            self.buffer[..data.len()].copy_from_slice(data);
-            self.buffered = data.len();
+        let left = whole.remainder();
+        self.buffer[..left.len()].copy_from_slice(left);
+        if !left.is_empty() {
+            self.buffered = left.len();
         }
     }
 
     pub fn finish(mut self) -> [u8; 16] {
         let bits = self.length.wrapping_mul(8);
-        self.update(&[0x80]);
+        self.feed_bytes(&[0x80]);
         while self.buffered != 56 {
-            self.update(&[0]);
+            self.feed_bytes(&[0]);
         }
-        self.update(&bits.to_le_bytes());
+        self.feed_bytes(&bits.to_le_bytes());
         let mut out = [0u8; 16];
         for (i, w) in self.state.iter().enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -109,16 +112,12 @@ impl Md5 {
 mod tests {
     use super::*;
 
-    fn hex(d: [u8; 16]) -> String {
-        d.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
     #[test]
     fn rfc_vectors() {
         let md5 = |s: &[u8]| {
             let mut m = Md5::new();
-            m.update(s);
-            hex(m.finish())
+            m.feed_bytes(s);
+            m.finish().iter().map(|b| format!("{b:02x}")).collect::<String>()
         };
         assert_eq!(md5(b""), "d41d8cd98f00b204e9800998ecf8427e");
         assert_eq!(md5(b"abc"), "900150983cd24fb0d6963f7d28e17f72");

@@ -20,10 +20,11 @@ mod testdir;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
 
 use install::Outcome;
 use manifest::{GAME_FILE, Manifest};
+use std::process::Command;
+use std::process::ExitCode;
 
 const TAG: &str = "[bo2mp-launcher]";
 const UPDATE_URL_ENV: &str = "BO2MP_UPDATE_URL";
@@ -31,28 +32,29 @@ const UPDATE_FLAG_ENV: &str = "BO2MP_UPDATE";
 const GAMES_ENV: &str = "BO2MP_GAMES";
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{TAG} {error}");
-            // A window opened by double-click would vanish with the message.
-            #[cfg(windows)]
-            {
-                eprintln!("{TAG} press Enter to exit");
-                let _ = std::io::stdin().read_line(&mut String::new());
-            }
-            ExitCode::FAILURE
-        }
-    }
+    launch().map_or_else(report_failure, |()| ExitCode::SUCCESS)
 }
 
-fn run() -> Result<(), String> {
-    let dir = install_dir()?;
+/// Prints why the run stopped and hands back the failing exit status.
+fn report_failure(error: String) -> ExitCode {
+    eprintln!("{TAG} {error}");
+    // Double-clicked, the console closes with the message unless we wait.
+    #[cfg(windows)]
+    {
+        eprintln!("{TAG} press Enter to exit");
+        let mut ignored = String::new();
+        std::io::stdin().read_line(&mut ignored).ok();
+    }
+    ExitCode::from(1)
+}
+
+fn launch() -> Result<(), String> {
+    let dir = app_home_folder()?;
     sidecar::load(&dir)?;
-    println!("{TAG} install {}", dir.display());
+    println!("{TAG} install {shown}", shown = dir.display());
 
     let flag = std::env::var(UPDATE_FLAG_ENV).ok();
-    let release_env = if update_asked(std::env::args().skip(1), flag.as_deref()) {
+    let shipping_variables = if update_asked(std::env::args().skip(1), flag.as_deref()) {
         let channel = std::env::var(UPDATE_URL_ENV).ok();
         update(&dir, channel.as_deref(), http::get)?
     } else {
@@ -62,11 +64,11 @@ fn run() -> Result<(), String> {
         println!("{TAG} starting the {GAME_FILE} already here (pass `update` to fetch a new one)");
         BTreeMap::new()
     };
-    start_game(&dir, &release_env)
+    start_game(&dir, &shipping_variables)
 }
 
 /// The folder the launcher lives in, which is the install.
-fn install_dir() -> Result<PathBuf, String> {
+fn app_home_folder() -> Result<PathBuf, String> {
     let beside_exe = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
@@ -82,7 +84,7 @@ fn install_dir() -> Result<PathBuf, String> {
 fn update_asked(args: impl IntoIterator<Item = String>, flag: Option<&str>) -> bool {
     if args
         .into_iter()
-        .any(|arg| arg == "update" || arg == "--update")
+        .any(|word| matches!(word.as_str(), "update" | "--update"))
     {
         return true;
     }
@@ -91,10 +93,10 @@ fn update_asked(args: impl IntoIterator<Item = String>, flag: Option<&str>) -> b
 }
 
 fn game_missing(dir: &Path) -> String {
+    let shown = dir.display();
     format!(
-        "{GAME_FILE} is not in {}. A release archive carries it; to fetch one instead, \
-         run `bo2mp-launcher update` with {UPDATE_URL_ENV} set in the portable .env",
-        dir.display()
+        "{GAME_FILE} is not in {shown}. A release archive carries it; to fetch one instead, \
+         run `bo2mp-launcher update` with {UPDATE_URL_ENV} set in the portable .env"
     )
 }
 
@@ -108,25 +110,24 @@ fn update(
     let base = channel::base_from(channel)?;
     println!("{TAG} channel {base}");
 
-    let manifest = Manifest::parse(&get(&channel::address_of(&base, "manifest.json"))?)?;
-    for entry in &manifest.files {
+    let Manifest { channel: lane, protocol, git, env, files } =
+        Manifest::parse(&get(&channel::address_of(&base, "manifest.json"))?)?;
+    for shipped in &files {
         let fetch = |name: &str| get(&channel::address_of(&base, name));
-        match install::bring_in(dir, entry, fetch)? {
-            Outcome::Current => println!("{TAG} {} up to date", entry.path),
-            Outcome::Installed => println!("{TAG} installed {}", entry.path),
+        let shown = &shipped.path;
+        match install::bring_in(dir, shipped, fetch)? {
+            Outcome::Current => println!("{TAG} {shown} up to date"),
+            Outcome::Installed => println!("{TAG} installed {shown}"),
         }
     }
-    sidecar::write_first(dir, &manifest.env, channel)?;
-    println!(
-        "{TAG} updated to channel={} protocol={} git={}",
-        manifest.channel, manifest.protocol, manifest.git
-    );
-    Ok(manifest.env)
+    sidecar::write_first(dir, &env, channel)?;
+    println!("{TAG} updated to channel={lane} protocol={protocol} git={git}");
+    Ok(env)
 }
 
-fn start_game(dir: &Path, release_env: &BTreeMap<String, String>) -> Result<(), String> {
+fn start_game(dir: &Path, shipping_variables: &BTreeMap<String, String>) -> Result<(), String> {
     println!("{TAG} starting {GAME_FILE}");
-    game_command(dir, release_env, |name| std::env::var_os(name).is_some())
+    game_command(dir, shipping_variables, |name| std::env::var_os(name).is_some())
         .spawn()
         .map(drop)
         .map_err(|error| format!("spawn {GAME_FILE}: {error}"))
@@ -137,7 +138,7 @@ fn start_game(dir: &Path, release_env: &BTreeMap<String, String>) -> Result<(), 
 /// player has not already set.
 fn game_command(
     dir: &Path,
-    release_env: &BTreeMap<String, String>,
+    shipping_variables: &BTreeMap<String, String>,
     is_set: impl Fn(&str) -> bool,
 ) -> Command {
     let mut game = Command::new(dir.join(GAME_FILE));
@@ -145,9 +146,9 @@ fn game_command(
     if !is_set(GAMES_ENV) {
         game.env(GAMES_ENV, dir);
     }
-    for (name, value) in release_env {
-        if !is_set(name) {
-            game.env(name, value);
+    for (key, default) in shipping_variables {
+        if !is_set(key) {
+            game.env(key, default);
         }
     }
     game
@@ -213,12 +214,12 @@ mod tests {
             }
         }
 
-        fn get(&self, url: &str) -> Result<Vec<u8>, String> {
-            self.asked.borrow_mut().push(url.to_owned());
+        fn answer(&self, address: &str) -> Result<Vec<u8>, String> {
+            self.asked.borrow_mut().push(address.to_owned());
             self.answers
-                .get(url)
+                .get(address)
                 .cloned()
-                .ok_or_else(|| format!("GET {url}: HTTP/1.1 404 Not Found"))
+                .ok_or_else(|| format!("GET {address}: HTTP/1.1 404 Not Found"))
         }
 
         fn asked(&self) -> Vec<String> {
@@ -252,13 +253,13 @@ mod tests {
 
     #[test]
     fn a_missing_game_says_how_to_fetch_one() {
-        let message = game_missing(Path::new("C:/games/bo2mp"));
+        let said = game_missing(Path::new("C:/games/bo2mp"));
         assert!(
-            message.contains("bo2mp.exe is not in C:/games/bo2mp"),
-            "{message}"
+            said.contains("bo2mp.exe is not in C:/games/bo2mp"),
+            "{said}"
         );
-        assert!(message.contains("`bo2mp-launcher update`"), "{message}");
-        assert!(message.contains("BO2MP_UPDATE_URL"), "{message}");
+        assert!(said.contains("`bo2mp-launcher update`"), "{said}");
+        assert!(said.contains("BO2MP_UPDATE_URL"), "{said}");
     }
 
     #[test]
@@ -277,7 +278,7 @@ mod tests {
             ("BO2MP_MASTER_ADDR", "release:4433"),
             ("BO2MP_MASTER_SERVER_NAME", "release-name"),
         ]
-        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .map(|pair| (pair.0.to_owned(), pair.1.to_owned()))
         .into();
         let set = ["BO2MP_MASTER_ADDR"];
         let game = game_command(dir, &release, |name| set.contains(&name));
@@ -305,7 +306,7 @@ mod tests {
         let env = update(
             dir.path(),
             Some(" https://updates.example.net/prod/ "),
-            |url| channel.get(url),
+            |url| channel.answer(url),
         )
         .unwrap();
 
@@ -324,7 +325,7 @@ mod tests {
             sidecar.ends_with("BO2MP_UPDATE_URL=https://updates.example.net/prod/\n"),
             "{sidecar}"
         );
-        assert_eq!(dir.names(), [".env", "bo2mp-ca.pem", "bo2mp.exe"]);
+        assert_eq!(dir.entry_names(), [".env", "bo2mp-ca.pem", "bo2mp.exe"]);
         assert_eq!(
             channel.asked(),
             [
@@ -339,11 +340,11 @@ mod tests {
     fn a_second_update_downloads_nothing_it_already_has() {
         let dir = TestDir::new("second-update");
         let channel = FakeChannel::release(b"game", b"ca");
-        update(dir.path(), Some(CHANNEL), |url| channel.get(url)).unwrap();
+        update(dir.path(), Some(CHANNEL), |url| channel.answer(url)).unwrap();
         fs::write(dir.join(".env"), "BO2MP_MASTER_ADDR=edited\n").unwrap();
         let before = channel.asked().len();
 
-        update(dir.path(), Some(CHANNEL), |url| channel.get(url)).unwrap();
+        update(dir.path(), Some(CHANNEL), |url| channel.answer(url)).unwrap();
         assert_eq!(
             channel.asked()[before..],
             [format!("{CHANNEL}/manifest.json")]
@@ -359,7 +360,7 @@ mod tests {
         let dir = TestDir::new("lost-file");
         let mut channel = FakeChannel::release(b"game", b"ca");
         channel.answers.remove(&format!("{CHANNEL}/bo2mp-ca.pem"));
-        let error = update(dir.path(), Some(CHANNEL), |url| channel.get(url)).unwrap_err();
+        let error = update(dir.path(), Some(CHANNEL), |url| channel.answer(url)).unwrap_err();
         assert!(error.contains("404"), "{error}");
         assert!(!dir.join(".env").exists());
     }
@@ -371,10 +372,10 @@ mod tests {
         channel
             .answers
             .insert(format!("{CHANNEL}/manifest.json"), b"{ not json".to_vec());
-        let error = update(dir.path(), Some(CHANNEL), |url| channel.get(url)).unwrap_err();
+        let error = update(dir.path(), Some(CHANNEL), |url| channel.answer(url)).unwrap_err();
         assert!(error.starts_with("manifest parse:"), "{error}");
         assert_eq!(channel.asked().len(), 1);
-        assert!(dir.names().is_empty());
+        assert!(dir.entry_names().is_empty());
     }
 
     #[test]
@@ -383,7 +384,7 @@ mod tests {
         let channel = FakeChannel::release(b"game", b"ca");
         for setting in [None, Some(""), Some("http://updates.example.net/prod")] {
             assert!(
-                update(dir.path(), setting, |url| channel.get(url)).is_err(),
+                update(dir.path(), setting, |url| channel.answer(url)).is_err(),
                 "{setting:?}"
             );
         }

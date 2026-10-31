@@ -185,6 +185,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "anim_bank"
+version = "0.1.0"
+dependencies = [
+ "asset_core",
+ "asset_t6",
+ "xmodel_runtime",
+]
+
+[[package]]
 name = "anim_t6"
 version = "0.1.0"
 
@@ -268,15 +277,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "asset_anim"
-version = "0.1.0"
-dependencies = [
- "asset_core",
- "asset_t6",
- "xmodel_runtime",
-]
-
-[[package]]
 name = "asset_audio"
 version = "0.1.0"
 dependencies = [
@@ -296,7 +296,7 @@ version = "0.1.0"
 name = "asset_game"
 version = "0.1.0"
 dependencies = [
- "asset_anim",
+ "anim_bank",
  "asset_audio",
  "asset_core",
  "asset_material",
@@ -388,7 +388,7 @@ dependencies = [
 name = "assets"
 version = "0.1.0"
 dependencies = [
- "asset_anim",
+ "anim_bank",
  "asset_audio",
  "asset_core",
  "asset_game",
@@ -549,6 +549,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bcdec_rs"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -689,8 +695,6 @@ dependencies = [
 [[package]]
 name = "bevy_audio"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06af3bd91de885f2a5c024569779a7fb43349df611d92f7b795c66c8797378db"
 dependencies = [
  "bevy_app",
  "bevy_asset",
@@ -1901,6 +1905,7 @@ dependencies = [
  "getrandom 0.3.4",
  "master_protocol",
  "quinn",
+ "rcgen",
  "rustls",
  "rustls-pemfile",
  "rustls-platform-verifier",
@@ -1917,7 +1922,9 @@ dependencies = [
  "asset_world",
  "bcdec_rs",
  "clipmap_t6",
+ "dpvs_t6",
  "fastfile_t6",
+ "glam",
  "gsc_t6",
  "hks_t6",
  "ipak_t6",
@@ -2440,10 +2447,6 @@ version = "0.1.0"
 [[package]]
 name = "d3d9_sm3"
 version = "0.1.0"
-dependencies = [
- "d3d9_decl",
- "d3d9_state",
-]
 
 [[package]]
 name = "d3d9_state"
@@ -2460,6 +2463,12 @@ name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
+name = "deranged"
+version = "0.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
 name = "derive_arbitrary"
@@ -3932,6 +3941,7 @@ name = "net"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bo2mp-master",
  "diag",
  "entity_t6",
  "frame",
@@ -3993,6 +4003,12 @@ dependencies = [
  "num-integer",
  "num-traits",
 ]
+
+[[package]]
+name = "num-conv"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "num-derive"
@@ -4545,6 +4561,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64",
+ "serde_core",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4665,6 +4691,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "powerfmt"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a6394b9e965e73d0a289ee54f589087e2c676aedf60885baf52c76b771e4958"
+
+[[package]]
 name = "pp-rs"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4754,8 +4786,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.17"
-source = "git+https://github.com/quinn-rs/quinn?rev=f650e0f213b01ea7bebd60023e5df7df65e5c2bd#f650e0f213b01ea7bebd60023e5df7df65e5c2bd"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -4876,6 +4909,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
+]
+
+[[package]]
 name = "read-fonts"
 version = "0.39.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4991,8 +5037,8 @@ dependencies = [
 name = "render_anim"
 version = "0.1.0"
 dependencies = [
+ "anim_bank",
  "anim_t6",
- "asset_anim",
  "asset_core",
  "asset_game",
  "asset_material",
@@ -5133,6 +5179,7 @@ dependencies = [
  "hud",
  "hud_t6",
  "lighting_t6",
+ "naga_oil",
  "perf",
  "render_frame",
  "render_material",
@@ -5498,7 +5545,7 @@ dependencies = [
 name = "session"
 version = "0.1.0"
 dependencies = [
- "asset_anim",
+ "anim_bank",
  "asset_audio",
  "asset_core",
  "asset_game",
@@ -5554,6 +5601,7 @@ name = "sim"
 version = "0.1.0"
 dependencies = [
  "anim_t6",
+ "asset_t6",
  "asset_world",
  "bevy_ecs",
  "bo2_profile",
@@ -6004,6 +6052,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "time"
+version = "0.3.55"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
+dependencies = [
+ "deranged",
+ "num-conv",
+ "powerfmt",
+ "serde_core",
+ "time-core",
+]
+
+[[package]]
+name = "time-core"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+
+[[package]]
 name = "tiny-skia"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6270,8 +6337,10 @@ dependencies = [
  "asset_transport",
  "asset_world",
  "assets",
+ "bcdec_rs",
  "bevy",
  "bo2_profile",
+ "cpal",
  "diag",
  "entity_t6",
  "frame",
@@ -7208,6 +7277,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "zip",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
 ]
 
 [[package]]

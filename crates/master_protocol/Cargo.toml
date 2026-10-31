@@ -1,6 +1,6 @@
 package.name = "master_protocol"
 package.version = "0.1.0"
 package.edition.workspace = true
-package.license.workspace = true
+package.publish.workspace = true
 package.description = "Wire format shared by the game and the bo2mp-master lobby service: control envelopes and relayed packets."
 lints.workspace = true

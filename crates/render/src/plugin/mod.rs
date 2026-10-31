@@ -3,29 +3,29 @@ mod hud_handoff;
 
 use bevy::prelude::*;
 use bevy::render::{ExtractSchedule, Render, RenderApp};
-use frame::{RenderSet, configure_render_sets};
-use net::ClientSet;
+use frame::{DrawPassStage, order_draw_stages};
+use net::ClientStep;
 
-use crate::diag::acceptance::register_acceptance_systems;
-use crate::diag::capture::{CaptureQueue, capture_frame, report_unwritten_captures};
-use crate::diag::frame_spans::register_frame_spans;
-use crate::diag::gpu_report::{gpu_report_enabled, report_gpu_allocator};
-use crate::diag::render_frame_diag::{register_render_frame_diag, sample_render_frame_diag};
-use crate::extract;
+use crate::checks::trial::register_acceptance_systems;
+use crate::checks::shots::{ScreenshotBacklog, grab_screenshot_frame, complain_uncaptured_outputs};
+use crate::checks::frame_timing::register_frame_spans;
+use crate::checks::gpu_report::{gpu_report_enabled, report_gpu_allocator};
+use crate::checks::frame_report::{register_render_frame_diag, sample_frame_diag};
+use crate::intake;
 
-pub struct RenderPlugin;
+pub struct PixelsPlugin;
 
-impl Plugin for RenderPlugin {
+impl Plugin for PixelsPlugin {
     fn build(&self, app: &mut App) {
-        configure_render_sets(app);
+        order_draw_stages(app);
         app.add_plugins((
-            render_anim::RenderAnimPlugin,
-            render_fx::RenderFxPlugin,
-            render_scene::RenderScenePlugin,
-            render_frontend::RenderPreparePlugin,
-            render_frontend::RenderAdaptersPlugin,
-            render_frontend::RenderAssemblePlugin,
-            render_gpu::RenderGpuPlugin,
+            render_anim::BodyAnimationPlugin,
+            render_fx::EffectsRenderPlugin,
+            render_scene::SceneRenderingModule,
+            render_frontend::DrawPreparePlugin,
+            render_frontend::DrawAdaptersPlugin,
+            render_frontend::DrawAssemblePlugin,
+            render_gpu::DrawGpuPlugin,
         ));
         add_main_world_handoffs(app);
 
@@ -34,34 +34,34 @@ impl Plugin for RenderPlugin {
         register_frame_spans(app);
         add_capture(app);
 
-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+        let Some(render_sub) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
-        render_app.add_systems(
+        render_sub.add_systems(
             ExtractSchedule,
             (
                 gpu_handoff::extract_gpu_load_progress,
-                extract::extract_exact_colour,
-                extract::extract_image_handles,
-                extract::extract_postfx,
-                extract::extract_model_lighting_tiles,
-                extract::extract_guest_weapons,
+                intake::pull_precise_colour,
+                intake::pull_image_handles_to_render_world,
+                intake::pull_screen_effects_to_render_world,
+                intake::extract_model_lighting_tiles,
+                intake::extract_guest_weapons,
             ),
         );
         if gpu_report_enabled() {
-            render_app.add_systems(Render, report_gpu_allocator);
+            render_sub.add_systems(Render, report_gpu_allocator);
         }
-        if render_gpu::geometry_diagnostic_enabled() {
+        if render_gpu::geometry_inspect_enabled() {
             // The first-person gun and arms (and later effects) are drawn by
             // the fallback path, which these feed.
-            render_app.add_systems(
+            render_sub.add_systems(
                 ExtractSchedule,
-                (extract::extract_geometry, extract::extract_t6_dynamic),
+                (intake::pull_geometry_to_render_world, intake::extract_t6_dynamic),
             );
         }
         // Only reached with a render world: a headless run returned above, and
         // without one every column of this diagnostic would stay NULL.
-        app.add_systems(Update, sample_render_frame_diag.in_set(ClientSet::Diag));
+        app.add_systems(Update, sample_frame_diag.in_set(ClientStep::Diag));
     }
 }
 
@@ -71,31 +71,31 @@ fn add_main_world_handoffs(app: &mut App) {
     app.add_systems(
         PostUpdate,
         (
-            gpu_handoff::stamp_gpu_submit_ready.after(RenderSet::FrontendAssemble),
+            gpu_handoff::stamp_gpu_submit_ready.after(DrawPassStage::FrontBuild),
             hud_handoff::publish_ui3d_frame
-                .after(RenderSet::FrontendAssemble)
-                .before(extract::seal_render_frame),
+                .after(DrawPassStage::FrontBuild)
+                .before(intake::seal_render_frame),
         ),
     )
     .add_systems(
         PostUpdate,
-        extract::seal_render_frame.after(gpu_handoff::stamp_gpu_submit_ready),
+        intake::seal_render_frame.after(gpu_handoff::stamp_gpu_submit_ready),
     )
     .add_systems(
         Update,
         hud_handoff::publish_overhead_posed_players
-            .after(frame::WorkerCmdSet::SkinModel)
+            .after(frame::JobQueueStage::SkinModel)
             .after(render_anim::occupancy::t6_body::T6BodyPosesPublished)
-            .in_set(hud::OverheadPosedPlayerFramePublished)
-            .in_set(ClientSet::Present),
+            .in_set(hud::NameplateBodyPoseShared)
+            .in_set(ClientStep::Present),
     );
 }
 
 fn add_capture(app: &mut App) {
-    app.init_resource::<CaptureQueue>().add_systems(
+    app.init_resource::<ScreenshotBacklog>().add_systems(
         Update,
-        (capture_frame, report_unwritten_captures)
+        (grab_screenshot_frame, complain_uncaptured_outputs)
             .chain()
-            .in_set(ClientSet::Diag),
+            .in_set(ClientStep::Diag),
     );
 }

@@ -12,28 +12,28 @@ mod buttons;
 mod client;
 mod held;
 mod look;
-mod names;
-mod usercmd;
-pub mod weapon_select;
+mod bind_ids;
+mod intent_cmd;
+pub mod gun_cycle;
 
 #[cfg(test)]
 mod tests;
 
 /// Key numbers a client tracks (the board, mouse and pad buttons).
-pub const KEY_COUNT: usize = 256;
+pub const KEYBOARD_SLOTS: usize = 256;
 
-pub use buttons::KbuttonSet;
-pub use client::{ClientInput, Holds, input_cmd, key_event, lower_key_held, set_ads};
-pub use held::{Kbutton, KeyState};
+pub use buttons::HeldKeyLatchBank;
+pub use client::{PlayerIntentFeed, Holds, input_cmd, key_event, lower_key_held, set_ads};
+pub use held::{HeldKeyLatch, KeyPressRecord};
 pub use look::{
-    ANGLE2SHORT, AdjustAnglesInput, CL_ANGLESPEEDKEY_DEFAULT, CL_PITCHSPEED_DEFAULT,
-    CL_YAWSPEED_DEFAULT, adjust_angles, apply_mouse_sensitivity, mouse_move_angles,
+    DEGREES_TO_WORD16, LookTurnRequest, FAST_TURN_KEY_RATIO, KEY_TILT_RATE,
+    KEY_TURN_RATE, adjust_angles, scale_pointer_motion, pointer_turn_units,
 };
-pub use names::{
-    HOLD_PAIR_LIMIT, INPUT_COMMAND_NAMES, INVENTORY_COMMAND, SCRIPT_KEYNUM,
-    WEAPNEXT_INVENTORY_DOWN, command_id_lookup, command_name, command_names, key_up_command_id,
+pub use bind_ids::{
+    HOLD_ID_END, BIND_COMMAND_TABLE, INVENTORY_COMMAND, SCRIPTED_KEY_SLOT,
+    WEAPNEXT_INVENTORY_DOWN, action_number_for, action_label, action_labels, release_action_number,
 };
-pub use usercmd::{
-    CreateCmdInput, MoveAxes, PITCH_STEP_MAX, axis_to_move, clamp_char, create_cmd,
-    pad_move_stretched, sample_move,
+pub use intent_cmd::{
+    IntentBuildRequest, StrideBasis, PITCH_STEP_MAX, stick_to_thrust, clamp_char, build_input_command,
+    pad_move_stretched, read_move_buttons,
 };

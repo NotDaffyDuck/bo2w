@@ -5,50 +5,50 @@ use std::sync::Arc;
 
 use bevy::prelude::Resource;
 
-use asset_anim::XAnimCatalog;
-use asset_core::{AssetEdge, MapXModelSpace, XAnimSpace};
-use asset_game::{LocalizeCatalog, WeaponRegistry};
-use asset_model::{BodyMeshCatalog, FpvMeshCatalog, ProjectileMeshCatalog, WorldWeaponCatalog};
+use anim_bank::MotionClipRoster;
+use asset_core::{AssetDependencyLink, MapXModelRange, XAnimRange};
+use asset_game::{TranslationStringIndex, WeaponLedger};
+use asset_model::{CharacterMeshRoster, FirstPersonMeshRoster, MissileMeshRoster, LevelWeaponRoster};
 
 #[derive(Clone, Debug, Default, Resource)]
-pub struct PreparedWeapons(pub Arc<WeaponRegistry>);
+pub struct StagedWeapons(pub Arc<WeaponLedger>);
 
 /// The sound names the match's effects reference through their type-10 entries.
 #[derive(Clone, Debug, Default, Resource)]
-pub struct MatchType10SoundHints(pub Vec<String>);
+pub struct RoundTenthKindAudioClues(pub Vec<String>);
 
 #[derive(Clone, Debug, Default, Resource)]
-pub struct PreparedFpvMeshes(pub FpvMeshCatalog);
+pub struct ReadiedFpvMeshes(pub FirstPersonMeshRoster);
 
 #[derive(Clone, Debug, Default, Resource)]
-pub struct PreparedBodies(pub Arc<BodyMeshCatalog>);
+pub struct ReadiedCharacterBodies(pub Arc<CharacterMeshRoster>);
 
 #[derive(Clone, Debug, Default, Resource)]
-pub struct PreparedWorldWeapons(pub WorldWeaponCatalog);
+pub struct ReadiedWorldWeapons(pub LevelWeaponRoster);
 
 #[derive(Clone, Debug, Default, Resource)]
-pub struct PreparedProjectileMeshes(pub ProjectileMeshCatalog);
+pub struct ReadiedProjectileMeshes(pub MissileMeshRoster);
 
 #[derive(Clone, Debug, Default, Resource)]
-pub struct PreparedXAnims(pub XAnimCatalog);
+pub struct StagedXAnims(pub MotionClipRoster);
 
 #[derive(Clone, Debug, Default, Resource)]
-pub struct PreparedLocalizedStrings(pub LocalizeCatalog);
+pub struct ReadiedLocalText(pub TranslationStringIndex);
 
 /// A marker the session installs for the model census; nothing fills it in.
 #[derive(Clone, Copy, Debug, Default, Resource)]
-pub struct PreparedXModelWalkCensus;
+pub struct ReadiedXModelWalkCensus;
 
 /// What a destructible plays and leaves behind when it dies, by kind. The
 /// hints name what to look for; `clip` and `husk` are what was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DestructibleDeathRow {
-    pub kind: &'static str,
-    pub clip_hint: &'static str,
-    pub husk_hint: &'static str,
-    pub clip: AssetEdge<XAnimSpace>,
-    pub husk: AssetEdge<MapXModelSpace>,
+pub struct BreakableDemiseRecord {
+    pub demise_kind: &'static str,
+    pub collision_clue: &'static str,
+    pub shell_corpse_clue: &'static str,
+    pub clip: AssetDependencyLink<XAnimRange>,
+    pub husk: AssetDependencyLink<MapXModelRange>,
 }
 
 #[derive(Clone, Debug, Default, Resource)]
-pub struct PreparedDestructibleDeath(pub Vec<DestructibleDeathRow>);
+pub struct ReadiedBreakableDeath(pub Vec<BreakableDemiseRecord>);

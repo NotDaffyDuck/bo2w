@@ -1,201 +1,143 @@
 //! The console variables of the renderer and the client, one table per
 //! resource that holds them.
 
-use net::ClientActionInput;
-use render_frontend::{
-    adapters::anim::view_kick::GunOffset,
-    assemble::drawsurf::{
-        ColourDrawMethod, DistortionSettings,
-        dof::{DofDvars, GlowDvars},
-        fog::FogDvars,
-    },
-    prepare::scene::{
-        smodel_geom_cache::{LodRampDvar, LodRampSkinnedDvar, SmcEnableDvar},
-        view_parms::{RZnearDepthhackDvar, RZnearDvar, SmEnableDvar, SmSunEnableDvar},
-    },
-};
-use render_fx::FxMarkDvars;
+use net::PlayerControlSnapshot;
+use render_frontend::adapters::motion::eye_kick::GunOffset;
+use render_frontend::assemble::draw_items::dof::{BloomTunables, BokehTunables};
+use render_frontend::assemble::draw_items::fog::HazeTunables;
+use render_frontend::assemble::draw_items::ColourPaintMethod;
+use render_frontend::assemble::draw_items::WarpSettings;
+use render_frontend::prepare::scene::eye_parms::GunNearClipSetting;
+use render_frontend::prepare::scene::eye_parms::NearClipSetting;
+use render_frontend::prepare::scene::eye_parms::SmEnableDvar;
+use render_frontend::prepare::scene::eye_parms::SmSunEnableDvar;
+use render_frontend::prepare::scene::prop_geom_memo::DetailRampSkinnedTunable;
+use render_frontend::prepare::scene::prop_geom_memo::DetailRampTunable;
+use render_frontend::prepare::scene::prop_geom_memo::PropCacheEnableTunable;
+use render_fx::EffectStainTunables;
+use render_fx::MarkSwitch;
 
-use super::{Dvar, DvarSet, Reading};
+use super::Dvar;
+use super::DvarSet;
+use super::Reading;
 
-impl DvarSet for GlowDvars {
+// One row per variable: `"name" => field.path`, then the help line. The row
+// syntax is not Rust expressions on purpose, so rustfmt keeps each row whole.
+
+/// On/off, kept in a `bool` field.
+macro_rules! flag {
+    ($name:literal => $($field:ident).+, $about:literal) => {
+        Dvar::<Self>::toggle(
+            $name,
+            $about,
+            |owner| owner.$($field).+.into(),
+            |owner, value| owner.$($field).+ = value != 0.0,
+        )
+    };
+}
+
+/// A number kept in an `f32` field, refused outside `low..=high`.
+macro_rules! ranged {
+    ($name:literal => $($field:ident).+ in $low:literal..=$high:literal, $about:literal) => {
+        Dvar::<Self>::range(
+            $name,
+            $about,
+            ($low, $high),
+            |owner| owner.$($field).+.into(),
+            |owner, value| owner.$($field).+ = value,
+        )
+    };
+}
+
+/// On/off for one of the effect-mark switches.
+macro_rules! mark_switch {
+    ($name:literal => $switch:ident, $about:literal) => {
+        Dvar::<Self>::toggle(
+            $name,
+            $about,
+            |marks| marks.is_on(MarkSwitch::$switch).into(),
+            |marks, value| marks.set(MarkSwitch::$switch, value != 0.0),
+        )
+    };
+}
+
+impl DvarSet for BloomTunables {
     const DVARS: &'static [Dvar<Self>] = &[
-        Dvar::<Self>::toggle(
-            "r_glow",
-            "glow on or off",
-            |glow| glow.enable.into(),
-            |glow, value| glow.enable = value != 0.0,
-        ),
-        Dvar::<Self>::toggle(
-            "r_glowUseTweaks",
-            "use the tweak values",
-            |glow| glow.use_tweaks.into(),
-            |glow, value| glow.use_tweaks = value != 0.0,
-        ),
-        Dvar::<Self>::toggle(
-            "r_glowTweakEnable",
-            "tweak values on or off",
-            |glow| glow.tweak_enable.into(),
-            |glow, value| glow.tweak_enable = value != 0.0,
-        ),
-        Dvar::<Self>::range(
-            "r_glowTweakRadius0",
-            "glow blur radius",
-            (0.0, 32.0),
-            |glow| glow.tweak_radius.into(),
-            |glow, value| glow.tweak_radius = value,
-        ),
-        Dvar::<Self>::range(
-            "r_glowTweakBloomIntensity0",
-            "bloom intensity",
-            (0.0, 20.0),
-            |glow| glow.tweak_intensity.into(),
-            |glow, value| glow.tweak_intensity = value,
-        ),
-        Dvar::<Self>::range(
-            "r_glowTweakBloomCutoff",
-            "bloom cutoff",
-            (0.0, 1.0),
-            |glow| glow.tweak_cutoff.into(),
-            |glow, value| glow.tweak_cutoff = value,
-        ),
-        Dvar::<Self>::range(
-            "r_glowTweakBloomDesaturation",
-            "bloom desaturation",
-            (0.0, 1.0),
-            |glow| glow.tweak_desaturation.into(),
-            |glow, value| glow.tweak_desaturation = value,
-        ),
+        flag!("r_glow" => enable, "glow on or off"),
+        flag!("r_glowUseTweaks" => use_trims, "use the tweak values"),
+        flag!("r_glowTweakEnable" => trim_enable, "tweak values on or off"),
+        ranged!("r_glowTweakRadius0" => trim_radius in 0.0..=32.0, "glow blur radius"),
+        ranged!("r_glowTweakBloomIntensity0" => trim_intensity in 0.0..=20.0, "bloom intensity"),
+        ranged!("r_glowTweakBloomCutoff" => trim_cutoff in 0.0..=1.0, "bloom cutoff"),
+        ranged!("r_glowTweakBloomDesaturation" => trim_desaturation in 0.0..=1.0, "bloom desaturation"),
     ];
 }
 
-impl DvarSet for DofDvars {
+impl DvarSet for BokehTunables {
     const DVARS: &'static [Dvar<Self>] = &[
-        Dvar::<Self>::toggle(
-            "r_dof_enable",
-            "depth of field on or off",
-            |dof| dof.enable.into(),
-            |dof, value| dof.enable = value != 0.0,
-        ),
-        Dvar::<Self>::toggle(
-            "r_dof_tweak",
-            "use the tweak values",
-            |dof| dof.tweak.into(),
-            |dof, value| dof.tweak = value != 0.0,
-        ),
-        Dvar::<Self>::range(
-            "r_dof_nearBlur",
-            "near blur strength",
-            (4.0, 10.0),
-            |dof| dof.values.near_blur.into(),
-            |dof, value| dof.values.near_blur = value,
-        ),
-        Dvar::<Self>::range(
-            "r_dof_farBlur",
-            "far blur strength",
-            (0.0, 10.0),
-            |dof| dof.values.far_blur.into(),
-            |dof, value| dof.values.far_blur = value,
-        ),
-        Dvar::<Self>::range(
-            "r_dof_viewModelStart",
-            "view model focus start",
-            (0.0, 128.0),
-            |dof| dof.values.view_model_start.into(),
-            |dof, value| dof.values.view_model_start = value,
-        ),
-        Dvar::<Self>::range(
-            "r_dof_viewModelEnd",
-            "view model focus end",
-            (0.0, 128.0),
-            |dof| dof.values.view_model_end.into(),
-            |dof, value| dof.values.view_model_end = value,
-        ),
-        Dvar::<Self>::range(
-            "r_dof_nearStart",
-            "near blur start",
-            (0.0, 1000.0),
-            |dof| dof.values.near_start.into(),
-            |dof, value| dof.values.near_start = value,
-        ),
-        Dvar::<Self>::range(
-            "r_dof_nearEnd",
-            "near blur end",
-            (0.0, 1000.0),
-            |dof| dof.values.near_end.into(),
-            |dof, value| dof.values.near_end = value,
-        ),
-        Dvar::<Self>::range(
-            "r_dof_farStart",
-            "far blur start",
-            (0.0, 80000.0),
-            |dof| dof.values.far_start.into(),
-            |dof, value| dof.values.far_start = value,
-        ),
-        Dvar::<Self>::range(
-            "r_dof_farEnd",
-            "far blur end",
-            (0.0, 80000.0),
-            |dof| dof.values.far_end.into(),
-            |dof, value| dof.values.far_end = value,
-        ),
-        Dvar::<Self>::range(
-            "r_dof_bias",
-            "blur bias",
-            (0.1, 3.0),
-            |dof| dof.bias.into(),
-            |dof, value| dof.bias = value,
-        ),
+        flag!("r_dof_enable" => enable, "depth of field on or off"),
+        flag!("r_dof_tweak" => tweak, "use the tweak values"),
+        ranged!("r_dof_nearBlur" => values.close_soften in 4.0..=10.0, "near blur strength"),
+        ranged!("r_dof_farBlur" => values.distant_soften in 0.0..=10.0, "far blur strength"),
+        ranged!("r_dof_viewModelStart" => values.hand_model_start in 0.0..=128.0, "view model focus start"),
+        ranged!("r_dof_viewModelEnd" => values.hand_model_end in 0.0..=128.0, "view model focus end"),
+        ranged!("r_dof_nearStart" => values.close_begin in 0.0..=1000.0, "near blur start"),
+        ranged!("r_dof_nearEnd" => values.close_stop in 0.0..=1000.0, "near blur end"),
+        ranged!("r_dof_farStart" => values.distant_begin in 0.0..=80000.0, "far blur start"),
+        ranged!("r_dof_farEnd" => values.distant_stop in 0.0..=80000.0, "far blur end"),
+        ranged!("r_dof_bias" => bias in 0.1..=3.0, "blur bias"),
     ];
 }
 
-impl DvarSet for FogDvars {
+impl DvarSet for HazeTunables {
     const DVARS: &'static [Dvar<Self>] = &[
-        Dvar::<Self>::toggle(
-            "r_fog",
-            "fog on or off",
-            |fog| fog.enabled.into(),
-            |fog, value| fog.enabled = value != 0.0,
-        ),
+        flag!("r_fog" => enabled, "fog on or off"),
         Dvar::<Self>::at_least(
             "r_zfar",
             "far clip distance; 0 leaves it to the map",
             0.0,
-            |fog| fog.zfar.into(),
-            |fog, value| fog.zfar = value,
+            |fog| fog.far_clip.into(),
+            |fog, value| fog.far_clip = value,
         ),
     ];
 }
 
-impl DvarSet for DistortionSettings {
-    const DVARS: &'static [Dvar<Self>] = &[Dvar::<Self>::toggle(
-        "r_distortion",
-        "scene distortion on or off (default 1)",
-        |distortion| distortion.enabled.into(),
-        |distortion, value| distortion.enabled = value != 0.0,
-    )];
+impl DvarSet for WarpSettings {
+    const DVARS: &'static [Dvar<Self>] =
+        &[flag!("r_distortion" => enabled, "scene distortion on or off (default 1)")];
 }
 
-impl DvarSet for ColourDrawMethod {
+impl DvarSet for EffectStainTunables {
+    const DVARS: &'static [Dvar<Self>] = &[
+        mark_switch!("fx_marks" => Marks, "ImpactMark outer gate")
+            .noting(|_: &EffectStainTunables| "(alloc + world verts; dyn packed fill)".to_owned()),
+        mark_switch!("fx_marks_smodels" => StaticModels, "models Generate OR with _ents"),
+        mark_switch!("fx_marks_ents" => Entities, "models Generate OR only; AddEntity* typed gap")
+            .noting(|_: &EffectStainTunables| "(AddEntity* typed gap; models Generate OR only)".to_owned()),
+        mark_switch!("fx_mark_profile" => Profile, "marks census log/dump, not overlay UI")
+            .noting(|_: &EffectStainTunables| "(census log/dump, not overlay UI)".to_owned()),
+    ];
+}
+
+impl DvarSet for ColourPaintMethod {
     const DVARS: &'static [Dvar<Self>] = &[Dvar::<Self>::toggle(
         "r_fullbright",
         "colour draw method: standard (0, tech 9) or fullbright (1, tech 4)",
-        |method| (*method != ColourDrawMethod::Standard).into(),
+        |method| (*method != ColourPaintMethod::Standard).into(),
         |method, value| {
             *method = if value != 0.0 {
-                ColourDrawMethod::Fullbright
+                ColourPaintMethod::Unshaded
             } else {
-                ColourDrawMethod::Standard
+                ColourPaintMethod::Standard
             };
         },
     )
-    .noting(|method: &ColourDrawMethod| {
-        match method {
-            ColourDrawMethod::Standard => "(standard tech 9)",
-            ColourDrawMethod::Fullbright => "(fullbright tech 4)",
-            ColourDrawMethod::DebugMaterial => "(debug-material tech 46)",
-        }
-        .to_owned()
+    .noting(|method: &ColourPaintMethod| {
+        String::from(match method {
+            ColourPaintMethod::Standard => "(standard tech 9)",
+            ColourPaintMethod::Unshaded => "(fullbright tech 4)",
+            ColourPaintMethod::MaterialProbe => "(debug-material tech 46)",
+        })
     })];
 }
 
@@ -225,13 +167,13 @@ impl DvarSet for GunOffset {
     ];
 }
 
-impl DvarSet for ClientActionInput {
+impl DvarSet for PlayerControlSnapshot {
     const DVARS: &'static [Dvar<Self>] = &[Dvar::<Self>::free(
         "cl_yawspeed",
         "keyboard +left/+right rate; default 140",
         "deg/s",
-        |input| input.cl_yawspeed.into(),
-        |input, value| input.cl_yawspeed = value,
+        |input| input.key_yaw_speed.into(),
+        |input, value| input.key_yaw_speed = value,
     )];
 }
 
@@ -253,7 +195,7 @@ impl DvarSet for SmSunEnableDvar {
     )];
 }
 
-impl DvarSet for SmcEnableDvar {
+impl DvarSet for PropCacheEnableTunable {
     const DVARS: &'static [Dvar<Self>] = &[Dvar::<Self>::toggle(
         "r_smc_enable",
         "static model cache",
@@ -262,7 +204,7 @@ impl DvarSet for SmcEnableDvar {
     )];
 }
 
-impl DvarSet for RZnearDvar {
+impl DvarSet for NearClipSetting {
     const DVARS: &'static [Dvar<Self>] = &[Dvar::<Self>::free(
         "r_znear",
         "DPVS infinite near; default 4",
@@ -272,7 +214,7 @@ impl DvarSet for RZnearDvar {
     )];
 }
 
-impl DvarSet for RZnearDepthhackDvar {
+impl DvarSet for GunNearClipSetting {
     const DVARS: &'static [Dvar<Self>] = &[Dvar::<Self>::free(
         "r_znear_depthhack",
         "viewmodel reverse-Z near; default 0.1",
@@ -282,137 +224,125 @@ impl DvarSet for RZnearDepthhackDvar {
     )];
 }
 
-impl DvarSet for FxMarkDvars {
-    const DVARS: &'static [Dvar<Self>] = &[
-        Dvar::<Self>::toggle(
-            "fx_marks",
-            "ImpactMark outer gate",
-            |marks| marks.fx_marks.into(),
-            |marks, value| marks.fx_marks = value != 0.0,
-        )
-        .noting(|_: &FxMarkDvars| "(alloc + world verts; dyn packed fill)".to_owned()),
-        Dvar::<Self>::toggle(
-            "fx_marks_smodels",
-            "models Generate OR with _ents",
-            |marks| marks.fx_marks_smodels.into(),
-            |marks, value| marks.fx_marks_smodels = value != 0.0,
-        ),
-        Dvar::<Self>::toggle(
-            "fx_marks_ents",
-            "models Generate OR only; AddEntity* typed gap",
-            |marks| marks.fx_marks_ents.into(),
-            |marks, value| marks.fx_marks_ents = value != 0.0,
-        )
-        .noting(|_: &FxMarkDvars| "(AddEntity* typed gap; models Generate OR only)".to_owned()),
-        Dvar::<Self>::toggle(
-            "fx_mark_profile",
-            "marks census log/dump, not overlay UI",
-            |marks| marks.fx_mark_profile.into(),
-            |marks, value| marks.fx_mark_profile = value != 0.0,
-        )
-        .noting(|_: &FxMarkDvars| "(census log/dump, not overlay UI)".to_owned()),
-    ];
-}
-
 /// What a LOD ramp shows besides the variable asked about: the other side of
 /// the ramp, what the last frame used, and the values the T5 curve applies.
-fn ramp_note(
-    other: (&str, Option<f32>),
-    last: (Option<f32>, Option<f32>),
-    t5: (f32, f32, f32),
-) -> String {
-    let (name, other) = other;
-    let (scale_last, world_unit) = last;
-    let (scale, bias, applied) = t5;
+struct RampNote<'a> {
+    other_name: &'a str,
+    other: Option<f32>,
+    last_frame_scale: Option<f32>,
+    last_frame_unit: Option<f32>,
+    scale: f32,
+    bias: f32,
+    applied: f32,
+}
+
+fn ramp_note(note: RampNote<'_>) -> String {
+    let RampNote { other_name, other, last_frame_scale, last_frame_unit, scale, bias, applied } = note;
     format!(
-        "{name} = {}  scale_last = {}  world_unit = {}  t5 scale/bias/applied = {scale}/{bias}/{applied}",
+        "{other_name} = {}  scale_last = {}  world_unit = {}  t5 scale/bias/applied = {scale}/{bias}/{applied}",
         Reading::from(other),
-        Reading::from(scale_last),
-        Reading::from(world_unit),
+        Reading::from(last_frame_scale),
+        Reading::from(last_frame_unit),
     )
 }
 
-impl DvarSet for LodRampDvar {
+impl DvarSet for DetailRampTunable {
     const DVARS: &'static [Dvar<Self>] = &[
         Dvar::<Self>::free(
             "r_lodScaleRigid",
             "rigid LOD distance scale",
             "f",
-            |ramp| ramp.scale_mid.into(),
+            |ramp| ramp.mid_scale.into(),
             |ramp, value| {
-                ramp.scale_mid = Some(value);
-                ramp.t5_scale = value;
+                ramp.mid_scale = Some(value);
+                ramp.classic_scale = value;
             },
         )
-        .noting(|ramp: &LodRampDvar| {
-            ramp_note(
-                ("r_lodBiasRigid", ramp.bias_mid),
-                (ramp.scale_last, ramp.world_unit),
-                (ramp.t5_scale, ramp.t5_bias, ramp.t5.applied_inv_scale),
-            )
+        .noting(|ramp: &DetailRampTunable| {
+            ramp_note(RampNote {
+                other_name: "r_lodBiasRigid",
+                other: ramp.mid_bias,
+                last_frame_scale: ramp.ramp_end_scale,
+                last_frame_unit: ramp.unit_len,
+                scale: ramp.classic_scale,
+                bias: ramp.classic_bias,
+                applied: ramp.t5.used_reciprocal_factor,
+            })
         }),
         Dvar::<Self>::free(
             "r_lodBiasRigid",
             "rigid LOD distance bias",
             "f",
-            |ramp| ramp.bias_mid.into(),
+            |ramp| ramp.mid_bias.into(),
             |ramp, value| {
-                ramp.bias_mid = Some(value);
-                ramp.t5_bias = value;
+                ramp.mid_bias = Some(value);
+                ramp.classic_bias = value;
             },
         )
-        .noting(|ramp: &LodRampDvar| {
-            ramp_note(
-                ("r_lodScaleRigid", ramp.scale_mid),
-                (ramp.scale_last, ramp.world_unit),
-                (ramp.t5_scale, ramp.t5_bias, ramp.t5.applied_inv_scale),
-            )
+        .noting(|ramp: &DetailRampTunable| {
+            ramp_note(RampNote {
+                other_name: "r_lodScaleRigid",
+                other: ramp.mid_scale,
+                last_frame_scale: ramp.ramp_end_scale,
+                last_frame_unit: ramp.unit_len,
+                scale: ramp.classic_scale,
+                bias: ramp.classic_bias,
+                applied: ramp.t5.used_reciprocal_factor,
+            })
         }),
     ];
 }
 
-impl DvarSet for LodRampSkinnedDvar {
+impl DvarSet for DetailRampSkinnedTunable {
     const DVARS: &'static [Dvar<Self>] = &[
         Dvar::<Self>::free(
             "r_lodScaleSkinned",
             "skinned LOD distance scale",
             "f",
-            |ramp| ramp.scale_mid.into(),
+            |ramp| ramp.mid_scale.into(),
             |ramp, value| {
-                ramp.scale_mid = Some(value);
-                ramp.t5_scale = value;
+                ramp.mid_scale = Some(value);
+                ramp.classic_scale = value;
             },
         )
-        .noting(|ramp: &LodRampSkinnedDvar| {
-            ramp_note(
-                ("r_lodBiasSkinned", ramp.bias_mid),
-                (ramp.scale_last, ramp.world_unit),
-                (ramp.t5_scale, ramp.t5_bias, ramp.t5.applied_inv_scale),
-            )
+        .noting(|ramp: &DetailRampSkinnedTunable| {
+            ramp_note(RampNote {
+                other_name: "r_lodBiasSkinned",
+                other: ramp.mid_bias,
+                last_frame_scale: ramp.prior_size,
+                last_frame_unit: ramp.map_unit,
+                scale: ramp.classic_scale,
+                bias: ramp.classic_bias,
+                applied: ramp.t5.used_reciprocal_factor,
+            })
         }),
         Dvar::<Self>::free(
             "r_lodBiasSkinned",
             "skinned LOD distance bias",
             "f",
-            |ramp| ramp.bias_mid.into(),
+            |ramp| ramp.mid_bias.into(),
             |ramp, value| {
-                ramp.bias_mid = Some(value);
-                ramp.t5_bias = value;
+                ramp.mid_bias = Some(value);
+                ramp.classic_bias = value;
             },
         )
-        .noting(|ramp: &LodRampSkinnedDvar| {
-            ramp_note(
-                ("r_lodScaleSkinned", ramp.scale_mid),
-                (ramp.scale_last, ramp.world_unit),
-                (ramp.t5_scale, ramp.t5_bias, ramp.t5.applied_inv_scale),
-            )
+        .noting(|ramp: &DetailRampSkinnedTunable| {
+            ramp_note(RampNote {
+                other_name: "r_lodScaleSkinned",
+                other: ramp.mid_scale,
+                last_frame_scale: ramp.prior_size,
+                last_frame_unit: ramp.map_unit,
+                scale: ramp.classic_scale,
+                bias: ramp.classic_bias,
+                applied: ramp.t5.used_reciprocal_factor,
+            })
         }),
     ];
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dvars::sets::*;
     use crate::dvars::Kind;
 
     /// A value each kind takes that is not what the resource starts with.
@@ -426,13 +356,13 @@ mod tests {
     }
 
     fn set_by_name<R: DvarSet>(resource: &mut R, name: &str, text: &str) -> String {
-        let dvar = R::DVARS.iter().find(|dvar| dvar.name == name).unwrap();
+        let dvar = R::DVARS.iter().find(|dvar| dvar.dvar_name == name).unwrap();
         let mut slot = resource;
         dvar.answer(&[text.to_owned()], &mut slot)
     }
 
     fn read_by_name<R: DvarSet>(resource: &R, name: &str) -> Reading {
-        let dvar = R::DVARS.iter().find(|dvar| dvar.name == name).unwrap();
+        let dvar = R::DVARS.iter().find(|dvar| dvar.dvar_name == name).unwrap();
         (dvar.get)(resource)
     }
 
@@ -440,51 +370,43 @@ mod tests {
         for dvar in R::DVARS {
             let mut resource = R::default();
             let value = probe(dvar.kind);
-            set_by_name(&mut resource, dvar.name, &value.to_string());
-            assert_eq!(
-                read_by_name(&resource, dvar.name),
-                Reading::Value(value),
-                "{}",
-                dvar.name
-            );
+            set_by_name(&mut resource, dvar.dvar_name, &value.to_string());
+            let expected = Reading::Value(value);
+            assert_eq!(read_by_name(&resource, dvar.dvar_name), expected, "{}", dvar.dvar_name);
         }
     }
 
     #[test]
     fn every_variable_reads_back_what_it_was_set_to() {
-        reads_back_what_was_set::<GlowDvars>();
-        reads_back_what_was_set::<DofDvars>();
-        reads_back_what_was_set::<FogDvars>();
-        reads_back_what_was_set::<DistortionSettings>();
-        reads_back_what_was_set::<ColourDrawMethod>();
+        reads_back_what_was_set::<BloomTunables>();
+        reads_back_what_was_set::<BokehTunables>();
+        reads_back_what_was_set::<HazeTunables>();
+        reads_back_what_was_set::<WarpSettings>();
+        reads_back_what_was_set::<ColourPaintMethod>();
         reads_back_what_was_set::<GunOffset>();
-        reads_back_what_was_set::<ClientActionInput>();
+        reads_back_what_was_set::<PlayerControlSnapshot>();
         reads_back_what_was_set::<SmEnableDvar>();
         reads_back_what_was_set::<SmSunEnableDvar>();
-        reads_back_what_was_set::<SmcEnableDvar>();
-        reads_back_what_was_set::<RZnearDvar>();
-        reads_back_what_was_set::<RZnearDepthhackDvar>();
-        reads_back_what_was_set::<FxMarkDvars>();
-        reads_back_what_was_set::<LodRampDvar>();
-        reads_back_what_was_set::<LodRampSkinnedDvar>();
+        reads_back_what_was_set::<PropCacheEnableTunable>();
+        reads_back_what_was_set::<NearClipSetting>();
+        reads_back_what_was_set::<GunNearClipSetting>();
+        reads_back_what_was_set::<EffectStainTunables>();
+        reads_back_what_was_set::<DetailRampTunable>();
+        reads_back_what_was_set::<DetailRampSkinnedTunable>();
     }
 
     #[test]
     fn depth_of_field_keeps_to_its_domains() {
-        let mut dof = DofDvars::default();
-        assert_eq!(
-            set_by_name(&mut dof, "r_dof_nearBlur", "3.9"),
-            "usage: r_dof_nearBlur [4..10]"
-        );
-        assert_eq!(
-            set_by_name(&mut dof, "r_dof_nearBlur", "4"),
-            "r_dof_nearBlur = 4"
-        );
-        assert_eq!(
-            set_by_name(&mut dof, "r_dof_bias", "3.5"),
-            "usage: r_dof_bias [0.1..3]"
-        );
-        assert_eq!(dof.values.near_blur, 4.0);
+        let mut dof = BokehTunables::default();
+        let near = "r_dof_nearBlur";
+        let expected = "usage: r_dof_nearBlur [4..10]";
+        assert_eq!(set_by_name(&mut dof, near, "3.9"), expected);
+        let expected = "r_dof_nearBlur = 4";
+        assert_eq!(set_by_name(&mut dof, near, "4"), expected);
+        let expected = "usage: r_dof_bias [0.1..3]";
+        let bias = "r_dof_bias";
+        assert_eq!(set_by_name(&mut dof, bias, "3.5"), expected);
+        assert_eq!(dof.values.close_soften, 4.0);
     }
 
     #[test]
@@ -496,20 +418,20 @@ mod tests {
 
     #[test]
     fn a_lod_scale_or_bias_sets_the_t5_curve_with_it() {
-        let mut ramp = LodRampDvar::default();
+        let mut ramp = DetailRampTunable::default();
         set_by_name(&mut ramp, "r_lodScaleRigid", "1.5");
         set_by_name(&mut ramp, "r_lodBiasRigid", "-2");
-        assert_eq!((ramp.scale_mid, ramp.bias_mid), (Some(1.5), Some(-2.0)));
-        assert_eq!((ramp.t5_scale, ramp.t5_bias), (1.5, -2.0));
+        assert_eq!((ramp.mid_scale, ramp.mid_bias), (Some(1.5), Some(-2.0)));
+        assert_eq!((ramp.classic_scale, ramp.classic_bias), (1.5, -2.0));
 
-        let mut skinned = LodRampSkinnedDvar::default();
+        let mut skinned = DetailRampSkinnedTunable::default();
         set_by_name(&mut skinned, "r_lodScaleSkinned", "0.5");
-        assert_eq!((skinned.scale_mid, skinned.t5_scale), (Some(0.5), 0.5));
+        assert_eq!((skinned.mid_scale, skinned.classic_scale), (Some(0.5), 0.5));
     }
 
     #[test]
     fn a_lod_answer_shows_the_other_half_of_the_ramp() {
-        let mut ramp = LodRampDvar::default();
+        let mut ramp = DetailRampTunable::default();
         let said = set_by_name(&mut ramp, "r_lodScaleRigid", "1.5");
         assert!(
             said.starts_with("r_lodScaleRigid = 1.5 r_lodBiasRigid = "),
@@ -521,22 +443,15 @@ mod tests {
 
     #[test]
     fn fullbright_says_which_technique_it_picked() {
-        let mut method = ColourDrawMethod::Standard;
-        assert_eq!(
-            set_by_name(&mut method, "r_fullbright", "1"),
-            "r_fullbright = 1 (fullbright tech 4)"
-        );
-        assert_eq!(method, ColourDrawMethod::Fullbright);
-        assert_eq!(
-            set_by_name(&mut method, "r_fullbright", "off"),
-            "r_fullbright = 0 (standard tech 9)"
-        );
-        method = ColourDrawMethod::DebugMaterial;
-        assert_eq!(
-            read_by_name(&method, "r_fullbright"),
-            Reading::Value(1.0),
-            "debug material is not standard"
-        );
+        let mut method = ColourPaintMethod::Standard;
+        let expected = "r_fullbright = 1 (fullbright tech 4)";
+        assert_eq!(set_by_name(&mut method, "r_fullbright", "1"), expected);
+        assert_eq!(method, ColourPaintMethod::Unshaded);
+        let expected = "r_fullbright = 0 (standard tech 9)";
+        assert_eq!(set_by_name(&mut method, "r_fullbright", "off"), expected);
+        method = ColourPaintMethod::MaterialProbe;
+        let expected = Reading::Value(1.0);
+        assert_eq!(read_by_name(&method, "r_fullbright"), expected, "debug material is not standard");
     }
 
     #[test]
@@ -544,6 +459,6 @@ mod tests {
         let mut gate = SmEnableDvar::default();
         assert_eq!(read_by_name(&gate, "sm_enable"), Reading::Unread);
         assert_eq!(set_by_name(&mut gate, "sm_enable", "0"), "sm_enable = 0");
-        assert_eq!(gate.enabled, Some(false));
+        assert!(gate.enabled == Some(false));
     }
 }

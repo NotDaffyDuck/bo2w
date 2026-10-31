@@ -1,9 +1,8 @@
-[package]
-name = "asset_core"
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-description = "Asset keys, typed catalog positions, zone-stored names and cross-asset links shared by every asset crate."
+package.name = "asset_core"
+package.version = "0.1.0"
+package.edition.workspace = true
+package.publish.workspace = true
+package.description = "Asset keys, typed catalog positions, zone-stored names and cross-asset links shared by every asset crate."
 
 [lints]
 workspace = true

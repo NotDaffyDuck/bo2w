@@ -24,7 +24,7 @@
 //! - the teams: him plus 5 bots against 6 (BO2's 6 v 6), Free-for-All him
 //!   against 7, a Party Game him against 5 (BO2's 6-player party and wager
 //!   lobbies), and so the public lobby's player limit (its session's
-//!   slots, `Playlist::max_players`),
+//!   slots, `Playlist::seat_capacity`),
 //! - the maps: a rotation of the installed maps (`crate::mapvote`),
 //! - the players-in-playlist counts (0: no online service) and how long
 //!   a new party's lobby keeps its map vote open (10 s, see `FIRST_VOTE_MS`).
@@ -38,7 +38,7 @@
 
 use crate::host::{EngineValues, Host};
 use crate::mp::Mp;
-use crate::value::{Table, Value};
+use crate::value::{LuaTable, Value};
 
 /// One Combat Training playlist (ours, see the module's notes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +58,7 @@ impl Playlist {
     /// limit, as BO2 sets `party_maxplayers` to the session's slots once a
     /// public lobby is joined. 12 for 6 v 6, 8 for Free-for-All, 6 for a
 /// Party Game.
-    pub fn max_players(&self) -> u32 {
+    pub fn seat_capacity(&self) -> u32 {
         1 + self.friends + self.enemies
     }
 }
@@ -125,7 +125,7 @@ pub const NEXT_MATCH_MS: f64 = NEXT_VOTE_MS + START_TIMER_MS;
 /// The public lobby is ready to start (BO2's `PartyIsReadyToStart`): its
 /// start timer runs, the map vote closed.
 pub fn start_timer_running(m: &crate::mp::MpState) -> bool {
-    m.public_start_ms.is_some_and(|at| at - crate::lui::now_ms() <= START_TIMER_MS)
+    m.public_start_ms.is_some_and(|at| at - crate::lui::clock_millis() <= START_TIMER_MS)
 }
 
 pub fn by_index(index: i32) -> Option<Playlist> {
@@ -158,15 +158,15 @@ pub fn install(host: &mut Host, mp: &Mp) {
         let vb = v.borrow();
         let text = |k: &str| vb.localize.get(&k.to_ascii_uppercase()).cloned().unwrap_or_else(|| k.to_owned());
         let rows = crate::mp::table_rows(&vb, "mp/gametypestable.csv");
-        let cats = Table::new_ref();
+        let cats = LuaTable::new_ref();
         for (slot, d) in CATEGORY_ORDER.into_iter().enumerate() {
-            let lists = Table::new_ref();
+            let lists = LuaTable::new_ref();
             for (n, p) in all().filter(|p| p.difficulty == d).enumerate() {
                 let row = rows
                     .iter()
                     .find(|r| r.first().map(String::as_str) == Some("0") && r.get(1).map(String::as_str) == Some(p.gametype));
                 let cell = |i: usize| row.and_then(|r| r.get(i)).cloned().unwrap_or_default();
-                let e = Table::new_ref();
+                let e = LuaTable::new_ref();
                 {
                     let mut e = e.borrow_mut();
                     e.set_str("index", Value::Num(p.index as f32));
@@ -175,12 +175,12 @@ pub fn install(host: &mut Host, mp: &Mp) {
                     e.set_str("description", Value::str(&text(&cell(3))));
                     e.set_str("icon", Value::str(&cell(4)));
                     e.set_str("playerCount", Value::Num(0.0));
-                    e.set_str("locked", Value::Bool(false));
+                    e.set_str("locked", Value::Boolean(false));
                     e.set_str("filter", Value::str("playermatch"));
                 }
-                lists.borrow_mut().set(Value::Num((n + 1) as f32), Value::Table(e));
+                lists.borrow_mut().store(Value::Num((n + 1) as f32), Value::Table(e));
             }
-            let cat = Table::new_ref();
+            let cat = LuaTable::new_ref();
             {
                 let mut c = cat.borrow_mut();
                 c.set_str("id", Value::Num((d + 1) as f32));
@@ -188,10 +188,10 @@ pub fn install(host: &mut Host, mp: &Mp) {
                 c.set_str("description", Value::str(&text("MPUI_BASICTRAINING_DESC")));
                 c.set_str("filter", Value::str("playermatch"));
                 c.set_str("playerCount", Value::Num(0.0));
-                c.set_str("locked", Value::Bool(false));
+                c.set_str("locked", Value::Boolean(false));
                 c.set_str("playlists", Value::Table(lists));
             }
-            cats.borrow_mut().set(Value::Num((slot + 1) as f32), Value::Table(cat));
+            cats.borrow_mut().store(Value::Num((slot + 1) as f32), Value::Table(cat));
         }
         Ok(vec![Value::Table(cats)])
     });
@@ -203,7 +203,7 @@ pub fn install(host: &mut Host, mp: &Mp) {
     });
     let m = mp.clone();
     host.bind("Engine", "GetPlaylistID", move |_, _| Ok(vec![Value::Num(m.borrow().playlist.unwrap_or(0) as f32)]));
-    host.bind("Engine", "IsPlaylistLocked", |_, _| Ok(vec![Value::Bool(false)]));
+    host.bind("Engine", "IsPlaylistLocked", |_, _| Ok(vec![Value::Boolean(false)]));
     // The lobby's names for the playlist and its category.
     let (m, v) = (mp.clone(), host.values.clone());
     host.bind("Engine", "GetPlaylistName", move |_, _| {
@@ -236,13 +236,13 @@ pub fn install(host: &mut Host, mp: &Mp) {
         // A Custom Game's START MATCH: "Game starting in N" (the number
         // is in the line, no time to append).
         if let Some(at) = m.borrow().private_start_ms {
-            let left = ((at - crate::lui::now_ms()) / 1000.0).ceil().max(0.0);
+            let left = ((at - crate::lui::clock_millis()) / 1000.0).ceil().max(0.0);
             let vb = v.borrow();
             let line = vb.localize.get("MENU_GAME_STARTING_IN").cloned().unwrap_or_else(|| "Game starting in &&1".to_owned());
-            return Ok(vec![Value::str(&line.replace("&&1", &format!("{}", left as i64)))]);
+            return Ok(vec![Value::str(&line.replace("&&1", &(left as i64).to_string()))]);
         }
         let Some(at) = m.borrow().public_start_ms else { return Ok(vec![Value::str("")]) };
-        let left = at - crate::lui::now_ms();
+        let left = at - crate::lui::clock_millis();
         let vb = v.borrow();
         let text = |k: &str, d: &str| vb.localize.get(k).cloned().unwrap_or_else(|| d.to_owned());
         // The map vote: "Time remaining:  N".
@@ -257,7 +257,7 @@ pub fn install(host: &mut Host, mp: &Mp) {
         }
         let secs = (left / 1000.0).ceil().max(0.0);
         let line = text("MENU_GAME_STARTING_IN", "Game starting in &&1");
-        Ok(vec![Value::str(&line.replace("&&1", &format!("{}", secs as i64)))])
+        Ok(vec![Value::str(&line.replace("&&1", &(secs as i64).to_string()))])
     });
 }
 
@@ -271,9 +271,9 @@ mod tests {
     #[test]
     fn a_6_v_6_lobby_holds_12_free_for_all_8_and_a_party_game_6() {
         let party = |p: &Playlist| PARTY.contains(&p.gametype);
-        assert!(all().filter(|p| p.gametype != "dm" && !party(p)).all(|p| p.max_players() == 12));
-        assert!(all().filter(|p| p.gametype == "dm").all(|p| p.max_players() == 8));
-        assert!(all().filter(party).all(|p| p.max_players() == 6 && p.friends == 0));
+        assert!(all().filter(|p| p.gametype != "dm" && !party(p)).all(|p| p.seat_capacity() == 12));
+        assert!(all().filter(|p| p.gametype == "dm").all(|p| p.seat_capacity() == 8));
+        assert!(all().filter(party).all(|p| p.seat_capacity() == 6 && p.friends == 0));
         assert_eq!(all().filter(|p| p.difficulty == 1).count(), 9);
     }
 }

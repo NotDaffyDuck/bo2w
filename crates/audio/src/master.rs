@@ -22,7 +22,7 @@ use std::sync::{Arc, RwLock};
 use asset_audio::{SndEqBand, SndMaster};
 use bevy::prelude::*;
 
-use crate::playback::SoundBank;
+use crate::play_core::AudioCatalogRes;
 
 /// `snd_menu_presets` 0-4 (`CoD.AudioSettings`), by master name.
 const PRESET_MASTERS: [&str; 5] = [
@@ -37,8 +37,8 @@ static CURRENT: RwLock<Option<Arc<SndMaster>>> = RwLock::new(None);
 /// Bumped whenever `CURRENT` changes; each voice rebuilds its filters when it moves.
 static VERSION: AtomicU32 = AtomicU32::new(0);
 
-pub(crate) fn register(app: &mut App) {
-    app.add_systems(Update, pick_master);
+pub(crate) fn wire_up(host: &mut App) {
+    host.add_systems(Update, pick_master);
 }
 
 /// The master the preset names, else "default"; none without Black Ops II's masters.
@@ -53,8 +53,8 @@ fn master_for_preset(masters: &[SndMaster], preset: u8) -> Option<&SndMaster> {
 /// A bank without masters (a map's own sounds) keeps the frontend's: Black Ops II's
 /// masters live in its always-loaded code zone.
 fn pick_master(
-    settings: Res<frame::GameSettings>,
-    bank: Option<Res<SoundBank>>,
+    settings: Res<frame::PlayerPrefsBundle>,
+    bank: Option<Res<AudioCatalogRes>>,
     mut picked: Local<Option<(u8, String)>>,
 ) {
     let Some(bank) = bank else { return };
@@ -201,7 +201,7 @@ impl MasterEq {
 pub(crate) struct VoiceEq {
     version: u32,
     rate: f32,
-    channels: usize,
+    chan_count: usize,
     next_channel: usize,
     eq: Option<MasterEq>,
     /// x1, x2, y1, y2 per channel per band.
@@ -209,11 +209,11 @@ pub(crate) struct VoiceEq {
 }
 
 impl VoiceEq {
-    pub(crate) fn new(rate: u32, channels: u16) -> Self {
+    pub(crate) fn new(rate: u32, chan_count: u16) -> Self {
         let mut eq = Self {
             version: VERSION.load(Ordering::Acquire),
             rate: rate.max(1) as f32,
-            channels: usize::from(channels.max(1)),
+            chan_count: usize::from(chan_count.max(1)),
             next_channel: 0,
             eq: None,
             history: Vec::new(),
@@ -226,7 +226,7 @@ impl VoiceEq {
         let master = CURRENT.read().ok().and_then(|m| m.clone());
         self.eq = master.map(|m| MasterEq::new(&m, self.rate));
         let bands = self.eq.as_ref().map_or(0, |e| e.bands.len());
-        self.history.resize(self.channels * bands, [0.0; 4]);
+        self.history.resize(self.chan_count * bands, [0.0; 4]);
     }
 
     /// The next interleaved sample, through the current master's EQ.
@@ -243,7 +243,7 @@ impl VoiceEq {
     #[inline]
     fn filter(&mut self, x: f32) -> f32 {
         let ch = self.next_channel;
-        self.next_channel = (ch + 1) % self.channels;
+        self.next_channel = (ch + 1) % self.chan_count;
         let Some(eq) = &self.eq else { return x };
         let n = eq.bands.len();
         let mut y = x;
@@ -327,7 +327,7 @@ mod tests {
         let mut voice = VoiceEq {
             version: 0,
             rate: RATE as f32,
-            channels: 2,
+            chan_count: 2,
             next_channel: 0,
             history: vec![[0.0; 4]; 2 * eq.bands.len()],
             eq: Some(eq.clone()),
@@ -352,7 +352,7 @@ mod tests {
         let mut voice = VoiceEq {
             version: 0,
             rate: 48_000.0,
-            channels: 2,
+            chan_count: 2,
             next_channel: 0,
             eq: None,
             history: Vec::new(),

@@ -2,65 +2,69 @@
 //! and the Bevy systems that play world, weapon, ambient and menu sounds.
 
 mod ads_sounds;
-mod aliases;
-mod ambient;
+mod cue_names;
+mod map_sound_set;
 mod attenuation;
 mod backend;
-mod clip_store;
+mod bus_gain;
+mod clip_bank;
 mod destructible_loops;
+mod dive_vox; // bo2zm
 mod duck;
-mod emit;
-mod entity_events;
-mod frontend;
+mod noise_out;
+mod ent_sounds;
+mod menu_track;
+mod mix_probe;
 mod guest;
+mod laststand; // bo2zm
+mod loop_emitter;
 mod master;
-mod match_set;
+mod match_sounds;
 mod match_voices;
 mod menu_volume;
-mod messages;
-mod pcm;
-mod playback;
-mod plugin;
+mod alerts;
+mod sample_feed;
+mod play_core;
+mod sound_out;
+mod room_echo;
 mod rumble;
-mod shellshock;
+mod shock_sound;
 mod slide_loop;
-mod space;
-mod start;
-mod voice;
+mod distance;
+mod staffloop; // bo2zm
+mod playback_gate;
+mod voice_slots;
 mod weapon_lock;
 mod weapon_loops;
 mod zm_music;
 
-pub use aliases::{
-    StepGait, footstep_aliases, gear_alias, gear_rattle_alias, land_aliases, quiet_surface_alias,
-    select_cg_fire_alias, select_fire_alias, step_prefix, surface_alias_candidates,
-    t6_movement_alias, world_surface_alias,
+pub use cue_names::{
+    FootfallPace, footfall_cue_names, gear_alias, gear_jingle_cue, touchdown_cue_names, hushed_ground_cue,
+    pick_view_gunshot_cue, pick_gunshot_cue, stride_prefix, surface_cue_list,
+    t6_movement_alias, surface_cue_for,
 };
-pub use ambient::{
-    MAX_ACTIVE_MAP_EMITTERS, MIN_AUDIBLE_EMITTER_GAIN, MapAmbient, MapAmbientBooted, MapEmitter,
-    SoundIwd, stop_map_ambient, update_map_emitter_gain,
-};
-pub use clip_store::{ClipPath, ClipPathCost, ClipPrepCost, ClipStore, PREP_BATCH, clip_prep_cost};
+pub use map_sound_set::{MAP_EMITTER_CAP, EMITTER_GAIN_FLOOR, SoundArchive};
+pub use map_sound_set::{LevelBackdropSound, AmbientBedStarted, LevelSoundSource};
+pub use map_sound_set::{end_map_ambience, map_emitter_gain_tick};
+pub use clip_bank::{ClipPath, ClipPathCost, ClipPrepCost, ClipRepository, PREP_BATCH, clip_prep_cost};
 pub use duck::{DuckGroup, DuckMixer};
-pub use emit::{BobCycleTracker, emit_footstep_on_bob_wrap, emit_weapon_fire};
-pub use frontend::FrontendAudio;
+pub use noise_out::{StrideRhythmWatch, send_footfall_at_stride_end, send_gunshot_noise};
+pub use menu_track::FrontendAudio;
 pub use guest::{GuestSoundQueue, GuestSoundRequest};
-pub use match_set::{AudioReady, AudioSilent};
+pub use match_sounds::{SoundSystemLive, AudioSilent};
 pub use menu_volume::MenuVolume;
-pub use messages::{
-    AliasCommand, BoundWeaponSound, Footstep, LandSound, PlayAlias, SND_ENT_LOCAL,
-    ViewmodelNotetracks, WeaponSound, ent_from_number,
+pub use alerts::{
+    AliasCommand, BoundWeaponSound, FootfallMsg, TouchdownNoiseMsg, TriggerCueMsg, SOUND_SOURCE_SELF,
+    FirstPersonAnimCues, GunNoiseMsg, ent_from_number,
 };
-pub use pcm::{LivePan, LoopingPcmAudio, PcmAudio, decode_audio_bytes};
-pub use playback::{
-    AmbientListener, Channel3d, MissingAliasGaps, SoundBank, SoundPickState,
-    world_oneshot_channel_gains, world_oneshot_pan,
-};
-pub use plugin::AudioPlugin;
+pub use sample_feed::{PanHandle, LoopedPcm, ClipPcm, decode_clip_bytes};
+pub use play_core::{BackgroundHearer, SpatialVoice, UnknownCueHoles};
+pub use play_core::{AudioCatalogRes, CuePickState};
+pub use play_core::{oneshot_lr_gains, oneshot_pan};
+pub use sound_out::SoundOutPlugin;
 pub use rumble::{CodeRumbleStopT6, CodeRumbleT6};
-pub use space::{distance_inches, transform_inches};
-pub use start::{
-    SoundClass, StartDecision, StartDecisions, StartFailure, StartOutcome, SuppressReason,
-};
-pub use voice::VoiceOccupancy;
+pub use distance::{gap_in_inches, inches_of};
+pub use playback_gate::{NoiseCategory, PlaybackBlocker, PlaybackVerdict, MuteCause};
+pub use playback_gate::{PlaybackVerdictEntry, PlaybackVerdictLog};
+pub use voice_slots::ChannelUsageTally;
 pub use weapon_loops::{WeaponLoopRow, WeaponLoops};

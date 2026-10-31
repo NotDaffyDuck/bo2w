@@ -1,0 +1,20 @@
+# H: Zombies knife on the M1911 (Die Rise numbers: knife_zm 500 ms swing, hit at 50; m1911_zm
+# quick raise 250). The side-by-side against a real BO2 clip of the same knife is in MELEE.md section 9.
+msec 50
+spawn m1911_zm
+hold melee
+run 1
+expect state MELEE_INIT
+expect anim MELEE_ATTACK
+release melee
+run 1
+expect state MELEE_FIRE
+run 8
+expect state MELEE_FIRE
+run 1
+expect state MELEE_END
+expect anim QUICK_RAISE
+run 4
+expect state MELEE_END
+run 1
+expect state READY

@@ -4,7 +4,7 @@
 //! All bit values are BO2's. Add a field here through window 1 when a mechanic needs one.
 
 /// BO2 `pmtype_t` values the weapon code tests.
-pub mod pm_type {
+pub mod movement_mode {
     pub const NORMAL: i32 = 0;
     pub const NORMAL_LINKED: i32 = 1;
     pub const NOCLIP: i32 = 2;
@@ -19,9 +19,9 @@ pub mod pm_type {
     pub const DEAD_LINKED: i32 = 11;
 }
 
-/// BO2 `pm_flags` bits the weapon code tests.
+/// BO2 `movement_state_bits` bits the weapon code tests.
 pub mod pmf {
-    pub const PRONE: u32 = 0x1;
+    pub const LYING_FLAT: u32 = 0x1;
     /// Mantling: ADS is refused.
     pub const MANTLE: u32 = 0x4;
     /// Mantling / ladder: the weapon must go away.
@@ -79,6 +79,16 @@ pub mod perk {
     pub const RATEOFFIRE: u32 = 52;
     pub const SPRINTRECOVERY: u32 = 57;
     pub const FASTADS: u32 = 15;
+    /// PERK_REDUCEBULLETFLINCH (Toughness): shrinks the flinch a hit puts on the view.
+    pub const REDUCEBULLETFLINCH: u32 = 5;
+    /// PERK_MOVEFASTER (Lightweight).
+    pub const MOVEFASTER: u32 = 40;
+
+    /// Whether the player's perk words (`AvatarState::perks`: perk `n` is bit `n % 32` of word `n / 32`) hold the
+    /// perk. Numbers past the last perk are never held.
+    pub const fn held(perks: [u32; 2], perk: u32) -> bool {
+        perk < 63 && perks[(perk >> 5) as usize] >> (perk & 31) & 1 != 0
+    }
 
     /// A script perk name (`setperk`) -> its BO2 perk number, for the perks the weapon code tests.
     pub fn by_name(name: &str) -> Option<u32> {
@@ -104,14 +114,14 @@ pub struct T6Dvars {
     pub player_disable_weapons_in_water: bool,
     pub tu_enforce_rechamber_on_switch: bool,
     pub perk_weap_switch_multiplier: f32,
-    pub perk_weap_reload_multiplier: f32,
+    pub quick_hands_factor: f32,
     pub perk_weap_rate_multiplier: f32,
     pub perk_weap_ads_multiplier: f32,
     pub perk_weap_melee_multiplier: f32,
     pub perk_weap_toss_multiplier: f32,
     pub perk_weap_equipment_use_multiplier: f32,
     pub perk_weap_spread_multiplier: f32,
-    pub player_melee_range: f32,
+    pub knife_reach: f32,
     pub player_bayonet_range: f32,
     pub player_sustain_ammo: bool,
     pub bg_charge_shot_queue_time: i32,
@@ -122,6 +132,10 @@ pub struct T6Dvars {
     pub bg_charge_shot_discharge_when_queue_reaches_max: bool,
     pub bg_charge_shot_auto_discharge_delay: i32,
     pub bg_charge_shot_use_one_ammo_for_multiple_bullets: bool,
+    /// `tu14_bg_chargeShotExponentialAmmoPerChargeLevel` (Origins sets it): a charge level
+    /// costs level-factorial rounds (1, 2, 6), and the level only climbs while the clip can
+    /// pay.
+    pub bg_charge_shot_exponential_ammo_per_charge_level: bool,
     pub tu5_uav_ads_fix: bool,
     /// `dtp`: dive to prone on.
     pub dtp: bool,
@@ -136,14 +150,14 @@ impl Default for T6Dvars {
             player_disable_weapons_in_water: false,
             tu_enforce_rechamber_on_switch: true,
             perk_weap_switch_multiplier: 0.5,
-            perk_weap_reload_multiplier: 0.5,
+            quick_hands_factor: 0.5,
             perk_weap_rate_multiplier: 0.75,
             perk_weap_ads_multiplier: 0.5,
             perk_weap_melee_multiplier: 0.5,
             perk_weap_toss_multiplier: 0.5,
             perk_weap_equipment_use_multiplier: 0.6,
             perk_weap_spread_multiplier: 0.65,
-            player_melee_range: 55.0,
+            knife_reach: 55.0,
             player_bayonet_range: 85.0,
             player_sustain_ammo: false,
             bg_charge_shot_queue_time: 128,
@@ -154,6 +168,7 @@ impl Default for T6Dvars {
             bg_charge_shot_discharge_when_queue_reaches_max: false,
             bg_charge_shot_auto_discharge_delay: 0,
             bg_charge_shot_use_one_ammo_for_multiple_bullets: true,
+            bg_charge_shot_exponential_ammo_per_charge_level: false,
             tu5_uav_ads_fix: true,
             dtp: true,
             dtp_post_move_pause: 100.0,
@@ -164,23 +179,23 @@ impl Default for T6Dvars {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct T6Env {
-    pub pm_type: i32,
-    pub pm_flags: u32,
-    pub e_flags: u32,
+    pub movement_mode: i32,
+    pub movement_state_bits: u32,
+    pub ent_bits: u32,
     pub e_flags2: u32,
-    pub link_flags: u32,
-    pub other_flags: u32,
+    pub attach_bits: u32,
+    pub secondary_state_bits: u32,
     pub waterlevel: i32,
     /// The player's own perks (`ps->perks`), one bit per perk. The perks a weapon grants come
     /// from the facts: [`crate::pm::Pm::has_perk`] (BG_HasPerk) and
     /// [`crate::pm::Pm::hand_has_perk`] (BG_GetPerks) add them.
     pub perks: u64,
     /// `mantleState.flags`.
-    pub mantle_flags: u32,
+    pub ledge_climb_bits: u32,
     /// Mantle time still to run (ms); 0 when not mantling.
     pub mantle_time_left: i32,
     /// Mantle_IsWeaponInactive.
-    pub mantle_weapon_inactive: bool,
+    pub gun_stowed_while_climbing: bool,
     /// Mantle_IsWeaponEquipped.
     pub mantle_weapon_equipped: bool,
     /// `viewHeightCurrent == viewHeightTarget`.
@@ -188,8 +203,8 @@ pub struct T6Env {
     /// BG_IsShellshockAnim: shocked by a shock file whose `bg_shock_animation` is set
     /// (concussion, flashbang, tabun gas...). Its own anim plays, so the fire script is skipped.
     pub shellshock_anim: bool,
-    /// `groundEntityNum != ENTITYNUM_NONE`.
-    pub on_ground: bool,
+    /// `groundEntityNum != NO_ENTITY_SLOT`.
+    pub grounded_now: bool,
     /// BO2's `proneChange`: he went prone or got up this tick (a reload then restarts in the body).
     pub prone_change: bool,
     /// Vertical speed (CheckForDeploy reads it).
@@ -215,7 +230,7 @@ pub struct T6Env {
     /// Com_SessionMode_IsZombiesGame.
     pub zombies: bool,
     /// `jumpTime`: below 0 while a landed dive slides along the ground.
-    pub jump_time: i32,
+    pub hop_start_ms: i32,
     /// `slideTime`: the server time the current slide started.
     pub slide_time: i32,
     /// When the last dive ended (server time; 0 = never).

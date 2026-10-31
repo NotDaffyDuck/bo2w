@@ -62,7 +62,7 @@ struct Shard {
 
 static SHARDS: Mutex<Vec<Arc<Mutex<Shard>>>> = Mutex::new(Vec::new());
 static NAMES: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
-static START: OnceLock<Instant> = OnceLock::new();
+static EPOCH: OnceLock<Instant> = OnceLock::new();
 
 thread_local! {
     static SHARD: Arc<Mutex<Shard>> = {
@@ -92,9 +92,9 @@ fn intern(name: String) -> &'static str {
 struct NameField(Option<String>);
 
 impl Visit for NameField {
-    fn record_str(&mut self, field: &Field, value: &str) {
+    fn record_str(&mut self, field: &Field, text: &str) {
         if matches!(field.name(), "name" | "plugin") {
-            self.0 = Some(value.to_owned());
+            self.0 = Some(text.to_owned());
         }
     }
 
@@ -149,7 +149,7 @@ where
         };
         drop(ext);
         let took = now - began;
-        let at = START.get().map_or(0.0, |s| (began - *s).as_secs_f32());
+        let at = EPOCH.get().map_or(0.0, |s| (began - *s).as_secs_f32());
         let _ = SHARD.try_with(|shard| {
             let mut shard = lock(shard);
             let stat = shard.stats.entry(label).or_default();
@@ -168,7 +168,7 @@ pub(crate) fn layer(_app: &mut App) -> Option<BoxedLayer> {
     let path = std::env::var_os("BO2MP_SPAN_STATS")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(diag::ARTIFACTS_DIR).join("span-stats.txt"));
-    START.get_or_init(Instant::now);
+    EPOCH.get_or_init(Instant::now);
     std::thread::Builder::new()
         .name("span stats".into())
         .spawn(move || write_windows(path))
@@ -177,7 +177,7 @@ pub(crate) fn layer(_app: &mut App) -> Option<BoxedLayer> {
 }
 
 fn write_windows(path: PathBuf) {
-    let start = *START.get_or_init(Instant::now);
+    let start = *EPOCH.get_or_init(Instant::now);
     let mut from = 0.0f32;
     let top = top();
     loop {
@@ -196,13 +196,13 @@ fn write_windows(path: PathBuf) {
             spikes.append(&mut shard.spikes);
         }
         let mut rows: Vec<_> = stats.into_iter().collect();
-        rows.sort_by(|a, b| b.1.total.cmp(&a.1.total));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.1.total));
         spikes.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut out = format!("== {from:.0}-{to:.0} s\n");
+        let mut report = format!("== {from:.0}-{to:.0} s\n");
         for (label, stat) in rows.iter().take(top) {
             let total = stat.total.as_secs_f64() * 1000.0;
             let _ = writeln!(
-                out,
+                report,
                 "{total:>10.1} ms {:>7} runs {:>8.3} avg {:>8.2} max  {label}",
                 stat.runs,
                 total / stat.runs.max(1) as f64,
@@ -210,10 +210,10 @@ fn write_windows(path: PathBuf) {
             );
         }
         for (at, label, ms) in &spikes {
-            let _ = writeln!(out, "  spike {at:>8.2} s {ms:>8.1} ms  {label}");
+            let _ = writeln!(report, "  spike {at:>8.2} s {ms:>8.1} ms  {label}");
         }
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = file.write_all(out.as_bytes());
+            let _ = file.write_all(report.as_bytes());
         }
         from = to;
     }

@@ -43,7 +43,7 @@ pub fn t6_grid_basis_dirs() -> [[f32; 3]; 56] {
 /// The light (linear, before exposure) a decoded set gives along each grid
 /// direction (`R_CalculateLightGridColorFromCoeffs`): the SH sum, never
 /// below zero.
-pub fn t6_grid_cube(c: &[[f32; 3]; 9]) -> [[f32; 3]; 56] {
+pub fn t6_grid_cube(chan: &[[f32; 3]; 9]) -> [[f32; 3]; 56] {
     t6_grid_basis_dirs().map(|[x, y, z]| {
         let basis = [
             1.0,
@@ -59,7 +59,7 @@ pub fn t6_grid_cube(c: &[[f32; 3]; 9]) -> [[f32; 3]; 56] {
         core::array::from_fn(|ch| {
             basis
                 .iter()
-                .zip(c)
+                .zip(chan)
                 .map(|(b, k)| b * k[ch])
                 .sum::<f32>()
                 .max(0.0)
@@ -73,11 +73,11 @@ pub fn t6_grid_cube(c: &[[f32; 3]; 9]) -> [[f32; 3]; 56] {
 /// `lum(c) = c.r/4 + c.g/2 + c.b/4`, `V0 = (c0 / (lum c0 + 1e-4), 3 lum c7)`,
 /// `V1 = (lum c1, lum c2, lum c3, lum c0 + 1e-4 - lum c7)`,
 /// `V2 = (lum c4, lum c5, lum c6, lum c8)`.
-pub fn t6_grid_sh(c: &[[f32; 3]; 9]) -> [[f32; 4]; 3] {
-    let lum = |k: usize| c[k][0] * 0.25 + c[k][1] * 0.5 + c[k][2] * 0.25;
+pub fn t6_grid_sh(chan: &[[f32; 3]; 9]) -> [[f32; 4]; 3] {
+    let lum = |k: usize| chan[k][0] * 0.25 + chan[k][1] * 0.5 + chan[k][2] * 0.25;
     let l0 = lum(0) + 0.0001;
     let sh = [
-        [c[0][0] / l0, c[0][1] / l0, c[0][2] / l0, 3.0 * lum(7)],
+        [chan[0][0] / l0, chan[0][1] / l0, chan[0][2] / l0, 3.0 * lum(7)],
         [lum(1), lum(2), lum(3), l0 - lum(7)],
         [lum(4), lum(5), lum(6), lum(8)],
     ];
@@ -99,45 +99,45 @@ pub fn t6_light_byte(light: f32) -> u8 {
 /// where legacy keeps 56 directional RGB8 colours; each set becomes the 56
 /// colours the game computes from it (`t6_grid_cube`), in the grid basis
 /// order, encoded with `t6_light_byte`.
-pub fn t6_light_grid(grid: &asset_t6::LightGridRef) -> Option<crate::OwnedLightGrid> {
+pub fn t6_light_grid(lattice: &asset_t6::LightGridRef) -> Option<crate::DetachedLightGrid> {
     const SET: usize = T6_COEFF_SET_BYTES;
     const DIRS: usize = 56;
-    if grid.row_axis > 2 || grid.col_axis > 2 || grid.coeffs.len() < SET {
+    if lattice.line_direction > 2 || lattice.column_direction > 2 || lattice.coeffs.len() < SET {
         return None;
     }
-    let mut colors = Vec::with_capacity(grid.coeffs.len() / SET * DIRS * 3);
-    for set in grid.coeffs.chunks_exact(SET) {
+    let mut colors = Vec::with_capacity(lattice.coeffs.len() / SET * DIRS * 3);
+    for set in lattice.coeffs.chunks_exact(SET) {
         let cube = t6_grid_cube(&t6_grid_coeffs(set)?);
         for rgb in cube {
             colors.extend_from_slice(&rgb.map(t6_light_byte));
         }
     }
-    Some(crate::OwnedLightGrid {
-        mins: grid.mins,
-        maxs: grid.maxs,
-        row_axis: grid.row_axis as usize,
-        col_axis: grid.col_axis as usize,
-        color_count: (grid.coeffs.len() / SET) as u32,
-        has_light_regions: false,
-        sun_primary_light_index: grid.sun_primary_light_index,
-        row_data_start: grid.row_data_start.clone(),
-        raw_row_data: grid.raw_row_data.clone(),
-        entries: grid.entries.clone(),
+    Some(crate::DetachedLightGrid {
+        low: lattice.lo_corner,
+        high: lattice.hi_corner,
+        line_direction: lattice.line_direction as usize,
+        column_direction: lattice.column_direction as usize,
+        tint_key_total: (lattice.coeffs.len() / SET) as u32,
+        carries_light_volumes: false,
+        sunlight_lamp_slot: lattice.sunlight_lamp_slot,
+        line_bytes_origin: lattice.line_bytes_origin.clone(),
+        unparsed_line_bytes: lattice.unparsed_line_bytes.clone(),
+        entries: lattice.entries.clone(),
         colors,
-        color_encoding: crate::LightGridColorEncoding::Rgb8,
+        color_encoding: crate::GridTintStorageFormat::Rgb8,
     })
 }
 
 /// The light (linear, before exposure) a T6 grid gives at `pos`: the mean
 /// of the sampled tile, decoded `(v / 255)^2 * 32`.
-pub fn t6_grid_light(grid: &crate::OwnedLightGrid, pos: [f32; 3]) -> Option<[f32; 3]> {
-    let sampled = crate::sample_light_grid(&grid.view(), pos).ok()?;
+pub fn t6_grid_light(lattice: &crate::DetachedLightGrid, where_at: [f32; 3]) -> Option<[f32; 3]> {
+    let sampled = crate::probe_light_cells(&lattice.view(), where_at).ok()?;
     Some(t6_sampled_light(&sampled))
 }
 
 /// `t6_grid_light` for a sample already taken.
-pub fn t6_sampled_light(sampled: &crate::SampledLighting) -> [f32; 3] {
-    let mean = crate::mean_tile_rgba01(&sampled.tile);
+pub fn t6_sampled_light(sampled: &crate::LightProbeReading) -> [f32; 3] {
+    let mean = crate::mean_tile_rgba01(&sampled.texels);
     mean.map(|v| v * v * 32.0)
 }
 
@@ -145,24 +145,24 @@ pub fn t6_sampled_light(sampled: &crate::SampledLighting) -> [f32; 3] {
 /// `pos`: each grid entry carries a primary light and that light's
 /// visibility; this is their weighted mean over the corners lit by
 /// `primary`, or over every live corner when none is.
-pub fn t6_grid_visibility(grid: &crate::OwnedLightGrid, pos: [f32; 3], primary: u8) -> Option<u8> {
-    let sampled = crate::sample_light_grid(&grid.view(), pos).ok()?;
+pub fn t6_grid_visibility(grid: &crate::DetachedLightGrid, pos: [f32; 3], primary: u8) -> Option<u8> {
+    let sampled = crate::probe_light_cells(&grid.view(), pos).ok()?;
     t6_sampled_visibility(&sampled, primary)
 }
 
 /// `t6_grid_visibility` for a sample already taken.
-pub fn t6_sampled_visibility(sampled: &crate::SampledLighting, primary: u8) -> Option<u8> {
+pub fn t6_sampled_visibility(sampled: &crate::LightProbeReading, primary: u8) -> Option<u8> {
     let mean = |only: Option<u8>| {
         let (mut sum, mut weight) = (0.0f32, 0.0f32);
         for i in 0..8 {
-            let (Some(p), Some(v)) = (sampled.corner_primaries[i], sampled.corner_flags[i]) else {
+            let (Some(p), Some(v)) = (sampled.corner_dominant_lights[i], sampled.corner_flags[i]) else {
                 continue;
             };
             if only.is_some_and(|o| o != p) {
                 continue;
             }
-            sum += sampled.weights[i] * f32::from(v);
-            weight += sampled.weights[i];
+            sum += sampled.mix[i] * f32::from(v);
+            weight += sampled.mix[i];
         }
         (weight > 1e-6).then(|| (sum / weight).round().clamp(0.0, 255.0) as u8)
     };

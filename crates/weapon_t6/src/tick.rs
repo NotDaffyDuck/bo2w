@@ -5,13 +5,15 @@
 //! in `crate::pm::*`; switching is window 2's `crate::switch`, wired in here.
 
 use crate::cmd::T6Cmd;
-use crate::env::{T6Env, pm_type, pmf};
-use crate::events::{self, AnimScript, Event};
+use crate::env::{T6Env, movement_mode, pmf};
+use crate::events::{
+    AnimScript, Event, EV_WEAPON_FINISH_DEPLOYING, EV_WEAPON_FINISH_BREAKING_DOWN, name,
+};
 use crate::facts::FactsTable;
 use crate::player::{T6WeaponPs, wf};
 use crate::pm::{FrameOut, Pm, ads, dual, fire, melee, moves, offhand, reload, shield, spread};
 use crate::switch::{self, SwitchOut};
-use crate::{base, state, timing};
+use {crate::base, crate::state, crate::timing};
 
 /// `eFlags` bits for a deployed (mounted) weapon.
 const EF_DEPLOYED: u32 = 0x300;
@@ -82,7 +84,7 @@ fn apply_switch(pm: &mut Pm, so: SwitchOut) {
         None => {}
     }
     if so.clear_deployed {
-        pm.env.e_flags &= !EF_DEPLOYED;
+        pm.env.ent_bits &= !EF_DEPLOYED;
     }
     if so.reset_riotshield_model {
         shield::model_off(pm);
@@ -114,16 +116,16 @@ fn finish_change(pm: &mut Pm) {
 /// The water part of PM_Weapon. `false` = the tick ends here.
 fn water(pm: &mut Pm) -> bool {
     if pm.env.waterlevel < WATER_UNDER {
-        if pm.ps.weaponstate == state::SWIM_IN {
-            pm.ps.weaponstate = state::SWIM_OUT;
-            pm.ps.weapon_time = SWIM_TIME;
+        if pm.ps.gun_phase == state::SWIM_IN {
+            pm.ps.gun_phase = state::SWIM_OUT;
+            pm.ps.gun_timer_ms = SWIM_TIME;
         }
         return true;
     }
     if !pm.env.dvars.player_disable_weapons_in_water {
         return true;
     }
-    if (state::RIOTSHIELD_PREPARE..=state::RIOTSHIELD_END).contains(&pm.ps.weaponstate) {
+    if (state::RIOTSHIELD_PREPARE..=state::RIOTSHIELD_END).contains(&pm.ps.gun_phase) {
         shield::model_off(pm);
     }
     let r = timing::time_adjust(pm);
@@ -131,22 +133,22 @@ fn water(pm: &mut Pm) -> bool {
     if !fire::burst_fire_pending(pm, left) {
         melee::check_for_melee(pm, r);
     }
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     if s == state::SWIM_IN {
-        if pm.ps.weap_flags & wf::SWIM_LOWERED == 0 {
+        if pm.ps.weapon_state_bits & wf::SWIM_LOWERED == 0 {
             return false;
         }
-        pm.ps.weap_flags &= !wf::SWIM_LOWERED;
+        pm.ps.weapon_state_bits &= !wf::SWIM_LOWERED;
     } else if !(state::OFFHAND_INIT..=state::OFFHAND_HOLDUSE).contains(&s)
         && !(state::MELEE_INIT..=state::MELEE_FIRE).contains(&s)
     {
-        pm.ps.weap_flags |= wf::SWIM_LOWERED;
-        pm.ps.weaponstate = state::SWIM_IN;
-        pm.ps.weapon_delay = 0;
-        pm.ps.weapon_time = if s == state::SWIM_OUT { SWIM_TIME } else { 0 };
+        pm.ps.weapon_state_bits |= wf::SWIM_LOWERED;
+        pm.ps.gun_phase = state::SWIM_IN;
+        pm.ps.weapon_ready_wait = 0;
+        pm.ps.gun_timer_ms = if s == state::SWIM_OUT { SWIM_TIME } else { 0 };
         ads::exit_ads(pm);
-        pm.ps.f_weapon_pos_frac = 0.0;
-        pm.ps.ads_delay_time = 0;
+        pm.ps.weapon_raise_fraction = 0.0;
+        pm.ps.scope_in_wait = 0;
     }
     true
 }
@@ -158,24 +160,24 @@ pub fn pm_weapon(pm: &mut Pm) {
         return;
     }
     debug_assert!(
-        pm.ps.weap_flags & wf::USING_OFFHAND == 0
-            || (state::RAISING..=state::DROPPING_ALTSWITCH).contains(&pm.ps.weaponstate)
-            || (state::OFFHAND_PREPARE..=state::OFFHAND_HOLDUSE).contains(&pm.ps.weaponstate),
+        pm.ps.weapon_state_bits & wf::USING_OFFHAND == 0
+            || (state::RAISING..=state::DROPPING_ALTSWITCH).contains(&pm.ps.gun_phase)
+            || (state::OFFHAND_PREPARE..=state::OFFHAND_HOLDUSE).contains(&pm.ps.gun_phase),
         "offhand flag outside an offhand/raise/drop state"
     );
     let env = *pm.env;
-    if env.pm_type > pm_type::LASTSTAND_TRANSITION
-        && env.link_flags & LF_WEAPON_ALLOWED == 0
+    if env.movement_mode > movement_mode::LASTSTAND_TRANSITION
+        && env.attach_bits & LF_WEAPON_ALLOWED == 0
         && env.e_flags2 & EF2_WEAPON_LOCKED == 0
     {
         pm.ps.weapon = 0;
         return;
     }
-    if env.pm_flags & pmf::FROZEN != 0 {
+    if env.movement_state_bits & pmf::FROZEN != 0 {
         return;
     }
-    if env.e_flags & EF_DEPLOYED != 0
-        && (env.e_flags2 & EF2_WEAPON_LOCKED == 0 || pm.ps.weaponstate == state::READY)
+    if env.ent_bits & EF_DEPLOYED != 0
+        && (env.e_flags2 & EF2_WEAPON_LOCKED == 0 || pm.ps.gun_phase == state::READY)
     {
         return;
     }
@@ -185,7 +187,7 @@ pub fn pm_weapon(pm: &mut Pm) {
 
     // Every-tick updates.
     shield::update_switching_flag(pm);
-    let prev_ads_frac = pm.ps.f_weapon_pos_frac;
+    let prev_ads_frac = pm.ps.weapon_raise_fraction;
     ads::update_ads_lerp(pm);
     fire::update_spin(pm);
     ads::update_scope_zoom(pm);
@@ -198,7 +200,7 @@ pub fn pm_weapon(pm: &mut Pm) {
     // The left hand only mirrors the right unless the gun runs its own left-hand actions.
     if left {
         if !dual::universal_action_dw(pm) {
-            pm.ps.weaponstate_left = pm.ps.weaponstate;
+            pm.ps.weaponstate_left = pm.ps.gun_phase;
             pm.ps.weapon_delay_left = 0;
             pm.ps.weapon_time_left = 0;
             pm.ps.weap_anim_left = LEFT_FOLLOWS_RIGHT;
@@ -208,7 +210,7 @@ pub fn pm_weapon(pm: &mut Pm) {
             pm.ps.weaponstate_left = state::READY;
             pm.ps.weapon_delay_left = 0;
             pm.ps.weapon_time_left = 0;
-            if pm.env.pm_type > pm_type::LASTSTAND_TRANSITION {
+            if pm.env.movement_mode > movement_mode::LASTSTAND_TRANSITION {
                 return;
             }
             pm.ps.weap_anim_left = crate::anim::TOGGLE;
@@ -245,13 +247,13 @@ pub fn pm_weapon(pm: &mut Pm) {
         return;
     }
 
-    let moving = pm.cmd.forwardmove != 0 || pm.cmd.rightmove != 0;
-    if (pm.env.pm_flags & pmf::PRONE != 0 && moving && pm.ps.f_weapon_pos_frac != 1.0)
-        || (state::MELEE_INIT..=state::MELEE_END).contains(&pm.ps.weaponstate)
+    let moving = pm.cmd.thrust_ahead != 0 || pm.cmd.thrust_lateral != 0;
+    if (pm.env.movement_state_bits & pmf::LYING_FLAT != 0 && moving && pm.ps.weapon_raise_fraction != 1.0)
+        || (state::MELEE_INIT..=state::MELEE_END).contains(&pm.ps.gun_phase)
     {
-        pm.ps.aim_spread_scale = SPREAD_MAX;
+        pm.ps.sight_spread_factor = SPREAD_MAX;
     }
-    debug_assert!(pm.ps.weapon_time >= 0 && pm.ps.weapon_delay >= 0);
+    debug_assert!(pm.ps.gun_timer_ms >= 0 && pm.ps.weapon_ready_wait >= 0);
 
     let h = pm.hand();
     if r == 0 && (h.time != 0 || h.delay != 0) {
@@ -259,7 +261,7 @@ pub fn pm_weapon(pm: &mut Pm) {
     }
 
     if !left {
-        match pm.ps.weaponstate {
+        match pm.ps.gun_phase {
             state::RAISING | state::RAISING_ALTSWITCH => {
                 return switch::finish_raise(pm.ps, pm.env);
             }
@@ -296,16 +298,16 @@ pub fn pm_weapon(pm: &mut Pm) {
             state::SPRINT_LOOP | state::DEPLOYED => return,
             state::NIGHTVISION_WEAR => return moves::finish_night_vision_wear(pm),
             state::NIGHTVISION_REMOVE => return moves::finish_night_vision_remove(pm),
-            state::DEPLOYING => return pm.add_event(events::EV_WEAPON_FINISH_DEPLOYING),
+            state::DEPLOYING => return pm.add_event(EV_WEAPON_FINISH_DEPLOYING),
             state::BREAKING_DOWN => {
                 base::idle(pm);
-                return pm.add_event(events::EV_WEAPON_FINISH_BREAKING_DOWN);
+                return pm.add_event(EV_WEAPON_FINISH_BREAKING_DOWN);
             }
             state::SWIM_IN => return moves::swim_in(pm),
             state::SWIM_OUT => return moves::swim_out(pm),
             state::DTP_IN => return moves::dtp_loop(pm),
             state::DTP_LOOP => {
-                if moves::dtp_is_sliding(pm) || pm.env.pm_flags & pmf::DTP_AIR == 0 {
+                if moves::dtp_is_sliding(pm) || pm.env.movement_state_bits & pmf::DTP_AIR == 0 {
                     moves::dtp_out(pm);
                 }
                 return;
@@ -331,12 +333,12 @@ pub fn pm_weapon(pm: &mut Pm) {
         && fire::should_be_firing(pm, false)
         && !fire::check_friendly_fire(pm)
         && !offhand::check_grenade_hold(pm, r)
-        && pm.env.pm_flags & pmf::NO_FIRE == 0
-        && pm.ps.weaponstate != state::DEPLOYING
-        && pm.env.other_flags & OF_NO_FIRE == 0
+        && pm.env.movement_state_bits & pmf::NO_FIRE == 0
+        && pm.ps.gun_phase != state::DEPLOYING
+        && pm.env.secondary_state_bits & OF_NO_FIRE == 0
     {
         fire::fire_weapon(pm);
-        debug_assert!(pm.ps.weapon_time >= 0 && pm.ps.weapon_delay >= 0);
+        debug_assert!(pm.ps.gun_timer_ms >= 0 && pm.ps.weapon_ready_wait >= 0);
     }
 }
 
@@ -345,7 +347,7 @@ pub fn describe(out: &FrameOut) -> Vec<String> {
     let mut v: Vec<String> = out
         .events
         .iter()
-        .map(|e: &Event| format!("ev {}({})", events::name(e.id), e.parm))
+        .map(|e: &Event| format!("ev {}({})", name(e.id), e.parm))
         .collect();
     v.extend(
         out.scripts
@@ -362,10 +364,10 @@ mod crawl_idle_tests {
 
     fn sprint_raise() -> T6WeaponPs {
         let mut ps = T6WeaponPs::default();
-        ps.weaponstate = state::SPRINT_RAISE;
-        ps.weapon_time = 300;
-        ps.weapon_delay = 40;
-        ps.weap_flags |= wf::USING_OFFHAND;
+        ps.gun_phase = state::SPRINT_RAISE;
+        ps.gun_timer_ms = 300;
+        ps.weapon_ready_wait = 40;
+        ps.weapon_state_bits |= wf::USING_OFFHAND;
         ps
     }
 
@@ -374,21 +376,21 @@ mod crawl_idle_tests {
         let facts = FactsTable::new();
         let mut ps = sprint_raise();
         let cmd = T6Cmd {
-            msec: 50,
+            frame_ms: 50,
             ..T6Cmd::default()
         };
         let mut env = T6Env {
             crawl_idle: true,
-            pm_flags: pmf::PRONE | pmf::PRONE_MOVE_OVERRIDE,
+            movement_state_bits: pmf::LYING_FLAT | pmf::PRONE_MOVE_OVERRIDE,
             ..T6Env::default()
         };
         pre_weapon(&mut ps, &cmd, &mut env, &facts);
-        assert_eq!(ps.weaponstate, state::READY);
+        assert_eq!(ps.gun_phase, state::READY);
         assert_eq!(ps.weaponstate_left, state::READY);
-        assert_eq!((ps.weapon_time, ps.weapon_delay), (0, 0));
-        assert_eq!(ps.weap_flags & wf::USING_OFFHAND, 0);
-        assert_eq!(env.pm_flags & pmf::PRONE_MOVE_OVERRIDE, 0);
-        assert_eq!(crate::anim::number(ps.weap_anim), crate::anim::IDLE);
+        assert_eq!((ps.gun_timer_ms, ps.weapon_ready_wait), (0, 0));
+        assert_eq!(ps.weapon_state_bits & wf::USING_OFFHAND, 0);
+        assert_eq!(env.movement_state_bits & pmf::PRONE_MOVE_OVERRIDE, 0);
+        assert_eq!(crate::anim::number(ps.gun_clip), crate::anim::REST);
     }
 
     #[test]
@@ -396,12 +398,12 @@ mod crawl_idle_tests {
         let facts = FactsTable::new();
         let mut ps = sprint_raise();
         let cmd = T6Cmd {
-            msec: 50,
+            frame_ms: 50,
             ..T6Cmd::default()
         };
         let mut env = T6Env::default();
         pre_weapon(&mut ps, &cmd, &mut env, &facts);
-        assert_eq!(ps.weaponstate, state::SPRINT_RAISE);
-        assert_eq!(ps.weapon_time, 300);
+        assert_eq!(ps.gun_phase, state::SPRINT_RAISE);
+        assert_eq!(ps.gun_timer_ms, 300);
     }
 }

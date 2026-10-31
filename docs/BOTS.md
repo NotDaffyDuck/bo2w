@@ -1,50 +1,38 @@
-# `bots` — host AI
+# Bots
 
-Authority tick: observation → memory → utility → task → route → motor → UserCmd.
+bo2mp does not carry its own bot brain. The bots are Black Ops II's: its bot
+scripts (`maps/mp/bots/_bot*`) decide goals, targets, aim, trigger, sights,
+grenades, melee and dives, and the engine only carries those decisions out.
 
-`bot dummy [N]` creates bots with no controller or perception queries. They keep
-their aim and weapon, accept `bot tp/give/fire`, and take damage and respawn normally.
-They retain normal bot loadouts/perks; `bot hold off` leaves dummies idle.
-Bots submit `TickInput.cmds` like players — [`SIM-STEP.md`](SIM-STEP.md).
+## Who does what
 
-| file | owns |
+| where | job |
 |---|---|
-| `observation.rs` / `memory.rs` | what a bot may know, and for how long |
-| `sensor.rs` | visibility probes and the rotation that spends them |
-| `controller.rs` / `task.rs` / `intent.rs` | scores, task choice, stages |
-| `nav.rs` | the baked graph, A\*, resumable route requests |
-| `query.rs` | the shared collision budget every subsystem draws on |
-| `weapon.rs` / `motor.rs` | the weapon channel; aim and movement |
+| `crates/console` (`feature_dispatch/bots.rs`) | parses the `bot` console verb |
+| `crates/bots` | seats and joins the clients the script adds, gives them gamertags and default classes, keeps one queued command per bot |
+| `crates/sim/src/t6/bots.rs` | the engine half: a test client joins through `addtestclient`, walks the best goal's route over the map's path nodes, turns its view at its difficulty's speed and presses the buttons |
+| `crates/sim/src/t6/console_bots.rs` | `bot add` and `bot hold`, multiplayer only |
 
-## The three rules that shape the rest
+Each tick a bot's command replaces its client's own, the way the zombies test
+player works. Bots therefore reach the step as ordinary input, the same funnel a
+human uses ([`SIM-STEP.md`](SIM-STEP.md)).
 
-**A negative needs a probe that ran.** Visibility answers seen, evaluated and
-not seen, or not evaluated. Only the second ends a contact; the third holds it,
-briefly and without coordinates. Firing needs a positive observation of that
-client, fresh on the tick the command goes out.
+## Goals
 
-**A denied query is not a collision.** Perception, connectors, execution and
-combat share one 96-query quota. A query that ran reports what it found even on
-the last token; one that never ran comes back as denial, so no refusal is ever
-fabricated from an empty budget.
+A goal is a named place (`wander`, `enemy_patrol`, `cover` ...) added by script
+with a priority and a radius. The highest priority wins; among equals, the newest.
 
-**Work survives a tick that is granted nothing.** A route request owns its
-phase — approach, attachments, search, validation — and every cursor inside it
-is resumable, so a zero allocation repeats nothing and A\* keeps its frontier
-under the shared 2048-expansion quota. Answers that follow from graph topology
-alone are cached per request key until the graph changes; collision-dependent
-refusals are rechecked.
+## Console verbs
 
-## Movement and combat
+* `bot add [N]` asks the game's own `spawn_bot(team)` for each bot, the call its
+  lobby fill uses, so the bot picks a class and plays like any other. N is capped
+  at 16 per call. An enemy goes to the side opposite the host, a friend to the
+  host's side, enemies first: `bot add 1` gives one target, `bot add 2` one of each.
+* `bot hold [on|off]`: while on, bots keep their view but neither move nor press
+  anything. It is a flag the driver reads, because BO2 has no counterpart that
+  survives a respawn.
+* `bot give <id> <weapon> [attachments...]` and
+  `bot tp all|<id> above <h>` / `bot tp all|<id> x y z [yaw [pitch]]`.
 
-The graph bakes world-aligned tiles at 48 units, refined to 24 near missing
-support or a height change, with directed Walk, Drop and BreakGlass edges that
-keep their entry and exit through execution. A fight moves to a *position*: one
-baked support per sector around the threat, checked for line of fire and
-exposure, then reached through the ordinary route executor — reachability is
-never inferred from a component label.
-
-`HostController::decision()` exposes scores, stage and objective; the periodic
-aggregate adds per-subsystem query counts and stuck bots. Both read live from a
-running match, which is where bot behaviour is judged: `make map mp_boneyard`
-([`RUN.md`](RUN.md)) and watch the aggregate.
+To judge bot behaviour, run a live match (`make map mp_raid`, see
+[`RUN.md`](RUN.md)) and watch it.

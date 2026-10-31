@@ -8,9 +8,10 @@
 //!   (`EvalLocalVariableCached 0` is the last declared).
 //! - `wait` rounds to 50 ms server frames (at least one); `waittillframeend`
 //!   runs after every other thread this frame.
-//! - `notify` runs the threads it wakes at once, before the notifier goes on
-//!   (endons first). A fired endon unwinds its thread to the function that
-//!   registered it; the caller sees that call return undefined.
+//! - `notify` ends endons at once; the threads it wakes run after the notifier
+//!   waits (VM_Notify queues them at the current time). A fired endon unwinds
+//!   its thread to the function that registered it; the caller sees that
+//!   call return undefined.
 //! - Deleting an entity ends the threads that run on it or wait on it.
 //! - Runtime errors are reported once per place and the operation yields
 //!   undefined; the thread goes on.
@@ -18,23 +19,25 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic;
+use std::sync::atomic::Ordering::Relaxed;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::program::{BinOp, CallKind, Op, Program};
 use crate::value::{
-    Array, ArrayRef, FuncRef, Key, ObjKind, ObjRef, Object, Str, Strings, Value, format_float,
+    Array, ArrayRef, FuncRef, Key, ObjKind, ObjRef, Object, Str, Strings, ScriptValue, format_float,
 };
 
 /// A builtin: `(vm, host, self, args) -> result`.
-pub type Native<H> = fn(&mut Vm<H>, &mut H, &Value, &[Value]) -> Result<Value, String>;
+pub type Native<H> = fn(&mut Vm<H>, &mut H, &ScriptValue, &[ScriptValue]) -> Result<ScriptValue, String>;
 
 /// Engine hooks: an engine-owned field of a host object (`Entity`,
 /// `HudElem`; `None` = use the script field), writing one (`true` when
 /// handled), and a builtin nobody bound.
-pub type GetFieldHook<H> = fn(&mut Vm<H>, &mut H, ObjRef, ObjKind, Str) -> Option<Value>;
-pub type SetFieldHook<H> = fn(&mut Vm<H>, &mut H, ObjRef, ObjKind, Str, &Value) -> bool;
-pub type UnboundHook<H> = fn(&mut Vm<H>, &mut H, u32, &Value, &[Value]) -> Value;
+pub type GetFieldHook<H> = fn(&mut Vm<H>, &mut H, ObjRef, ObjKind, Str) -> Option<ScriptValue>;
+pub type SetFieldHook<H> = fn(&mut Vm<H>, &mut H, ObjRef, ObjKind, Str, &ScriptValue) -> bool;
+pub type UnboundHook<H> = fn(&mut Vm<H>, &mut H, u32, &ScriptValue, &[ScriptValue]) -> ScriptValue;
 
 pub struct Hooks<H> {
     pub get_field: Option<GetFieldHook<H>>,
@@ -66,11 +69,11 @@ pub fn hash_name(name: &str) -> u32 {
 }
 
 /// Script truth: numbers non-zero; undefined false; other values true.
-pub fn truthy(v: &Value) -> bool {
+pub fn truthy(v: &ScriptValue) -> bool {
     match v {
-        Value::Undefined | Value::Marker => false,
-        Value::Int(i) => *i != 0,
-        Value::Float(f) => *f != 0.0,
+        ScriptValue::Undefined | ScriptValue::Marker => false,
+        ScriptValue::Int(i) => *i != 0,
+        ScriptValue::Float(f) => *f != 0.0,
         _ => true,
     }
 }
@@ -78,17 +81,17 @@ pub fn truthy(v: &Value) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ThreadId {
     pub index: u32,
-    pub generation: u32,
+    pub stamp: u32,
 }
 
 #[derive(Debug)]
 struct Frame {
     func: u32,
     pc: u32,
-    locals: Vec<Value>,
-    self_: Value,
+    locals: Vec<ScriptValue>,
+    self_: ScriptValue,
     base: u32,
-    args: Vec<Value>,
+    args: Vec<ScriptValue>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,7 +106,7 @@ enum State {
 #[derive(Debug)]
 struct Thread {
     frames: Vec<Frame>,
-    stack: Vec<Value>,
+    stack: Vec<ScriptValue>,
     /// (object, name, frame depth).
     endons: Vec<(ObjRef, Str, u32)>,
     waiting_on: Option<(ObjRef, Str)>,
@@ -114,7 +117,7 @@ struct Thread {
 #[derive(Clone, Debug)]
 enum WaiterKind {
     Waittill,
-    Match(Vec<Value>),
+    Match(Vec<ScriptValue>),
     Endon(u32),
 }
 
@@ -168,12 +171,15 @@ pub struct Vm<H> {
     dying: Vec<u32>,
     pub level: ObjRef,
     pub anim: ObjRef,
-    pub game: Value,
+    pub game: ScriptValue,
     threads: Vec<Option<Box<Thread>>>,
     thread_gens: Vec<u32>,
     free_threads: Vec<u32>,
+    /// (due ms, !seq, thread index, stamp): soonest first, and of the
+    /// threads due on the same tick the newest `wait` first, as BO2 runs
+    /// them (OP_wait puts a thread at the head of its time's list).
     timers: BinaryHeap<Reverse<(i64, u64, u32, u32)>>,
-    next_seq: u64,
+    upcoming_serial: u64,
     frame_end: Vec<ThreadId>,
     ready: VecDeque<ThreadId>,
     waiters: FxHashMap<(u32, Str), Vec<Waiter>>,
@@ -182,7 +188,7 @@ pub struct Vm<H> {
     nest: u32,
     /// Woken threads wait in `ready` instead of running at once.
     queue_wakes: bool,
-    pub time_ms: i64,
+    pub clock_stamp_ms: i64,
     pub dvars: FxHashMap<String, String>,
     reported: FxHashSet<String>,
     /// Messages for the host to show (errors, unbound builtins).
@@ -201,9 +207,76 @@ pub struct Vm<H> {
     pub ftrace: FxHashSet<u32>,
 }
 
+/// Hang watch (read from another thread when the sim stops ticking): the
+/// builtin running now (id + 1, 0 = none), the script function that called
+/// it, and a count of instructions run (moves while scripts loop).
+static NATIVE_NOW: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+static NATIVE_CALLER: atomic::AtomicU32 = atomic::AtomicU32::new(u32::MAX);
+static STEPS_RUN: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+/// Sampled every 4096 instructions: the function running and its thread's
+/// first function; and how many times a thread was resumed.
+static SAMPLE_FUNC: atomic::AtomicU32 = atomic::AtomicU32::new(u32::MAX);
+static SAMPLE_ROOT: atomic::AtomicU32 = atomic::AtomicU32::new(u32::MAX);
+static RESUMES: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+static NAMES: std::sync::Mutex<(Vec<String>, Vec<String>)> =
+    std::sync::Mutex::new((Vec::new(), Vec::new()));
+
+/// What the scripts are doing now, for a hang report: the builtin being
+/// run (and by which function), or none, and the instructions run so far.
+pub fn hang_report() -> String {
+    let (id, caller, steps) = (
+        NATIVE_NOW.load(Relaxed),
+        NATIVE_CALLER.load(Relaxed),
+        STEPS_RUN.load(Relaxed),
+    );
+    let names = NAMES.lock().map(|n| n.clone()).unwrap_or_default();
+    let get = |v: &Vec<String>, i: u32| {
+        v.get(i as usize)
+            .cloned()
+            .unwrap_or_else(|| format!("#{i}"))
+    };
+    let sample = format!(
+        "{} instructions run, {} resumes; sampled {} in thread {}",
+        steps,
+        RESUMES.load(Relaxed),
+        get(&names.1, SAMPLE_FUNC.load(Relaxed)),
+        get(&names.1, SAMPLE_ROOT.load(Relaxed))
+    );
+    if id == 0 {
+        format!("no builtin running; {sample}")
+    } else {
+        format!(
+            "builtin {} called from {}; {sample}",
+            get(&names.0, id - 1),
+            get(&names.1, caller)
+        )
+    }
+}
+
 impl<H> Vm<H> {
     pub fn new(program: Program, strings: Strings) -> Self {
         let n = program.builtins.len();
+        // The biggest program's names (the server's, not the client's).
+        if let Ok(mut names) = NAMES.lock()
+            && names.1.len() < program.functions.len()
+        {
+            names.0 = program
+                .builtins
+                .iter()
+                .map(|(b, _)| strings.get(*b).to_owned())
+                .collect();
+            names.1 = program
+                .functions
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}::{}",
+                        program.scripts[f.script as usize].name,
+                        strings.get(f.name)
+                    )
+                })
+                .collect();
+        }
         let mut vm = Self {
             strings,
             program: Arc::new(program),
@@ -220,12 +293,12 @@ impl<H> Vm<H> {
                 index: 0,
                 generation: 0,
             },
-            game: Value::array(Array::new()),
+            game: ScriptValue::array(Array::new()),
             threads: Vec::new(),
             thread_gens: Vec::new(),
             free_threads: Vec::new(),
             timers: BinaryHeap::new(),
-            next_seq: 0,
+            upcoming_serial: 0,
             frame_end: Vec::new(),
             ready: VecDeque::new(),
             waiters: FxHashMap::default(),
@@ -233,7 +306,7 @@ impl<H> Vm<H> {
             pending_unwind: FxHashMap::default(),
             nest: 0,
             queue_wakes: false,
-            time_ms: 0,
+            clock_stamp_ms: 0,
             dvars: FxHashMap::default(),
             reported: FxHashSet::default(),
             messages: Vec::new(),
@@ -303,20 +376,20 @@ impl<H> Vm<H> {
     pub fn alloc_object(&mut self, kind: ObjKind) -> ObjRef {
         if let Some(i) = self.free_objects.pop() {
             let o = &mut self.objects[i as usize];
-            o.generation = o.generation.wrapping_add(1);
-            o.alive = true;
+            o.stamp = o.stamp.wrapping_add(1);
+            o.living = true;
             o.dying = false;
             o.kind = kind;
             o.fields.clear();
             return ObjRef {
                 index: i,
-                generation: o.generation,
+                generation: o.stamp,
             };
         }
         let i = self.objects.len() as u32;
         self.objects.push(Object {
-            generation: 0,
-            alive: true,
+            stamp: 0,
+            living: true,
             dying: false,
             kind,
             fields: FxHashMap::default(),
@@ -327,46 +400,46 @@ impl<H> Vm<H> {
         }
     }
 
-    pub fn new_struct(&mut self) -> Value {
-        Value::Object(self.alloc_object(ObjKind::Struct))
+    pub fn new_struct(&mut self) -> ScriptValue {
+        ScriptValue::Object(self.alloc_object(ObjKind::Struct))
     }
 
     pub fn alive(&self, o: ObjRef) -> bool {
         self.objects
             .get(o.index as usize)
-            .is_some_and(|x| x.alive && x.generation == o.generation)
+            .is_some_and(|x| x.living && x.stamp == o.generation)
     }
 
     /// Deleted this frame (its fields still read).
     fn dying(&self, o: ObjRef) -> bool {
         self.objects
             .get(o.index as usize)
-            .is_some_and(|x| x.dying && x.generation == o.generation)
+            .is_some_and(|x| x.dying && x.stamp == o.generation)
     }
 
-    pub fn kind(&self, o: ObjRef) -> Option<ObjKind> {
+    pub fn kind(&self, obj: ObjRef) -> Option<ObjKind> {
         self.objects
-            .get(o.index as usize)
-            .filter(|x| x.alive && x.generation == o.generation)
+            .get(obj.index as usize)
+            .filter(|x| x.living && x.stamp == obj.generation)
             .map(|x| x.kind)
     }
 
     /// The script field (not the engine's). A deleted object's last until
     /// the frame's scripts are done (BO2's `destroyhelicopter` deletes the
     /// chopper, then reads its `hardpointtype` and `killstreak_id`).
-    pub fn raw_field(&self, o: ObjRef, f: Str) -> Value {
+    pub fn raw_field(&self, o: ObjRef, f: Str) -> ScriptValue {
         match self.objects.get(o.index as usize) {
-            Some(x) if (x.alive || x.dying) && x.generation == o.generation => {
+            Some(x) if (x.living || x.dying) && x.stamp == o.generation => {
                 x.fields.get(&f).cloned().unwrap_or_default()
             }
-            _ => Value::Undefined,
+            _ => ScriptValue::Undefined,
         }
     }
 
-    pub fn set_raw_field(&mut self, o: ObjRef, f: Str, v: Value) {
+    pub fn set_raw_field(&mut self, o: ObjRef, f: Str, v: ScriptValue) {
         if let Some(x) = self.objects.get_mut(o.index as usize)
-            && (x.alive || x.dying)
-            && x.generation == o.generation
+            && (x.living || x.dying)
+            && x.stamp == o.generation
         {
             if v.is_undefined() {
                 x.fields.remove(&f);
@@ -378,14 +451,14 @@ impl<H> Vm<H> {
 
     pub fn field_names(&self, o: ObjRef) -> Vec<Str> {
         match self.objects.get(o.index as usize) {
-            Some(x) if x.alive && x.generation == o.generation => {
+            Some(x) if x.living && x.stamp == o.generation => {
                 x.fields.keys().copied().collect()
             }
             _ => Vec::new(),
         }
     }
 
-    pub fn get_field(&mut self, host: &mut H, o: ObjRef, f: Str) -> Value {
+    pub fn get_field(&mut self, host: &mut H, o: ObjRef, f: Str) -> ScriptValue {
         let Some(kind) = self.kind(o) else {
             return self.raw_field(o, f);
         };
@@ -398,7 +471,7 @@ impl<H> Vm<H> {
         self.raw_field(o, f)
     }
 
-    pub fn set_field(&mut self, host: &mut H, o: ObjRef, f: Str, v: Value) {
+    pub fn set_field(&mut self, host: &mut H, o: ObjRef, f: Str, v: ScriptValue) {
         let Some(kind) = self.kind(o) else {
             if self.dying(o) {
                 self.set_raw_field(o, f, v);
@@ -416,16 +489,20 @@ impl<H> Vm<H> {
         self.set_raw_field(o, f, v);
     }
 
-    /// Free an object (an entity deleted): threads that run on it, wait on
-    /// it or end on it end.
+    /// Free an object (an entity deleted), as BO2 cancels a dead entity's
+    /// notify list (Scr_FreeEntityList -> Scr_CancelNotifyList): a thread
+    /// waiting on it ends, an endon on it is dropped and its thread runs on,
+    /// and threads that run on it run on (nothing ends them for that; a
+    /// `delete` ends `endon("death")` threads by notifying "death" first).
     pub fn free_object(&mut self, host: &mut H, o: ObjRef) {
         if !self.alive(o) {
             return;
         }
-        // Endons on it unwind; waits on it end. Threads running on it (its
-        // `self`) go on, as in Black Ops II: a care package's crate thread
-        // runs on the helicopter that dropped it, long after the helicopter
-        // is gone (a call on a removed entity is that thread's own error).
+        // Endons on it are dropped (their threads run on) and waits on it end.
+        // Threads running on it (its `self`) go on, as in Black Ops II: a care
+        // package's crate thread runs on the helicopter that dropped it, long
+        // after the helicopter is gone (a call on a removed entity is that
+        // thread's own error).
         let keys: Vec<(u32, Str)> = self
             .waiters
             .keys()
@@ -433,7 +510,7 @@ impl<H> Vm<H> {
             .copied()
             .collect();
         let mut kill: Vec<ThreadId> = Vec::new();
-        let mut unwind: Vec<(ThreadId, u32)> = Vec::new();
+        let mut dropped: Vec<ThreadId> = Vec::new();
         for k in keys {
             if let Some(list) = self.waiters.remove(&k) {
                 for w in list {
@@ -441,28 +518,27 @@ impl<H> Vm<H> {
                         continue;
                     }
                     match w.kind {
-                        WaiterKind::Endon(d) => unwind.push((w.thread, d)),
+                        WaiterKind::Endon(_) => dropped.push(w.thread),
                         _ => kill.push(w.thread),
                     }
                 }
             }
         }
-        // Running threads on it (this call may come from one of them).
-        for &t in &self.running {
-            if let Some(Some(_)) = self.threads.get(t.index as usize) {
-                continue;
+        // A running thread's own list keeps its stale entry; its waiter is
+        // gone, so nothing can fire it.
+        for t in dropped {
+            if self.thread_gens.get(t.index as usize) == Some(&t.stamp)
+                && let Some(Some(th)) = self.threads.get_mut(t.index as usize)
+            {
+                th.endons.retain(|e| e.0 != o);
             }
-            let _ = t;
         }
         let x = &mut self.objects[o.index as usize];
-        x.alive = false;
+        x.living = false;
         x.dying = true;
         self.dying.push(o.index);
         for t in kill {
             self.unwind(host, t, 0);
-        }
-        for (t, d) in unwind {
-            self.unwind(host, t, d);
         }
     }
 
@@ -484,8 +560,8 @@ impl<H> Vm<H> {
         self.waiters.clear();
         self.pending_unwind.clear();
         for (i, o) in self.objects.iter_mut().enumerate() {
-            if o.alive {
-                o.alive = false;
+            if o.living {
+                o.living = false;
                 o.fields.clear();
                 self.free_objects.push(i as u32);
             }
@@ -496,7 +572,7 @@ impl<H> Vm<H> {
 
     // ---- threads --------------------------------------------------------
 
-    fn new_thread(&mut self, func: u32, self_: Value, args: Vec<Value>) -> ThreadId {
+    fn new_thread(&mut self, func: u32, self_: ScriptValue, args: Vec<ScriptValue>) -> ThreadId {
         let th = Box::new(Thread {
             frames: vec![Frame {
                 func,
@@ -517,7 +593,7 @@ impl<H> Vm<H> {
             self.threads[i as usize] = Some(th);
             return ThreadId {
                 index: i,
-                generation: self.thread_gens[i as usize],
+                stamp: self.thread_gens[i as usize],
             };
         }
         let i = self.threads.len() as u32;
@@ -525,19 +601,24 @@ impl<H> Vm<H> {
         self.thread_gens.push(0);
         ThreadId {
             index: i,
-            generation: 0,
+            stamp: 0,
         }
     }
 
     /// Is thread `t` still running (not returned, not ended by an endon)?
     pub fn thread_live(&self, t: ThreadId) -> bool {
-        self.thread_gens.get(t.index as usize) == Some(&t.generation)
+        self.thread_gens.get(t.index as usize) == Some(&t.stamp)
             && (self.threads[t.index as usize].is_some() || self.running.contains(&t))
     }
 
+    /// Is the thread still running (not returned or ended)?
+    pub fn thread_running(&self, t: ThreadId) -> bool {
+        self.thread_live(t)
+    }
+
     /// Start `func` as a new thread on `self_` and run it until it yields.
-    pub fn spawn(&mut self, host: &mut H, func: u32, self_: Value, args: Vec<Value>) -> ThreadId {
-        let t = self.new_thread(func, self_, args);
+    pub fn spawn(&mut self, host: &mut H, entry: u32, owner: ScriptValue, args: Vec<ScriptValue>) -> ThreadId {
+        let t = self.new_thread(entry, owner, args);
         self.exec(host, t);
         t
     }
@@ -546,12 +627,12 @@ impl<H> Vm<H> {
     pub fn spawn_named(
         &mut self,
         host: &mut H,
-        script: &str,
+        file: &str,
         name: &str,
-        self_: Value,
-        args: Vec<Value>,
+        self_: ScriptValue,
+        args: Vec<ScriptValue>,
     ) -> Option<ThreadId> {
-        let f = self.program.find(&self.strings, script, name)?;
+        let f = self.program.find(&self.strings, file, name)?;
         Some(self.spawn(host, f, self_, args))
     }
 
@@ -599,7 +680,7 @@ impl<H> Vm<H> {
             *d = (*d).min(depth);
             return;
         }
-        if self.thread_gens.get(t.index as usize) != Some(&t.generation) {
+        if self.thread_gens.get(t.index as usize) != Some(&t.stamp) {
             return;
         }
         let Some(mut th) = self.threads[t.index as usize].take() else {
@@ -627,16 +708,16 @@ impl<H> Vm<H> {
         let base = th.frames[depth].base as usize;
         th.frames.truncate(depth);
         th.stack.truncate(base);
-        let mut removed = Vec::new();
+        let mut dropped_endons = Vec::new();
         th.endons.retain(|e| {
             if e.2 as usize >= depth {
-                removed.push((e.0, e.1));
+                dropped_endons.push((e.0, e.1));
                 false
             } else {
                 true
             }
         });
-        for (o, n) in removed {
+        for (o, n) in dropped_endons {
             if let Some(list) = self.waiters.get_mut(&(o.index, n)) {
                 list.retain(|w| {
                     !(w.thread == t
@@ -650,7 +731,7 @@ impl<H> Vm<H> {
         if th.frames.is_empty() {
             return false;
         }
-        th.stack.push(Value::Undefined);
+        th.stack.push(ScriptValue::Undefined);
         true
     }
 
@@ -664,7 +745,7 @@ impl<H> Vm<H> {
 
     /// Notify `name` on `obj` with `args`: endons fire, then waiting threads
     /// run.
-    pub fn notify(&mut self, host: &mut H, obj: ObjRef, name: Str, args: &[Value]) {
+    pub fn notify(&mut self, host: &mut H, obj: ObjRef, name: Str, args: &[ScriptValue]) {
         let Some(list) = self.waiters.remove(&(obj.index, name)) else {
             return;
         };
@@ -718,22 +799,37 @@ impl<H> Vm<H> {
     /// Notify `name` on `obj` as BO2's VM_Notify does: endons end at once,
     /// waiting threads are queued to run after the caller (on the current
     /// time's list). `delete` notifies "death" so: its waiters run after the
-    /// entity is freed and find `self` undefined.
-    pub fn notify_queued(&mut self, host: &mut H, obj: ObjRef, name: &str, args: &[Value]) {
+    /// entity is freed and find `self` undefined (Die Rise's corpse-room
+    /// count returns on a deleted zombie).
+    pub fn notify_queued(&mut self, host: &mut H, obj: ObjRef, name: &str, args: &[ScriptValue]) {
         let n = self.intern(name);
         let was = std::mem::replace(&mut self.queue_wakes, true);
         self.notify(host, obj, n, args);
         self.queue_wakes = was;
     }
 
+    /// Notify `name` on `obj` to one thread only, the others waiting on it
+    /// left asleep: a script started late (another map's weapon set up on
+    /// its first give) past the `waittill( "spawned_player" )` it opens with.
+    pub fn notify_thread(&mut self, host: &mut H, t: ThreadId, obj: ObjRef, name: &str, args: &[ScriptValue]) {
+        let n = self.intern(name);
+        if let Some(list) = self.waiters.get_mut(&(obj.index, n)) {
+            list.retain(|w| !(w.thread == t && matches!(w.kind, WaiterKind::Waittill)));
+            if list.is_empty() {
+                self.waiters.remove(&(obj.index, n));
+            }
+        }
+        self.wake(host, t, obj, n, args);
+    }
+
     /// Notify by string.
-    pub fn notify_str(&mut self, host: &mut H, obj: ObjRef, name: &str, args: &[Value]) {
+    pub fn notify_str(&mut self, host: &mut H, obj: ObjRef, name: &str, args: &[ScriptValue]) {
         let n = self.intern(name);
         self.notify(host, obj, n, args);
     }
 
-    fn wake(&mut self, host: &mut H, t: ThreadId, obj: ObjRef, name: Str, args: &[Value]) {
-        if self.thread_gens.get(t.index as usize) != Some(&t.generation) {
+    fn wake(&mut self, host: &mut H, t: ThreadId, obj: ObjRef, name: Str, args: &[ScriptValue]) {
+        if self.thread_gens.get(t.index as usize) != Some(&t.stamp) {
             return;
         }
         let Some(th) = self.threads[t.index as usize].as_mut() else {
@@ -745,7 +841,7 @@ impl<H> Vm<H> {
         }
         th.waiting_on = None;
         th.state = State::Ready;
-        th.stack.push(Value::Marker);
+        th.stack.push(ScriptValue::Marker);
         for a in args.iter().rev() {
             th.stack.push(a.clone());
         }
@@ -754,7 +850,7 @@ impl<H> Vm<H> {
 
     /// Advance one server frame: due timers, then frame-end threads.
     pub fn run_frame(&mut self, host: &mut H) {
-        self.time_ms += FRAME_MS;
+        self.clock_stamp_ms += FRAME_MS;
         self.run_due(host);
     }
 
@@ -768,16 +864,17 @@ impl<H> Vm<H> {
             while let Some(t) = self.ready.pop_front() {
                 self.exec(host, t);
             }
-            let Some(&Reverse((at, seq, index, generation))) = self.timers.peek() else {
+            let Some(&Reverse((at, newest, index, stamp))) = self.timers.peek() else {
                 break;
             };
-            if at > self.time_ms || wakes >= 100_000 {
+            let seq = !newest;
+            if at > self.clock_stamp_ms || wakes >= 100_000 {
                 break;
             }
             wakes += 1;
             self.timers.pop();
-            let t = ThreadId { index, generation };
-            let ok = self.thread_gens.get(index as usize) == Some(&generation)
+            let t = ThreadId { index, stamp };
+            let ok = self.thread_gens.get(index as usize) == Some(&stamp)
                 && self.threads[index as usize]
                     .as_ref()
                     .is_some_and(|th| th.state == State::Timer && th.timer_seq == seq);
@@ -798,11 +895,17 @@ impl<H> Vm<H> {
             let list = std::mem::take(&mut self.frame_end);
             for t in list {
                 if let Some(Some(th)) = self.threads.get_mut(t.index as usize)
-                    && self.thread_gens[t.index as usize] == t.generation
+                    && self.thread_gens[t.index as usize] == t.stamp
                     && th.state == State::FrameEnd
                 {
                     th.state = State::Ready;
                     self.exec(host, t);
+                    // Threads it woke run as soon as it waits, before the next
+                    // frame-end thread (_globallogic_player's "connected" sets
+                    // up _visionset_mgr's player state before its monitor reads it).
+                    while let Some(t) = self.ready.pop_front() {
+                        self.exec(host, t);
+                    }
                 }
             }
         }
@@ -823,7 +926,7 @@ impl<H> Vm<H> {
     }
 
     fn exec(&mut self, host: &mut H, t: ThreadId) {
-        if self.thread_gens.get(t.index as usize) != Some(&t.generation) {
+        if self.thread_gens.get(t.index as usize) != Some(&t.stamp) {
             return;
         }
         let Some(mut th) = self.threads[t.index as usize].take() else {
@@ -841,7 +944,7 @@ impl<H> Vm<H> {
             let func = |f: Option<&Frame>| f.map(|f| f.func);
             (std::time::Instant::now(), func(th.frames.first()), func(th.frames.last()))
         });
-        let outcome = self.interp(host, t, &mut th, &program);
+        let step_result = self.interp(host, t, &mut th, &program);
         if let Some((started, entry, at)) = timed {
             let ms = started.elapsed().as_secs_f64() * 1000.0;
             if let (Some(p), Some(f)) = (self.profile.as_mut(), at) {
@@ -861,7 +964,7 @@ impl<H> Vm<H> {
         }
         self.nest -= 1;
         self.running.pop();
-        match outcome {
+        match step_result {
             Outcome::Done => {
                 self.threads[t.index as usize] = Some(th);
                 let mut th = self.threads[t.index as usize].take().unwrap();
@@ -873,7 +976,7 @@ impl<H> Vm<H> {
         }
     }
 
-    fn fail(&mut self, program: &Program, th: &Thread, msg: &str) {
+    fn fail_thread(&mut self, program: &Program, th: &Thread, msg: &str) {
         let (f, pc) = th.frames.last().map_or((0, 0), |f| (f.func, f.pc));
         let func = &program.functions[f as usize];
         let script = &program.scripts[func.script as usize].name;
@@ -888,86 +991,86 @@ impl<H> Vm<H> {
 
     // ---- values ---------------------------------------------------------
 
-    pub fn equal(&self, a: &Value, b: &Value) -> bool {
+    pub fn equal(&self, a: &ScriptValue, b: &ScriptValue) -> bool {
         match (a, b) {
-            (Value::Undefined, Value::Undefined) => true,
-            (Value::Int(x), Value::Int(y)) => x == y,
-            (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+            (ScriptValue::Undefined, ScriptValue::Undefined) => true,
+            (ScriptValue::Int(x), ScriptValue::Int(y)) => x == y,
+            (ScriptValue::Int(_) | ScriptValue::Float(_), ScriptValue::Int(_) | ScriptValue::Float(_)) => {
                 a.as_float() == b.as_float()
             }
-            (Value::Str(x) | Value::IStr(x), Value::Str(y) | Value::IStr(y)) => x == y,
-            (Value::Hash(x), Value::Hash(y)) => x == y,
-            (Value::Vec3(x), Value::Vec3(y)) => x == y,
-            (Value::Object(x), Value::Object(y)) => x == y && self.alive(*x),
-            (Value::Object(x), Value::Undefined) | (Value::Undefined, Value::Object(x)) => {
+            (ScriptValue::Str(x) | ScriptValue::IStr(x), ScriptValue::Str(y) | ScriptValue::IStr(y)) => x == y,
+            (ScriptValue::Hash(x), ScriptValue::Hash(y)) => x == y,
+            (ScriptValue::Vec3(x), ScriptValue::Vec3(y)) => x == y,
+            (ScriptValue::Object(x), ScriptValue::Object(y)) => x == y && self.alive(*x),
+            (ScriptValue::Object(x), ScriptValue::Undefined) | (ScriptValue::Undefined, ScriptValue::Object(x)) => {
                 !self.alive(*x)
             }
-            (Value::Array(x), Value::Array(y)) => ArrayRef::ptr_eq(x, y),
-            (Value::Func(x), Value::Func(y)) => x == y,
-            (Value::Anim(x), Value::Anim(y)) | (Value::AnimTree(x), Value::AnimTree(y)) => x == y,
+            (ScriptValue::Array(x), ScriptValue::Array(y)) => ArrayRef::ptr_eq(x, y),
+            (ScriptValue::Func(x), ScriptValue::Func(y)) => x == y,
+            (ScriptValue::Anim(x), ScriptValue::Anim(y)) | (ScriptValue::AnimTree(x), ScriptValue::AnimTree(y)) => x == y,
             _ => false,
         }
     }
 
     /// A value made fit to read: dead objects read as undefined (one
     /// deleted this frame stays, for its fields; it is not defined).
-    fn live(&self, v: Value) -> Value {
+    fn live(&self, v: ScriptValue) -> ScriptValue {
         match v {
-            Value::Object(o) if !self.alive(o) && !self.dying(o) => Value::Undefined,
+            ScriptValue::Object(o) if !self.alive(o) && !self.dying(o) => ScriptValue::Undefined,
             v => v,
         }
     }
 
-    pub fn is_defined(&self, v: &Value) -> bool {
+    pub fn is_defined(&self, v: &ScriptValue) -> bool {
         match v {
-            Value::Undefined | Value::Marker => false,
-            Value::Object(o) => self.alive(*o),
+            ScriptValue::Undefined | ScriptValue::Marker => false,
+            ScriptValue::Object(o) => self.alive(*o),
             _ => true,
         }
     }
 
-    pub fn to_key(&self, v: &Value) -> Result<Key, String> {
+    pub fn to_key(&self, v: &ScriptValue) -> Result<Key, String> {
         match v {
-            Value::Int(i) => Ok(Key::Int(*i)),
-            Value::Float(f) => Ok(Key::Int(*f as i32)),
-            Value::Str(s) | Value::IStr(s) => Ok(Key::Str(*s)),
-            Value::Object(o) => Ok(Key::Obj(*o)),
-            Value::Hash(h) => Ok(Key::Int(*h as i32)),
+            ScriptValue::Int(i) => Ok(Key::Int(*i)),
+            ScriptValue::Float(f) => Ok(Key::Int(*f as i32)),
+            ScriptValue::Str(s) | ScriptValue::IStr(s) => Ok(Key::Str(*s)),
+            ScriptValue::Object(o) => Ok(Key::Obj(*o)),
+            ScriptValue::Hash(h) => Ok(Key::Int(*h as i32)),
             other => Err(format!("{} is not an array index", other.type_name())),
         }
     }
 
-    pub fn to_text(&self, v: &Value) -> String {
+    pub fn to_text(&self, v: &ScriptValue) -> String {
         match v {
-            Value::Undefined => "undefined".into(),
-            Value::Int(i) => i.to_string(),
-            Value::Float(f) => format_float(*f),
-            Value::Str(s) | Value::IStr(s) => self.strings.get(*s).to_owned(),
-            Value::Vec3(v) => format!(
+            ScriptValue::Undefined => "undefined".into(),
+            ScriptValue::Int(i) => i.to_string(),
+            ScriptValue::Float(f) => format_float(*f),
+            ScriptValue::Str(s) | ScriptValue::IStr(s) => self.strings.get(*s).to_owned(),
+            ScriptValue::Vec3(v) => format!(
                 "({}, {}, {})",
                 format_float(v[0]),
                 format_float(v[1]),
                 format_float(v[2])
             ),
-            Value::Hash(h) => format!("#{h:08x}"),
-            Value::Object(_) => "[object]".into(),
-            Value::Array(_) => "[array]".into(),
-            Value::Func(_) => "[function]".into(),
-            Value::Anim(_) | Value::AnimTree(_) => "[anim]".into(),
-            Value::Marker => "[marker]".into(),
+            ScriptValue::Hash(h) => format!("#{h:08x}"),
+            ScriptValue::Object(_) => "[object]".into(),
+            ScriptValue::Array(_) => "[array]".into(),
+            ScriptValue::Func(_) => "[function]".into(),
+            ScriptValue::Anim(_) | ScriptValue::AnimTree(_) => "[anim]".into(),
+            ScriptValue::Marker => "[marker]".into(),
         }
     }
 
-    pub fn string(&mut self, s: &str) -> Value {
-        Value::Str(self.strings.intern(s))
+    pub fn string(&mut self, s: &str) -> ScriptValue {
+        ScriptValue::Str(self.strings.intern(s))
     }
 
-    fn binop(&mut self, op: BinOp, a: Value, b: Value) -> Result<Value, String> {
-        use Value::{Float, Int, Vec3};
-        let num = |v: &Value| v.as_float();
+    fn binop(&mut self, op: BinOp, a: ScriptValue, b: ScriptValue) -> Result<ScriptValue, String> {
+        use ScriptValue::{Float, Int, Vec3};
+        let num = |v: &ScriptValue| v.as_float();
         Ok(match op {
-            BinOp::Eq => Value::bool(self.equal(&a, &b)),
-            BinOp::Ne => Value::bool(!self.equal(&a, &b)),
+            BinOp::Eq => ScriptValue::bool(self.equal(&a, &b)),
+            BinOp::Ne => ScriptValue::bool(!self.equal(&a, &b)),
             BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                 use std::cmp::Ordering::{Greater, Less};
                 let ord = match (&a, &b) {
@@ -975,7 +1078,7 @@ impl<H> Vm<H> {
                     // bo2mp: two strings (or two localized strings) go by
                     // BO2's `I_strcmp`, case-sensitive over signed chars;
                     // `_sharpshooter` orders two attachment names this way.
-                    (Value::Str(x), Value::Str(y)) | (Value::IStr(x), Value::IStr(y)) => {
+                    (ScriptValue::Str(x), ScriptValue::Str(y)) | (ScriptValue::IStr(x), ScriptValue::IStr(y)) => {
                         let key = |s| {
                             self.strings
                                 .get(s)
@@ -998,7 +1101,7 @@ impl<H> Vm<H> {
                 };
                 // bo2mp: BO2's `Scr_EvalLessEqual` is not-greater and its
                 // `Scr_EvalGreaterEqual` is not-less, so NaN reads true for both.
-                Value::bool(match op {
+                ScriptValue::bool(match op {
                     BinOp::Lt => ord == Some(Less),
                     BinOp::Gt => ord == Some(Greater),
                     BinOp::Le => ord != Some(Greater),
@@ -1006,7 +1109,7 @@ impl<H> Vm<H> {
                 })
             }
             BinOp::Or | BinOp::Xor | BinOp::And | BinOp::Shl | BinOp::Shr => {
-                let (Some(x), Some(y)) = (a.as_int(), b.as_int()) else {
+                let (Some(lhs), Some(rhs)) = (a.as_int(), b.as_int()) else {
                     return Err(format!(
                         "bit operation on {} and {}",
                         a.type_name(),
@@ -1014,11 +1117,11 @@ impl<H> Vm<H> {
                     ));
                 };
                 Int(match op {
-                    BinOp::Or => x | y,
-                    BinOp::Xor => x ^ y,
-                    BinOp::And => x & y,
-                    BinOp::Shl => x.wrapping_shl(y as u32 & 31),
-                    _ => x.wrapping_shr(y as u32 & 31),
+                    BinOp::Or => lhs | rhs,
+                    BinOp::Xor => lhs ^ rhs,
+                    BinOp::And => lhs & rhs,
+                    BinOp::Shl => lhs.wrapping_shl(rhs as u32 & 31),
+                    _ => lhs.wrapping_shr(rhs as u32 & 31),
                 })
             }
             BinOp::Add => match (&a, &b) {
@@ -1026,11 +1129,11 @@ impl<H> Vm<H> {
                 // bo2mp: a hashed dvar name plus an index (`_class`'s
                 // exclusion lists walk `#"..." + n` until one is unset): a
                 // hash no dvar of ours has, so it reads as unset.
-                (Value::Hash(h), Int(y)) | (Int(y), Value::Hash(h)) => {
-                    Value::Hash(h.wrapping_add(*y as u32))
+                (ScriptValue::Hash(h), Int(y)) | (Int(y), ScriptValue::Hash(h)) => {
+                    ScriptValue::Hash(h.wrapping_add(*y as u32))
                 }
                 (Vec3(x), Vec3(y)) => Vec3([x[0] + y[0], x[1] + y[1], x[2] + y[2]]),
-                (Value::Str(_) | Value::IStr(_), _) | (_, Value::Str(_) | Value::IStr(_)) => {
+                (ScriptValue::Str(_) | ScriptValue::IStr(_), _) | (_, ScriptValue::Str(_) | ScriptValue::IStr(_)) => {
                     let s = format!("{}{}", self.to_text(&a), self.to_text(&b));
                     self.string(&s)
                 }
@@ -1048,6 +1151,16 @@ impl<H> Vm<H> {
             BinOp::Sub => match (&a, &b) {
                 (Int(x), Int(y)) => Int(x.wrapping_sub(*y)),
                 (Vec3(x), Vec3(y)) => Vec3([x[0] - y[0], x[1] - y[1], x[2] - y[2]]),
+                // A number with a vector is first made (n, n, n), as BO2's
+                // own VM does (the Jet Gun's smoke: tag_flash - view height).
+                (Vec3(v), s) if num(s).is_some() => {
+                    let k = num(s).unwrap_or(0.0);
+                    Vec3([v[0] - k, v[1] - k, v[2] - k])
+                }
+                (s, Vec3(v)) if num(s).is_some() => {
+                    let k = num(s).unwrap_or(0.0);
+                    Vec3([k - v[0], k - v[1], k - v[2]])
+                }
                 _ => match (num(&a), num(&b)) {
                     (Some(x), Some(y)) => Float(x - y),
                     _ => {
@@ -1082,7 +1195,7 @@ impl<H> Vm<H> {
             // by part, two ints as floats. By 0 is `by_zero`'s.
             BinOp::Div => match (&a, &b) {
                 (Vec3(_), _) | (_, Vec3(_)) => {
-                    let splat = |v: &Value| match v {
+                    let splat = |v: &ScriptValue| match v {
                         Vec3(x) => Some(*x),
                         _ => num(v).map(|k| [k; 3]),
                     };
@@ -1134,9 +1247,9 @@ impl<H> Vm<H> {
     /// bo2mp: what BO2 leaves for a divide by 0 (`Scr_EvalDivide`, and
     /// `Scr_EvalMod` on two ints): 0, (0, 0, 0) when a vector is in it (any
     /// part of a vector divisor 0). `None` when `b` does not divide by 0.
-    fn by_zero(op: BinOp, a: &Value, b: &Value) -> Option<Value> {
-        use Value::{Float, Int, Vec3};
-        let zero = |v: &Value| v.as_float() == Some(0.0);
+    fn by_zero(op: BinOp, a: &ScriptValue, b: &ScriptValue) -> Option<ScriptValue> {
+        use ScriptValue::{Float, Int, Vec3};
+        let zero = |v: &ScriptValue| v.as_float() == Some(0.0);
         match (op, a, b) {
             (BinOp::Mod, Int(_), Int(0)) => Some(Int(0)),
             (BinOp::Div, Vec3(_) | Int(_) | Float(_), Vec3(d)) if d.contains(&0.0) => {
@@ -1149,14 +1262,14 @@ impl<H> Vm<H> {
     }
 
     /// `a[i]`, with BO2's own error lines (`Scr_EvalArray`).
-    fn index(&mut self, container: &Value, key: &Value) -> Result<Value, String> {
+    fn index(&mut self, container: &ScriptValue, key: &ScriptValue) -> Result<ScriptValue, String> {
         match container {
-            Value::Array(a) => {
+            ScriptValue::Array(a) => {
                 let k = self.to_key(key)?;
                 Ok(self.live(a.get(&k).unwrap_or_default()))
             }
-            Value::Object(_) => Err(format!("{} is not an array", container.type_name())),
-            Value::Str(s) | Value::IStr(s) => {
+            ScriptValue::Object(_) => Err(format!("{} is not an array", container.type_name())),
+            ScriptValue::Str(s) | ScriptValue::IStr(s) => {
                 let i = key
                     .as_int()
                     .ok_or_else(|| format!("{} is not a string index", key.type_name()))?;
@@ -1167,32 +1280,32 @@ impl<H> Vm<H> {
                     .ok_or_else(|| format!("string index {i} out of range"))?;
                 Ok(self.string(&c.to_string()))
             }
-            Value::Vec3(v) => {
+            ScriptValue::Vec3(v) => {
                 let i = key
                     .as_int()
                     .ok_or_else(|| format!("{} is not a vector index", key.type_name()))?;
                 usize::try_from(i)
                     .ok()
                     .and_then(|i| v.get(i))
-                    .map(|x| Value::Float(*x))
+                    .map(|x| ScriptValue::Float(*x))
                     .ok_or_else(|| format!("vector index {i} out of range"))
             }
-            other => Err(format!(
+            bad => Err(format!(
                 "{} is not an array, string, or vector",
-                other.type_name()
+                bad.type_name()
             )),
         }
     }
 
-    fn write_path(slot: &mut Value, path: &[Key], v: Value) -> Result<(), String> {
+    fn write_path(slot: &mut ScriptValue, path: &[Key], v: ScriptValue) -> Result<(), String> {
         let Some((&k, rest)) = path.split_first() else {
             *slot = v;
             return Ok(());
         };
         if slot.is_undefined() {
-            *slot = Value::array(Array::new());
+            *slot = ScriptValue::array(Array::new());
         }
-        let Value::Array(rc) = slot else {
+        let ScriptValue::Array(rc) = slot else {
             return Err(format!("{} is not an array", slot.type_name()));
         };
         rc.make_unique();
@@ -1201,7 +1314,7 @@ impl<H> Vm<H> {
             arr.set(k, v);
             return Ok(());
         }
-        let child = arr.map.entry(k).or_insert(Value::Undefined);
+        let child = arr.map.entry(k).or_insert(ScriptValue::Undefined);
         let r = Self::write_path(child, rest, v);
         if child.is_undefined() {
             arr.map.shift_remove(&k);
@@ -1209,19 +1322,19 @@ impl<H> Vm<H> {
         r
     }
 
-    fn read_path(&mut self, mut v: Value, path: &[Key]) -> Value {
+    fn read_path(&mut self, mut v: ScriptValue, path: &[Key]) -> ScriptValue {
         for k in path {
             v = match &v {
-                Value::Array(a) => a.get(k).unwrap_or_default(),
-                _ => return Value::Undefined,
+                ScriptValue::Array(a) => a.get(k).unwrap_or_default(),
+                _ => return ScriptValue::Undefined,
             };
         }
         self.live(v)
     }
 
-    fn read_ref(&mut self, host: &mut H, th: &Thread, r: &Ref) -> Value {
+    fn read_ref(&mut self, host: &mut H, th: &Thread, r: &Ref) -> ScriptValue {
         let base = match &r.base {
-            RefBase::None => Value::Undefined,
+            RefBase::None => ScriptValue::Undefined,
             RefBase::Local(k) => {
                 let f = th.frames.last().unwrap();
                 let n = f.locals.len();
@@ -1241,7 +1354,7 @@ impl<H> Vm<H> {
         host: &mut H,
         th: &mut Thread,
         r: &Ref,
-        v: Value,
+        v: ScriptValue,
     ) -> Result<(), String> {
         match &r.base {
             RefBase::None => Err("assignment with no target".into()),
@@ -1261,7 +1374,7 @@ impl<H> Vm<H> {
                 }
                 let mut cur = self.get_field(host, *o, *f);
                 // Take the script field out so the array is not shared.
-                self.set_raw_field(*o, *f, Value::Undefined);
+                self.set_raw_field(*o, *f, ScriptValue::Undefined);
                 let res = Self::write_path(&mut cur, &r.path, v);
                 self.set_field(host, *o, *f, cur);
                 res
@@ -1275,10 +1388,10 @@ impl<H> Vm<H> {
         }
     }
 
-    fn pop_args(th: &mut Thread) -> Vec<Value> {
+    fn pop_args(th: &mut Thread) -> Vec<ScriptValue> {
         let mut args = Vec::new();
         while let Some(v) = th.stack.pop() {
-            if matches!(v, Value::Marker) {
+            if matches!(v, ScriptValue::Marker) {
                 return args;
             }
             args.push(v);
@@ -1299,20 +1412,20 @@ impl<H> Vm<H> {
         }
     }
 
-    pub fn trace_builtins(&mut self, names: &str, count: u32) {
+    pub fn trace_builtins(&mut self, names: &str, limit: u32) {
         for n in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
             let Some(s) = self.strings.find(&n.to_ascii_lowercase()) else {
                 continue;
             };
             for method in [false, true] {
                 if let Some(&id) = self.program.builtin_index.get(&(s, method)) {
-                    self.trace.insert(id, count);
+                    self.trace.insert(id, limit);
                 }
             }
         }
     }
 
-    fn call_native(&mut self, host: &mut H, id: u32, self_: &Value, args: &[Value]) -> Value {
+    fn call_native(&mut self, host: &mut H, id: u32, self_: &ScriptValue, args: &[ScriptValue]) -> ScriptValue {
         if let Some(left) = self.trace.get_mut(&id)
             && *left > 0
         {
@@ -1321,7 +1434,7 @@ impl<H> Vm<H> {
             let (n, m) = self.program.builtins[id as usize];
             let a: Vec<String> = args.iter().map(|a| self.to_text(a)).collect();
             let who = match self_ {
-                Value::Object(o) => match self.kind(*o) {
+                ScriptValue::Object(o) => match self.kind(*o) {
                     Some(ObjKind::Entity(e)) => format!("ent{e} "),
                     Some(ObjKind::Level) => "level ".to_owned(),
                     _ => String::new(),
@@ -1339,9 +1452,9 @@ impl<H> Vm<H> {
             return r;
         }
         if self.profile.is_some() {
-            let started = std::time::Instant::now();
+            let clock = std::time::Instant::now();
             let r = self.call_native_inner(host, id, self_, args);
-            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            let ms = clock.elapsed().as_secs_f64() * 1000.0;
             if let Some(p) = self.profile.as_mut() {
                 let row = p.natives.entry(id).or_default();
                 row.0 += ms;
@@ -1374,27 +1487,27 @@ impl<H> Vm<H> {
         let b: Vec<String> = natives
             .iter()
             .take(top)
-            .filter_map(|(id, (ms, n))| {
-                let (name, _) = program.builtins.get(*id as usize)?;
+            .filter_map(|(key, (ms, n))| {
+                let (name, _) = program.builtins.get(*key as usize)?;
                 Some(format!("{} {ms:.1} ({n})", self.strings.get(*name)))
             })
             .collect();
         Some(format!("scripts: {}; builtins: {}", f.join(", "), b.join(", ")))
     }
 
-    fn call_native_inner(&mut self, host: &mut H, id: u32, self_: &Value, args: &[Value]) -> Value {
+    fn call_native_inner(&mut self, host: &mut H, id: u32, self_: &ScriptValue, args: &[ScriptValue]) -> ScriptValue {
         match self.natives.get(id as usize).copied().flatten() {
             Some(f) => match f(self, host, self_, args) {
                 Ok(v) => v,
                 Err(e) => {
                     let (n, m) = self.program.builtins[id as usize];
-                    let msg = format!(
+                    let text = format!(
                         "{}{}: {e}",
                         if m { "method " } else { "" },
                         self.strings.get(n)
                     );
-                    self.report_once(msg);
-                    Value::Undefined
+                    self.report_once(text);
+                    ScriptValue::Undefined
                 }
             },
             None => match self.hooks.unbound {
@@ -1406,7 +1519,7 @@ impl<H> Vm<H> {
                         "unbound builtin {}{n}",
                         if method { "method " } else { "" }
                     ));
-                    Value::Undefined
+                    ScriptValue::Undefined
                 }
             },
         }
@@ -1414,14 +1527,14 @@ impl<H> Vm<H> {
 
     /// Call a function value now with `self_` and `args` (from a builtin):
     /// a script function runs as a new thread until it yields.
-    pub fn call_value(&mut self, host: &mut H, f: &Value, self_: Value, args: Vec<Value>) -> Value {
+    pub fn call_value(&mut self, host: &mut H, f: &ScriptValue, self_: ScriptValue, args: Vec<ScriptValue>) -> ScriptValue {
         match f {
-            Value::Func(FuncRef::Script(fi)) => {
+            ScriptValue::Func(FuncRef::Script(fi)) => {
                 self.spawn(host, *fi, self_, args);
-                Value::Undefined
+                ScriptValue::Undefined
             }
-            Value::Func(FuncRef::Builtin(b)) => self.call_native(host, *b, &self_, &args),
-            _ => Value::Undefined,
+            ScriptValue::Func(FuncRef::Builtin(b)) => self.call_native(host, *b, &self_, &args),
+            _ => ScriptValue::Undefined,
         }
     }
 
@@ -1449,31 +1562,56 @@ impl<H> Vm<H> {
     }
 
     fn timer(&mut self, t: ThreadId, th: &mut Thread, ms: i64) {
-        self.next_seq += 1;
-        th.timer_seq = self.next_seq;
+        self.upcoming_serial += 1;
+        th.timer_seq = self.upcoming_serial;
         th.state = State::Timer;
         self.timers.push(Reverse((
-            self.time_ms + ms,
-            self.next_seq,
+            self.clock_stamp_ms + ms,
+            !self.upcoming_serial,
             t.index,
-            t.generation,
+            t.stamp,
         )));
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// The thread's call chain, outermost first: `script::func@addr > ...`.
+    fn frame_chain(&self, program: &Program, th: &Thread) -> String {
+        let chain: Vec<String> = th
+            .frames
+            .iter()
+            .map(|fr| {
+                let func = &program.functions[fr.func as usize];
+                let at = func
+                    .addrs
+                    .get(fr.pc.saturating_sub(1) as usize)
+                    .copied()
+                    .unwrap_or(0);
+                format!(
+                    "{}::{}@{at:#x}",
+                    program.scripts[func.script as usize].name,
+                    self.strings.get(func.name)
+                )
+            })
+            .collect();
+        chain.join(" > ")
+    }
+
+    #[allow(clippy::too_many_lines, reason = "one arm per opcode")]
     fn interp(&mut self, host: &mut H, t: ThreadId, th: &mut Thread, program: &Program) -> Outcome {
         let mut r = Ref::default();
         let mut obj: Option<ObjRef> = None;
         let mut steps: u64 = 0;
+        let resumed_at = std::time::Instant::now();
+        let mut slow_named = false;
+        RESUMES.fetch_add(1, Relaxed);
         macro_rules! pop {
             () => {
                 th.stack.pop().unwrap_or_default()
             };
         }
         macro_rules! fail {
-            ($($arg:tt)*) => {{
-                let m = format!($($arg)*);
-                self.fail(program, th, &m);
+            ($($parts:tt)*) => {{
+                let m = format!($($parts)*);
+                self.fail_thread(program, th, &m);
             }};
         }
         loop {
@@ -1483,28 +1621,25 @@ impl<H> Vm<H> {
                 }
             }
             steps += 1;
-            if steps > STEP_LIMIT {
-                let chain: Vec<String> = th
-                    .frames
-                    .iter()
-                    .map(|fr| {
-                        let func = &program.functions[fr.func as usize];
-                        let at = func
-                            .addrs
-                            .get(fr.pc.saturating_sub(1) as usize)
-                            .copied()
-                            .unwrap_or(0);
-                        format!(
-                            "{}::{}@{at:#x}",
-                            program.scripts[func.script as usize].name,
-                            self.strings.get(func.name)
-                        )
-                    })
-                    .collect();
-                fail!(
-                    "thread ran {STEP_LIMIT} instructions without waiting; ended ({})",
-                    chain.join(" > ")
+            if steps & 0xFFF == 0 {
+                STEPS_RUN.fetch_add(0x1000, Relaxed);
+                SAMPLE_FUNC.store(th.frames.last().map_or(u32::MAX, |f| f.func), Relaxed);
+                SAMPLE_ROOT.store(th.frames.first().map_or(u32::MAX, |f| f.func), Relaxed);
+            }
+            // Slow-thread watchdog: a thread that has run 2 s without waiting
+            // names itself on stderr once (the step limit may be far off when
+            // its builtins are slow, and messages only drain after the tick).
+            if steps & 0xFFFF == 0 && !slow_named && resumed_at.elapsed().as_secs() >= 2 {
+                slow_named = true;
+                eprintln!(
+                    "bo2zm gsc: thread running {} ms, {steps} instructions without waiting: {}",
+                    resumed_at.elapsed().as_millis(),
+                    self.frame_chain(program, th)
                 );
+            }
+            if steps > STEP_LIMIT {
+                let chain = self.frame_chain(program, th);
+                fail!("thread ran {STEP_LIMIT} instructions without waiting; ended ({chain})");
                 return Outcome::Done;
             }
             let Some(frame) = th.frames.last_mut() else {
@@ -1519,22 +1654,22 @@ impl<H> Vm<H> {
                     let v = if matches!(op, Op::Return) {
                         pop!()
                     } else {
-                        Value::Undefined
+                        ScriptValue::Undefined
                     };
                     let f = th.frames.pop().unwrap();
                     th.stack.truncate(f.base as usize);
                     let depth = th.frames.len() as u32;
                     if th.endons.iter().any(|e| e.2 >= depth) {
-                        let mut removed = Vec::new();
+                        let mut dropped_endons = Vec::new();
                         th.endons.retain(|e| {
                             if e.2 >= depth {
-                                removed.push((e.0, e.1));
+                                dropped_endons.push((e.0, e.1));
                                 false
                             } else {
                                 true
                             }
                         });
-                        for (o, n) in removed {
+                        for (o, n) in dropped_endons {
                             if let Some(list) = self.waiters.get_mut(&(o.index, n)) {
                                 list.retain(|w| {
                                     !(w.thread == t
@@ -1552,19 +1687,19 @@ impl<H> Vm<H> {
                     th.stack.push(v);
                     obj = None;
                 }
-                Op::Undefined => th.stack.push(Value::Undefined),
-                Op::Int(i) => th.stack.push(Value::Int(i)),
-                Op::Float(f) => th.stack.push(Value::Float(f)),
-                Op::Str(s) => th.stack.push(Value::Str(s)),
-                Op::IStr(s) => th.stack.push(Value::IStr(s)),
-                Op::Vector(i) => th.stack.push(Value::Vec3(program.vectors[i as usize])),
-                Op::Hash(h) => th.stack.push(Value::Hash(h)),
+                Op::Undefined => th.stack.push(ScriptValue::Undefined),
+                Op::Int(i) => th.stack.push(ScriptValue::Int(i)),
+                Op::Real(f) => th.stack.push(ScriptValue::Float(f)),
+                Op::Str(s) => th.stack.push(ScriptValue::Str(s)),
+                Op::IStr(s) => th.stack.push(ScriptValue::IStr(s)),
+                Op::Vector(i) => th.stack.push(ScriptValue::Vec3(program.vectors[i as usize])),
+                Op::Hash(h) => th.stack.push(ScriptValue::Hash(h)),
                 Op::LevelObject => obj = Some(self.level),
                 Op::AnimObject => obj = Some(self.anim),
                 Op::SelfObject => {
                     let s = th.frames.last().unwrap().self_.clone();
                     match s {
-                        Value::Object(o) => obj = Some(o),
+                        ScriptValue::Object(o) => obj = Some(o),
                         other => {
                             obj = None;
                             fail!("self is {}, not an object", other.type_name());
@@ -1576,23 +1711,23 @@ impl<H> Vm<H> {
                     let s = self.live(s);
                     th.stack.push(s);
                 }
-                Op::Level => th.stack.push(Value::Object(self.level)),
+                Op::Level => th.stack.push(ScriptValue::Object(self.level)),
                 Op::Game => th.stack.push(self.game.clone()),
-                Op::AnimValue => th.stack.push(Value::Object(self.anim)),
+                Op::AnimValue => th.stack.push(ScriptValue::Object(self.anim)),
                 Op::GameRef => {
                     r.base = RefBase::Game;
                     r.path.clear();
                 }
-                Op::Anim(i) => th.stack.push(Value::Anim(i)),
-                Op::AnimTree(i) => th.stack.push(Value::AnimTree(i)),
+                Op::Anim(i) => th.stack.push(ScriptValue::Anim(i)),
+                Op::AnimTree(i) => th.stack.push(ScriptValue::AnimTree(i)),
                 Op::FuncRef(site) => th
                     .stack
-                    .push(Value::Func(program.sites[site as usize].callee)),
+                    .push(ScriptValue::Func(program.sites[site as usize].callee)),
                 Op::Locals(n) => {
                     let params = usize::from(func.params);
                     let frame = th.frames.last_mut().unwrap();
                     let args = std::mem::take(&mut frame.args);
-                    let mut locals = vec![Value::Undefined; usize::from(n)];
+                    let mut locals = vec![ScriptValue::Undefined; usize::from(n)];
                     for (i, a) in args
                         .into_iter()
                         .enumerate()
@@ -1634,7 +1769,7 @@ impl<H> Vm<H> {
                     match self.index(&a, &k) {
                         Ok(v) => th.stack.push(v),
                         Err(e) => {
-                            th.stack.push(Value::Undefined);
+                            th.stack.push(ScriptValue::Undefined);
                             if !a.is_undefined() {
                                 fail!("{e}");
                             }
@@ -1655,21 +1790,21 @@ impl<H> Vm<H> {
                     let k = pop!();
                     if let Ok(k) = self.to_key(&k) {
                         let cur = self.read_ref(host, th, &r);
-                        if let Value::Array(mut rc) = cur
+                        if let ScriptValue::Array(mut rc) = cur
                             && rc.get(&k).is_some()
                         {
                             rc.make_unique();
-                            rc.write().set(k, Value::Undefined);
+                            rc.write().set(k, ScriptValue::Undefined);
                             let rr = r.clone();
-                            let _ = self.write_ref(host, th, &rr, Value::Array(rc));
+                            let _ = self.write_ref(host, th, &rr, ScriptValue::Array(rc));
                         }
                     }
                 }
-                Op::EmptyArray => th.stack.push(Value::array(Array::new())),
+                Op::EmptyArray => th.stack.push(ScriptValue::array(Array::new())),
                 Op::EvalField(f) => {
                     let v = match obj {
                         Some(o) => self.get_field(host, o, f),
-                        None => Value::Undefined,
+                        None => ScriptValue::Undefined,
                     };
                     let v = self.live(v);
                     th.stack.push(v);
@@ -1686,12 +1821,12 @@ impl<H> Vm<H> {
                 }
                 Op::ClearField(f) => {
                     if let Some(o) = obj {
-                        self.set_field(host, o, f, Value::Undefined);
+                        self.set_field(host, o, f, ScriptValue::Undefined);
                     }
                 }
                 Op::WaittillVar(k) => {
-                    let v = if matches!(th.stack.last(), Some(Value::Marker) | None) {
-                        Value::Undefined
+                    let v = if matches!(th.stack.last(), Some(ScriptValue::Marker) | None) {
+                        ScriptValue::Undefined
                     } else {
                         pop!()
                     };
@@ -1703,7 +1838,7 @@ impl<H> Vm<H> {
                 }
                 Op::ClearParams => {
                     while let Some(v) = th.stack.pop() {
-                        if matches!(v, Value::Marker) {
+                        if matches!(v, ScriptValue::Marker) {
                             break;
                         }
                     }
@@ -1728,7 +1863,7 @@ impl<H> Vm<H> {
                     self.frame_end.push(t);
                     return Outcome::Yield;
                 }
-                Op::PreCall | Op::VoidCodePos => th.stack.push(Value::Marker),
+                Op::PreCall | Op::VoidCodePos => th.stack.push(ScriptValue::Marker),
                 Op::Call(site, kind) => {
                     let callee = program.sites[site as usize].callee;
                     let self_v = if kind.method() {
@@ -1751,7 +1886,7 @@ impl<H> Vm<H> {
                     };
                     let args = Self::pop_args(th);
                     match f {
-                        Value::Func(callee) => {
+                        ScriptValue::Func(callee) => {
                             if let Some(o) =
                                 self.call(host, t, th, program, callee, kind, self_v, args)
                             {
@@ -1760,7 +1895,7 @@ impl<H> Vm<H> {
                         }
                         other => {
                             fail!("call through a {}, not a function", other.type_name());
-                            th.stack.push(Value::Undefined);
+                            th.stack.push(ScriptValue::Undefined);
                         }
                     }
                     obj = None;
@@ -1771,10 +1906,10 @@ impl<H> Vm<H> {
                 Op::CastObject => {
                     let v = pop!();
                     match v {
-                        Value::Object(o) if self.alive(o) || self.dying(o) => obj = Some(o),
+                        ScriptValue::Object(o) if self.alive(o) || self.dying(o) => obj = Some(o),
                         other => {
                             obj = None;
-                            if !matches!(other, Value::Object(_)) {
+                            if !matches!(other, ScriptValue::Object(_)) {
                                 fail!("{} is not an object", other.type_name());
                             }
                         }
@@ -1782,15 +1917,15 @@ impl<H> Vm<H> {
                 }
                 Op::CastBool => {
                     let v = pop!();
-                    th.stack.push(Value::bool(truthy(&v)));
+                    th.stack.push(ScriptValue::bool(truthy(&v)));
                 }
                 Op::Not => {
                     let v = pop!();
-                    th.stack.push(Value::bool(!truthy(&v)));
+                    th.stack.push(ScriptValue::bool(!truthy(&v)));
                 }
-                Op::Complement => {
+                Op::BitNot => {
                     let v = pop!();
-                    th.stack.push(Value::Int(!v.as_int().unwrap_or(0)));
+                    th.stack.push(ScriptValue::Int(!v.as_int().unwrap_or(0)));
                 }
                 Op::JumpFalse(to) => {
                     let v = pop!();
@@ -1823,11 +1958,11 @@ impl<H> Vm<H> {
                     let cur = self.read_ref(host, th, &r);
                     let d = if matches!(op, Op::Inc) { 1 } else { -1 };
                     let nv = match cur {
-                        Value::Int(i) => Value::Int(i.wrapping_add(d)),
-                        Value::Float(f) => Value::Float(f + d as f32),
-                        Value::Undefined => {
+                        ScriptValue::Int(i) => ScriptValue::Int(i.wrapping_add(d)),
+                        ScriptValue::Float(f) => ScriptValue::Float(f + d as f32),
+                        ScriptValue::Undefined => {
                             fail!("++/-- on undefined");
-                            Value::Int(d)
+                            ScriptValue::Int(d)
                         }
                         other => {
                             fail!("++/-- on a {}", other.type_name());
@@ -1852,7 +1987,7 @@ impl<H> Vm<H> {
                             Ok(v) => th.stack.push(v),
                             Err(e) => {
                                 fail!("{e}");
-                                th.stack.push(Value::Undefined);
+                                th.stack.push(ScriptValue::Undefined);
                             }
                         }
                     }
@@ -1860,11 +1995,11 @@ impl<H> Vm<H> {
                 Op::Size => {
                     let v = pop!();
                     let n = match &v {
-                        Value::Array(a) => a.len() as i32,
-                        Value::Str(s) | Value::IStr(s) => {
+                        ScriptValue::Array(a) => a.len() as i32,
+                        ScriptValue::Str(s) | ScriptValue::IStr(s) => {
                             self.strings.get(*s).chars().count() as i32
                         }
-                        Value::Undefined => {
+                        ScriptValue::Undefined => {
                             fail!("size of undefined");
                             0
                         }
@@ -1873,7 +2008,7 @@ impl<H> Vm<H> {
                             0
                         }
                     };
-                    th.stack.push(Value::Int(n));
+                    th.stack.push(ScriptValue::Int(n));
                 }
                 Op::Waittill | Op::WaittillMatch(_) => {
                     let o = pop!();
@@ -1885,7 +2020,7 @@ impl<H> Vm<H> {
                         }
                     }
                     match (o, n.as_str_id()) {
-                        (Value::Object(o), Some(n)) if self.alive(o) => {
+                        (ScriptValue::Object(o), Some(n)) if self.alive(o) => {
                             let kind = if matches!(op, Op::Waittill) {
                                 WaiterKind::Waittill
                             } else {
@@ -1896,7 +2031,7 @@ impl<H> Vm<H> {
                             th.state = State::Notify;
                             return Outcome::Yield;
                         }
-                        (Value::Object(_), Some(_)) => {
+                        (ScriptValue::Object(_), Some(..)) => {
                             // Waiting on a deleted object ends the thread.
                             return Outcome::Done;
                         }
@@ -1906,7 +2041,7 @@ impl<H> Vm<H> {
                                 o.type_name(),
                                 n.map(|s| self.strings.get(s).to_owned())
                             );
-                            th.stack.push(Value::Marker);
+                            th.stack.push(ScriptValue::Marker);
                         }
                     }
                 }
@@ -1915,11 +2050,21 @@ impl<H> Vm<H> {
                     let n = pop!();
                     let args = Self::pop_args(th);
                     match (o, n.as_str_id()) {
-                        (Value::Object(o), Some(n)) => {
+                        (ScriptValue::Object(o), Some(n)) => {
+                            // BO2's notify op (VM_Notify): endons end at once, the
+                            // woken threads go on the current time's list and run
+                            // after this one waits. Buried's Head Chopper reads
+                            // is_slicing after "end" and must see it cleared.
                             if self.alive(o) {
+                                let was = std::mem::replace(&mut self.queue_wakes, true);
                                 self.notify(host, o, n, &args);
+                                self.queue_wakes = was;
                             }
                         }
+                        // A thing this thread just deleted reads as undefined;
+                        // BO2 goes on past the notify (_zm_powerups: powerup_delete
+                        // then notify "powerup_grabbed").
+                        (ScriptValue::Undefined, Some(..)) => {}
                         (o, _) => fail!("notify on a {}", o.type_name()),
                     }
                 }
@@ -1927,12 +2072,12 @@ impl<H> Vm<H> {
                     let o = pop!();
                     let n = pop!();
                     match (o, n.as_str_id()) {
-                        (Value::Object(o), Some(n)) if self.alive(o) => {
+                        (ScriptValue::Object(o), Some(n)) if self.alive(o) => {
                             let depth = th.frames.len() as u32 - 1;
                             th.endons.push((o, n, depth));
                             self.register(t, o, n, WaiterKind::Endon(depth));
                         }
-                        (Value::Object(_), Some(_)) => return Outcome::Done,
+                        (ScriptValue::Object(_), Some(_)) => return Outcome::Done,
                         (o, _) => fail!("endon on a {}", o.type_name()),
                     }
                 }
@@ -1940,14 +2085,14 @@ impl<H> Vm<H> {
                     let v = pop!();
                     let table = &program.switches[i as usize];
                     let hit = match &v {
-                        Value::Int(n) => table.ints.get(n).copied(),
-                        Value::Float(f) if f.fract() == 0.0 => {
+                        ScriptValue::Int(n) => table.ints.get(n).copied(),
+                        ScriptValue::Float(f) if f.fract() == 0.0 => {
                             table.ints.get(&(*f as i32)).copied()
                         }
-                        Value::Str(s) | Value::IStr(s) => table.strs.get(s).copied(),
+                        ScriptValue::Str(s) | ScriptValue::IStr(s) => table.strs.get(s).copied(),
                         _ => None,
                     };
-                    let to = hit.or(table.default).unwrap_or(table.end);
+                    let to = hit.or(table.default).unwrap_or(table.end_addr);
                     th.frames.last_mut().unwrap().pc = to;
                 }
                 Op::MakeVector => {
@@ -1955,10 +2100,10 @@ impl<H> Vm<H> {
                     let y = pop!();
                     let z = pop!();
                     match (x.as_float(), y.as_float(), z.as_float()) {
-                        (Some(x), Some(y), Some(z)) => th.stack.push(Value::Vec3([x, y, z])),
+                        (Some(x), Some(y), Some(z)) => th.stack.push(ScriptValue::Vec3([x, y, z])),
                         _ => {
                             fail!("vector of non-numbers");
-                            th.stack.push(Value::Undefined);
+                            th.stack.push(ScriptValue::Undefined);
                         }
                     }
                 }
@@ -1969,31 +2114,31 @@ impl<H> Vm<H> {
                         _ => 0.0,
                     };
                     th.stack
-                        .push(Value::Vec3([c(flags >> 4), c(flags >> 2), c(flags)]));
+                        .push(ScriptValue::Vec3([c(flags >> 4), c(flags >> 2), c(flags)]));
                 }
                 Op::IsDefined => {
                     let v = pop!();
-                    th.stack.push(Value::bool(self.is_defined(&v)));
+                    th.stack.push(ScriptValue::bool(self.is_defined(&v)));
                 }
                 Op::VectorScale => {
                     let v = pop!();
                     let s = pop!();
                     match (v.as_vec3(), s.as_float()) {
                         (Some(v), Some(s)) => {
-                            th.stack.push(Value::Vec3([v[0] * s, v[1] * s, v[2] * s]))
+                            th.stack.push(ScriptValue::Vec3([v[0] * s, v[1] * s, v[2] * s]))
                         }
                         _ => {
                             fail!("vectorscale of {} by {}", v.type_name(), s.type_name());
-                            th.stack.push(Value::Undefined);
+                            th.stack.push(ScriptValue::Undefined);
                         }
                     }
                 }
                 Op::AnglesToUp | Op::AnglesToRight | Op::AnglesToForward => {
                     let v = pop!();
                     match v.as_vec3() {
-                        Some(a) => {
-                            let (f, rgt, up) = crate::math::angle_vectors(a);
-                            th.stack.push(Value::Vec3(match op {
+                        Some(angles) => {
+                            let (f, rgt, up) = crate::math::facing_axes(angles);
+                            th.stack.push(ScriptValue::Vec3(match op {
                                 Op::AnglesToUp => up,
                                 Op::AnglesToRight => rgt,
                                 _ => f,
@@ -2001,34 +2146,34 @@ impl<H> Vm<H> {
                         }
                         None => {
                             fail!("angles of a {}", v.type_name());
-                            th.stack.push(Value::Undefined);
+                            th.stack.push(ScriptValue::Undefined);
                         }
                     }
                 }
                 Op::AngleClamp180 => {
                     let v = pop!();
                     let a = v.as_float().unwrap_or(0.0);
-                    th.stack.push(Value::Float(crate::math::angle_clamp180(a)));
+                    th.stack.push(ScriptValue::Float(crate::math::angle_clamp180(a)));
                 }
                 Op::VectorToAngles => {
                     let v = pop!();
                     match v.as_vec3() {
-                        Some(d) => th.stack.push(Value::Vec3(crate::math::vector_to_angles(d))),
+                        Some(d) => th.stack.push(ScriptValue::Vec3(crate::math::vector_to_angles(d))),
                         None => {
                             fail!("vectortoangles of a {}", v.type_name());
-                            th.stack.push(Value::Undefined);
+                            th.stack.push(ScriptValue::Undefined);
                         }
                     }
                 }
                 Op::Abs => {
                     let v = pop!();
                     th.stack.push(match v {
-                        Value::Int(i) => Value::Int(i.wrapping_abs()),
-                        Value::Float(f) => Value::Float(f.abs()),
-                        _ => Value::Undefined,
+                        ScriptValue::Int(i) => ScriptValue::Int(i.wrapping_abs()),
+                        ScriptValue::Float(f) => ScriptValue::Float(f.abs()),
+                        _ => ScriptValue::Undefined,
                     });
                 }
-                Op::GetTime => th.stack.push(Value::Int(self.time_ms as i32)),
+                Op::GetTime => th.stack.push(ScriptValue::Int(self.clock_stamp_ms as i32)),
                 Op::GetDvar
                 | Op::GetDvarInt
                 | Op::GetDvarFloat
@@ -2038,14 +2183,15 @@ impl<H> Vm<H> {
                     let text = self.dvar_text(&n);
                     let v = match op {
                         Op::GetDvar => self.string(&text),
-                        Op::GetDvarInt => Value::Int(crate::math::parse_int(&text)),
-                        Op::GetDvarFloat => Value::Float(text.trim().parse::<f32>().unwrap_or(0.0)),
+                        Op::GetDvarInt => ScriptValue::Int(crate::math::parse_int(&text)),
+                        Op::GetDvarFloat => ScriptValue::Float(text.trim().parse::<f32>().unwrap_or(0.0)),
                         Op::GetDvarVector => {
                             let p: Vec<f32> = text
-                                .split_whitespace()
+                                .split(char::is_whitespace)
+                                .filter(|w| !w.is_empty())
                                 .filter_map(|x| x.parse().ok())
                                 .collect();
-                            Value::Vec3([
+                            ScriptValue::Vec3([
                                 p.first().copied().unwrap_or(0.0),
                                 p.get(1).copied().unwrap_or(0.0),
                                 p.get(2).copied().unwrap_or(0.0),
@@ -2053,30 +2199,31 @@ impl<H> Vm<H> {
                         }
                         Op::GetDvarColor(c) => {
                             let p: Vec<f32> = text
-                                .split_whitespace()
+                                .split(char::is_whitespace)
+                                .filter(|w| !w.is_empty())
                                 .filter_map(|x| x.parse().ok())
                                 .collect();
-                            Value::Float(p.get(usize::from(c)).copied().unwrap_or(if c == 3 {
+                            ScriptValue::Float(p.get(usize::from(c)).copied().unwrap_or(if c == 3 {
                                 1.0
                             } else {
                                 0.0
                             }))
                         }
-                        _ => Value::Undefined,
+                        _ => ScriptValue::Undefined,
                     };
                     th.stack.push(v);
                 }
                 Op::FirstKey => {
                     let a = pop!();
                     let v = match &a {
-                        Value::Array(a) => a.read().first_key().map(Key::value).unwrap_or_default(),
-                        Value::Undefined => {
+                        ScriptValue::Array(a) => a.read().first_key().map(Key::value).unwrap_or_default(),
+                        ScriptValue::Undefined => {
                             fail!("foreach over undefined");
-                            Value::Undefined
+                            ScriptValue::Undefined
                         }
                         other => {
                             fail!("foreach over a {}", other.type_name());
-                            Value::Undefined
+                            ScriptValue::Undefined
                         }
                     };
                     th.stack.push(v);
@@ -2085,10 +2232,10 @@ impl<H> Vm<H> {
                     let a = pop!();
                     let k = pop!();
                     let v = match (&a, self.to_key(&k)) {
-                        (Value::Array(a), Ok(k)) => {
+                        (ScriptValue::Array(a), Ok(k)) => {
                             a.read().next_key(&k).map(Key::value).unwrap_or_default()
                         }
-                        _ => Value::Undefined,
+                        _ => ScriptValue::Undefined,
                     };
                     th.stack.push(v);
                 }
@@ -2110,8 +2257,8 @@ impl<H> Vm<H> {
         program: &Program,
         callee: FuncRef,
         kind: CallKind,
-        self_v: Value,
-        args: Vec<Value>,
+        self_v: ScriptValue,
+        args: Vec<ScriptValue>,
     ) -> Option<Outcome> {
         match callee {
             FuncRef::Script(fi) => {
@@ -2138,11 +2285,11 @@ impl<H> Vm<H> {
                 }
                 if kind.thread() {
                     self.spawn(host, fi, self_v, args);
-                    th.stack.push(Value::Undefined);
+                    th.stack.push(ScriptValue::Undefined);
                 } else {
                     if th.frames.len() >= MAX_FRAMES {
-                        self.fail(program, th, "call stack too deep");
-                        th.stack.push(Value::Undefined);
+                        self.fail_thread(program, th, "call stack too deep");
+                        th.stack.push(ScriptValue::Undefined);
                         return None;
                     }
                     let base = th.stack.len() as u32;
@@ -2157,14 +2304,17 @@ impl<H> Vm<H> {
                 }
             }
             FuncRef::Builtin(b) => {
+                NATIVE_CALLER.store(th.frames.last().map_or(u32::MAX, |f| f.func), Relaxed);
+                NATIVE_NOW.store(b + 1, Relaxed);
                 let v = self.call_native(host, b, &self_v, &args);
+                NATIVE_NOW.store(0, Relaxed);
                 th.stack
-                    .push(if kind.thread() { Value::Undefined } else { v });
+                    .push(if kind.thread() { ScriptValue::Undefined } else { v });
             }
             FuncRef::Missing(n) => {
                 let m = format!("missing function {}", self.strings.get(n));
                 self.report_once(m);
-                th.stack.push(Value::Undefined);
+                th.stack.push(ScriptValue::Undefined);
             }
         }
         let _ = t;
@@ -2216,7 +2366,7 @@ impl<H> Vm<H> {
     }
 
     /// The frame-0 self of a thread (tests and tools).
-    pub fn thread_self(&self, t: ThreadId) -> Option<Value> {
+    pub fn thread_self(&self, t: ThreadId) -> Option<ScriptValue> {
         self.threads
             .get(t.index as usize)?
             .as_ref()
@@ -2225,9 +2375,9 @@ impl<H> Vm<H> {
     }
 
     /// A dvar's text by name or by `#"name"` hash ("" when unset).
-    pub fn dvar_text(&self, name: &Value) -> String {
+    pub fn dvar_text(&self, name: &ScriptValue) -> String {
         match name {
-            Value::Hash(h) => self
+            ScriptValue::Hash(h) => self
                 .dvars
                 .iter()
                 .find(|(k, _)| hash_name(k) == *h)
@@ -2242,9 +2392,9 @@ impl<H> Vm<H> {
     }
 
     /// The dvar name a value names (a hash maps to a set dvar's name).
-    pub fn dvar_name(&self, name: &Value) -> String {
+    pub fn dvar_name(&self, name: &ScriptValue) -> String {
         match name {
-            Value::Hash(h) => self
+            ScriptValue::Hash(h) => self
                 .dvars
                 .keys()
                 .find(|k| hash_name(k) == *h)
@@ -2256,12 +2406,12 @@ impl<H> Vm<H> {
 
     /// Next pseudo-random u32 (xorshift; the host may reseed `rng`).
     pub fn rand_u32(&mut self) -> u32 {
-        let mut x = self.rng;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng = x;
-        (x >> 32) as u32
+        let mut bits = self.rng;
+        bits ^= bits << 13;
+        bits ^= bits >> 7;
+        bits ^= bits << 17;
+        self.rng = bits;
+        (bits >> 32) as u32
     }
 
     /// A pseudo-random float in [0, 1).

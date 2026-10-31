@@ -1,7 +1,7 @@
 package.name = "bo2mp-master"
 package.version = "0.1.0"
 package.edition.workspace = true
-package.license.workspace = true
+package.publish.workspace = true
 package.description = "Lobby service for bo2mp: room browser, request handling and packet relay over QUIC."
 # xtask installs and probes this binary by name.
 bin = [{ name = "bo2mp-master", path = "src/app.rs" }]
@@ -13,3 +13,5 @@ dependencies.rustls-pemfile = "2.2.0"
 dependencies.rustls-platform-verifier = "0.7.0"
 dependencies.tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time"] }
 lints.workspace = true
+# A LAN host makes its own certificate (`lan`).
+dependencies.rcgen = { version = "0.13.2", default-features = false, features = ["crypto", "pem", "ring"] }

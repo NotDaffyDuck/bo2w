@@ -20,26 +20,18 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
-use crate::value::{Table, TableRef, UserData, Value};
+use crate::value::{LuaTable, UserData, Value};
 use crate::vm::{LuaError, Vm};
-
-type Res<T> = Result<T, LuaError>;
 
 /// What an element shows, and where (relative to its parent).
 #[derive(Clone, Debug, PartialEq)]
 pub struct State {
-    pub left: f32,
-    pub top: f32,
-    pub right: f32,
-    pub bottom: f32,
+    pub left: f32, pub top: f32, pub right_edge: f32, pub bottom_edge: f32,
     pub left_anchor: bool,
     pub top_anchor: bool,
     pub right_anchor: bool,
     pub bottom_anchor: bool,
-    pub red: f32,
-    pub green: f32,
-    pub blue: f32,
-    pub alpha: f32,
+    pub tint_r: f32, pub tint_g: f32, pub tint_b: f32, pub opacity: f32,
     pub alpha_multiplier: f32,
     pub x_rot: f32,
     pub y_rot: f32,
@@ -48,47 +40,37 @@ pub struct State {
     /// BO2's `zoom`: the element moves toward the camera by this much, so
     /// it and its children grow about the screen's centre by 1 / (1 - zoom / 1280)
     /// (the focused tile of a grid, GrowingGridButton's button_over).
-    pub zoom: f32,
+    pub depth_zoom: f32,
     /// A material name (`RegisterMaterial`), when it draws a picture.
-    pub material: Option<String>,
-    pub font: Option<String>,
+    pub material: Option<String>, pub font: Option<String>,
     /// LUI.Alignment: 0 none, 1 left, 2 centre, 3 right (also 4 top,
     /// 5 middle, 6 bottom).
     pub alignment: i32,
     pub text: Option<String>,
+    /// bo2zm M4: the material's shader vectors 0..3 (`setShaderVector`):
+    /// what an engine shader reads (the globe's turn is vector 2).
+    pub shader: [[f32; 4]; 4],
+    /// `ui3DWindow`: the element is drawn into that 3D window (a picture
+    /// on a model in the world: Grief and Turned's round scoreboard), not
+    /// on the screen.
+    pub ui3d_window: Option<i32>,
 }
 
 impl Default for State {
     fn default() -> Self {
         State {
-            left: 0.0,
-            top: 0.0,
-            right: 0.0,
-            bottom: 0.0,
-            left_anchor: false,
-            top_anchor: false,
-            right_anchor: false,
-            bottom_anchor: false,
-            red: 1.0,
-            green: 1.0,
-            blue: 1.0,
-            alpha: 1.0,
-            alpha_multiplier: 1.0,
-            x_rot: 0.0,
-            y_rot: 0.0,
-            z_rot: 0.0,
-            scale: 1.0,
-            zoom: 0.0,
-            material: None,
-            font: None,
-            alignment: 0,
-            text: None,
+            left: 0.0, top: 0.0, right_edge: 0.0, bottom_edge: 0.0,
+            left_anchor: false, top_anchor: false, right_anchor: false, bottom_anchor: false,
+            tint_r: 1.0, tint_g: 1.0, tint_b: 1.0, opacity: 1.0, alpha_multiplier: 1.0,
+            x_rot: 0.0, y_rot: 0.0, z_rot: 0.0, scale: 1.0, depth_zoom: 0.0,
+            material: None, font: None, alignment: 0, text: None,
+            shader: [[0.0; 4]; 4], ui3d_window: None,
         }
     }
 }
 
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
+fn lerp(from: f32, to: f32, along: f32) -> f32 {
+    from + along * (to - from)
 }
 
 impl State {
@@ -99,38 +81,46 @@ impl State {
         // gain, `before + gained - 2` at no gain) ends with no width, not
         // a flipped 2-unit sliver (BO2 draws none: no orange tick).
         let mut to = to.clone();
-        if to.left_anchor && !to.right_anchor && to.right < to.left {
-            to.right = to.left;
+        if to.left_anchor && !to.right_anchor && to.right_edge < to.left {
+            to.right_edge = to.left;
         }
         let to = &to;
         State {
             left: lerp(self.left, to.left, t),
             top: lerp(self.top, to.top, t),
-            right: lerp(self.right, to.right, t),
-            bottom: lerp(self.bottom, to.bottom, t),
-            red: lerp(self.red, to.red, t),
-            green: lerp(self.green, to.green, t),
-            blue: lerp(self.blue, to.blue, t),
-            alpha: lerp(self.alpha, to.alpha, t),
+            right_edge: lerp(self.right_edge, to.right_edge, t),
+            bottom_edge: lerp(self.bottom_edge, to.bottom_edge, t),
+            tint_r: lerp(self.tint_r, to.tint_r, t),
+            tint_g: lerp(self.tint_g, to.tint_g, t),
+            tint_b: lerp(self.tint_b, to.tint_b, t),
+            opacity: lerp(self.opacity, to.opacity, t),
             alpha_multiplier: lerp(self.alpha_multiplier, to.alpha_multiplier, t),
             x_rot: lerp(self.x_rot, to.x_rot, t),
             y_rot: lerp(self.y_rot, to.y_rot, t),
             z_rot: lerp(self.z_rot, to.z_rot, t),
             scale: lerp(self.scale, to.scale, t),
-            zoom: lerp(self.zoom, to.zoom, t),
+            depth_zoom: lerp(self.depth_zoom, to.depth_zoom, t),
             left_anchor: to.left_anchor,
             top_anchor: to.top_anchor,
             right_anchor: to.right_anchor,
             bottom_anchor: to.bottom_anchor,
-            material: if t >= 1.0 { to.material.clone() } else { self.material.clone() },
+            material: if t >= 1.0 {
+                to.material.clone()
+            } else {
+                self.material.clone()
+            },
             font: to.font.clone(),
             alignment: to.alignment,
             text: to.text.clone(),
+            shader: std::array::from_fn(|i| {
+                std::array::from_fn(|j| lerp(self.shader[i][j], to.shader[i][j], t))
+            }),
+            ui3d_window: to.ui3d_window,
         }
     }
 
     /// The fields a registered state table names, over this state.
-    fn apply_table(&mut self, t: &Table) {
+    fn apply_table(&mut self, t: &LuaTable) {
         let num = |k: &str| t.get_str(k).as_num();
         let flag = |k: &str| match t.get_str(k) {
             Value::Nil => None,
@@ -143,10 +133,10 @@ impl State {
             self.top = v;
         }
         if let Some(v) = num("right") {
-            self.right = v;
+            self.right_edge = v;
         }
         if let Some(v) = num("bottom") {
-            self.bottom = v;
+            self.bottom_edge = v;
         }
         if let Some(v) = flag("leftAnchor") {
             self.left_anchor = v;
@@ -161,23 +151,23 @@ impl State {
             self.bottom_anchor = v;
         }
         if let Some(v) = num("red") {
-            self.red = v;
+            self.tint_r = v;
         }
         if let Some(v) = num("green") {
-            self.green = v;
+            self.tint_g = v;
         }
         if let Some(v) = num("blue") {
-            self.blue = v;
+            self.tint_b = v;
         }
         // A state's `alphaMultiplier` is its alpha by another name: BO2's
         // card carousels are made with `alpha = 0` and shown by a
-        // `fade_in` state of `alphaMultiplier = 1` alone (and hidden by
-        // `fade_out`'s `alpha = 0`); no script sets the two apart.
+        // `ease_on` state of `alphaMultiplier = 1` alone (and hidden by
+        // `ease_off`'s `alpha = 0`); no script sets the two apart.
         if let Some(v) = num("alphaMultiplier") {
-            self.alpha = v;
+            self.opacity = v;
         }
         if let Some(v) = num("alpha") {
-            self.alpha = v;
+            self.opacity = v;
         }
         if let Some(v) = num("zRot") {
             self.z_rot = v;
@@ -186,16 +176,16 @@ impl State {
             self.scale = v;
         }
         if let Some(v) = num("zoom") {
-            self.zoom = v;
+            self.depth_zoom = v;
         }
         match t.get_str("material") {
             Value::Str(s) => self.material = Some(s.to_string()),
-            Value::User(u) => self.material = material_name(&u),
+            Value::User(u) => self.material = surface_title(&u),
             _ => {}
         }
         match t.get_str("font") {
             Value::Str(s) => self.font = Some(s.to_string()),
-            Value::User(u) if u.kind == "font" => {
+            Value::User(u) if u.type_tag == "font" => {
                 self.font = u.data.borrow().downcast_ref::<String>().cloned()
             }
             _ => {}
@@ -203,25 +193,48 @@ impl State {
         if let Some(v) = num("alignment") {
             self.alignment = v as i32;
         }
+        if let Some(v) = num("ui3DWindow") {
+            self.ui3d_window = Some(v as i32);
+        }
     }
 }
 
-/// A screen rectangle (x0, y0, x1, y1) in the root's units.
-pub type Rect = [f32; 4];
-
-/// Where an element's edges fall inside its parent's rectangle.
-pub fn place(s: &State, parent: Rect) -> Rect {
-    let axis = |lo_anchor: bool, hi_anchor: bool, lo: f32, hi: f32, p0: f32, p1: f32| -> (f32, f32) {
-        let mid = (p0 + p1) * 0.5;
-        match (lo_anchor, hi_anchor) {
-            (true, true) => (p0 + lo, p1 + hi),
-            (true, false) => (p0 + lo, p0 + hi),
-            (false, true) => (p1 + lo, p1 + hi),
-            (false, false) => (mid + lo, mid + hi),
-        }
-    };
-    let (x0, x1) = axis(s.left_anchor, s.right_anchor, s.left, s.right, parent[0], parent[2]);
-    let (y0, y1) = axis(s.top_anchor, s.bottom_anchor, s.top, s.bottom, parent[1], parent[3]);
+/// Where an element's edges fall inside its parent's rectangle
+/// (x0, y0, x1, y1 in the root's units).
+pub fn place(s: &State, parent: [f32; 4]) -> [f32; 4] {
+    let axis =
+        |lo_anchor: bool, hi_anchor: bool, lo: f32, hi: f32, p0: f32, p1: f32| -> (f32, f32) {
+            let mid = (p0 + p1) * 0.5;
+            match (lo_anchor, hi_anchor) {
+                (true, true) => (p0 + lo, p1 + hi),
+                (true, false) => (p0 + lo, p0 + hi),
+                (false, true) => (p1 + lo, p1 + hi),
+                (false, false) => (mid + lo, mid + hi),
+            }
+        };
+    let (x0, x1) = axis(
+        s.left_anchor,
+        s.right_anchor,
+        s.left,
+        s.right_edge,
+        parent[0],
+        parent[2],
+    );
+    let (y0, y1) = axis(
+        s.top_anchor,
+        s.bottom_anchor,
+        s.top,
+        s.bottom_edge,
+        parent[1],
+        parent[3],
+    );
+    // setScale: the element (and so its children) grown about its centre
+    // (the map zooms in with it).
+    if (s.scale - 1.0).abs() > 1e-4 {
+        let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        let (hw, hh) = ((x1 - x0) * 0.5 * s.scale, (y1 - y0) * 0.5 * s.scale);
+        return [cx - hw, cy - hh, cx + hw, cy + hh];
+    }
     [x0, y0, x1, y1]
 }
 
@@ -268,7 +281,7 @@ pub struct Element {
     anim: Option<Anim>,
     /// The end state the setters write while an animation is open.
     pending: Option<State>,
-    states: HashMap<String, TableRef>,
+    states: HashMap<String, Rc<RefCell<LuaTable>>>,
     pub use_stencil: bool,
     /// `setBlur(true)`: what is drawn under the element shows blurred (a
     /// front-end menu over another, CoD.Menu's updateBlur).
@@ -281,7 +294,7 @@ pub struct Element {
     /// Where the last layout put it (`getRect`, the mouse's hit test). Under
     /// an unseen element (alpha 0) the layout does not go, so there it is
     /// where it was last laid out.
-    pub last_rect: Option<Rect>,
+    pub last_rect: Option<[f32; 4]>,
     /// Holds the menu focus (`setFocus`, `isInFocus`).
     pub focused: bool,
     /// A dashes bar's (count, lit, change) and units from one dash to the next
@@ -290,13 +303,11 @@ pub struct Element {
     pub dash_pitch: f32,
     /// `setupTiles(n)`: a picture repeated across its width in tiles n units
     /// wide (BO2's dot grid backdrop: an 8-wide picture at 8); 0 = not tiled.
-    pub tiles: f32,
-    /// bo2mp: `setShaderVector(0, x, y, z, w)`: the globe's reveal (0: hidden,
-    /// 1: wireframe, 2: its map in).
-    pub shader: [f32; 4],
-    pub kind: &'static str,
+    pub tiles: f32, pub element_kind: &'static str,
+    /// A `UITightText`: as wide as its words (a list gives it that slot).
+    pub tight: bool,
     /// The element's own field table (its metatable's `__newindex`).
-    pub fields: TableRef,
+    pub fields: Rc<RefCell<LuaTable>>,
     /// A streamed image (`setupUIStreamedImage`): how long it waits for its
     /// image (ms, 0 = for ever), and since when it has been waiting.
     stream_timeout: Option<f64>,
@@ -311,8 +322,8 @@ pub struct Element {
     pub extra_rot: f32,
 }
 
-pub fn material_name(u: &UserData) -> Option<String> {
-    if u.kind != "material" {
+pub fn surface_title(u: &UserData) -> Option<String> {
+    if u.type_tag != "material" {
         return None;
     }
     u.data.borrow().downcast_ref::<String>().cloned()
@@ -321,28 +332,30 @@ pub fn material_name(u: &UserData) -> Option<String> {
 /// The element behind a value, if it is one.
 pub fn element(v: &Value) -> Option<Rc<UserData>> {
     match v {
-        Value::User(u) if u.kind == "LUIElement" => Some(u.clone()),
+        Value::User(u) if u.type_tag == "LUIElement" => Some(u.clone()),
         _ => None,
     }
 }
 
 pub(crate) fn with<R>(u: &UserData, f: impl FnOnce(&mut Element) -> R) -> R {
     let mut data = u.data.borrow_mut();
-    let e = data.downcast_mut::<Element>().expect("LUIElement userdata holds an Element");
+    let e = data
+        .downcast_mut::<Element>()
+        .expect("LUIElement userdata holds an Element");
     f(e)
 }
 
 /// LUI's clock and the elements' animations (the engine drives `tick`).
 pub struct Lui {
-    pub now_ms: f64,
+    pub clock_millis: f64,
     next_id: usize,
-    pub natives: TableRef,
+    pub natives: Rc<RefCell<LuaTable>>,
     /// Elements whose animation ended since the last tick: the
     /// animation's name and whether a new one cut it short.
     finished: Vec<(Rc<UserData>, String, bool)>,
     pub roots: Vec<Rc<UserData>>,
     /// The roots' rectangle in their units (0,0 top left).
-    pub root_rect: Rect,
+    pub root_rect: [f32; 4],
     /// bo2mp: the entity containers made (`entity_containers`).
     containers: Vec<Weak<UserData>>,
 }
@@ -356,7 +369,7 @@ pub fn set_hide_occluded(on: bool) {
     HIDE_OCCLUDED.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-thread_local! {
+std::thread_local! {
     /// How many covered main menus the layout is inside (see `walk`).
     static BEHIND: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// bo2mp: inside a clamped entity container, the way to its point
@@ -376,7 +389,7 @@ fn next_anim_seq() -> u64 {
     })
 }
 
-thread_local! {
+std::thread_local! {
     /// The layout walk's field names, made once: `get_str` makes a new key
     /// string on every call, and the walk reads these for every element of
     /// every menu every frame.
@@ -387,8 +400,8 @@ const MENU_NAME: usize = 1;
 const DARKEN: usize = 2;
 
 /// One of the walk's fields (`WALK_KEYS`) of an element's field table.
-fn walk_field(t: &TableRef, k: usize) -> Value {
-    WALK_KEYS.with(|keys| t.borrow().get(&keys[k]))
+fn walk_field(t: &Rc<RefCell<LuaTable>>, k: usize) -> Value {
+    WALK_KEYS.with(|keys| t.borrow().read_key(&keys[k]))
 }
 
 /// bo2mp: a menu another menu covers, when that menu blurs what is under it
@@ -407,19 +420,57 @@ fn is_behind_menu(u: &Rc<UserData>) -> bool {
     }
 }
 
-thread_local! {
+std::thread_local! {
     static LUI: RefCell<Option<Rc<RefCell<Lui>>>> = const { RefCell::new(None) };
 }
 
+/// bo2zm (debugging aid): the element with engine id `id` under `root` and
+/// its ancestors, nearest first: (id, script `id` field, last rect).
+pub fn chain_of(root: &Rc<UserData>, id: usize) -> Vec<(usize, String, Option<[f32; 4]>)> {
+    let mut stack = vec![root.clone()];
+    while let Some(u) = stack.pop() {
+        if with(&u, |e| e.id) == id {
+            let mut out = Vec::new();
+            let mut at = Some(u);
+            while let Some(x) = at {
+                let (eid, name, rect, parent) = with(&x, |e| {
+                    (
+                        e.id,
+                        e.fields
+                            .borrow()
+                            .get_str("id")
+                            .as_str()
+                            .unwrap_or("")
+                            .to_owned(),
+                        e.last_rect,
+                        e.parent.as_ref().and_then(Weak::upgrade),
+                    )
+                });
+                out.push((eid, name, rect));
+                at = parent;
+            }
+            return out;
+        }
+        stack.extend(with(&u, |e| e.children.clone()));
+    }
+    Vec::new()
+}
+
+/// An element's engine id (debugging).
+pub fn with_id(u: &Rc<UserData>) -> usize {
+    with(u, |e| e.id)
+}
+
 fn lui() -> Rc<RefCell<Lui>> {
-    LUI.with(|l| l.borrow().clone()).expect("LUI natives installed")
+    LUI.with(|l| l.borrow().clone())
+        .expect("LUI natives installed")
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
     a.get(i).cloned().unwrap_or(Value::Nil)
 }
 
-fn this(a: &[Value], f: &str) -> Res<Rc<UserData>> {
+fn this(a: &[Value], f: &str) -> Result<Rc<UserData>, LuaError> {
     element(&arg(a, 0)).ok_or_else(|| LuaError::new(format!("{f}: not called on an LUI element")))
 }
 
@@ -448,6 +499,16 @@ fn edit(e: &mut Element, f: impl Fn(&mut State)) {
     f(&mut e.state);
 }
 
+std::thread_local! {
+    /// Element setup methods the scripts called that the engine lacks.
+    static MISSING_METHODS: RefCell<std::collections::BTreeSet<String>> = RefCell::default();
+}
+
+/// The engine widget setups the scripts asked for that are not built.
+pub fn missing_methods() -> Vec<String> {
+    MISSING_METHODS.with(|m| m.borrow().iter().cloned().collect())
+}
+
 /// A new element (`ConstructLUIElement`).
 pub fn construct(vm: &mut Vm, kind: &'static str) -> Value {
     let l = lui();
@@ -456,25 +517,38 @@ pub fn construct(vm: &mut Vm, kind: &'static str) -> Value {
         l.next_id += 1;
         (l.next_id, l.natives.clone())
     };
-    let fields = Table::new_ref();
-    fields.borrow_mut().set_str("m_eventHandlers", Value::Table(Table::new_ref()));
-    fields.borrow_mut().set_str("m_animationStates", Value::Table(Table::new_ref()));
-    let meta = Table::new_ref();
+    let fields = LuaTable::new_ref();
+    fields
+        .borrow_mut()
+        .set_str("m_eventHandlers", Value::Table(LuaTable::new_ref()));
+    fields
+        .borrow_mut()
+        .set_str("m_animationStates", Value::Table(LuaTable::new_ref()));
+    let meta = LuaTable::new_ref();
     let f2 = fields.clone();
     let index = vm.native("LUIElement_index", move |vm, a| {
         let key = arg(&a, 1);
-        let own = vm.index(&Value::Table(f2.clone()), &key)?;
+        let own = vm.lookup_index(&Value::Table(f2.clone()), &key)?;
         if !matches!(own, Value::Nil) {
             return Ok(vec![own]);
         }
-        Ok(vec![natives.borrow().get(&key)])
+        let native = natives.borrow().read_key(&key);
+        // An engine widget setup we do not draw yet (`setupGlobe`, ...): a
+        // do-nothing method, named in `missing_methods` (what to build next).
+        if matches!(native, Value::Nil)
+            && let Some(name) = key.as_str().filter(|k| k.starts_with("setup"))
+        {
+            MISSING_METHODS.with(|m| m.borrow_mut().insert(name.to_owned()));
+            return Ok(vec![vm.native("stub_setup", |_, _| Ok(vec![]))]);
+        }
+        Ok(vec![native])
     });
     meta.borrow_mut().set_str("__index", index);
-    meta.borrow_mut().set_str("__newindex", Value::Table(fields.clone()));
+    meta.borrow_mut()
+        .set_str("__newindex", Value::Table(fields.clone()));
     let el = Element {
         id,
-        parent: None,
-        children: Vec::new(),
+        parent: None, children: Vec::new(),
         priority: 0.0,
         state: State::default(),
         anim: None,
@@ -489,8 +563,8 @@ pub fn construct(vm: &mut Vm, kind: &'static str) -> Value {
         dashes: (0, 0, 0),
         dash_pitch: 8.0,
         tiles: 0.0,
-        shader: [0.0; 4],
-        kind,
+        element_kind: kind,
+        tight: false,
         fields,
         stream_timeout: None,
         stream_since: None,
@@ -499,7 +573,7 @@ pub fn construct(vm: &mut Vm, kind: &'static str) -> Value {
         extra_rot: 0.0,
     };
     Value::User(Rc::new(UserData {
-        kind: "LUIElement",
+        type_tag: "LUIElement",
         data: RefCell::new(Box::new(el)),
         meta: RefCell::new(Some(meta)),
     }))
@@ -560,8 +634,8 @@ pub fn add_drawn_child(
     let kind = if material.is_some() { "image" } else { "element" };
     // (Through the scripts' own constructor, so it answers events like any element.)
     let made = vm
-        .index(&vm.global("LUI"), &Value::str("UIElement"))
-        .and_then(|c| vm.index(&c, &Value::str("new")))
+        .lookup_index(&vm.global("LUI"), &Value::str("UIElement"))
+        .and_then(|c| vm.lookup_index(&c, &Value::str("new")))
         .and_then(|f| vm.call(f, vec![]));
     let child = match made.ok().and_then(|r| r.into_iter().next()) {
         Some(Value::User(u)) => u,
@@ -570,18 +644,18 @@ pub fn add_drawn_child(
             _ => return,
         },
     };
-    with(&child, |e| e.kind = kind);
+    with(&child, |e| e.element_kind = kind);
     with(&child, |e| {
         e.state.left_anchor = true;
         e.state.top_anchor = true;
         e.state.left = rect[0];
         e.state.top = rect[1];
-        e.state.right = rect[2];
-        e.state.bottom = rect[3];
-        e.state.red = rgba[0];
-        e.state.green = rgba[1];
-        e.state.blue = rgba[2];
-        e.state.alpha = rgba[3];
+        e.state.right_edge = rect[2];
+        e.state.bottom_edge = rect[3];
+        e.state.tint_r = rgba[0];
+        e.state.tint_g = rgba[1];
+        e.state.tint_b = rgba[2];
+        e.state.opacity = rgba[3];
         e.state.material = material.map(str::to_owned);
         e.state.text = text.map(str::to_owned);
         e.state.font = font;
@@ -596,25 +670,27 @@ pub fn font_of(u: &UserData) -> Option<String> {
 }
 
 fn sibling_index(parent: &Rc<UserData>, sib: &Rc<UserData>) -> Option<usize> {
-    with(parent, |e| e.children.iter().position(|c| Rc::ptr_eq(c, sib)))
+    with(parent, |e| {
+        e.children.iter().position(|c| Rc::ptr_eq(c, sib))
+    })
 }
 
-/// Advance every running animation to `now_ms`; returns the elements whose
+/// Advance every running animation to `clock_millis`; returns the elements whose
 /// animation ended (their `transition_complete_<name>` goes to the
 /// scripts).
 /// Animations that ended: the element, the animation, whether a new one cut
 /// it short, and how long after its end this tick saw it (`lateness`: a
 /// 0 ms timer moves by it).
-pub fn tick(now_ms: f64) -> Vec<(Rc<UserData>, String, bool, f64)> {
+pub fn tick(clock_millis: f64) -> Vec<(Rc<UserData>, String, bool, f64)> {
     let l = lui();
-    l.borrow_mut().now_ms = now_ms;
+    l.borrow_mut().clock_millis = clock_millis;
     let roots = l.borrow().roots.clone();
     let mut done = Vec::new();
     // bo2mp: animations that end on one frame go to the scripts by end time,
     // then in the order they began: a UITimer is a plain animation (luitimer.lua
     // animates to "default" for its interval), so a scroll's rows, begun before
     // the timer that ends with them, end (and close) first, and a card carousel's
-    // fade_out (begun by lose_focus before the title list's 50 ms timer) moves the
+    // ease_off (begun by lose_focus before the title list's 50 ms timer) moves the
     // list to the new category before that timer adds the row below it. Tree
     // order sent the timer first, so the bottom row showed the category before
     // the old one (SMG twice on the shotguns screen).
@@ -623,19 +699,19 @@ pub fn tick(now_ms: f64) -> Vec<(Rc<UserData>, String, bool, f64)> {
         let ended = with(&u, |e| {
             stack.extend(e.children.iter().rev().cloned());
             let a = e.anim.as_ref()?;
-            let t = if a.duration_ms <= 0.0 { 1.0 } else { (now_ms - a.start_ms) / a.duration_ms };
+            let t = if a.duration_ms <= 0.0 { 1.0 } else { (clock_millis - a.start_ms) / a.duration_ms };
             let k = ease(t, a.ease_in, a.ease_out) as f32;
             e.state = a.from.mix(&a.to, if t >= 1.0 { 1.0 } else { k });
             if t >= 1.0 {
                 let a = e.anim.take()?;
                 e.state = a.to;
-                Some((a.name, (now_ms - a.start_ms - a.duration_ms).max(0.0), (a.start_ms + a.duration_ms, a.seq)))
+                Some((a.name, (clock_millis - a.start_ms - a.duration_ms).max(0.0), (a.start_ms + a.duration_ms, a.seq)))
             } else {
                 None
             }
         });
-        if let Some((name, late, at)) = ended {
-            done.push((at, (u.clone(), name, false, late)));
+        if let Some((anim_name, late, at)) = ended {
+            done.push((at, (u.clone(), anim_name, false, late)));
         }
     }
     done.sort_by(|x, y| x.0 .0.total_cmp(&y.0 .0).then(x.0 .1.cmp(&y.0 .1)));
@@ -647,15 +723,34 @@ pub fn tick(now_ms: f64) -> Vec<(Rc<UserData>, String, bool, f64)> {
 
 /// Every element in drawing order (parents before children, children by
 /// priority), with its rectangle and its alpha including its parents'.
-pub fn layout(root: &Rc<UserData>, rect: Rect) -> Vec<(Rc<UserData>, Rect, f32)> {
-    layout_clipped(root, rect).into_iter().map(|(u, r, a, _)| (u, r, a)).collect()
+pub fn layout(
+    root: &Rc<UserData>,
+    rect: [f32; 4],
+    measure: &dyn Fn(&str, &str, f32) -> f32,
+) -> Vec<(Rc<UserData>, [f32; 4], f32)> {
+    layout_clipped(root, rect, measure).into_iter().map(|p| (p.element, p.rect, p.alpha)).collect()
+}
+
+/// One element as `layout_clipped` places it: its rectangle, its alpha
+/// including its parents', and the stencil clip it is drawn inside.
+pub struct ClippedPlace {
+    pub element: Rc<UserData>,
+    pub rect: [f32; 4],
+    pub alpha: f32,
+    pub stencil_box: Option<[f32; 4]>,
 }
 
 /// bo2mp: `layout` with each element's clip too: the rectangle of its
 /// nearest ancestor that `setUseStencil`s (LUI's stencil clips the children
 /// to that element's box; BO2's scorestreak and class tiles keep their
 /// big pictures inside the tile this way), intersected with the clips above.
-pub fn layout_clipped(root: &Rc<UserData>, rect: Rect) -> Vec<(Rc<UserData>, Rect, f32, Option<Rect>)> {
+/// `measure(text, font, height)` is a text's width (a tight text is as wide
+/// as its words).
+pub fn layout_clipped(
+    root: &Rc<UserData>,
+    rect: [f32; 4],
+    measure: &dyn Fn(&str, &str, f32) -> f32,
+) -> Vec<ClippedPlace> {
     let mut out = Vec::new();
     // `slot`: a list's child is placed along the list's axis by the list
     // (vertical?, start, end); across it by its own anchors. `xf`: where
@@ -664,38 +759,47 @@ pub fn layout_clipped(root: &Rc<UserData>, rect: Rect) -> Vec<(Rc<UserData>, Rec
     // bo2mp: the covered main menu stays drawn, blurred and dimmed by the
     // renderer (`Drawn::behind`), under Options and the Quit prompt: BO2
     // shows it so. Its children inherit the mark.
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         u: &Rc<UserData>,
-        parent: Rect,
+        parent: [f32; 4],
         alpha: f32,
         slot: Option<(bool, f32, f32)>,
         xf: (f32, f32, f32),
         mid: (f32, f32),
-        clip: Option<Rect>,
-        out: &mut Vec<(Rc<UserData>, Rect, f32, Option<Rect>)>,
+        stencil_box: Option<[f32; 4]>,
+        measure: &dyn Fn(&str, &str, f32) -> f32,
+        out: &mut Vec<ClippedPlace>,
     ) {
         let on = is_behind_menu(u);
         if on {
             BEHIND.with(|b| b.set(b.get() + 1));
         }
-        let (toward, rot) = (TOWARD.get(), ROT.get());
-        walk_in(u, parent, alpha, slot, xf, mid, clip, out);
+        let (toward, turn_matrix) = (TOWARD.get(), ROT.get());
+        walk_in(u, parent, alpha, slot, xf, mid, stencil_box, measure, out);
         TOWARD.set(toward);
-        ROT.set(rot);
+        ROT.set(turn_matrix);
         if on {
             BEHIND.with(|b| b.set(b.get() - 1));
         }
     }
+    #[allow(clippy::too_many_arguments)]
     fn walk_in(
         u: &Rc<UserData>,
-        parent: Rect,
+        parent: [f32; 4],
         alpha: f32,
         slot: Option<(bool, f32, f32)>,
         xf: (f32, f32, f32),
         mid: (f32, f32),
-        clip: Option<Rect>,
-        out: &mut Vec<(Rc<UserData>, Rect, f32, Option<Rect>)>,
+        stencil_box: Option<[f32; 4]>,
+        measure: &dyn Fn(&str, &str, f32) -> f32,
+        out: &mut Vec<ClippedPlace>,
     ) {
+        // A 3D window's element and all inside it go onto a model in the
+        // world, never the screen.
+        if with(u, |e| e.state.ui3d_window.is_some()) {
+            return;
+        }
         let (r, a, mut kids, list, xf, shown, stencil) = with(u, |e| {
             // bo2mp: an entity container sits on its point (the host places
             // it each frame, `set_entity_screen`): its parent's box is that
@@ -724,10 +828,10 @@ pub fn layout_clipped(root: &Rc<UserData>, rect: Rect) -> Vec<(Rc<UserData>, Rec
             let xf = (xf.0 * s, xf.0 * cx * (1.0 - s) + xf.1, xf.0 * cy * (1.0 - s) + xf.2);
             // `zoom` (toward the camera) scales everything about the screen's
             // centre, after the parents' and its own scale.
-            let xf = if e.state.zoom == 0.0 {
+            let xf = if e.state.depth_zoom == 0.0 {
                 xf
             } else {
-                let z = 1.0 / (1.0 - e.state.zoom / 1280.0);
+                let z = 1.0 / (1.0 - e.state.depth_zoom / 1280.0);
                 (xf.0 * z, z * (xf.1 - mid.0) + mid.0, z * (xf.2 - mid.1) + mid.1)
             };
             let mut shown = [r[0] * xf.0 + xf.1, r[1] * xf.0 + xf.2, r[2] * xf.0 + xf.1, r[3] * xf.0 + xf.2];
@@ -738,18 +842,18 @@ pub fn layout_clipped(root: &Rc<UserData>, rect: Rect) -> Vec<(Rc<UserData>, Rec
                     let (s, c) = deg.to_radians().sin_cos();
                     let (cx, cy) = ((shown[0] + shown[2]) * 0.5, (shown[1] + shown[3]) * 0.5);
                     let (ox, oy) = (cx - px, cy - py);
-                    let (dx, dy) = (px + ox * c + oy * s - cx, py - ox * s + oy * c - cy);
-                    shown = [shown[0] + dx, shown[1] + dy, shown[2] + dx, shown[3] + dy];
+                    let (step_along_x, dy) = (px + ox * c + oy * s - cx, py - ox * s + oy * c - cy);
+                    shown = [shown[0] + step_along_x, shown[1] + dy, shown[2] + step_along_x, shown[3] + dy];
                     deg
                 }
-                None => 0.0,
+                _ => 0.0,
             };
             // An edge pointer in a clamped container turns its children
             // toward the point.
-            if let (Some(off), Some(t)) = (e.edge_pointer.filter(|_| e.kind == "pointer"), TOWARD.get()) {
+            if let (Some(off), Some(t)) = (e.edge_pointer.filter(|_| e.element_kind == "pointer"), TOWARD.get()) {
                 ROT.set(Some((t + off, (shown[0] + shown[2]) * 0.5, (shown[1] + shown[3]) * 0.5)));
             }
-            let a = alpha * e.state.alpha * e.state.alpha_multiplier;
+            let a = alpha * e.state.opacity * e.state.alpha_multiplier;
             // bo2mp: a menu another menu covers (`occludedBy`, set by
             // CoD.Menu's occlusion_change) is not drawn (`set_hide_occluded`).
             // An in-game popup (End Game?) keeps what it covers drawn: the
@@ -775,29 +879,29 @@ pub fn layout_clipped(root: &Rc<UserData>, rect: Rect) -> Vec<(Rc<UserData>, Rec
                 a
             };
             e.last_rect = Some(shown);
-            let list = match e.kind {
+            let list = match e.element_kind {
                 "vlist" => Some((true, e.spacing, e.state.alignment)),
                 "hlist" => Some((false, e.spacing, e.state.alignment)),
                 _ => None,
             };
             (r, a, e.children.clone(), list, xf, shown, e.use_stencil)
         });
-        out.push((u.clone(), shown, a, clip));
+        out.push(ClippedPlace { element: u.clone(), rect: shown, alpha: a, stencil_box });
         // bo2mp: nothing under an unseen element can show (alpha only falls
         // further down), so its subtree is not laid out: most of the front
         // end's menus sit hidden in the tree, and walking them every frame
         // was most of the menus' cost.
-        if a <= 0.0 {
+        if 0.0 >= a {
             return;
         }
-        let clip = if stencil {
+        let stencil_box = if stencil {
             let b = [shown[0].min(shown[2]), shown[1].min(shown[3]), shown[0].max(shown[2]), shown[1].max(shown[3])];
-            Some(match clip {
+            Some(match stencil_box {
                 Some(c) => [b[0].max(c[0]), b[1].max(c[1]), b[2].min(c[2]), b[3].min(c[3])],
                 None => b,
             })
         } else {
-            clip
+            stencil_box
         };
         // bo2mp: a menu's `darkenElement` (the popup's full-screen black dim,
         // added by setOccludedMenu after the popup's panel, at the panel's
@@ -812,7 +916,7 @@ pub fn layout_clipped(root: &Rc<UserData>, rect: Rect) -> Vec<(Rc<UserData>, Rec
         });
         let Some((vertical, spacing, align)) = list else {
             for k in &kids {
-                walk(k, r, a, None, xf, mid, clip, out);
+                walk(k, r, a, None, xf, mid, stencil_box, measure, out);
             }
             return;
         };
@@ -825,9 +929,13 @@ pub fn layout_clipped(root: &Rc<UserData>, rect: Rect) -> Vec<(Rc<UserData>, Rec
             .map(|k| {
                 with(k, |e| {
                     if vertical {
-                        (e.state.bottom - e.state.top).abs()
+                        (e.state.bottom_edge - e.state.top).abs()
+                    } else if let (true, Some(text)) = (e.tight, e.state.text.as_deref()) {
+                        // Tight text: its words' width at its height.
+                        let h = (e.state.bottom_edge - e.state.top).abs();
+                        measure(text, e.state.font.as_deref().unwrap_or(""), h)
                     } else {
-                        (e.state.right - e.state.left).abs()
+                        (e.state.right_edge - e.state.left).abs()
                     }
                 })
             })
@@ -852,59 +960,65 @@ pub fn layout_clipped(root: &Rc<UserData>, rect: Rect) -> Vec<(Rc<UserData>, Rec
             order.reverse();
         }
         for (k, size) in order.iter().map(|(k, s)| (k, *s)) {
-            walk(k, r, a, Some((vertical, at, at + size)), xf, mid, clip, out);
+            walk(k, r, a, Some((vertical, at, at + size)), xf, mid, stencil_box, measure, out);
             if !skip(size) {
                 at += size + spacing;
             }
         }
     }
-    walk(root, rect, 1.0, None, (1.0, 0.0, 0.0), ((rect[0] + rect[2]) * 0.5, (rect[1] + rect[3]) * 0.5), None, &mut out);
+    walk(root, rect, 1.0, None, (1.0, 0.0, 0.0), ((rect[0] + rect[2]) * 0.5, (rect[1] + rect[3]) * 0.5), None, measure, &mut out);
     out
 }
 
-fn reg(vm: &mut Vm, t: &TableRef, name: &'static str, f: impl Fn(&mut Vm, Vec<Value>) -> Res<Vec<Value>> + 'static) {
+fn reg(
+    vm: &mut Vm, t: &Rc<RefCell<LuaTable>>, native_name: &'static str,
+    f: impl Fn(&mut Vm, Vec<Value>) -> Result<Vec<Value>, LuaError> + 'static,
+) {
     // T6LUA_TRACE=1 prints every element call (debugging aid).
     let trace = std::env::var_os("T6LUA_TRACE").is_some();
-    let v = vm.native(name, move |vm, a| {
+    let v = vm.native(native_name, move |vm, a| {
         if trace {
-            let id = a.first().and_then(element).map_or_else(|| "-".to_owned(), |u| with(&u, |e| e.id.to_string()));
+            let id = a
+                .first()
+                .and_then(element)
+                .map_or_else(|| String::from("-"), |u| with(&u, |e| e.id.to_string()));
             let rest: Vec<String> = a.iter().skip(1).map(|v| format!("{v:?}")).collect();
-            println!("  call #{id} {name}({})", rest.join(", "));
+            println!("  call #{id} {native_name}({})", rest.join(", "));
         }
         f(vm, a)
     });
-    t.borrow_mut().set_str(name, v);
+    t.borrow_mut().set_str(native_name, v);
 }
 
 /// bo2mp: one more element native (`self:<name>(...)`) beside `install`'s,
 /// for a game's own widgets. Call after `install`, before elements exist.
-pub fn add_native(vm: &mut Vm, name: &'static str, f: impl Fn(&mut Vm, Vec<Value>) -> Res<Vec<Value>> + 'static) {
+pub fn add_native(vm: &mut Vm, native_name: &'static str, f: impl Fn(&mut Vm, Vec<Value>) -> Result<Vec<Value>, LuaError> + 'static) {
     let t = lui().borrow().natives.clone();
-    reg(vm, &t, name, f);
+    reg(vm, &t, native_name, f);
 }
 
 /// bo2mp: the element natives' table.
-pub fn natives() -> TableRef {
+pub fn natives() -> Rc<RefCell<LuaTable>> {
     lui().borrow().natives.clone()
 }
 
 /// bo2mp: an element native that names the element's kind (an
 /// engine-drawn widget not drawn yet), as `install`'s `setupUIImage` ones.
-pub fn add_kind_native(vm: &mut Vm, name: &'static str, kind: &'static str) {
-    add_native(vm, name, move |_, a| {
-        let u = this(&a, name)?;
-        with(&u, |e| e.kind = kind);
+pub fn add_kind_native(vm: &mut Vm, native_name: &'static str, kind: &'static str) {
+    add_native(vm, native_name, move |_, a| {
+        let u = this(&a, native_name)?;
+        with(&u, |e| e.element_kind = kind);
         Ok(vec![])
     });
 }
 
 /// Install `ConstructLUIElement`, `RegisterMaterial` and the element
 /// natives into the VM.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, reason = "every element native in one place")]
 pub fn install(vm: &mut Vm) {
-    let natives = Table::new_ref();
+    let natives = LuaTable::new_ref();
     let l = Rc::new(RefCell::new(Lui {
-        now_ms: 0.0,
+        clock_millis: 0.0,
         next_id: 0,
         natives: natives.clone(),
         finished: Vec::new(),
@@ -918,13 +1032,16 @@ pub fn install(vm: &mut Vm) {
     reg(vm, n, "setLeftRight", |_, a| {
         let u = this(&a, "setLeftRight")?;
         let (la, ra) = (arg(&a, 1).truthy(), arg(&a, 2).truthy());
-        let (l, r) = (arg(&a, 3).as_num().unwrap_or(0.0), arg(&a, 4).as_num().unwrap_or(0.0));
+        let (l, r) = (
+            arg(&a, 3).as_num().unwrap_or(0.0),
+            arg(&a, 4).as_num().unwrap_or(0.0),
+        );
         with(&u, |e| {
             edit(e, |s| {
                 s.left_anchor = la;
                 s.right_anchor = ra;
                 s.left = l;
-                s.right = r;
+                s.right_edge = r;
             });
         });
         Ok(vec![])
@@ -932,13 +1049,16 @@ pub fn install(vm: &mut Vm) {
     reg(vm, n, "setTopBottom", |_, a| {
         let u = this(&a, "setTopBottom")?;
         let (ta, ba) = (arg(&a, 1).truthy(), arg(&a, 2).truthy());
-        let (t, b) = (arg(&a, 3).as_num().unwrap_or(0.0), arg(&a, 4).as_num().unwrap_or(0.0));
+        let (t, b) = (
+            arg(&a, 3).as_num().unwrap_or(0.0),
+            arg(&a, 4).as_num().unwrap_or(0.0),
+        );
         with(&u, |e| {
             edit(e, |s| {
                 s.top_anchor = ta;
                 s.bottom_anchor = ba;
                 s.top = t;
-                s.bottom = b;
+                s.bottom_edge = b;
             });
         });
         Ok(vec![])
@@ -946,7 +1066,7 @@ pub fn install(vm: &mut Vm) {
     reg(vm, n, "setAlpha", |_, a| {
         let u = this(&a, "setAlpha")?;
         let v = arg(&a, 1).as_num().unwrap_or(1.0);
-        with(&u, |e| edit(e, |s| s.alpha = v));
+        with(&u, |e| edit(e, |s| s.opacity = v));
         Ok(vec![])
     });
     reg(vm, n, "setRGB", |_, a| {
@@ -954,9 +1074,9 @@ pub fn install(vm: &mut Vm) {
         let c = [1, 2, 3].map(|i| arg(&a, i).as_num().unwrap_or(1.0));
         with(&u, |e| {
             edit(e, |s| {
-                s.red = c[0];
-                s.green = c[1];
-                s.blue = c[2];
+                s.tint_r = c[0];
+                s.tint_g = c[1];
+                s.tint_b = c[2];
             });
         });
         Ok(vec![])
@@ -984,11 +1104,11 @@ pub fn install(vm: &mut Vm) {
     reg(vm, n, "setImage", |_, a| {
         let u = this(&a, "setImage")?;
         let m = match arg(&a, 1) {
-            Value::User(m) => material_name(&m),
+            Value::User(m) => surface_title(&m),
             Value::Str(s) => Some(s.to_string()),
             _ => None,
         };
-        let now = lui().borrow().now_ms;
+        let now = lui().borrow().clock_millis;
         with(&u, |e| {
             // A streamed image streams each new image in.
             if e.stream_timeout.is_some() {
@@ -1058,7 +1178,28 @@ pub fn install(vm: &mut Vm) {
         with(&u, |e| e.use_stencil = v);
         Ok(vec![])
     });
-    for name in [
+    // setShaderVector(index, x, y, z, w): one of the material's shader
+    // vectors (animated like the rest); getShaderVector<n>() reads it now.
+    reg(vm, n, "setShaderVector", |_, a| {
+        let u = this(&a, "setShaderVector")?;
+        let i = arg(&a, 1).as_num().map_or(0, |n| n as usize).min(3);
+        let v: [f32; 4] = std::array::from_fn(|k| arg(&a, k + 2).as_num().unwrap_or(0.0));
+        with(&u, |e| edit(e, |s| s.shader[i] = v));
+        Ok(vec![])
+    });
+    for (name, i) in [
+        ("getShaderVector0", 0),
+        ("getShaderVector1", 1),
+        ("getShaderVector2", 2),
+        ("getShaderVector3", 3),
+    ] {
+        reg(vm, n, name, move |_, a| {
+            let u = this(&a, name)?;
+            let v = with(&u, |e| e.state.shader[i]);
+            Ok(v.iter().map(|x| Value::Num(*x)).collect())
+        });
+    }
+    for method in [
         "setLayoutCached",
         "setUseGameTime",
         "updateElementLayout",
@@ -1074,16 +1215,8 @@ pub fn install(vm: &mut Vm) {
         "setupPitchMeter",
         "setupCrosshairDistance",
     ] {
-        reg(vm, n, name, |_, _| Ok(vec![]));
+        reg(vm, n, method, |_, _| Ok(vec![]));
     }
-    reg(vm, n, "setShaderVector", |_, a| {
-        let u = this(&a, "setShaderVector")?;
-        if arg(&a, 1).as_num().unwrap_or(-1.0) == 0.0 {
-            let v = |i: usize| arg(&a, i).as_num().unwrap_or(0.0) as f32;
-            with(&u, |e| e.shader = [v(2), v(3), v(4), v(5)]);
-        }
-        Ok(vec![])
-    });
     // setupDashes(count, filled, ...): a slider's bar, `count` dashes of
     // which `filled` are lit (the engine draws it).
     reg(vm, n, "setupDashes", |_, a| {
@@ -1097,7 +1230,7 @@ pub fn install(vm: &mut Vm) {
         let change = arg(&a, 3).as_num().unwrap_or(0.0) as i32;
         let pitch = arg(&a, 4).as_num().unwrap_or(8.0);
         with(&u, |e| {
-            e.kind = "dashes";
+            e.element_kind = "dashes";
             e.dashes = (count.max(0), filled.clamp(0, count.max(0)), change);
             e.dash_pitch = pitch.max(1.0);
         });
@@ -1108,8 +1241,21 @@ pub fn install(vm: &mut Vm) {
         let u = this(&a, "setupTiles")?;
         let t = arg(&a, 1).as_num().unwrap_or(0.0);
         with(&u, |e| {
-            e.kind = "image";
+            e.element_kind = "image";
             e.tiles = t.max(0.0);
+        });
+        Ok(vec![])
+    });
+    // setupVoiceMeter(count): Settings' Level Indicator, `count` square
+    // dashes 14 apart lit by how loud the microphone is (none here: no
+    // voice chat, so all unlit, as the real one sits with no one talking).
+    reg(vm, n, "setupVoiceMeter", |_, a| {
+        let u = this(&a, "setupVoiceMeter")?;
+        let count = arg(&a, 1).as_num().unwrap_or(20.0) as i32;
+        with(&u, |e| {
+            e.element_kind = "meter";
+            e.dashes = (count.max(0), 0, 0);
+            e.dash_pitch = 14.0;
         });
         Ok(vec![])
     });
@@ -1122,7 +1268,7 @@ pub fn install(vm: &mut Vm) {
     });
     reg(vm, n, "isInFocus", |_, a| {
         let u = this(&a, "isInFocus")?;
-        Ok(vec![Value::Bool(with(&u, |e| e.focused))])
+        Ok(vec![Value::Boolean(with(&u, |e| e.focused))])
     });
     reg(vm, n, "registerAnimationState", |_, a| {
         let u = this(&a, "registerAnimationState")?;
@@ -1143,7 +1289,7 @@ pub fn install(vm: &mut Vm) {
         let name = arg(&a, 1).as_str().unwrap_or("").to_owned();
         let ms = f64::from(arg(&a, 2).as_num().unwrap_or(0.0));
         let (ei, eo) = (arg(&a, 3).truthy(), arg(&a, 4).truthy());
-        let now = lui().borrow().now_ms;
+        let started = lui().borrow().clock_millis;
         let interrupted = with(&u, |e| {
             let old = e.anim.take().map(|a| a.name);
             let from = e.state.clone();
@@ -1151,8 +1297,7 @@ pub fn install(vm: &mut Vm) {
             e.anim = Some(Anim {
                 name,
                 from: from.clone(),
-                to: from,
-                start_ms: now,
+                to: from, start_ms: started,
                 duration_ms: ms,
                 ease_in: ei,
                 ease_out: eo,
@@ -1168,7 +1313,7 @@ pub fn install(vm: &mut Vm) {
     // How far the running animation is (0 to 1); 1 when none runs.
     reg(vm, n, "getAnimationFraction", |_, a| {
         let u = this(&a, "getAnimationFraction")?;
-        let now = lui().borrow().now_ms;
+        let now = lui().borrow().clock_millis;
         let f = with(&u, |e| match &e.anim {
             Some(a) if a.duration_ms > 0.0 => ((now - a.start_ms) / a.duration_ms).clamp(0.0, 1.0),
             _ => 1.0,
@@ -1177,12 +1322,14 @@ pub fn install(vm: &mut Vm) {
     });
     reg(vm, n, "animateToState", |_, a| {
         let u = this(&a, "animateToState")?;
-        let name = arg(&a, 1).as_str().unwrap_or("").to_owned();
+        let state_name = arg(&a, 1).as_str().unwrap_or("").to_owned();
         let ms = f64::from(arg(&a, 2).as_num().unwrap_or(0.0));
         let (ei, eo) = (arg(&a, 3).truthy(), arg(&a, 4).truthy());
-        let now = lui().borrow().now_ms;
+        let started = lui().borrow().clock_millis;
         with(&u, |e| {
-            let Some(t) = e.states.get(&name).cloned() else { return };
+            let Some(t) = e.states.get(&state_name).cloned() else {
+                return;
+            };
             let mut to = e.state.clone();
             to.apply_table(&t.borrow());
             // A list's state names its spacing too (CoD.Menu's button
@@ -1190,16 +1337,14 @@ pub fn install(vm: &mut Vm) {
             if let Some(sp) = t.borrow().get_str("spacing").as_num() {
                 e.spacing = sp;
             }
-            e.pending = None;
+            e.pending.take();
             if ms <= 0.0 {
                 e.state = to;
                 e.anim = None;
             } else {
                 e.anim = Some(Anim {
-                    name: name.clone(),
-                    from: e.state.clone(),
-                    to,
-                    start_ms: now,
+                    name: state_name.clone(), from: e.state.clone(),
+                    to, start_ms: started,
                     duration_ms: ms,
                     ease_in: ei,
                     ease_out: eo,
@@ -1209,19 +1354,26 @@ pub fn install(vm: &mut Vm) {
         });
         Ok(vec![])
     });
+    // completeAnimation: the running animation jumps to its end (the
+    // values written since beginAnimation included), and, as LUI does it,
+    // its `transition_complete_<name>` runs now, before the script's next
+    // line, marked `interrupted`: a looping handler stops there (the menu
+    // button's pulse_high/pulse_low loop ends when it loses focus; without
+    // the mark every button once passed over kept pulsing grey), and the
+    // globe's handlers skip it before its next move starts.
     reg(vm, n, "completeAnimation", |_, a| {
         let u = this(&a, "completeAnimation")?;
         let name = with(&u, |e| {
-            e.pending = None;
+            let pending = e.pending.take();
             let a = e.anim.take()?;
-            e.state = a.to;
+            e.state = pending.unwrap_or(a.to);
             Some(a.name)
         });
         // bo2mp: its transition_complete_<name> comes as interrupted:
         // BO2's HUDDigit stops its red pulse with completeAnimation, and its
         // handlers restart the pulse on a whole (not interrupted) finish.
-        if let Some(name) = name {
-            lui().borrow_mut().finished.push((u, name, true));
+        if let Some(anim_name) = name {
+            lui().borrow_mut().finished.push((u, anim_name, true));
         }
         Ok(vec![])
     });
@@ -1258,7 +1410,8 @@ pub fn install(vm: &mut Vm) {
     reg(vm, n, "removeElement", |_, a| {
         let p = this(&a, "removeElement")?;
         if let Some(c) = element(&arg(&a, 1)) {
-            let mine = with(&c, |e| e.parent.as_ref().and_then(Weak::upgrade)).is_some_and(|q| Rc::ptr_eq(&q, &p));
+            let mine = with(&c, |e| e.parent.as_ref().and_then(Weak::upgrade))
+                .is_some_and(|q| Rc::ptr_eq(&q, &p));
             if mine {
                 with(&c, |e| e.parent = None);
                 with(&p, |e| e.children.retain(|x| !Rc::ptr_eq(x, &c)));
@@ -1276,15 +1429,21 @@ pub fn install(vm: &mut Vm) {
     });
     reg(vm, n, "getParent", |_, a| {
         let u = this(&a, "getParent")?;
-        Ok(vec![with(&u, |e| e.parent.as_ref().and_then(Weak::upgrade)).map_or(Value::Nil, Value::User)])
+        Ok(vec![
+            with(&u, |e| e.parent.as_ref().and_then(Weak::upgrade)).map_or(Value::Nil, Value::User),
+        ])
     });
     reg(vm, n, "getFirstChild", |_, a| {
         let u = this(&a, "getFirstChild")?;
-        Ok(vec![with(&u, |e| e.children.first().cloned()).map_or(Value::Nil, Value::User)])
+        Ok(vec![
+            with(&u, |e| e.children.first().cloned()).map_or(Value::Nil, Value::User),
+        ])
     });
     reg(vm, n, "getLastChild", |_, a| {
         let u = this(&a, "getLastChild")?;
-        Ok(vec![with(&u, |e| e.children.last().cloned()).map_or(Value::Nil, Value::User)])
+        Ok(vec![
+            with(&u, |e| e.children.last().cloned()).map_or(Value::Nil, Value::User),
+        ])
     });
     reg(vm, n, "getNumChildren", |_, a| {
         let u = this(&a, "getNumChildren")?;
@@ -1326,7 +1485,7 @@ pub fn install(vm: &mut Vm) {
             chain.push(p.clone());
             at = p;
         }
-        let mut rect: Rect = lui().borrow().root_rect;
+        let mut rect: [f32; 4] = lui().borrow().root_rect;
         for e in chain.iter().rev() {
             rect = with(e, |e| place(&e.state, rect));
         }
@@ -1336,9 +1495,10 @@ pub fn install(vm: &mut Vm) {
     for (name, kind) in [
         ("setupUIElement", "element"),
         ("setupUIImage", "image"),
+        // bo2zm M4: the Zombies globe (its material's shader draws it).
+        ("setupGlobe", "globe"),
         ("setupUIText", "text"),
         ("setupUITextUncached", "text"),
-        ("setupUITightText", "text"),
         ("setupUIHorizontalList", "hlist"),
         ("setupUIVerticalList", "vlist"),
         ("setupGameTimer", "timer"),
@@ -1351,8 +1511,6 @@ pub fn install(vm: &mut Vm) {
         ("setupGameMessages", "messages"),
         ("setupObjectiveProgress", "progress"),
         ("setupHUDShaker", "element"),
-        ("setupVoipImage", "voip"),
-        ("setupVoiceMeter", "voip"),
         ("setupCinematicSubtitles", "subtitles"),
         ("setupEdgePointer", "pointer"),
         ("setupHorizontalCompass", "compass"),
@@ -1372,7 +1530,7 @@ pub fn install(vm: &mut Vm) {
         reg(vm, n, name, move |_, a| {
             let u = this(&a, name)?;
             with(&u, |e| {
-                e.kind = kind;
+                e.element_kind = kind;
                 // A player's emblem is the engine's picture; with none to
                 // draw it is empty (never the white square of no material).
                 // The Solo team's emblem (drawn by the host: no material
@@ -1384,7 +1542,7 @@ pub fn install(vm: &mut Vm) {
                     // (A player with none of his own shows his rank's
                     // default: the PFC chevron in the rank green.)
                     e.state.material = Some("em_rank_pvt_full".to_owned());
-                    (e.state.red, e.state.green, e.state.blue) = (0.431, 0.584, 0.055);
+                    (e.state.tint_r, e.state.tint_g, e.state.tint_b) = (0.431, 0.584, 0.055);
                 }
             });
             Ok(vec![])
@@ -1395,7 +1553,7 @@ pub fn install(vm: &mut Vm) {
     reg(vm, n, "setupVoipImage", |_, a| {
         let u = this(&a, "setupVoipImage")?;
         with(&u, |e| {
-            e.kind = "image";
+            e.element_kind = "image";
             e.state.material = Some("nottalkingicon".to_owned());
         });
         Ok(vec![])
@@ -1407,9 +1565,9 @@ pub fn install(vm: &mut Vm) {
     reg(vm, n, "setupUIStreamedImage", |_, a| {
         let u = this(&a, "setupUIStreamedImage")?;
         let timeout = arg(&a, 1).as_num().map_or(0.0, f64::from);
-        let now = lui().borrow().now_ms;
+        let now = lui().borrow().clock_millis;
         with(&u, |e| {
-            e.kind = "image";
+            e.element_kind = "image";
             e.stream_timeout = Some(timeout);
             e.stream_since = Some(now);
         });
@@ -1424,7 +1582,7 @@ pub fn install(vm: &mut Vm) {
         let u = this(&a, "setupEntityContainer")?;
         let f = |i: usize| arg(&a, i).as_num().unwrap_or(0.0);
         let (entity, offset) = (f(1) as i32, [f(2), f(3), f(4)]);
-        with(&u, |e| e.kind = "entity");
+        with(&u, |e| e.element_kind = "entity");
         container(&u, |c| (c.entity, c.offset) = (entity, offset));
         Ok(vec![])
     });
@@ -1447,7 +1605,7 @@ pub fn install(vm: &mut Vm) {
         let u = this(&a, "setupEdgePointer")?;
         let off = arg(&a, 1).as_num().unwrap_or(0.0);
         with(&u, |e| {
-            e.kind = "pointer";
+            e.element_kind = "pointer";
             e.edge_pointer = Some(off);
         });
         Ok(vec![])
@@ -1455,8 +1613,17 @@ pub fn install(vm: &mut Vm) {
     reg(vm, n, "setupUIElement", |_, a| {
         let u = this(&a, "setupUIElement")?;
         with(&u, |e| {
-            e.kind = "element";
+            e.element_kind = "element";
             e.edge_pointer = None;
+        });
+        Ok(vec![])
+    });
+    // bo2zm: a text as wide as its words (a list measures it; `layout`'s `measure`).
+    reg(vm, n, "setupUITightText", |_, a| {
+        let u = this(&a, "setupUITightText")?;
+        with(&u, |e| {
+            e.element_kind = "text";
+            e.tight = true;
         });
         Ok(vec![])
     });
@@ -1468,7 +1635,7 @@ pub fn install(vm: &mut Vm) {
         Ok(vec![])
     });
     // Engine settings on widgets not drawn yet (no effect here).
-    for name in [
+    for method in [
         "setZoom",
         "setTileVertically",
         "setOwnerControllerIndex",
@@ -1476,15 +1643,21 @@ pub fn install(vm: &mut Vm) {
         "addCompass",
         "addCrosshairDistance",
     ] {
-        reg(vm, n, name, |_, _| Ok(vec![]));
+        reg(vm, n, method, |_, _| Ok(vec![]));
     }
 
-    let construct_fn = vm.native("ConstructLUIElement", |vm, _| Ok(vec![construct(vm, "element")]));
+    let construct_fn = vm.native("ConstructLUIElement", |vm, _| {
+        Ok(vec![construct(vm, "element")])
+    });
     vm.set_global("ConstructLUIElement", construct_fn);
     let register_material = vm.native("RegisterMaterial", |_, a| {
         let name = arg(&a, 0).as_str().unwrap_or("").to_owned();
+        // BO2ZM_LUI_LOG: the map pictures the menus ask for, in order.
+        if name.starts_with("menu_zm_") && std::env::var_os("BO2ZM_LUI_LOG").is_some() {
+            eprintln!("bo2zm lui: RegisterMaterial {name}");
+        }
         Ok(vec![Value::User(Rc::new(UserData {
-            kind: "material",
+            type_tag: "material",
             data: RefCell::new(Box::new(name)),
             meta: RefCell::new(None),
         }))])
@@ -1493,7 +1666,7 @@ pub fn install(vm: &mut Vm) {
     let register_font = vm.native("RegisterFont", |_, a| {
         let name = arg(&a, 0).as_str().unwrap_or("").to_owned();
         Ok(vec![Value::User(Rc::new(UserData {
-            kind: "font",
+            type_tag: "font",
             data: RefCell::new(Box::new(name)),
             meta: RefCell::new(None),
         }))])
@@ -1503,7 +1676,9 @@ pub fn install(vm: &mut Vm) {
     vm.set_global("hpairs", pairs);
     // ProjectRootCoordinate(rootName, x, y): the engine's mouse position in a
     // root's units (the host sends it in root units already).
-    let project = vm.native("ProjectRootCoordinate", |_, a| Ok(vec![arg(&a, 1), arg(&a, 2)]));
+    let project = vm.native("ProjectRootCoordinate", |_, a| {
+        Ok(vec![arg(&a, 1), arg(&a, 2)])
+    });
     vm.set_global("ProjectRootCoordinate", project);
 }
 
@@ -1511,7 +1686,7 @@ pub fn install(vm: &mut Vm) {
 /// sends them: `streamed_image_ready` once the image is set (the images
 /// here are read straight from the game's files, so they are in as soon
 /// as they are named), `streamed_image_timed_out` when none came in time.
-pub fn stream_events(now_ms: f64) -> Vec<(Rc<UserData>, &'static str)> {
+pub fn stream_events(clock_millis: f64) -> Vec<(Rc<UserData>, &'static str)> {
     let l = lui();
     let roots = l.borrow().roots.clone();
     let mut out = Vec::new();
@@ -1524,7 +1699,7 @@ pub fn stream_events(now_ms: f64) -> Vec<(Rc<UserData>, &'static str)> {
             let timeout = e.stream_timeout.unwrap_or(0.0);
             let ev = if named {
                 "streamed_image_ready"
-            } else if timeout > 0.0 && now_ms - since >= timeout {
+            } else if timeout > 0.0 && clock_millis - since >= timeout {
                 "streamed_image_timed_out"
             } else {
                 return None;
@@ -1532,8 +1707,8 @@ pub fn stream_events(now_ms: f64) -> Vec<(Rc<UserData>, &'static str)> {
             e.stream_since = None;
             Some(ev)
         });
-        if let Some(ev) = ev {
-            out.push((u.clone(), ev));
+        if let Some(started) = ev {
+            out.push((u.clone(), started));
         }
     }
     out
@@ -1592,13 +1767,13 @@ pub fn entity_containers() -> Vec<(Rc<UserData>, i32, [f32; 3], bool)> {
 /// None: not on screen), whether it is clamped to the screen's edge and
 /// the way to its point then (degrees, counter-clockwise from the right).
 /// The new clamp when it changed.
-pub fn set_entity_screen(u: &Rc<UserData>, screen: Option<[f32; 2]>, clamped: bool, toward: f32) -> Option<bool> {
+pub fn set_entity_screen(u: &Rc<UserData>, screen: Option<[f32; 2]>, pinned: bool, toward: f32) -> Option<bool> {
     with(u, |e| {
         let c = e.entity.as_mut()?;
         c.screen = screen;
         c.toward = toward;
-        let was = std::mem::replace(&mut c.clamped, clamped);
-        (was != clamped).then_some(clamped)
+        let was = std::mem::replace(&mut c.clamped, pinned);
+        (was != pinned).then_some(pinned)
     })
 }
 
@@ -1622,15 +1797,21 @@ mod tests {
     #[test]
     fn anchors_place_edges() {
         let parent = [0.0, 0.0, 100.0, 50.0];
-        let mut s = State { left_anchor: true, right_anchor: true, left: 10.0, right: -10.0, ..State::default() };
+        let mut s = State {
+            left_anchor: true,
+            right_anchor: true,
+            left: 10.0,
+            right_edge: -10.0,
+            ..State::default()
+        };
         assert_eq!(place(&s, parent)[0..1], [10.0]);
         assert_eq!(place(&s, parent)[2], 90.0);
         s.right_anchor = false;
-        s.right = 30.0;
+        s.right_edge = 30.0;
         assert_eq!(place(&s, parent)[2], 30.0);
         s.left_anchor = false;
         s.left = -5.0;
-        s.right = 5.0;
+        s.right_edge = 5.0;
         let r = place(&s, parent);
         assert_eq!((r[0], r[2]), (45.0, 55.0));
     }
@@ -1655,15 +1836,15 @@ mod tests {
                 e.state.left_anchor = true;
                 e.state.right_anchor = true;
                 e.state.top_anchor = true;
-                e.state.bottom = h;
+                e.state.bottom_edge = h;
             });
             add_child(&list, &c, None);
         }
-        let laid = layout(&list, [0.0, 0.0, 100.0, 100.0]);
+        let laid = layout(&list, [0.0, 0.0, 100.0, 100.0], &|_, _, _| 0.0);
         let tops: Vec<(f32, f32)> = laid.iter().skip(1).map(|(_, r, _)| (r[1], r[3])).collect();
         assert_eq!(tops, vec![(0.0, 30.0), (32.0, 62.0)]);
         with(&list, |e| e.state.alignment = 5);
-        let laid = layout(&list, [0.0, 0.0, 100.0, 100.0]);
+        let laid = layout(&list, [0.0, 0.0, 100.0, 100.0], &|_, _, _| 0.0);
         assert_eq!(laid[1].1[1], 19.0);
     }
 }
@@ -1683,19 +1864,19 @@ pub fn native_names() -> Vec<String> {
 }
 
 /// LUI's clock (the last `tick`'s time).
-pub fn now_ms() -> f64 {
-    lui().borrow().now_ms
+pub fn clock_millis() -> f64 {
+    lui().borrow().clock_millis
 }
 
 /// Set the roots' rectangle (the host, on a resize).
-pub fn set_root_rect(r: Rect) {
+pub fn set_root_rect(r: [f32; 4]) {
     lui().borrow_mut().root_rect = r;
 }
 
 /// The element tree under `u` as indented lines: id, kind, focus, the
 /// fields that gate input (`m_inputDisabled`, `m_ownerController`) and
 /// the element's `id` field (debugging aid).
-pub fn tree(u: &Rc<UserData>, depth: usize, out: &mut Vec<String>) {
+pub fn tree(u: &Rc<UserData>, nest: usize, out: &mut Vec<String>) {
     let (line, kids) = with(u, |e| {
         let f = e.fields.borrow();
         let name = f.get_str("id");
@@ -1703,22 +1884,22 @@ pub fn tree(u: &Rc<UserData>, depth: usize, out: &mut Vec<String>) {
         let owner = f.get_str("m_ownerController");
         (
             format!(
-                "{:indent$}#{} {}{}{}{} {}",
+                "{:lead_spaces$}#{} {}{}{}{} {}",
                 "",
                 e.id,
-                e.kind,
+                e.element_kind,
                 if e.focused { " FOCUS" } else { "" },
                 if off.truthy() { " input-off" } else { "" },
                 if matches!(owner, Value::Nil) { String::new() } else { format!(" owner={owner}") },
                 if matches!(name, Value::Nil) { String::new() } else { name.to_string() },
-                indent = depth * 2
+                lead_spaces = nest * 2
             ),
             e.children.clone(),
         )
     });
     out.push(line);
     for k in &kids {
-        tree(k, depth + 1, out);
+        tree(k, nest + 1, out);
     }
 }
 
@@ -1732,11 +1913,75 @@ pub fn find(u: &Rc<UserData>, id: usize) -> Option<Rc<UserData>> {
 }
 
 /// The `id` fields of an element's children (a menu's is `Menu.<name>`).
+/// bo2zm M4 (debugging aid): every menu under `u` (an element whose `id`
+/// starts with `Menu.`), with its input state: `m_inputDisabled`,
+/// `occludedBy` (a popup over it), `m_ownerController`,
+/// `anyControllerAllowed`, and its focused child's id.
+pub fn menu_report(u: &Rc<UserData>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![(u.clone(), 0usize)];
+    while let Some((x, depth)) = stack.pop() {
+        let (fields, kids) = with(&x, |e| (e.fields.clone(), e.children.clone()));
+        let f = fields.borrow();
+        if let Some(id) = f.get_str("id").as_str().filter(|i| i.starts_with("Menu.")) {
+            let show = |k: &str| {
+                let v = f.get_str(k);
+                match v {
+                    Value::Nil => "-".to_owned(),
+                    Value::User(_) | Value::Table(_) => "set".to_owned(),
+                    other => other.to_string(),
+                }
+            };
+            let report_line = format!(
+                "{}{id}: inputDisabled {} occludedBy {} owner {} anyController {} disabled {}",
+                "  ".repeat(depth),
+                show("m_inputDisabled"),
+                show("occludedBy"),
+                show("m_ownerController"),
+                show("anyControllerAllowed"),
+                show("m_disableAllButtons")
+            );
+            out.push(report_line);
+        }
+        for k in kids.into_iter().rev() {
+            stack.push((k, depth + 1));
+        }
+    }
+    out
+}
+
 pub fn child_ids(u: &Rc<UserData>) -> Vec<String> {
     let kids = with(u, |e| e.children.clone());
     kids.iter()
-        .filter_map(|k| with(k, |e| e.fields.borrow().get_str("id").as_str().map(str::to_owned)))
+        .filter_map(|k| {
+            with(k, |e| {
+                e.fields.borrow().get_str("id").as_str().map(str::to_owned)
+            })
+        })
         .collect()
+}
+
+/// The engine ids of the element whose `id` field is `name` and of all
+/// under it (a menu's elements), if it is in this tree.
+pub fn ids_under_named(u: &Rc<UserData>, name: &str) -> Option<std::collections::HashSet<usize>> {
+    let (named, kids) = with(u, |e| {
+        (
+            e.fields.borrow().get_str("id").as_str() == Some(name),
+            e.children.clone(),
+        )
+    });
+    if named {
+        let mut out = std::collections::HashSet::new();
+        let mut stack = vec![u.clone()];
+        while let Some(x) = stack.pop() {
+            with(&x, |e| {
+                out.insert(e.id);
+                stack.extend(e.children.iter().cloned());
+            });
+        }
+        return Some(out);
+    }
+    kids.iter().find_map(|k| ids_under_named(k, name))
 }
 
 /// An element's id.

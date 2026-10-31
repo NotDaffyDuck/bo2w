@@ -22,7 +22,7 @@ pub struct PortalEnd {
 #[derive(Clone, Copy, Debug)]
 pub struct PortalLook {
     /// 0 when the blue end is looked into, 1 the orange.
-    pub slot: usize,
+    pub bay: usize,
     pub pair: u32,
     pub entry: PortalEnd,
     pub exit: PortalEnd,
@@ -53,17 +53,17 @@ pub fn choose_looks(ends: &[PortalEnd], eye: Vec3) -> Vec<PortalLook> {
     if std::env::var_os("BO2MP_NO_PORTAL_VIEW").is_some() {
         return Vec::new();
     }
-    let mut best: Option<(f32, [PortalEnd; 2])> = None;
+    let mut nearest_pair: Option<(f32, [PortalEnd; 2])> = None;
     for a in ends.iter().filter(|e| e.linked && !e.orange) {
         let Some(b) = ends.iter().find(|e| e.linked && e.orange && e.pair == a.pair) else {
             continue;
         };
         let d = eye.distance(a.centre).min(eye.distance(b.centre));
-        if d < REACH && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
-            best = Some((d, [*a, *b]));
+        if d < REACH && nearest_pair.as_ref().is_none_or(|(bd, _)| d < *bd) {
+            nearest_pair = Some((d, [*a, *b]));
         }
     }
-    let Some((_, pair)) = best else { return Vec::new() };
+    let Some((_, pair)) = nearest_pair else { return Vec::new() };
     let mut looks = Vec::new();
     for k in 0..2 {
         let (entry, exit) = (pair[k], pair[1 - k]);
@@ -73,7 +73,7 @@ pub fn choose_looks(ends: &[PortalEnd], eye: Vec3) -> Vec<PortalLook> {
         let n = exit.normal.normalize_or(Vec3::Z);
         let on = exit.centre + n;
         looks.push(PortalLook {
-            slot: k,
+            bay: k,
             pair: entry.pair,
             entry,
             exit,
@@ -135,7 +135,7 @@ mod tests {
         assert!((front - (b.centre - Vec3::Y * 100.0)).length() < 1e-3);
         let looks = choose_looks(&[a, b], Vec3::new(200.0, 0.0, 50.0));
         assert_eq!(looks.len(), 1);
-        assert_eq!(looks[0].slot, 0);
+        assert_eq!(looks[0].bay, 0);
     }
 
     #[test]

@@ -1,9 +1,9 @@
-pub const GAMETYPE_TOKEN: &str = "dem";
+pub const MODE_TOKEN: &str = "dem";
 
-pub const DISPLAY_NAME: &str = "DEMOLITION";
+pub const MODE_TITLE: &str = "DEMOLITION";
 
 // gm-13: BO2 reads the limits from playlist data. TODO(fact): the BO2 defaults.
-pub const TIME_LIMIT_MS: u32 = 180_000;
+pub const TIME_LIMIT_MS: u32 = 3 * 60 * 1_000;
 
 /// gm-10: attackers spawn from one grid; defenders from the main grid plus the _a and _b ones.
 pub const SPAWN_ATTACKER: &str = "mp_dem_spawn_attacker";

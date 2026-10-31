@@ -1,116 +1,117 @@
 //! The two per-frame effect ticks: the part that does not depend on this frame's poses (windows,
 //! effect lights, spawning) and the part that does (bolted effects, movement).
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use fx::MarkReceiverEnable;
-use net::ClientPredictionState;
+use fx::DecalAcceptToggle;
+use net::ClientGuessState;
 use render_fx::{
-    FxCameraOrigin, FxMarkDvars, HostFxPostLights, HostFxSystem, PreparedFxCatalog,
-    PreparedFxElemInfos,
+    EffectsEyePosition, EffectStainTunables, PostEffectLightSet, EffectsSystemHandle, MarkSwitch,
+    ReadyFxBook, PreparedFxElemTable,
 };
 
-use super::glass_cues::{self, PredictionGlassTrace};
-use super::scene_access::FxSceneAccess;
-use crate::adapters::fx::present::{FxScene, tick_fx_non_dependent, tick_fx_remaining};
-use crate::assemble::drawsurf::T6GlassCues;
+use super::glass_cues::{PredictionGlassTrace, sound_cues, play_shatter_effects};
+use super::scene_access::EffectStageAccess;
+use render_fx::effect_play::{EffectStage, tick_effect_non_dependent, tick_effect_remaining};
+use crate::assemble::draw_items::T6GlassCues;
 
 /// The prediction world effects collide with, once the client is predicting against a map that
 /// has clip data.
-fn collision_world(prediction: Option<&ClientPredictionState>) -> Option<&sim::SimWorld> {
-    prediction
-        .filter(|prediction| prediction.0.is_armed() && prediction.0.world().has_world_clip())
+fn collision_world(predicted: Option<&ClientGuessState>) -> Option<&sim::SimWorld> {
+    predicted
+        .filter(|prediction| prediction.0.is_forecast_live() && prediction.0.world().has_static_collision())
         .map(|prediction| prediction.0.world())
 }
 
-fn mark_receivers(dvars: &FxMarkDvars) -> MarkReceiverEnable {
-    MarkReceiverEnable {
-        fx_marks: dvars.fx_marks,
-        fx_marks_ents: dvars.fx_marks_ents,
-        fx_marks_smodels: dvars.fx_marks_smodels,
+fn stain_receivers(dvars: &EffectStainTunables) -> DecalAcceptToggle {
+    let on = |switch| dvars.is_on(switch);
+    DecalAcceptToggle {
+        stains: on(MarkSwitch::Marks),
+        stains_on_ents: on(MarkSwitch::Entities),
+        stains_on_props: on(MarkSwitch::StaticModels),
     }
 }
 
+/// What both ticks read besides the host itself.
+#[derive(SystemParam)]
+pub(super) struct TickWorld<'w> {
+    fx_catalog: Option<Res<'w, ReadyFxBook>>,
+    elem_infos: ResMut<'w, PreparedFxElemTable>,
+    prediction: Option<Res<'w, ClientGuessState>>,
+    camera_origin: Res<'w, EffectsEyePosition>,
+    effect_level: EffectStageAccess<'w>,
+}
+
 pub(super) fn tick_fx_non_dependent_update(
-    mut host: ResMut<HostFxSystem>,
-    dvars: Res<FxMarkDvars>,
-    catalog: Option<Res<PreparedFxCatalog>>,
-    mut elem_infos: ResMut<PreparedFxElemInfos>,
-    prediction: Option<Res<ClientPredictionState>>,
-    camera_origin: Res<FxCameraOrigin>,
-    fx_world: FxSceneAccess,
-    mut post_lights: ResMut<HostFxPostLights>,
+    mut fx_host: ResMut<EffectsSystemHandle>,
+    dvars: Res<EffectStainTunables>,
+    mut world: TickWorld,
+    mut after_lights: ResMut<PostEffectLightSet>,
     mut aliases: MessageWriter<audio::AliasCommand>,
     mut glass: ResMut<T6GlassCues>,
 ) {
-    let msec = host.0.msec_now;
-    let world = collision_world(prediction.as_deref());
+    let msec = fx_host.0.clock_ms_now;
+    let collision = collision_world(world.prediction.as_deref());
 
-    let trace = world.map(PredictionGlassTrace);
-    host.0.glass.advance_in_world(
-        msec,
-        trace.as_ref().map(|trace| trace as &dyn fx::GlassWorldTrace),
-    );
+    let trace = collision.map(PredictionGlassTrace);
+    let trace = trace.as_ref().map(|trace| trace as &dyn fx::GlassWorldTrace);
+    fx_host.0.glass.advance_in_world(msec, trace);
 
     // A window's own def sounds as it cracks and shatters, at its origin.
     let cues = std::mem::take(&mut glass.0);
-    glass_cues::sound_cues(&cues, &mut aliases);
+    sound_cues(&cues, &mut aliases);
 
-    let Some(catalog) = catalog else {
+    let Some(effect_book) = world.fx_catalog.as_deref() else {
         return;
     };
-    post_lights.queued.clear();
-    post_lights.cap_full = 0;
-    host.0.mark_receivers = mark_receivers(&dvars);
-    let _update = perf::Span::HostFxUpdateCpuMs.enter();
+    after_lights.begin_tick();
+    fx_host.0.stain_receivers = stain_receivers(&dvars);
+    let _update = perf::Span::ServerEffectsRefreshCpuMillis.enter();
 
-    elem_infos.0.sync(&catalog.0);
-    let scene = fx_world.view();
-    let scene = scene.as_ref().map(|scene| scene as &dyn FxScene);
-    glass_cues::play_shatter_effects(&cues, &mut host.0, &catalog.0, &elem_infos.0, scene);
-    tick_fx_non_dependent(
-        &mut host.0,
-        &catalog.0,
-        &elem_infos.0,
+    let infos = &mut world.elem_infos.0;
+    infos.restock(&effect_book.0);
+    let view = world.effect_level.view();
+    let scene = view.as_ref().map(|view| view as &dyn EffectStage);
+    play_shatter_effects(&cues, &mut fx_host.0, &effect_book.0, infos, scene);
+    tick_effect_non_dependent(
+        &mut fx_host.0,
+        &effect_book.0,
+        infos,
         msec,
-        camera_origin.0,
-        world,
+        world.camera_origin.0,
+        collision,
         scene,
     );
 }
 
 pub(super) fn tick_fx_remaining_update(
-    mut host: ResMut<HostFxSystem>,
-    catalog: Option<Res<PreparedFxCatalog>>,
-    mut elem_infos: ResMut<PreparedFxElemInfos>,
-    prediction: Option<Res<ClientPredictionState>>,
-    camera_origin: Res<FxCameraOrigin>,
-    fx_world: FxSceneAccess,
-    dobj_poses: Option<Res<crate::adapters::anim::dobj_pose::HostDObjPoseFrame>>,
+    mut fx_host: ResMut<EffectsSystemHandle>,
+    mut world: TickWorld,
+    dobj_poses: Option<Res<crate::adapters::motion::puppet_pose::HostSkeletonFrame>>,
 ) {
-    let Some(catalog) = catalog else {
+    let Some(effect_book) = world.fx_catalog.as_deref() else {
         return;
     };
-    let msec = host.0.msec_now;
-    let _update = perf::Span::HostFxUpdateCpuMs.enter();
+    let msec = fx_host.0.clock_ms_now;
+    let _update = perf::Span::ServerEffectsRefreshCpuMillis.enter();
 
-    host.0.refresh_bolt_poses(|dobj, bone| {
-        dobj_poses
-            .as_deref()
-            .and_then(|poses| poses.resolve_live_bolt(dobj, bone))
-    });
-    elem_infos.0.sync(&catalog.0);
-    let scene = fx_world.view();
-    tick_fx_remaining(
-        &mut host.0,
-        &catalog.0,
-        &elem_infos.0,
+    fx_host.0
+        .redo_attach_frames(|dobj, bone| dobj_poses.as_deref()?.find_live_mount(dobj, bone));
+    let infos = &mut world.elem_infos.0;
+    infos.restock(&effect_book.0);
+    let view = world.effect_level.view();
+    tick_effect_remaining(
+        &mut fx_host.0,
+        &effect_book.0,
+        infos,
         msec,
-        camera_origin.0,
-        collision_world(prediction.as_deref()),
-        scene.as_ref().map(|scene| scene as &dyn FxScene),
+        world.camera_origin.0,
+        collision_world(world.prediction.as_deref()),
+        view.as_ref().map(|view| view as &dyn EffectStage),
     );
-    perf::Counter::CounterFxElemLive.emit(f64::from(host.0.elem_live_count));
-    perf::Counter::CounterFxElemAllocFail.emit(f64::from(host.0.elem_alloc_failures));
+    let host = &fx_host.0;
+    perf::Counter::TallyEffectSlotsInUse.emit(f64::from(host.live_parts));
+    perf::Counter::TallyEffectSlotShortage.emit(f64::from(host.part_take_failures));
 }
 
 #[cfg(test)]
@@ -119,16 +120,14 @@ mod tests {
 
     #[test]
     fn the_mark_dvars_carry_over_one_for_one() {
-        let dvars = FxMarkDvars {
-            fx_marks: true,
-            fx_marks_ents: false,
-            fx_marks_smodels: true,
-            ..FxMarkDvars::default()
-        };
-        let receivers = mark_receivers(&dvars);
-        assert!(receivers.fx_marks);
-        assert!(!receivers.fx_marks_ents);
-        assert!(receivers.fx_marks_smodels);
+        let dvars = EffectStainTunables::default()
+            .with(MarkSwitch::Marks, true)
+            .with(MarkSwitch::Entities, false)
+            .with(MarkSwitch::StaticModels, true);
+        let receivers = stain_receivers(&dvars);
+        assert!(receivers.stains);
+        assert!(!receivers.stains_on_ents);
+        assert!(receivers.stains_on_props);
     }
 
     #[test]

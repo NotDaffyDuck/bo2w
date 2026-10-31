@@ -70,7 +70,7 @@ pub struct T6Blend {
     pub final_lerp: i32,
     /// An animation played on the part before.
     pub old_exists: bool,
-    /// The old animation moves or turns (move or rot speed).
+    /// The old animation moves or turns (move or turn_matrix speed).
     pub old_moving: bool,
     /// The new animation moves (move speed).
     pub new_moving: bool,
@@ -120,10 +120,10 @@ pub fn t6_blend_ms(b: &T6Blend) -> i32 {
     blend.max(floor).max(b.stance_hold_ms)
 }
 
-/// How far (0..1) a part's new animation has blended in, `blend_ms` after
+/// How far (0..1) a part's new animation has blended in, `crossfade_millis` after
 /// it started at `switched`; the old one weighs the rest.
-pub fn t6_blend_weight(now: i32, switched: i32, blend_ms: i32) -> f32 {
-    ((now - switched) as f32 / blend_ms.max(1) as f32).clamp(0.0, 1.0)
+pub fn t6_blend_weight(now: i32, switched: i32, crossfade_millis: i32) -> f32 {
+    ((now - switched) as f32 / crossfade_millis.max(1) as f32).clamp(0.0, 1.0)
 }
 
 /// `BG_PlayerAnimation_VerifyAnim`: an animation whose weight has reached 0
@@ -175,7 +175,7 @@ pub const T6_TURN_RATE_MIN: f32 = 0.4;
 pub const T6_TURN_RATE_MAX: f32 = 1.0;
 
 /// `BG_RunLerpFrameRate` for an animation that turns but does not move
-/// (`move_speed` 0, `rot_speed` set): his turn speed (the yaw change since
+/// (`stride_velocity` 0, `rot_speed` set): his turn speed (the yaw change since
 /// the last sample, wrapped to -180..180, made positive, per second) over
 /// its own, held to 0.4..1. None when it has no `rot_speed` either (the
 /// anim script parser zeroes it for some events and the mantles): BO2 plays
@@ -185,10 +185,10 @@ pub fn t6_turn_rate(turn_speed: f32, rot_speed: f32) -> Option<f32> {
 }
 
 /// `BG_RunLerpFrameRate`'s limits on a moving animation's rate (his speed
-/// over the animation's own `move_speed`): at least 0.1 (0 for a ladder
+/// over the animation's own `stride_velocity`): at least 0.1 (0 for a ladder
 /// climb under 0.01); above 2, at most 4 on a ladder, else 3 easing to 2
 /// over move speeds 20..150. The same as MW2's.
-pub fn t6_moving_rate(scale: f32, move_speed: f32, ladder: bool) -> f32 {
+pub fn t6_moving_rate(scale: f32, stride_velocity: f32, ladder: bool) -> f32 {
     if scale < T6_RATE_MIN {
         return if ladder && scale < T6_RATE_ZERO_EPS { 0.0 } else { T6_RATE_MIN };
     }
@@ -197,11 +197,11 @@ pub fn t6_moving_rate(scale: f32, move_speed: f32, ladder: bool) -> f32 {
     }
     let max = if ladder {
         T6_RATE_LADDER_CAP
-    } else if move_speed > T6_RATE_LERP_MAX_SPEED {
+    } else if stride_velocity > T6_RATE_LERP_MAX_SPEED {
         T6_RATE_CAP
-    } else if move_speed >= T6_RATE_LERP_MIN_SPEED {
+    } else if stride_velocity >= T6_RATE_LERP_MIN_SPEED {
         T6_RATE_SHORT_CAP
-            - (move_speed - T6_RATE_LERP_MIN_SPEED) / (T6_RATE_LERP_MAX_SPEED - T6_RATE_LERP_MIN_SPEED)
+            - (stride_velocity - T6_RATE_LERP_MIN_SPEED) / (T6_RATE_LERP_MAX_SPEED - T6_RATE_LERP_MIN_SPEED)
     } else {
         T6_RATE_SHORT_CAP
     };

@@ -1,40 +1,38 @@
-[package]
-name = "console"
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-description = "The in-game console: typing, parsing, running commands, binds, settings and the menus' commands."
+# The console crate: the typed command line, how a line is parsed and run, key
+# binds, the player's settings, and the commands the menus send.
+package.name = "console"
+package.version = "0.1.0"
+package.edition.workspace = true
+package.publish.workspace = true
+package.description = "The in-game console: typing, parsing, running commands, binds, settings and the menus' commands."
 
-[dependencies]
-bevy.workspace = true
-diag.workspace = true
+lints.workspace = true
 
-# Game data and the world.
-asset_core.workspace = true
-asset_game.workspace = true
-asset_transport.workspace = true
-asset_world.workspace = true
-assets = { path = "../assets" }
-entity_t6.workspace = true
-input_t6.workspace = true
+dependencies.bevy.workspace = true
+dependencies.diag.workspace = true
 
-# What the commands drive.
-audio = { path = "../audio" }
-bots = { path = "../bots" }
-frame.workspace = true
-hud = { path = "../hud" }
-net = { path = "../net" }
-render = { path = "../render" }
-render_frontend.workspace = true
-render_fx.workspace = true
-replay = { path = "../replay" }
-session = { path = "../session" }
-sim = { path = "../sim" }
-ui.workspace = true
+# Loaded game data and the world it builds.
+dependencies.asset_core.workspace = true
+dependencies.asset_game.workspace = true
+dependencies.asset_transport.workspace = true
+dependencies.asset_world.workspace = true
+dependencies.assets.path = "../assets"
+dependencies.entity_t6.workspace = true
+dependencies.input_t6.workspace = true
 
-[dev-dependencies]
-playerstate_t6.workspace = true
-weapon_t6.workspace = true
+# The systems that console commands act on.
+dependencies.audio.path = "../audio"
+dependencies.bots.path = "../bots"
+dependencies.frame.workspace = true
+dependencies.hud.path = "../hud"
+dependencies.net.path = "../net"
+dependencies.render.path = "../render"
+dependencies.render_frontend.workspace = true
+dependencies.render_fx.workspace = true
+dependencies.replay.path = "../replay"
+dependencies.session.path = "../session"
+dependencies.sim.path = "../sim"
+dependencies.ui.workspace = true
 
-[lints]
-workspace = true
+dev-dependencies.playerstate_t6.workspace = true
+dev-dependencies.weapon_t6.workspace = true

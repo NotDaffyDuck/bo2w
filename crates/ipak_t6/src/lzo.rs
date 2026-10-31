@@ -17,43 +17,43 @@ pub enum LzoError {
     OutputOverrun,
     LookBehindOverrun {
         distance: usize,
-        have: usize,
+        got: usize,
     },
     /// The stream ended without the end-of-stream marker.
     NoEndMarker,
 }
 
 impl core::fmt::Display for LzoError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&self, w: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            LzoError::InputOverrun => write!(f, "LZO input ends inside an instruction"),
-            LzoError::OutputOverrun => write!(f, "LZO output exceeds its limit"),
-            LzoError::LookBehindOverrun { distance, have } => {
+            LzoError::InputOverrun => write!(w, "LZO input ends inside an instruction"),
+            LzoError::OutputOverrun => write!(w, "LZO output exceeds its limit"),
+            LzoError::LookBehindOverrun { distance, got } => {
                 write!(
-                    f,
-                    "LZO match reaches {distance} bytes back with {have} written"
+                    w,
+                    "LZO match reaches {distance} bytes back with {got} written"
                 )
             }
-            LzoError::NoEndMarker => write!(f, "LZO stream has no end marker"),
+            LzoError::NoEndMarker => write!(w, "LZO stream has no end marker"),
         }
     }
 }
 
 struct In<'a> {
-    src: &'a [u8],
+    input: &'a [u8],
     at: usize,
 }
 
 impl In<'_> {
-    fn byte(&mut self) -> Result<u8, LzoError> {
-        let b = *self.src.get(self.at).ok_or(LzoError::InputOverrun)?;
+    fn next_byte(&mut self) -> Result<u8, LzoError> {
+        let b = *self.input.get(self.at).ok_or(LzoError::InputOverrun)?;
         self.at += 1;
         Ok(b)
     }
 
     fn le16(&mut self) -> Result<usize, LzoError> {
-        let lo = self.byte()? as usize;
-        let hi = self.byte()? as usize;
+        let lo = self.next_byte()? as usize;
+        let hi = self.next_byte()? as usize;
         Ok(lo | hi << 8)
     }
 
@@ -62,7 +62,7 @@ impl In<'_> {
     fn extension(&mut self) -> Result<usize, LzoError> {
         let mut n = 0usize;
         loop {
-            let b = self.byte()?;
+            let b = self.next_byte()?;
             if b != 0 {
                 return Ok(n + b as usize);
             }
@@ -71,62 +71,62 @@ impl In<'_> {
     }
 }
 
-fn literals(inp: &mut In<'_>, out: &mut Vec<u8>, n: usize, limit: usize) -> Result<(), LzoError> {
+fn literals(inp: &mut In<'_>, dst: &mut Vec<u8>, n: usize, limit: usize) -> Result<(), LzoError> {
     let end = inp.at.checked_add(n).ok_or(LzoError::InputOverrun)?;
-    let bytes = inp.src.get(inp.at..end).ok_or(LzoError::InputOverrun)?;
-    if out.len() + n > limit {
+    let bytes = inp.input.get(inp.at..end).ok_or(LzoError::InputOverrun)?;
+    if dst.len() + n > limit {
         return Err(LzoError::OutputOverrun);
     }
-    out.extend_from_slice(bytes);
+    dst.extend_from_slice(bytes);
     inp.at = end;
     Ok(())
 }
 
 fn copy_match(
-    out: &mut Vec<u8>,
+    written: &mut Vec<u8>,
     distance: usize,
     len: usize,
-    limit: usize,
+    cap: usize,
 ) -> Result<(), LzoError> {
-    if distance == 0 || distance > out.len() {
+    if distance == 0 || distance > written.len() {
         return Err(LzoError::LookBehindOverrun {
             distance,
-            have: out.len(),
+            got: written.len(),
         });
     }
-    if out.len() + len > limit {
+    if written.len() + len > cap {
         return Err(LzoError::OutputOverrun);
     }
-    let start = out.len() - distance;
+    let start = written.len() - distance;
     if distance >= len {
-        out.extend_from_within(start..start + len);
+        written.extend_from_within(start..start + len);
     } else {
         // Overlapping: each copied byte may be one this copy just wrote.
-        for i in 0..len {
-            let b = out[start + i];
-            out.push(b);
+        for from in start..start + len {
+            let byte = written[from];
+            written.push(byte);
         }
     }
     Ok(())
 }
 
-/// Decompress one LZO1X stream, appending at most `limit - out.len()` bytes
-/// to `out`. Returns how many input bytes the stream used.
-pub fn decompress(src: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<usize, LzoError> {
-    let mut inp = In { src, at: 0 };
+/// Decompress one LZO1X stream, appending at most `limit - dst.len()` bytes
+/// to `dst`. Returns how many input bytes the stream used.
+pub fn decompress(src: &[u8], dst: &mut Vec<u8>, limit: usize) -> Result<usize, LzoError> {
+    let mut inp = In { input: src, at: 0 };
     let mut state;
     let first = *src.first().ok_or(LzoError::InputOverrun)?;
     if first > 17 {
         inp.at = 1;
         let t = (first - 17) as usize;
-        literals(&mut inp, out, t, limit)?;
+        literals(&mut inp, dst, t, limit)?;
         state = if t < 4 { t } else { 4 };
     } else {
         state = 0;
     }
 
     loop {
-        let inst = inp.byte()?;
+        let inst = inp.next_byte()?;
         let (distance, len, trailing);
         if inst < 16 {
             if state == 0 {
@@ -135,11 +135,11 @@ pub fn decompress(src: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<usize, 
                 if n == 0 {
                     n = 15 + inp.extension()?;
                 }
-                literals(&mut inp, out, n + 3, limit)?;
+                literals(&mut inp, dst, n + 3, limit)?;
                 state = 4;
                 continue;
             }
-            let h = inp.byte()? as usize;
+            let h = inp.next_byte()? as usize;
             let d = ((inst >> 2) & 3) as usize;
             if state < 4 {
                 distance = (h << 2) + d + 1;
@@ -172,7 +172,7 @@ pub fn decompress(src: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<usize, 
             len = n + 2;
             trailing = le & 3;
         } else {
-            let h = inp.byte()? as usize;
+            let h = inp.next_byte()? as usize;
             distance = (h << 3) + ((inst >> 2) & 7) as usize + 1;
             len = if inst < 128 {
                 3 + ((inst >> 5) & 1) as usize
@@ -181,8 +181,8 @@ pub fn decompress(src: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<usize, 
             };
             trailing = (inst & 3) as usize;
         }
-        copy_match(out, distance, len, limit)?;
-        literals(&mut inp, out, trailing, limit)?;
+        copy_match(dst, distance, len, limit)?;
+        literals(&mut inp, dst, trailing, limit)?;
         state = trailing;
     }
 }

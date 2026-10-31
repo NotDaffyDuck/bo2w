@@ -1,21 +1,21 @@
-//! The fixed-function state vocabulary: compare functions, blend factors, the
-//! alpha test and the render-state ids and values a material sets.
+//! Names for the fixed-function numbers a material carries: how depth and alpha are
+//! compared, how colours blend, the alpha cutoff, and which render-state slot is set.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
-mod alpha_test;
-mod blend;
-mod cmp;
-mod render_state;
+mod alpha_gate;
+mod blend_weight;
+mod compare;
+mod state_ids;
 
-pub use alpha_test::{ALPHA_REF_SCALE, AlphaTest};
-pub use blend::BlendFactor;
-pub use cmp::{
-    CompareFunc, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
-    D3DCMP_LESSEQUAL,
+pub use alpha_gate::{ALPHA_CUTOFF_UNIT, AlphaGate};
+pub use blend_weight::{BlendWeight};
+pub use compare::{
+    COMPARE_PASS_ALWAYS, COMPARE_PASS_IF_ABOVE, COMPARE_PASS_IF_ABOVE_OR_SAME, COMPARE_PASS_IF_SAME, CompareOp,
+    DEPTH_COMPARE_BELOW_OR_SAME, DEPTH_COMPARE_STRICT_BELOW,
 };
-pub use render_state::{
-    D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE, D3DRS_CULLMODE, D3DRS_ZENABLE, D3DRS_ZFUNC,
-    D3DRS_ZWRITEENABLE,
+pub use state_ids::{
+    STATE_FACE_CULL, STATE_DEPTH_TEST, STATE_DEPTH_COMPARE, FACE_CULL_CLOCKWISE, FACE_CULL_DISABLED, STATE_DEPTH_WRITE_TOGGLE,
+    WINDING_CULL_COUNTERCLOCKWISE,
 };

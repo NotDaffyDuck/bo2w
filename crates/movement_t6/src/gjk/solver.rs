@@ -8,7 +8,15 @@
 //! are `m` (rows) and its origin `w` in that frame.
 
 use super::hull::Mover;
-use super::{Shape, add, cross, dot, len_sq, scale, sub, to_local, to_world};
+use super::Shape;
+use super::add;
+use super::cross;
+use super::dot;
+use super::magnitude_squared;
+use super::scale;
+use super::sub;
+use super::to_local;
+use super::to_world;
 
 /// Closer than this (squared) the two shapes are taken as touching inside.
 const PEN_THRESH_SQ: f32 = 0.001_156_000_1;
@@ -85,7 +93,7 @@ pub(super) struct Contact {
     /// On the other shape, from the player's origin at the start.
     pub p2: [f32; 3],
     /// From the other shape toward the player, unit length.
-    pub normal: [f32; 3],
+    pub facing: [f32; 3],
     /// How far along the move (0..1) the contact is.
     pub lambda: f32,
 }
@@ -96,7 +104,7 @@ pub(super) struct Sweep {
     /// The player's move relative to the other shape.
     pub translation: [f32; 3],
     pub start_time: f32,
-    pub end_time: f32,
+    pub finish_stamp: f32,
 }
 
 /// BO2's phys_collide_do_gjk_collide: the closest points of the two shapes
@@ -108,7 +116,7 @@ pub(super) fn do_gjk_collide(pair: &Pair, r1: f32, r2: f32, sep_thresh: f32, swe
         Some(s) => {
             g.rel_t = s.translation;
             g.flags |= CONTINUOUS;
-            (s.start_time, s.end_time)
+            (s.start_time, s.finish_stamp)
         }
         None => (0.0, 1.0),
     };
@@ -124,8 +132,8 @@ pub(super) fn do_gjk_collide(pair: &Pair, r1: f32, r2: f32, sep_thresh: f32, swe
     }
     let (p1, p2) = g.closest_points();
     let v = g.comp_v(g.w_set);
-    let length = libm::sqrtf(len_sq(v));
-    if length == 0.0 {
+    let length = libm::sqrtf(magnitude_squared(v));
+    if 0.0 == length {
         // BO2 divides by this length unguarded; a zero here only comes from
         // a broken simplex, so it counts as no contact.
         return None;
@@ -134,7 +142,7 @@ pub(super) fn do_gjk_collide(pair: &Pair, r1: f32, r2: f32, sep_thresh: f32, swe
     Some(Contact {
         p1: sub(p1, scale(normal, r1)),
         p2: add(p2, scale(normal, r2)),
-        normal,
+        facing: normal,
         lambda: g.lambda,
     })
 }
@@ -150,7 +158,7 @@ struct Gjk {
     last_w_set: u32,
     /// The closest point of the difference so far: the search direction.
     v: [f32; 3],
-    origin: [f32; 3],
+    pivot: [f32; 3],
     lower: f32,
     upper: f32,
     iter: i32,
@@ -173,7 +181,7 @@ impl Gjk {
             w_set: 0,
             last_w_set: 0,
             v: [0.0; 3],
-            origin: [0.0; 3],
+            pivot: Default::default(),
             lower: -START_DIST_SQ,
             upper: START_DIST_SQ,
             iter: 0,
@@ -204,12 +212,12 @@ impl Gjk {
         let v = self.v;
         self.a[slot] = pair.support1(scale(v, -1.0));
         self.b[slot] = pair.support2(v);
-        sub(sub(self.a[slot], self.b[slot]), self.origin)
+        sub(sub(self.a[slot], self.b[slot]), self.pivot)
     }
 
     /// A new point this close to one the last simplex held.
     fn duplicate(&self, w: [f32; 3]) -> bool {
-        (0..4).any(|i| self.last_w_set & (1 << i) != 0 && len_sq(sub(w, self.w[i])) < DUPLICATE_SQ)
+        (0..4).any(|i| self.last_w_set & (1 << i) != 0 && magnitude_squared(sub(w, self.w[i])) < DUPLICATE_SQ)
     }
 
     /// Packs the shape points of `set` into the first slots, in order.
@@ -229,7 +237,7 @@ impl Gjk {
     /// points and the current origin, then reduces them.
     fn seed_simplex(&mut self, n: usize) -> u32 {
         for i in 0..n {
-            self.w[i] = sub(sub(self.a[i], self.b[i]), self.origin);
+            self.w[i] = sub(sub(self.a[i], self.b[i]), self.pivot);
         }
         self.w_set = (1 << n) - 1;
         self.backup1(0, true)
@@ -259,7 +267,7 @@ impl Gjk {
     /// points alone and the edge between slots 1 and 2.
     fn backup1(&mut self, k: usize, reuse: bool) -> u32 {
         let p = self.w[k];
-        let mut best = len_sq(p);
+        let mut best = magnitude_squared(p);
         let mut result = 1u32 << k;
         self.lambdas[result as usize][k] = 1.0;
 
@@ -275,12 +283,12 @@ impl Gjk {
             others[n] = i;
             let e = sub(self.w[i], p);
             edges[n] = e;
-            ee[n] = len_sq(e);
+            ee[n] = magnitude_squared(e);
             pe[n] = dot(e, p);
             if DEGENERATE_EDGE_SQ < ee[n] {
                 let t = -pe[n] / ee[n];
                 if 0.0 < t && 0.0 < 1.0 - t {
-                    let d = len_sq(add(p, scale(e, t)));
+                    let d = magnitude_squared(add(p, scale(e, t)));
                     if d < best {
                         result = (1 << k) | (1 << i);
                         self.lambdas[result as usize][i] = t;
@@ -290,7 +298,7 @@ impl Gjk {
                 }
             }
             if reuse {
-                let d = len_sq(self.w[i]);
+                let d = magnitude_squared(self.w[i]);
                 if d < best {
                     self.lambdas[1 << i][i] = 1.0;
                     result = 1 << i;
@@ -302,11 +310,11 @@ impl Gjk {
 
         if reuse && n == 2 {
             let e = sub(self.w[2], self.w[1]);
-            let l = len_sq(e);
+            let l = magnitude_squared(e);
             if DEGENERATE_EDGE_SQ < l {
                 let t = -dot(e, self.w[1]) / l;
                 if 0.0 < t && 0.0 < 1.0 - t {
-                    let d = len_sq(add(self.w[1], scale(e, t)));
+                    let d = magnitude_squared(add(self.w[1], scale(e, t)));
                     if d < best {
                         result = 6;
                         self.lambdas[6][1] = 1.0 - t;
@@ -326,7 +334,7 @@ impl Gjk {
                     let u = (-ee[i] * pe[j] + g * pe[i]) / det;
                     let r = (1.0 - s) - u;
                     if 0.0 < s && 0.0 < u && 0.0 < r {
-                        let d = len_sq(add(add(p, scale(edges[i], s)), scale(edges[j], u)));
+                        let d = magnitude_squared(add(add(p, scale(edges[i], s)), scale(edges[j], u)));
                         if d < best {
                             result = (1 << others[i]) | (1 << others[j]) | (1 << k);
                             let slot = &mut self.lambdas[result as usize];
@@ -376,13 +384,13 @@ impl Gjk {
             2 => closest_on_line(p[0], sub(p[1], p[0])),
             3 => {
                 let c = cross(sub(p[1], p[0]), sub(p[2], p[0]));
-                let cc = len_sq(c);
+                let cc = magnitude_squared(c);
                 if FLAT_TRIANGLE_SQ < cc {
                     return scale(c, dot(c, p[0]) / cc);
                 }
                 // Too flat: the longest edge.
                 let e = [sub(p[1], p[0]), sub(p[2], p[1]), sub(p[0], p[2])];
-                let l = [len_sq(e[0]), len_sq(e[1]), len_sq(e[2])];
+                let l = [magnitude_squared(e[0]), magnitude_squared(e[1]), magnitude_squared(e[2])];
                 let i = if l[0] < l[1] {
                     if l[1] < l[2] { 2 } else { 1 }
                 } else if l[0] < l[2] {
@@ -419,7 +427,7 @@ impl Gjk {
     fn initial_dir(pair: &Pair) -> [f32; 3] {
         let other = add(to_world(&pair.m, pair.cg2.center()), pair.w);
         let d = sub(pair.cg1.center(), other);
-        if MIN_DIR_SQ <= len_sq(d) { d } else { [1.0, 0.0, 0.0] }
+        if MIN_DIR_SQ <= magnitude_squared(d) { d } else { [1.0_f32, 0.0, 0.0] }
     }
 
     /// The plain distance search from `dir`.
@@ -428,7 +436,7 @@ impl Gjk {
         self.upper = START_DIST_SQ;
         self.iter = self.init_gjk(dir, reuse);
         loop {
-            self.upper = len_sq(self.v);
+            self.upper = magnitude_squared(self.v);
             if self.iter != 0 && self.upper < self.pen_sq {
                 return Status::Penetrating;
             }
@@ -447,8 +455,8 @@ impl Gjk {
             if self.iter != 0 && 0.0 < self.lower && (conv() * self.upper < self.lower || self.duplicate(w)) {
                 return Status::Valid;
             }
-            if let Some(status) = self.add_point(slot, w) {
-                return status;
+            if let Some(found) = self.add_point(slot, w) {
+                return found;
             }
             if MAX_ITER < self.iter {
                 return Status::Valid;
@@ -458,11 +466,11 @@ impl Gjk {
 
     /// Adds `w` in `slot`, reduces the simplex and takes its closest point.
     /// Some(Penetrating) when the simplex holds the origin.
-    fn add_point(&mut self, slot: usize, w: [f32; 3]) -> Option<Status> {
-        self.w[slot] = w;
-        self.w_set |= 1 << slot;
+    fn add_point(&mut self, idx: usize, w: [f32; 3]) -> Option<Status> {
+        self.w[idx] = w;
+        self.w_set |= 1 << idx;
         self.last_w_set = self.w_set;
-        self.w_set = self.backup1(slot, false);
+        self.w_set = self.backup1(idx, false);
         if self.w_set == 0xf {
             return Some(Status::Penetrating);
         }
@@ -475,7 +483,7 @@ impl Gjk {
     /// first time the shapes come within reach.
     fn ray_cast(&mut self, pair: &Pair, dir: [f32; 3], start: f32, end: f32) -> Status {
         self.lambda = start;
-        self.origin = scale(self.rel_t, -start);
+        self.pivot = scale(self.rel_t, -start);
         self.lower = -START_DIST_SQ;
         self.upper = START_DIST_SQ;
         self.iter = self.init_gjk(dir, false);
@@ -484,7 +492,7 @@ impl Gjk {
         self.cc_reset = 0;
         let margin = if MIN_MARGIN <= self.radii { self.radii } else { MIN_MARGIN };
         loop {
-            self.upper = len_sq(self.v);
+            self.upper = magnitude_squared(self.v);
             if self.iter != 0 {
                 if self.flags & UPPER_SEPARATION != 0 && self.upper < self.sep * self.sep {
                     self.flags |= SEPARATION_TEST;
@@ -514,7 +522,7 @@ impl Gjk {
                 let gap = vw - nv * margin;
                 if 0.0 < closing {
                     if 0.0 <= gap {
-                        let vo = dot(self.v, self.origin);
+                        let vo = dot(self.v, self.pivot);
                         let mut lam = (vo + gap) / closing;
                         if self.lambda + LAMBDA_STEP < lam {
                             if end < lam {
@@ -528,7 +536,7 @@ impl Gjk {
                                 self.flags |= SEPARATION_TEST | LAMBDA_DONE;
                             }
                             self.lambda = lam;
-                            self.origin = scale(self.rel_t, -lam);
+                            self.pivot = scale(self.rel_t, -lam);
                             self.cc_reset += 1;
                             self.lower = -START_DIST_SQ;
                             self.upper = START_DIST_SQ;
@@ -557,8 +565,8 @@ impl Gjk {
             if done {
                 return Status::Valid;
             }
-            if let Some(status) = self.add_point(slot, w) {
-                return status;
+            if let Some(found) = self.add_point(slot, w) {
+                return found;
             }
             if MAX_ITER < self.iter {
                 return if 0.0 < self.lower { Status::Valid } else { Status::Penetrating };
@@ -570,27 +578,27 @@ impl Gjk {
     /// overlap, how deep: the other shape is moved 17 units out along the
     /// best separating direction and the distance measured again.
     fn collide(&mut self, pair: &Pair, start: f32, end: f32) -> Status {
-        self.origin = [0.0; 3];
+        self.pivot = [0.0; 3];
         self.flags |= SEPARATION_TEST;
         let d0 = Self::initial_dir(pair);
-        let status = if self.flags & CONTINUOUS == 0 {
+        let verdict = if self.flags & CONTINUOUS == 0 {
             self.gjk(pair, d0, false)
         } else {
             self.ray_cast(pair, d0, start, end)
         };
-        if status != Status::Penetrating || self.flags & INTERSECTION_ONLY != 0 {
-            return status;
+        if verdict != Status::Penetrating || self.flags & INTERSECTION_ONLY != 0 {
+            return verdict;
         }
         self.lambda = 0.0;
         let mut sd = comp_sep_dir(pair);
-        if len_sq(sd) < MIN_DIR_SQ {
-            if len_sq(d0) < MIN_DIR_SQ {
+        if magnitude_squared(sd) < MIN_DIR_SQ {
+            if magnitude_squared(d0) < MIN_DIR_SQ {
                 return Status::Invalid;
             }
             sd = d0;
         }
         self.flags &= !SEPARATION_TEST;
-        let mut dd = len_sq(sd);
+        let mut dd = magnitude_squared(sd);
         let mut it = 0;
         let sep_conv = (1.0 - SEP_CONV_THRESH) * (1.0 - SEP_CONV_THRESH);
         loop {
@@ -598,12 +606,12 @@ impl Gjk {
             let a = pair.support1(scale(sd, -1.0));
             let b = pair.support2(sd);
             let k = -(PULL_APART / libm::sqrtf(dd) - dot(sd, sub(a, b)) / dd);
-            self.origin = scale(sd, k);
+            self.pivot = scale(sd, k);
             if self.gjk(pair, sd, 1 < it) == Status::Penetrating {
                 return Status::Invalid;
             }
             sd = self.comp_v(self.w_set);
-            dd = len_sq(sd);
+            dd = magnitude_squared(sd);
             if !(PULL_APART * PULL_APART <= sep_conv * self.lower && it < 10) {
                 break;
             }
@@ -614,7 +622,7 @@ impl Gjk {
 
 /// The point of the line through `p` along `e` closest to the origin.
 fn closest_on_line(p: [f32; 3], e: [f32; 3]) -> [f32; 3] {
-    sub(p, scale(e, dot(e, p) / len_sq(e)))
+    sub(p, scale(e, dot(e, p) / magnitude_squared(e)))
 }
 
 /// GJK is done when the gap's lower bound is within this share of the
@@ -685,13 +693,13 @@ fn comp_sep_dir(pair: &Pair) -> [f32; 3] {
     let b_avg = scale(b_sum, twelfth);
     let w_avg = scale(w_sum, twelfth);
 
-    let mut best: Option<([f32; 3], f32)> = None;
+    let mut best = None::<([f32; 3], f32)>;
     for [i0, i1, i2] in SEP_TRIS {
         let mut n = cross(sub(wd[i1], wd[i0]), sub(wd[i2], wd[i0]));
         if dot(sub(wd[i0], w_avg), n) < 0.0 {
             n = scale(n, -1.0);
         }
-        let nn = len_sq(n);
+        let nn = magnitude_squared(n);
         if MIN_DIR_SQ <= nn {
             let f = dot(scale(wd[i0], -1.0), n);
             let mut score = f * f / nn;
@@ -707,7 +715,7 @@ fn comp_sep_dir(pair: &Pair) -> [f32; 3] {
         return scale(n, -1.0);
     }
     let d = sub(a_avg, b_avg);
-    if MIN_DIR_SQ < len_sq(d) { d } else { [1.0, 0.0, 0.0] }
+    if MIN_DIR_SQ < magnitude_squared(d) { d } else { [1.0_f32, 0.0, 0.0] }
 }
 
 #[cfg(test)]
@@ -730,7 +738,7 @@ mod tests {
         // The player's origin 10 above the floor's top.
         let pair = Pair { cg1: &Mover::Body(hull), cg2: &floor, m: IDENTITY, w: [0.0, 0.0, -10.0] };
         let c = do_gjk_collide(&pair, hull.skin(), 0.0, 100.0, None).expect("in reach");
-        assert!((c.normal[2] - 1.0).abs() < 1e-4, "{c:?}");
+        assert!((c.facing[2] - 1.0).abs() < 1e-4, "{c:?}");
         // The feet's tip is 0.375 above the origin, the skin 0.5 below that.
         let gap = c.p1[2] - c.p2[2];
         assert!((gap - (10.0 + 0.375 - 0.5)).abs() < 1e-3, "{c:?}");
@@ -749,13 +757,13 @@ mod tests {
         let hull = standing();
         let floor = floor_box();
         let pair = Pair { cg1: &Mover::Body(hull), cg2: &floor, m: IDENTITY, w: [0.0, 0.0, -10.0] };
-        let sweep = Sweep { translation: [0.0, 0.0, -20.0], start_time: 0.0, end_time: 1.0 };
+        let sweep = Sweep { translation: [0.0, 0.0, -20.0], start_time: 0.0, finish_stamp: 1.0 };
         let c = do_gjk_collide(&pair, hull.skin(), 0.0, 0.125, Some(sweep)).expect("hits");
         // The core gap of 10.375 closes to the 0.5 skin after 9.875 of the
         // 20 down.
         let drop = c.lambda * 20.0;
         assert!(drop > 9.0 && drop < 10.0, "{c:?}");
-        assert!((c.normal[2] - 1.0).abs() < 1e-3, "{c:?}");
+        assert!((c.facing[2] - 1.0).abs() < 1e-3, "{c:?}");
     }
 
     #[test]
@@ -763,7 +771,7 @@ mod tests {
         let hull = standing();
         let floor = floor_box();
         let pair = Pair { cg1: &Mover::Body(hull), cg2: &floor, m: IDENTITY, w: [0.0, 0.0, -10.0] };
-        let sweep = Sweep { translation: [0.0, 0.0, 20.0], start_time: 0.0, end_time: 1.0 };
+        let sweep = Sweep { translation: [0.0, 0.0, 20.0], start_time: 0.0, finish_stamp: 1.0 };
         assert!(do_gjk_collide(&pair, hull.skin(), 0.0, 0.125, Some(sweep)).is_none());
     }
 
@@ -774,8 +782,8 @@ mod tests {
         // The origin 3 below the floor's top.
         let pair = Pair { cg1: &Mover::Body(hull), cg2: &floor, m: IDENTITY, w: [0.0, 0.0, 3.0] };
         let c = do_gjk_collide(&pair, hull.skin(), 0.0, 0.125, None).expect("overlap");
-        assert!((c.normal[2] - 1.0).abs() < 1e-3, "{c:?}");
-        let depth = dot(c.normal, sub(c.p1, c.p2));
+        assert!((c.facing[2] - 1.0).abs() < 1e-3, "{c:?}");
+        let depth = dot(c.facing, sub(c.p1, c.p2));
         assert!((depth - (-3.0 + 0.375 - 0.5)).abs() < 1e-2, "{depth} {c:?}");
     }
 
@@ -786,7 +794,7 @@ mod tests {
         // The wall's near face 40 ahead on +x.
         let pair = Pair { cg1: &Mover::Body(hull), cg2: &wall, m: IDENTITY, w: [48.0, 0.0, 0.0] };
         let c = do_gjk_collide(&pair, hull.skin(), 0.0, 100.0, None).expect("in reach");
-        assert!((c.normal[0] + 1.0).abs() < 1e-4, "{c:?}");
+        assert!((c.facing[0] + 1.0).abs() < 1e-4, "{c:?}");
         // The ring's corner reaches the polygon radius toward +x.
         let reach = c.p1[0];
         assert!((reach - (hull.polygon_radius + 0.5)).abs() < 1e-3, "{c:?}");

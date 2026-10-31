@@ -1,23 +1,26 @@
 //! The two systems that move a world spawn along: `spawn_world` runs the
-//! early phases a slice at a time, `spawn_world_finish` places the tessellated
+//! early phases a slice at a time, `spawn_level_finish` places the tessellated
 //! world once its plans exist.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use frame::LaunchReport;
-use render_fx::{HostFxSystem, PreparedFxCatalog, PreparedTracers};
+use frame::StartupReport;
+use render_fx::{EffectsSystemHandle, ReadyFxBook, StagedStreaks};
 
-use super::job::{WorldSpawnJob, WorldSpawnPhase};
+use super::job::{LevelSpawnJob, LevelSpawnPhase};
 use super::look;
-use super::present::{WorldPresentAck, record_first_world_frame};
-use crate::prepare::scene::world::WorldScene;
-use crate::prepare::scene::world_gpu::{self, WorldGpuReady};
-use crate::prepare::scene::world_images::{
-    IMAGE_BYTES_PER_OVERLAY_FRAME, IMAGES_PER_OVERLAY_FRAME, MAX_IMAGE_BYTES_PER_SLICE,
+use super::shown_frame::{LevelPresentAck, note_first_world_frame};
+use crate::assemble::draw_items::LiveLightbakeHandles;
+use crate::prepare::scene::world::LevelStage;
+use crate::prepare::scene::level_gpu::{LevelGpuReady, check_once};
+use crate::prepare::scene::level_pictures::{
+    IMAGE_BYTES_PER_TOPMOST_FRAME, IMAGES_PER_TOPMOST_FRAME, MAX_IMAGE_BYTES_PER_SLICE,
     ResidentGpuImages,
 };
-use crate::prepare::scene::{world_occupancy, world_plan};
+use crate::prepare::scene::{level_presence, level_plan};
 
 /// How long one frame may spend on spawn work while the loading overlay is up.
 const SLICE_BUDGET: Duration = Duration::from_millis(40);
@@ -25,225 +28,277 @@ const SLICE_BUDGET: Duration = Duration::from_millis(40);
 /// A frame at 60 Hz, the unit the per-frame image byte budget is scaled by.
 const FRAME_MS: f32 = 16.7;
 
+/// Everything `spawn_world` only reads: what other systems have prepared and
+/// what the launch has reported so far.
+#[derive(SystemParam)]
+pub(crate) struct SpawnReads<'w> {
+    gpu_ready: Option<Res<'w, LevelGpuReady>>,
+    tracer_defs: Option<Res<'w, StagedStreaks>>,
+    effect_defs: Option<Res<'w, ReadyFxBook>>,
+    launch: Option<Res<'w, StartupReport>>,
+    first_frame: Res<'w, LevelPresentAck>,
+    viewmodels: Res<'w, render_anim::PreparedFpv>,
+    model_mats: Res<'w, render_anim::PreparedModelMaterials>,
+    effect_models: Option<Res<'w, render_fx::ReadyFxProps>>,
+}
+
+/// Owned copies of the three handle tables the plan and the placement take:
+/// exact material images, reflection probes, lightmaps.
+struct HandleTables {
+    exact: Vec<Option<Handle<Image>>>,
+    probes: Vec<Option<Handle<Image>>>,
+    lightmaps: Vec<Option<LiveLightbakeHandles>>,
+}
+
+fn handle_tables(job: &LevelSpawnJob) -> HandleTables {
+    let up = &job.images;
+    HandleTables {
+        exact: up.precise_handles().to_vec(),
+        probes: up.probe_refs().to_vec(),
+        lightmaps: up.lightbake_handles().to_vec(),
+    }
+}
+
 /// The loading progress of the load that is still running, if any. Pacing
 /// follows the load, not the overlay: a run with no overlay spawns the world
 /// the same way.
-fn running_load(load: Option<&assets::MapLoadProcess>) -> Option<asset_transport::LoadProgress> {
-    load.filter(|process| !process.is_complete())
-        .map(|process| process.progress.clone())
+fn running_load(load: Option<&assets::MapLoadProcess>) -> Option<asset_transport::LoadCompletion> {
+    let process = load?;
+    (!process.is_done()).then(|| process.progress.clone())
 }
 
-fn mark_done(scene: &mut WorldScene, job: &mut WorldSpawnJob, commands: &mut Commands) {
-    job.phase = WorldSpawnPhase::Done;
-    scene.spawned = true;
-    commands.insert_resource(render_scene::WorldPresentFacts { spawned: true });
-    perf::world_ready(1);
+fn ms_since(start: Instant) -> f32 {
+    start.elapsed().as_secs_f32() * 1000.0
 }
 
-pub(crate) fn spawn_world(
+/// Ends the spawn: the world counts as up from here on.
+fn conclude(commands: &mut Commands, stage: &mut LevelStage, job: &mut LevelSpawnJob) {
+    job.stage_now = LevelSpawnPhase::Done;
+    stage.spawned = true;
+    let facts = render_scene::LevelPresentFacts {
+        spawned: stage.spawned,
+    };
+    commands.insert_resource(facts);
+    perf::level_ready(1);
+}
+
+pub(crate) fn spawn_level_world(
     mut commands: Commands,
     load: Option<Res<assets::MapLoadProcess>>,
-    mut scene: ResMut<WorldScene>,
-    mut images: ResMut<Assets<Image>>,
+    mut stage: ResMut<LevelStage>,
+    mut image_store: ResMut<Assets<Image>>,
     mut common_images: ResMut<ResidentGpuImages>,
-    mut job: ResMut<WorldSpawnJob>,
-    mut tess: ResMut<render_scene::TessMaterials>,
-    mut fx_host: Option<ResMut<HostFxSystem>>,
-    gpu: Option<Res<WorldGpuReady>>,
-    tracers: Option<Res<PreparedTracers>>,
-    fx_catalog: Option<Res<PreparedFxCatalog>>,
-    report: Option<Res<LaunchReport>>,
-    present_ack: Res<WorldPresentAck>,
-    prepared: (
-        Res<render_anim::PreparedFpv>,
-        Res<render_anim::PreparedModelMaterials>,
-        Option<Res<render_fx::PreparedFxModels>>,
-    ),
+    mut job: ResMut<LevelSpawnJob>,
+    mut tess: ResMut<render_scene::StitchMaterials>,
+    mut effect_host: Option<ResMut<EffectsSystemHandle>>,
+    reads: SpawnReads,
 ) {
-    let (fpv, model_materials, fx_models) = prepared;
     let progress = running_load(load.as_deref());
     let paced = progress.is_some();
 
-    if job.phase == WorldSpawnPhase::Gpu {
-        if !paced {
-            mark_done(&mut scene, &mut job, &mut commands);
-            return;
-        }
-        // bo2zm: a world with no material images never starts either
-        // preparation job, and a match with no weapon catalogs (a BO2 world
-        // before weapons are read) never starts the first-person one; there
-        // is nothing for them to prepare.
-        let fpv_ready = ((fpv.settled_for(&tess.catalog) || fpv.inputs_absent())
-            && model_materials.settled_for(&tess.catalog))
-            || tess.material_images.is_empty();
-        let gap_ms = job.slice_gap_ms(Instant::now());
-        let spawn = job.spawn;
-        let gpu_ready = world_gpu::poll(&mut job.gpu_wait, spawn, gpu.as_deref(), gap_ms);
-        if gpu_ready && !fpv_ready {
-            diag::info!(
-                World,
-                "world spawn: GPU ready; overlay holds for model and first-person preparation"
-            );
-        }
-        if gpu_ready && fpv_ready {
-            let quiet = job.gpu_wait.quiet();
-            let waited_ms = job.gpu_wait.elapsed().as_secs_f32() * 1000.0;
-            mark_done(&mut scene, &mut job, &mut commands);
-            let gpu = gpu.as_deref();
-            diag::info!(
-                World,
-                "world spawn: GPU ready quiet={quiet} images={} pipelines={} elapsed={waited_ms:.1}ms; overlay waits for admission",
-                gpu.map_or(-1, |g| i32::from(g.images)),
-                gpu.map_or(-1, |g| i32::from(g.pipelines)),
-            );
-            log_load_ledger(&job, gpu, &fpv, waited_ms);
+    if job.stage_now == LevelSpawnPhase::Gpu {
+        if paced {
+            wait_for_gpu(&mut commands, &mut stage, &mut job, &tess, &reads);
+        } else {
+            conclude(&mut commands, &mut stage, &mut job);
         }
         return;
     }
-
-    if scene.spawned {
-        record_first_world_frame(progress.as_ref(), &job, &present_ack, report.as_deref());
-        return;
-    }
-
-    if scene.batches.is_empty() {
-        let no_gfx_world = report.as_ref().is_some_and(|report| {
-            report
-                .world_report
-                .iter()
-                .any(|line| line.contains("no GfxWorld reached"))
-        });
-        if paced && job.phase != WorldSpawnPhase::Done && no_gfx_world {
-            diag::warn!(
-                World,
-                "world spawn: empty batches — spawn_world returns without Camera3d (no GfxWorld or world_draw produced none)"
-            );
-            job.phase = WorldSpawnPhase::Done;
-        }
-        return;
-    }
-    if job.phase == WorldSpawnPhase::Done {
-        return;
-    }
-
-    if paced && job.phase == WorldSpawnPhase::Unarmed {
-        job.phase = WorldSpawnPhase::Yield;
-        diag::info!(
-            World,
-            "world spawn: yield one frame so the overlay can tick after match install"
+    if stage.spawned {
+        note_first_world_frame(
+            progress.as_ref(),
+            &job,
+            &reads.first_frame,
+            reads.launch.as_deref(),
         );
         return;
     }
-
-    let started = Instant::now();
-    let deadline = paced.then(|| started + SLICE_BUDGET);
-    let out_of_time = || deadline.is_some_and(|end| Instant::now() >= end);
-
-    match job.phase {
-        WorldSpawnPhase::Unarmed | WorldSpawnPhase::Yield => {
-            job.images.arm(&mut scene, progress.as_ref());
-            job.phase = WorldSpawnPhase::Materials;
-        }
-        WorldSpawnPhase::Materials | WorldSpawnPhase::Images | WorldSpawnPhase::Plan => {}
-        _ => return,
+    if stage.batches.is_empty() {
+        give_up_on_missing_world(&mut job, paced, reads.launch.as_deref());
+        return;
     }
 
-    let images_done = if job.images.unfinished() {
-        hand_over_image_slice(
+    match job.stage_now {
+        LevelSpawnPhase::Done => return,
+        LevelSpawnPhase::Unarmed if paced => {
+            job.stage_now = LevelSpawnPhase::Yield;
+            diag::info!(
+                World,
+                "world spawn: wait a frame so the overlay ticks once the match is installed"
+            );
+            return;
+        }
+        LevelSpawnPhase::Unarmed | LevelSpawnPhase::Yield => {
+            job.images.take_from(&mut stage, progress.as_ref());
+            job.stage_now = LevelSpawnPhase::Materials;
+        }
+        LevelSpawnPhase::Materials | LevelSpawnPhase::Images | LevelSpawnPhase::Plan => {}
+        LevelSpawnPhase::WorldTess | LevelSpawnPhase::Gpu => return,
+    }
+
+    let began = Instant::now();
+    let deadline = paced.then(|| began + SLICE_BUDGET);
+
+    // The image hand-over runs every slice while images remain, even while
+    // the materials step is still to come.
+    let images_done = !job.images.has_slots_left()
+        || hand_over_image_slice(
             &mut job,
-            &mut images,
+            &mut image_store,
             &mut common_images,
-            started,
+            began,
             deadline,
             paced,
-        )
-    } else {
-        true
-    };
+        );
 
-    if job.phase == WorldSpawnPhase::Materials {
-        look::publish(&mut commands, &scene);
-        job.phase = WorldSpawnPhase::Images;
-        job.last_work_ms = started.elapsed().as_secs_f32() * 1000.0;
+    loop {
+        let next = match job.stage_now {
+            LevelSpawnPhase::Materials => {
+                look::publish(&mut commands, &stage);
+                job.prior_work_ms = ms_since(began);
+                diag::info!(
+                    World,
+                    "world spawn slice: phase=materials install {:.1}ms (budget 40ms)",
+                    job.prior_work_ms
+                );
+                LevelSpawnPhase::Images
+            }
+            LevelSpawnPhase::Images if images_done => LevelSpawnPhase::Plan,
+            LevelSpawnPhase::Plan => {
+                let HandleTables { exact, probes, lightmaps } = handle_tables(&job);
+                tess.shader_textures = Arc::new(exact.clone());
+                level_plan::register_into(
+                    &mut commands,
+                    &stage,
+                    &image_store,
+                    exact,
+                    probes,
+                    lightmaps,
+                    reads.tracer_defs.as_deref(),
+                    reads.effect_defs.as_deref(),
+                );
+                let fx_geometry =
+                    level_plan::prepare_fx_model_geometry(&stage, reads.effect_models.as_deref());
+                commands.insert_resource(fx_geometry.0.clone());
+                commands.insert_resource(fx_geometry);
+                if let Some(host) = effect_host.as_deref_mut() {
+                    host.0.glass = fx::PaneShardOwner::default();
+                }
+                LevelSpawnPhase::WorldTess
+            }
+            _ => return,
+        };
+        job.stage_now = next;
+        let over_budget = deadline.is_some_and(|end| Instant::now() >= end);
+        if next == LevelSpawnPhase::WorldTess || over_budget {
+            return;
+        }
+    }
+}
+
+/// The world drew no batches. A paced load whose launch report says no
+/// GfxWorld arrived stops here for good; otherwise the spawn keeps waiting.
+fn give_up_on_missing_world(job: &mut LevelSpawnJob, paced: bool, launch: Option<&StartupReport>) {
+    if !paced || job.stage_now == LevelSpawnPhase::Done {
+        return;
+    }
+    let no_world = launch.is_some_and(|launch| {
+        launch
+            .level_digest
+            .iter()
+            .any(|entry| entry.contains("no GfxWorld reached"))
+    });
+    if no_world {
+        diag::warn!(
+            World,
+            "world spawn: no batches, so spawn_world leaves without a Camera3d (no GfxWorld, or world_draw gave none)"
+        );
+        job.stage_now = LevelSpawnPhase::Done;
+    }
+}
+
+/// The GPU phase of a paced load: the spawn ends once the GPU has taken the
+/// images and pipelines and the model and first-person preparations settle.
+fn wait_for_gpu(
+    commands: &mut Commands,
+    scene: &mut LevelStage,
+    job: &mut LevelSpawnJob,
+    tess: &render_scene::StitchMaterials,
+    reads: &SpawnReads,
+) {
+    // bo2zm: a world with no material images never starts either
+    // preparation job, and a match with no weapon catalogs (a BO2 world
+    // before weapons are read) never starts the first-person one; there
+    // is nothing for them to prepare.
+    let catalog = &tess.catalog;
+    let viewmodels_settled =
+        reads.viewmodels.settled_for(catalog) || reads.viewmodels.inputs_absent();
+    let preparations_settled = tess.shader_textures.is_empty()
+        || (viewmodels_settled && reads.model_mats.settled_for(catalog));
+
+    let gap_ms = job.slice_gap_millis(Instant::now());
+    let epoch = job.spawn;
+    let ready = reads.gpu_ready.as_deref();
+    if !check_once(&mut job.gpu_wait, epoch, ready, gap_ms) {
+        return;
+    }
+    if !preparations_settled {
         diag::info!(
             World,
-            "world spawn slice: phase=materials install {:.1}ms (budget 40ms)",
-            job.last_work_ms
+            "world spawn: GPU ready; overlay holds for model and first-person preparation"
         );
-        if out_of_time() {
-            return;
-        }
+        return;
     }
 
-    if job.phase == WorldSpawnPhase::Images {
-        if !images_done {
-            return;
-        }
-        job.phase = WorldSpawnPhase::Plan;
-        if out_of_time() {
-            return;
-        }
-    }
-
-    if job.phase == WorldSpawnPhase::Plan {
-        world_plan::install(
-            &mut commands,
-            &scene,
-            &images,
-            job.images.exact_handles().to_vec(),
-            job.images.probe_handles().to_vec(),
-            job.images.lightmap_handles().to_vec(),
-            tracers.as_deref(),
-            fx_catalog.as_deref(),
-        );
-        let fx_geometry = world_plan::prepare_fx_model_geometry(&scene, fx_models.as_deref());
-        commands.insert_resource(fx_geometry.0.clone());
-        commands.insert_resource(fx_geometry);
-        tess.material_images = std::sync::Arc::new(job.images.exact_handles().to_vec());
-        if let Some(host) = fx_host.as_mut() {
-            host.0.glass = fx::FxGlassSystemHost::default();
-        }
-        job.phase = WorldSpawnPhase::WorldTess;
-    }
+    let quiet = job.gpu_wait.steady_frames();
+    let waited_ms = job.gpu_wait.elapsed().as_secs_f32() * 1000.0;
+    conclude(commands, scene, job);
+    diag::info!(
+        World,
+        "world spawn: GPU is ready, quiet={quiet} images={} pipelines={} after {waited_ms:.1}ms; the overlay waits to be admitted",
+        ready.map_or(-1, |r| i32::from(r.images_resident)),
+        ready.map_or(-1, |r| i32::from(r.pipelines_warm)),
+    );
+    log_load_ledger(job, ready, &reads.viewmodels, waited_ms);
 }
 
 /// Runs one slice of the image hand-over and logs it. True once every image
 /// has been handed over.
 fn hand_over_image_slice(
-    job: &mut WorldSpawnJob,
-    images: &mut Assets<Image>,
+    job: &mut LevelSpawnJob,
+    gpu_images: &mut Assets<Image>,
     common_images: &mut ResidentGpuImages,
-    started: Instant,
-    deadline: Option<Instant>,
+    slice_start: Instant,
+    due_at: Option<Instant>,
     paced: bool,
 ) -> bool {
-    let gap_ms = job.slice_gap_ms(started);
-    let max_images = if paced { IMAGES_PER_OVERLAY_FRAME } else { u32::MAX };
+    let gap_ms = job.slice_gap_millis(slice_start);
+    let image_cap = if paced { IMAGES_PER_TOPMOST_FRAME } else { u32::MAX };
     // A slow frame earns a proportionally larger byte allowance.
-    let byte_budget = (IMAGE_BYTES_PER_OVERLAY_FRAME as f32 * (gap_ms.max(FRAME_MS) / FRAME_MS))
-        .round() as u64;
-    let byte_budget = byte_budget.min(MAX_IMAGE_BYTES_PER_SLICE);
-    let bytes_before = job.images.handed_bytes;
+    let frames_elapsed = gap_ms.max(FRAME_MS) / FRAME_MS;
+    let byte_budget = ((IMAGE_BYTES_PER_TOPMOST_FRAME as f32 * frames_elapsed).round() as u64)
+        .min(MAX_IMAGE_BYTES_PER_SLICE);
+    let handed_before = job.images.handed_bytes;
 
     let finished = job
         .images
-        .until(images, common_images, deadline, max_images, byte_budget);
+        .hand_over_until(gpu_images, common_images, due_at, image_cap, byte_budget);
 
-    job.last_work_ms = started.elapsed().as_secs_f32() * 1000.0;
+    job.prior_work_ms = ms_since(slice_start);
     let up = &job.images;
     diag::info!(
         World,
         "world spawn slice: phase=images done={}/{} resident={} skipped={} reused_handles={}/{}B common_reused={}/{}B {:.1}ms gap={gap_ms:.1}ms handed_bytes={} total_handed={} byte_budget={byte_budget} largest_step={:.1}ms/{}B (budget 40ms; bytes are handed to Assets<Image>, not copied to the GPU; a reused handle is a slot whose variant was already an asset)",
-        up.done,
-        up.total,
+        up.finished,
+        up.expected,
         up.resident,
-        up.skipped,
+        up.passed_over,
         up.reused_handles,
         up.reused_handle_bytes,
         up.reused_common_handles,
         up.reused_common_bytes,
-        job.last_work_ms,
-        up.handed_bytes - bytes_before,
+        job.prior_work_ms,
+        up.handed_bytes - handed_before,
         up.handed_bytes,
         up.largest_step_ns as f64 / 1.0e6,
         up.largest_step_bytes,
@@ -251,76 +306,83 @@ fn hand_over_image_slice(
     finished
 }
 
-pub(crate) fn spawn_world_finish(
+pub(crate) fn spawn_level_finish(
     mut commands: Commands,
     load: Option<Res<assets::MapLoadProcess>>,
-    mut scene: ResMut<WorldScene>,
-    mut images: ResMut<Assets<Image>>,
-    mut job: ResMut<WorldSpawnJob>,
-    mut tess: ResMut<render_scene::TessMaterials>,
+    mut stage: ResMut<LevelStage>,
+    mut gpu_images: ResMut<Assets<Image>>,
+    mut job: ResMut<LevelSpawnJob>,
+    mut tess: ResMut<render_scene::StitchMaterials>,
 ) {
-    if job.phase != WorldSpawnPhase::WorldTess {
+    if job.stage_now != LevelSpawnPhase::WorldTess {
         return;
     }
     let progress = running_load(load.as_deref());
-    let started = Instant::now();
+    let began = Instant::now();
 
-    world_occupancy::place(
+    let HandleTables { exact, probes, lightmaps } = handle_tables(&job);
+    let shared = Arc::new(exact.clone());
+    level_presence::populate_world(
         &mut commands,
-        &mut scene,
-        &mut images,
-        job.images.exact_handles().to_vec(),
-        job.images.probe_handles().to_vec(),
-        job.images.lightmap_handles().to_vec(),
+        &mut stage,
+        &mut gpu_images,
+        level_presence::RegistryHandles {
+            precise_materials: exact,
+            env_probes: probes,
+            lightbakes: lightmaps,
+        },
     );
-    tess.material_images = std::sync::Arc::new(job.images.exact_handles().to_vec());
-    job.last_work_ms = started.elapsed().as_secs_f32() * 1000.0;
+    tess.shader_textures = shared;
+    job.prior_work_ms = ms_since(began);
 
-    let (done, total) = (job.images.done, job.images.total);
-    if progress.is_some() {
-        job.phase = WorldSpawnPhase::Gpu;
-        job.gpu_wait.arm(progress.as_ref());
-        diag::info!(
-            World,
-            "world spawn: Camera3d up; overlay holds for GPU images/pipelines last_slice={:.1}ms images={done}/{total}",
-            job.last_work_ms
-        );
-        return;
+    let slice_ms = job.prior_work_ms;
+    let (done, total) = (job.images.finished, job.images.expected);
+    match progress {
+        Some(progress) => {
+            job.stage_now = LevelSpawnPhase::Gpu;
+            job.gpu_wait.arm_t(Some(&progress));
+            diag::info!(
+                World,
+                "world spawn: Camera3d is up; the overlay waits on GPU images/pipelines, last_slice={slice_ms:.1}ms images={done}/{total}"
+            );
+        }
+        None => {
+            conclude(&mut commands, &mut stage, &mut job);
+            diag::info!(
+                World,
+                "world spawn: complete last_slice={slice_ms:.1}ms images={done}/{total} (no overlay)"
+            );
+        }
     }
-    mark_done(&mut scene, &mut job, &mut commands);
-    diag::info!(
-        World,
-        "world spawn: complete last_slice={:.1}ms images={done}/{total} (no overlay)",
-        job.last_work_ms
-    );
 }
 
 /// One line summing up what the load cost and reused, written when the GPU
 /// side reports ready.
 fn log_load_ledger(
-    job: &WorldSpawnJob,
-    gpu: Option<&WorldGpuReady>,
-    fpv: &render_anim::PreparedFpv,
+    spawn_job: &LevelSpawnJob,
+    ready: Option<&LevelGpuReady>,
+    viewmodels: &render_anim::PreparedFpv,
     gpu_wait_ms: f32,
 ) {
-    let up = &job.images;
-    let compiled = gpu.and_then(|gpu| job.gpu_wait.pipelines_added(gpu.pipeline_n));
-    let census = fpv.table().map(|table| table.census());
+    let up = &spawn_job.images;
+    let unknown = || "?".to_owned();
+    let compiled = ready.and_then(|r| spawn_job.gpu_wait.pipelines_added(r.pipeline_tally));
+    let census = viewmodels.table().map(|table| table.census());
     diag::info!(
         World,
         "load ledger: images handed={} handed_bytes={} reused_slot={} reused_slot_bytes={} reused_common={} reused_common_bytes={} resident_map={} | pipelines cached={} compiled_this_load={} | fpv models={} rigs={} materials={} built_ms={} | gpu_wait_ms={gpu_wait_ms:.1}",
-        up.done.saturating_sub(up.skipped).saturating_sub(up.reused_handles),
+        up.finished.saturating_sub(up.passed_over).saturating_sub(up.reused_handles),
         up.handed_bytes,
         up.reused_handles,
         up.reused_handle_bytes,
         up.reused_common_handles,
         up.reused_common_bytes,
         up.resident,
-        gpu.map_or_else(|| "?".to_owned(), |gpu| gpu.pipeline_n.to_string()),
-        compiled.map_or_else(|| "?".to_owned(), |n| n.to_string()),
-        census.map_or_else(|| "?".to_owned(), |c| c.models.to_string()),
-        census.map_or_else(|| "?".to_owned(), |c| c.rigs.to_string()),
-        census.map_or_else(|| "?".to_owned(), |c| c.materials.to_string()),
-        census.map_or_else(|| "?".to_owned(), |c| format!("{:.1}", c.elapsed_ms)),
+        ready.map_or_else(unknown, |r| r.pipeline_tally.to_string()),
+        compiled.map_or_else(unknown, |count| count.to_string()),
+        census.map_or_else(unknown, |c| c.models.to_string()),
+        census.map_or_else(unknown, |c| c.rigs.to_string()),
+        census.map_or_else(unknown, |c| c.materials.to_string()),
+        census.map_or_else(unknown, |c| format!("{:.1}", c.elapsed_ms)),
     );
 }

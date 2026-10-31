@@ -9,14 +9,13 @@
 //! around the crosshair pointing back at whoever hit him (`hit_direction`).
 //! The MW2 splatter (`hud`'s blood overlay) stays off in a BO2 match.
 
-use std::collections::HashMap;
-
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
-use frame::ClientSet;
-use net::{LocalPresentClient, PresentedSnapshot};
+use frame::ClientStep;
+use net::{HostViewClient, ShownWorldFrame};
 
-use crate::layers::{UiLayer, UiLayerVisibility};
+use crate::{MainWindow, ScreenBox, pinned_node};
+use crate::lui_hud::PictureCache;
+use crate::tiers::{OverlayTier, OverlayStackShown};
 
 #[derive(Component)]
 struct Bo2mpDamageNode;
@@ -42,7 +41,7 @@ const BLOOD_SIZE: (usize, usize) = (512, 256);
 
 #[derive(Default)]
 struct DamageState {
-    pictures: HashMap<&'static str, Handle<Image>>,
+    pictures: PictureCache,
     /// The last damage event seen and his health then.
     event: Option<(u32, i32)>,
     /// The hit's blood (0..1).
@@ -93,26 +92,35 @@ fn blood_picture(color: &Image, reveal: &Image, amount: f32) -> Option<Image> {
             out[o + 3] = (a * 255.0) as u8;
         }
     }
-    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-    let size = Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };
-    let mut img = Image::new(size, TextureDimension::D2, out, TextureFormat::Rgba8UnormSrgb, bevy::asset::RenderAssetUsages::default());
-    img.sampler = bevy::image::ImageSampler::linear();
-    Some(img)
+    Some(crate::lui_scene::srgb_image(w, h, out))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What the local player sees this frame: the world feed, which client he is, and whose eyes the view is in.
+#[derive(bevy::ecs::system::SystemParam)]
+struct LocalFeed<'w> {
+    world: Option<Res<'w, ShownWorldFrame>>,
+    me: Option<Res<'w, HostViewClient>>,
+    view: Option<Res<'w, frame::EyeSubject>>,
+}
+
+/// The packs' HUD pictures and the asset store the blood is copied into.
+#[derive(bevy::ecs::system::SystemParam)]
+struct BloodPictures<'w> {
+    icons: Option<Res<'w, assets::T6HudIcons>>,
+    pics: ResMut<'w, Assets<Image>>,
+}
+
 fn bo2mp_damage(
     mut commands: Commands,
-    presented: Option<Res<PresentedSnapshot>>,
-    local: Option<Res<LocalPresentClient>>,
-    icons: Option<Res<assets::T6HudIcons>>,
-    mut images: ResMut<Assets<Image>>,
+    feed: LocalFeed,
+    store: BloodPictures,
     time: Res<Time>,
-    window: Query<&Window, With<PrimaryWindow>>,
+    window: MainWindow,
     nodes: Query<Entity, With<Bo2mpDamageNode>>,
-    view: Option<Res<frame::ViewSubject>>,
     mut st: Local<DamageState>,
 ) {
+    let LocalFeed { world: presented, me: local, view } = feed;
+    let BloodPictures { icons, mut pics } = store;
     let clear = |commands: &mut Commands, st: &mut DamageState| {
         if st.shown {
             for e in &nodes {
@@ -135,8 +143,8 @@ fn bo2mp_damage(
         && let Some(icons) = icons.as_deref()
     {
         for name in PICTURES {
-            if let Some((_, image)) = icons.0.iter().find(|(n, _)| n == name) {
-                st.pictures.insert(name, images.add((**image).clone()));
+            if let Some(image) = crate::hud_picture(icons, name) {
+                st.pictures.keep(name.to_owned(), &pics.add((**image).clone()));
             }
         }
         // Every step of the blood at once (each on the GPU before it is
@@ -144,7 +152,7 @@ fn bo2mp_damage(
         let find = |name: &str| icons.0.iter().find(|(n, _)| n == name).map(|(_, i)| i.clone());
         if let (Some(color), Some(reveal)) = (find("iw2_blood_color"), find("iw2_blood_reveal")) {
             st.blood = (0..=BLOOD_STEPS)
-                .map(|k| (k > 0).then(|| blood_picture(&color, &reveal, k as f32 / BLOOD_STEPS as f32)).flatten().map(|i| images.add(i)))
+                .map(|k| (k > 0).then(|| blood_picture(&color, &reveal, k as f32 / BLOOD_STEPS as f32)).flatten().map(|i| pics.add(i)))
                 .collect();
         }
     }
@@ -153,11 +161,11 @@ fn bo2mp_damage(
     // killer (alive, maybe hurt), but the damage feedback is the local
     // player's own, so none of it draws (as every other HUD part hides
     // while the view is seated: compass, kill feed, score bar, names).
-    let seated = view.as_deref().is_some_and(|v| v.in_killcam());
+    let seated = view.as_deref().is_some_and(|v| v.replaying_final_death());
     // Alive and playing (not dead, spectating or in a killcam).
-    let Some(ps) = p
+    let Some(pstate) = p
         .player(l.0)
-        .filter(|ps| !seated && ps.health > 0 && ps.max_health > 0 && ps.pm_type < 2)
+        .filter(|pstate| !seated && pstate.health > 0 && pstate.hit_point_ceiling > 0 && pstate.movement_mode < 2)
         .copied()
     else {
         clear(&mut commands, &mut st);
@@ -165,35 +173,36 @@ fn bo2mp_damage(
         return;
     };
     // A new hit: blood by how much it took, and its direction.
-    match st.event {
-        // (A new life's full health is no hit.)
-        Some((event, health)) if event != ps.damage_event && ps.health < health => {
-            let lost = (health - ps.health).max(0) as f32 / ps.max_health as f32;
-            st.splat = (st.splat + 0.25 + lost * 2.0).min(1.0);
-            // The damage bytes are the hit's travel (Black Ops II's), so
-            // the attacker is back the other way; 255/255 = no direction.
-            let from = (ps.damage_yaw != 255 || ps.damage_pitch != 255)
-                .then(|| (ps.damage_yaw as f32 * 360.0 / 256.0 + 180.0) % 360.0);
-            if let Some(from) = from {
-                st.hits.push((now, from));
-            }
-            diag::info!(
-                Ui,
-                "bo2mp damage: hit for {} (health {}), from yaw {:?}, facing {:.0}",
-                health - ps.health,
-                ps.health,
-                from.map(|y| y.round()),
-                ps.viewangles[1]
-            );
-            if st.hits.len() > 4 {
-                st.hits.remove(0);
-            }
+    // (A new life's full health is no hit.)
+    if let Some((event, health)) = st.event
+        && event != pstate.damage_event
+        && pstate.health < health
+    {
+        let (took, health_now) = (health - pstate.health, pstate.health);
+        let lost = took.max(0) as f32 / pstate.hit_point_ceiling as f32;
+        st.splat = (st.splat + 0.25 + lost * 2.0).min(1.0);
+        // The damage bytes are the hit's travel (Black Ops II's), so
+        // the attacker is back the other way; 255/255 = no direction.
+        let from = (pstate.damage_yaw != 255 || pstate.damage_pitch != 255)
+            .then(|| (pstate.damage_yaw as f32 * 360.0 / 256.0 + 180.0) % 360.0);
+        if let Some(from) = from {
+            st.hits.push((now, from));
         }
-        _ => {}
+        diag::info!(
+            Ui,
+            "bo2mp damage: took {} (health now {}), came from yaw {:?}, view yaw {:.0}",
+            took,
+            health_now,
+            from.map(|y| y.round()),
+            pstate.look_angles[1]
+        );
+        if st.hits.len() > 4 {
+            st.hits.remove(0);
+        }
     }
-    st.event = Some((ps.damage_event, ps.health));
+    st.event = Some((pstate.damage_event, pstate.health));
     st.hits.retain(|(at, _)| now - at < HIT_MS);
-    let frac = (ps.health as f32 / ps.max_health as f32).clamp(0.0, 1.0);
+    let frac = (pstate.health as f32 / pstate.hit_point_ceiling as f32).clamp(0.0, 1.0);
     let low = ((LOW_HEALTH - frac) / LOW_HEALTH).clamp(0.0, 1.0);
     // The hit's extra blood fades; what stays is how hurt he is (it clears
     // as his health comes back).
@@ -206,79 +215,73 @@ fn bo2mp_damage(
     if st.splat <= 0.0 && low_alpha <= 0.0 && st.hits.is_empty() {
         return;
     }
-    let (sw, sh) = window.single().map_or((1920.0, 1080.0), |w| (w.width(), w.height()));
+    let (sw, sh) = window.shown().map_or((1920.0, 1080.0), |w| (w.width(), w.height()));
     if std::env::var_os("BO2MP_DAMAGE_LOG").is_some() && (now / 500.0) as i64 != ((now - time.delta_secs_f64() * 1000.0) / 500.0) as i64 {
+        let (arcs, steps_ready) = (st.hits.len(), st.blood.iter().flatten().count());
         diag::info!(
             Ui,
-            "bo2mp damage: drawing blood {:.2} edge {low_alpha:.2} arcs {} pictures {:?} blood steps made {}",
+            "bo2mp damage: blood {:.2} edge {low_alpha:.2}, {} arcs, pictures {:?}, {} blood steps ready",
             st.splat,
-            st.hits.len(),
+            arcs,
             st.pictures.keys().collect::<Vec<_>>(),
-            st.blood.iter().filter(|b| b.is_some()).count()
+            steps_ready
         );
     }
     let k = sh / 480.0;
     let full = Node {
-        position_type: PositionType::Absolute,
-        left: Val::Px(0.0),
-        top: Val::Px(0.0),
         width: Val::Percent(100.0),
         height: Val::Percent(100.0),
-        ..default()
-    };
-    let pictures = st.pictures.clone();
-    let spawn = |commands: &mut Commands, name: &str, alpha: f32, node: Node, turn: f32, z: i32| {
-        let Some(handle) = pictures.get(name) else { return };
-        commands.spawn((
-            Bo2mpDamageNode,
-            UiLayer::Hud,
-            UiLayerVisibility,
-            ImageNode::new(handle.clone())
-                .with_color(Color::srgba(1.0, 1.0, 1.0, alpha))
-                .with_mode(bevy::ui::widget::NodeImageMode::Stretch),
-            UiTransform { rotation: Rot2::radians(turn), ..UiTransform::IDENTITY },
-            ZIndex(z),
-            node,
-        ));
+        ..pinned_node(0.0, 0.0)
     };
     // Under the HUD: the beating edge, the blood, then the arcs.
-    if low_alpha > 0.0 {
-        spawn(&mut commands, "overlay_low_health", low_alpha, full.clone(), 0.0, -2100);
+    if low_alpha > 0.0
+        && let Some(edge) = st.pictures.kept("overlay_low_health")
+    {
+        commands.spawn(damage_picture(edge, low_alpha, full.clone(), 0.0, -2100));
     }
     let step = ((st.splat * BLOOD_STEPS as f32).round() as usize).min(BLOOD_STEPS);
-    if step > 0 && step < st.blood.len() {
-        if let Some(handle) = st.blood[step].clone() {
-            commands.spawn((
-                Bo2mpDamageNode,
-                UiLayer::Hud,
-                UiLayerVisibility,
-                ImageNode::new(handle).with_mode(bevy::ui::widget::NodeImageMode::Stretch),
-                ZIndex(-2090),
-                full.clone(),
-            ));
-        }
+    if step > 0
+        && let Some(Some(blood)) = st.blood.get(step)
+    {
+        commands.spawn(damage_picture(blood.clone(), 1.0, full.clone(), 0.0, -2090));
     }
-    let hits = st.hits.clone();
-    for (at, yaw) in hits {
+    let Some(arc) = st.pictures.kept("hit_direction") else {
+        st.shown = true;
+        return;
+    };
+    for &(at, yaw) in &st.hits {
         let age = now - at;
         let alpha = if age < HIT_MS - HIT_FADE_MS { 1.0 } else { ((HIT_MS - age) / HIT_FADE_MS) as f32 };
         // Clockwise from straight up: where the hit came from, as he faces.
-        let turn = -(yaw - ps.viewangles[1]).to_radians();
+        let turn = -(yaw - pstate.look_angles[1]).to_radians();
         let (w, h, off) = (ARC_W * k, ARC_H * k, ARC_OFFSET * k);
         let (cx, cy) = (sw * 0.5 + turn.sin() * off, sh * 0.5 - turn.cos() * off);
-        let node = Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(cx - w * 0.5),
-            top: Val::Px(cy - h * 0.5),
-            width: Val::Px(w),
-            height: Val::Px(h),
-            ..default()
-        };
-        spawn(&mut commands, "hit_direction", alpha.clamp(0.0, 1.0), node, turn, -2080);
+        let node = ScreenBox {
+            left_px: cx - w * 0.5,
+            top_px: cy - h * 0.5,
+            width_px: w,
+            height_px: h,
+        }.node();
+        commands.spawn(damage_picture(arc.clone(), alpha.clamp(0.0, 1.0), node, turn, -2080));
     }
     st.shown = true;
 }
 
-pub(crate) fn register_bo2mp_damage(app: &mut App) {
-    app.add_systems(Update, bo2mp_damage.in_set(ClientSet::Ui));
+/// One of the damage pictures, stretched over `node`, faded to `alpha`, turned by `turn` radians and drawn at depth `z`.
+fn damage_picture(picture: Handle<Image>, alpha: f32, node: Node, turn: f32, z: i32) -> impl Bundle {
+    (
+        Bo2mpDamageNode,
+        OverlayTier::Hud,
+        OverlayStackShown,
+        ImageNode::new(picture)
+            .with_color(Color::srgba(1.0, 1.0, 1.0, alpha))
+            .with_mode(bevy::ui::widget::NodeImageMode::Stretch),
+        UiTransform { rotation: Rot2::radians(turn), ..UiTransform::IDENTITY },
+        ZIndex(z),
+        node,
+    )
+}
+
+pub(crate) fn register_bo2mp_damage(host: &mut App) {
+    host.add_systems(Update, bo2mp_damage.in_set(ClientStep::Ui));
 }

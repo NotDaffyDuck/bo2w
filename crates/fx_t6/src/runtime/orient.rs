@@ -1,31 +1,31 @@
 //! Moving a point between a frame's own space and the world.
 
-/// The world position of `local`, a point in the frame (`origin`, `axis`).
+/// The world position of `local`, a point in the frame (`spot`, `turn`).
 pub fn orientation_pos_to_world(
-    origin: [f32; 3],
-    axis: [[f32; 3]; 3],
+    spot: [f32; 3],
+    turn: [[f32; 3]; 3],
     local: [f32; 3],
 ) -> [f32; 3] {
-    let mut world = origin;
+    let mut world = spot;
     for (i, slot) in world.iter_mut().enumerate() {
-        *slot = origin[i] + axis[0][i] * local[0] + axis[1][i] * local[1] + axis[2][i] * local[2];
+        *slot = spot[i] + turn[0][i] * local[0] + turn[1][i] * local[1] + turn[2][i] * local[2];
     }
     world
 }
 
-/// The position of the world point `world` inside the frame (`origin`,
-/// `axis`).
+/// The position of the world point `world` inside the frame (`spot`,
+/// `turn`).
 pub fn orientation_pos_from_world(
-    origin: [f32; 3],
-    axis: [[f32; 3]; 3],
+    spot: [f32; 3],
+    turn: [[f32; 3]; 3],
     world: [f32; 3],
 ) -> [f32; 3] {
     let d = [
-        world[0] - origin[0],
-        world[1] - origin[1],
-        world[2] - origin[2],
+        world[0] - spot[0],
+        world[1] - spot[1],
+        world[2] - spot[2],
     ];
-    axis.map(|row| d[0] * row[0] + d[1] * row[1] + d[2] * row[2])
+    turn.map(|row| d[0] * row[0] + d[1] * row[1] + d[2] * row[2])
 }
 
 #[cfg(test)]

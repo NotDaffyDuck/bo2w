@@ -5,11 +5,11 @@ use bevy::prelude::*;
 /// The commands the process was started with (`+map ...`). The console holds
 /// them back until the main menu is up, then runs them.
 #[derive(Resource, Default)]
-pub struct StartupCommands {
-    pub lines: Vec<String>,
+pub struct BootConsoleScript {
+    pub commands: Vec<String>,
 }
 
 /// Lines other systems want run or shown by the console. The console empties
 /// this every frame.
 #[derive(Resource, Default)]
-pub struct PendingConsoleLines(pub Vec<String>);
+pub struct StagedConsoleText(pub Vec<String>);

@@ -16,9 +16,15 @@
 use alloc::vec::Vec;
 use trace_t6::{Trace, TraceHitType};
 
-use super::hull::{self, Mover, player_hull};
+use super::hull::{Mover, brush_face_walkable, is_walkable, player_hull, triangles_face_walkable};
 use super::solver::{Pair, Sweep, do_gjk_collide};
-use super::{Bo2Collision, Geom, Shape, add, dot, sub, to_local};
+use super::Bo2Collision;
+use super::Geom;
+use super::Shape;
+use super::add;
+use super::dot;
+use super::sub;
+use super::to_local;
 
 /// The trace margin: the body's trace box is this much inside its real box,
 /// a shape counts as touching this far out, and a hit's gap is measured from
@@ -45,14 +51,14 @@ const QUERY_PAD: f32 = 1.0;
 /// One contact a trace found.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Hit<'a> {
-    pub geom: Geom<'a>,
+    pub shape_data: Geom<'a>,
     /// The contact on the player (with the skin), from its origin at the
     /// hit.
     pub arm: [f32; 3],
     /// The contact on the shape, in the world.
     pub hit_point: [f32; 3],
     /// From the shape toward the player.
-    pub normal: [f32; 3],
+    pub facing: [f32; 3],
     /// How far along the move (0..1).
     pub hit_time: f32,
     /// The gap at the hit, plus the margin: below zero the body overlaps.
@@ -69,9 +75,9 @@ pub(crate) struct TraceInput {
     /// The trace box, from the player's origin.
     pub cg_mins: [f32; 3],
     pub cg_maxs: [f32; 3],
-    pub start: [f32; 3],
+    pub from_pt: [f32; 3],
     pub translation: [f32; 3],
-    pub mask: u32,
+    pub solid_mask: u32,
     /// Keep hits the player is moving away from.
     pub keep_all: bool,
     /// Stop at the first hit that starts inside a shape.
@@ -85,26 +91,26 @@ pub(crate) struct TraceInput {
 /// BO2's setup_trace_info: the body for the player's box (BO2 rebuilds it
 /// only when the box changes; it is cheap to build), its trace box (the
 /// body's box less the margin), and the move from `start` to `end`.
-pub(crate) fn setup_trace_info(mins: [f32; 3], maxs: [f32; 3], start: [f32; 3], end: [f32; 3], mask: u32) -> TraceInput {
-    mover_trace_info(player_mover(mins, maxs), start, end, mask)
+pub(crate) fn setup_trace_info(box_lo: [f32; 3], box_hi: [f32; 3], from_pt: [f32; 3], to_pt: [f32; 3], mask: u32) -> TraceInput {
+    mover_trace_info(player_mover(box_lo, box_hi), from_pt, to_pt, mask)
 }
 
 /// The player's body for its box.
-pub(crate) fn player_mover(mins: [f32; 3], maxs: [f32; 3]) -> Mover {
-    Mover::Body(player_hull(mins, maxs, ADJUST_HEIGHT))
+pub(crate) fn player_mover(box_lo: [f32; 3], box_hi: [f32; 3]) -> Mover {
+    Mover::Body(player_hull(box_lo, box_hi, ADJUST_HEIGHT))
 }
 
 /// setup_trace_info for any moving shape: its trace box is its box less the
 /// margin.
-pub(crate) fn mover_trace_info(mover: Mover, start: [f32; 3], end: [f32; 3], mask: u32) -> TraceInput {
+pub(crate) fn mover_trace_info(mover: Mover, src_pt: [f32; 3], dst_pt: [f32; 3], filter: u32) -> TraceInput {
     let (lo, hi) = mover.calc_aabb();
     TraceInput {
         mover,
         cg_mins: lo.map(|v| v + AC_EPS),
         cg_maxs: hi.map(|v| v - AC_EPS),
-        start,
-        translation: sub(end, start),
-        mask,
+        from_pt: src_pt,
+        translation: sub(dst_pt, src_pt),
+        solid_mask: filter,
         keep_all: false,
         exit_on_penetration: true,
         skip_sentients: false,
@@ -114,14 +120,14 @@ pub(crate) fn mover_trace_info(mover: Mover, start: [f32; 3], end: [f32; 3], mas
 
 /// BO2's gjk_trace_aabb: whether the trace box, swept along the move, comes
 /// within the margin of the shape's box, and from when (0..1).
-fn trace_aabb(input: &TraceInput, geom: &Geom) -> Option<f32> {
+fn trace_aabb(input: &TraceInput, shape_data: &Geom) -> Option<f32> {
     // The shape's box grown by the trace box: the origin must reach it.
-    let lo = sub(geom.mins, input.cg_maxs);
-    let hi = sub(geom.maxs, input.cg_mins);
+    let lo = sub(shape_data.lo_corner, input.cg_maxs);
+    let hi = sub(shape_data.hi_corner, input.cg_mins);
     let mut t_min = 0.0f32;
     let mut t_max = 1.0f32;
     for a in 0..3 {
-        let pos = input.start[a];
+        let pos = input.from_pt[a];
         let t = input.translation[a];
         // Each side: how far out the origin starts and ends (above zero:
         // outside).
@@ -156,35 +162,35 @@ fn trace_aabb(input: &TraceInput, geom: &Geom) -> Option<f32> {
 }
 
 /// BO2's gjk_collide: the swept test of the body against one shape, from
-/// `start_time` to `end_time`, finding contacts up to `sep_thresh` apart
+/// `start_time` to `finish_stamp`, finding contacts up to `sep_thresh` apart
 /// (a trace: the margin). The body meets brushes as its 12-sided self and
 /// everything else as the capsule; a vehicle's brush is always itself.
 pub(super) fn gjk_collide<'a>(
     input: &TraceInput,
-    geom: &Geom<'a>,
+    shape_data: &Geom<'a>,
     start_time: f32,
-    end_time: f32,
+    finish_stamp: f32,
     sep_thresh: f32,
 ) -> Option<Hit<'a>> {
-    let mover = input.mover.against(geom.shape.is_brush());
-    let pair = Pair { cg1: &mover, cg2: &geom.shape, m: geom.axis, w: sub(geom.origin, input.start) };
-    let sweep = Sweep { translation: input.translation, start_time, end_time };
-    let c = do_gjk_collide(&pair, mover.skin(), geom.shape.skin(), sep_thresh, Some(sweep))?;
-    let closing = dot(input.translation, c.normal);
-    let hit_dist = dot(c.normal, sub(c.p1, c.p2)) + c.lambda * closing + AC_EPS;
+    let mover = input.mover.against(shape_data.shape.is_brush());
+    let pair = Pair { cg1: &mover, cg2: &shape_data.shape, m: shape_data.axis, w: sub(shape_data.origin, input.from_pt) };
+    let sweep = Sweep { translation: input.translation, start_time, finish_stamp };
+    let c = do_gjk_collide(&pair, mover.skin(), shape_data.shape.skin(), sep_thresh, Some(sweep))?;
+    let closing = dot(input.translation, c.facing);
+    let hit_dist = dot(c.facing, sub(c.p1, c.p2)) + c.lambda * closing + AC_EPS;
     let mut hit_time = c.lambda;
     if closing >= 0.0 && HALF_EPS < hit_dist && !input.keep_all {
         // Clear of it and not moving toward it: no hit on this move.
         hit_time = 1.0;
     }
-    if !(hit_time < end_time || hit_dist < 0.0) {
+    if !(hit_time < finish_stamp || hit_dist < 0.0) {
         return None;
     }
     Some(Hit {
-        geom: *geom,
+        shape_data: *shape_data,
         arm: c.p1,
-        hit_point: add(input.start, c.p2),
-        normal: c.normal,
+        hit_point: add(input.from_pt, c.p2),
+        facing: c.facing,
         hit_time,
         hit_dist,
         foot: mover.is_foot(c.p1[2]),
@@ -201,44 +207,44 @@ pub(crate) struct Hits<'a> {
 /// BO2's gjk_trace: every shape near the move but those in `skip` (keys),
 /// in the order the box test says they are reached, each tested from then
 /// until the first hit so far (plus `extra_time`).
-pub(crate) fn gjk_trace<'a, C: Bo2Collision>(collision: &'a C, input: &TraceInput, skip: &[u64]) -> Hits<'a> {
-    let end = add(input.start, input.translation);
+pub(crate) fn gjk_trace<'a, C: Bo2Collision>(solids: &'a C, input: &TraceInput, skip: &[u64]) -> Hits<'a> {
+    let end = add(input.from_pt, input.translation);
     let mut lo = [0.0; 3];
     let mut hi = [0.0; 3];
     for a in 0..3 {
-        lo[a] = input.start[a].min(end[a]) + input.cg_mins[a] - QUERY_PAD;
-        hi[a] = input.start[a].max(end[a]) + input.cg_maxs[a] + QUERY_PAD;
+        lo[a] = input.from_pt[a].min(end[a]) + input.cg_mins[a] - QUERY_PAD;
+        hi[a] = input.from_pt[a].max(end[a]) + input.cg_maxs[a] + QUERY_PAD;
     }
     let mut geoms = Vec::new();
-    collision.gjk_query(lo, hi, input.mask, &mut geoms);
+    solids.gjk_query(lo, hi, input.solid_mask, &mut geoms);
     let mut reached: Vec<(f32, Geom<'a>)> = geoms
         .into_iter()
         .filter(|g| (!input.skip_sentients || !g.sentient) && !skip.contains(&g.key))
         .filter_map(|g| trace_aabb(input, &g).map(|t| (t, g)))
         .collect();
-    reached.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+    reached.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(core::cmp::Ordering::Equal));
 
     let mut hits = Hits { list: Vec::new(), first: None };
-    let mut end_time = 1.0f32;
-    for (start_time, geom) in reached {
-        if end_time < start_time {
+    let mut finish_stamp = 1.0f32;
+    for (start_time, shape_data) in reached {
+        if finish_stamp < start_time {
             break;
         }
-        let Some(hit) = gjk_collide(input, &geom, start_time, end_time, AC_EPS) else {
+        let Some(strike) = gjk_collide(input, &shape_data, start_time, finish_stamp, AC_EPS) else {
             continue;
         };
-        if hit.hit_time < end_time {
-            let t = input.extra_time + hit.hit_time;
-            end_time = if t < 1.0 { t } else { 1.0 };
+        if strike.hit_time < finish_stamp {
+            let t = input.extra_time + strike.hit_time;
+            finish_stamp = if t < 1.0 { t } else { 1.0 };
         }
         let first = match hits.first {
             None => true,
             Some(i) => {
                 let f = &hits.list[i];
-                hit.hit_time < f.hit_time || (hit.hit_time == 0.0 && hit.hit_dist < f.hit_dist)
+                strike.hit_time < f.hit_time || (strike.hit_time == 0.0 && strike.hit_dist < f.hit_dist)
             }
         };
-        hits.list.push(hit);
+        hits.list.push(strike);
         if first {
             hits.first = Some(hits.list.len() - 1);
         }
@@ -252,19 +258,19 @@ pub(crate) fn gjk_trace<'a, C: Bo2Collision>(collision: &'a C, input: &TraceInpu
 /// BO2's gjk_player_trace: the body from `start` to `end`, stopped at the
 /// first hit.
 pub(crate) fn player_trace<C: Bo2Collision>(
-    collision: &C,
-    start: [f32; 3],
+    solids: &C,
+    from_pt: [f32; 3],
     end: [f32; 3],
-    mins: [f32; 3],
-    maxs: [f32; 3],
+    box_lo: [f32; 3],
+    box_hi: [f32; 3],
     mask: u32,
 ) -> Trace {
-    let input = setup_trace_info(mins, maxs, start, end, mask);
-    let hits = gjk_trace(collision, &input, &[]);
+    let input = setup_trace_info(box_lo, box_hi, from_pt, end, mask);
+    let hits = gjk_trace(solids, &input, &[]);
     match hits.first {
         Some(i) => {
-            let hit = &hits.list[i];
-            fill_results(hit, hit_walkable(hit))
+            let strike = &hits.list[i];
+            fill_results(strike, hit_walkable(strike))
         }
         None => no_hit(),
     }
@@ -275,30 +281,30 @@ pub(crate) fn player_trace<C: Bo2Collision>(
 /// for the best ground: among the hits no more than half a unit below the
 /// first, ground you can stand on beats ground you cannot, then the earlier
 /// one wins, terrain by a hair.
-pub(crate) fn ground_trace<C: Bo2Collision>(
-    collision: &C,
-    start: [f32; 3],
+pub(crate) fn floor_probe<C: Bo2Collision>(
+    solids: &C,
+    from_pt: [f32; 3],
     end: [f32; 3],
-    mins: [f32; 3],
-    maxs: [f32; 3],
+    box_lo: [f32; 3],
+    box_hi: [f32; 3],
     mask: u32,
 ) -> Trace {
-    let mut input = setup_trace_info(mins, maxs, start, end, mask);
-    let depth = start[2] - end[2];
+    let mut input = setup_trace_info(box_lo, box_hi, from_pt, end, mask);
+    let depth = from_pt[2] - end[2];
     input.exit_on_penetration = false;
     input.extra_time = if depth >= GROUND_BAND { GROUND_BAND / depth } else { 1.0 };
     input.skip_sentients = !STEP_ON_ACTORS;
-    let hits = gjk_trace(collision, &input, &[]);
+    let hits = gjk_trace(solids, &input, &[]);
     let Some(first) = hits.first else {
         return no_hit();
     };
-    let z_at = |t: f32| start[2] + (end[2] - start[2]) * t;
+    let z_at = |t: f32| from_pt[2] + (end[2] - from_pt[2]) * t;
     let first_z = z_at(hits.list[first].hit_time);
     let mut best = 0;
     let mut best_time = hits.list[0].hit_time;
     let mut best_walk = hit_walkable(&hits.list[0]);
     for (i, h) in hits.list.iter().enumerate().skip(1) {
-        let t = if matches!(h.geom.shape, Shape::Partition { .. }) {
+        let t = if matches!(h.shape_data.shape, Shape::Partition { .. }) {
             h.hit_time - TERRAIN_HEAD_START
         } else {
             h.hit_time
@@ -320,20 +326,20 @@ pub(crate) fn ground_trace<C: Bo2Collision>(
 
 /// BO2's is_walkable for a hit: at the feet, and either facing up enough or
 /// on a face of the shape that does (asked in the shape's own frame).
-pub(crate) fn hit_walkable(hit: &Hit) -> bool {
-    hull::is_walkable(hit.foot, hit.normal[2], || {
-        let g = &hit.geom;
-        let point = to_local(&g.axis, sub(hit.hit_point, g.origin));
+pub(crate) fn hit_walkable(strike: &Hit) -> bool {
+    is_walkable(strike.foot, strike.facing[2], || {
+        let g = &strike.shape_data;
+        let point = to_local(&g.axis, sub(strike.hit_point, g.origin));
         let up = to_local(&g.axis, [0.0, 0.0, 1.0]);
         match g.shape {
             Shape::Box { center, half, .. } => {
-                hull::brush_face_walkable(sub(center, half), add(center, half), &[], point, up)
+                brush_face_walkable(sub(center, half), add(center, half), &[], point, up)
             }
-            Shape::Brush { mins, maxs, sides, .. } => hull::brush_face_walkable(mins, maxs, sides, point, up),
-            Shape::Partition { verts, indices } => hull::triangles_face_walkable(
+            Shape::Brush { lo_corner: box_lo, hi_corner: box_hi, sides, .. } => brush_face_walkable(box_lo, box_hi, sides, point, up),
+            Shape::Partition { vertex_points, indices } => triangles_face_walkable(
                 indices
                     .chunks_exact(3)
-                    .map(|t| [verts[usize::from(t[0])], verts[usize::from(t[1])], verts[usize::from(t[2])]]),
+                    .map(|t| [vertex_points[usize::from(t[0])], vertex_points[usize::from(t[1])], vertex_points[usize::from(t[2])]]),
                 point,
                 up,
             ),
@@ -343,27 +349,25 @@ pub(crate) fn hit_walkable(hit: &Hit) -> bool {
 }
 
 /// BO2's fill_results.
-fn fill_results(hit: &Hit, walkable: bool) -> Trace {
-    let g = &hit.geom;
+fn fill_results(strike: &Hit, walkable: bool) -> Trace {
+    let g = &strike.shape_data;
     let reports = matches!(g.shape, Shape::Brush { .. } | Shape::Box { brush: true, .. } | Shape::Partition { .. });
-    let (cflags, sflags) = if reports { (g.contents, g.surface_flags) } else { (0, 0) };
-    Trace {
-        fraction: hit.hit_time,
-        normal: hit.normal,
-        sflags,
-        cflags,
-        hit_type: TraceHitType::Entity,
-        hit_id: g.hit_id,
-        allsolid: false,
-        startsolid: hit.hit_dist < 0.0,
-        walkable,
-        ..Trace::default()
-    }
+    let (cflags, sflags) = if reports { (g.contents, g.surf_bits) } else { (0, 0) };
+    let mut out = Trace::new();
+    (out.fraction, out.normal) = (strike.hit_time, strike.facing);
+    (out.sflags, out.cflags) = (sflags, cflags);
+    out.impact_category = TraceHitType::Entity;
+    out.struck_entity_num = g.struck_entity_num;
+    out.starts_inside = strike.hit_dist < 0.0;
+    out.walkable = walkable;
+    out
 }
 
 /// BO2's fill_results_no_hit.
 fn no_hit() -> Trace {
-    Trace { fraction: 1.0, ..Trace::default() }
+    let mut empty = Trace::default();
+    empty.fraction = 1.0_f32;
+    empty
 }
 
 /// BO2's get_material_from_brush: the surface flags a brush hit reports.
@@ -377,15 +381,15 @@ pub fn brush_surface_flags(axial: [[u32; 3]; 2], sides: impl IntoIterator<Item =
     if top != caulk {
         return top;
     }
-    let mut best = None;
+    let mut pick = None;
     let mut best_z = -10.0f32;
-    for (nz, flags) in sides {
-        if flags != caulk && best_z < nz {
-            best = Some(flags);
-            best_z = nz;
+    for (facing_z, flags) in sides {
+        if flags != caulk && best_z < facing_z {
+            pick = Some(flags);
+            best_z = facing_z;
         }
     }
-    if let Some(flags) = best {
+    if let Some(flags) = pick {
         return flags;
     }
     axial.iter().flatten().copied().find(|&f| f != caulk).unwrap_or(caulk)
@@ -398,7 +402,7 @@ mod tests {
     use trace_t6::ENTITYNUM_WORLD;
 
     fn ground(world: &World, z: f32) -> Trace {
-        ground_trace(world, [0.0, 0.0, z + 0.25], [0.0, 0.0, z - 0.25], MINS, MAXS, MASK)
+        floor_probe(world, [0.0, 0.0, z + 0.25], [0.0, 0.0, z - 0.25], MINS, MAXS, MASK)
     }
 
     /// The body rests with its skin on the floor, the origin 0.125 up
@@ -410,8 +414,8 @@ mod tests {
         let t = ground(&world, 0.125);
         assert!((t.fraction - 0.5).abs() < 0.01, "{t:?}");
         assert_eq!(t.normal, [0.0, 0.0, 1.0]);
-        assert_eq!((t.walkable, t.startsolid, t.allsolid), (true, false, false));
-        assert_eq!((t.hit_type, t.hit_id), (TraceHitType::Entity, ENTITYNUM_WORLD));
+        assert_eq!((t.walkable, t.starts_inside, t.fully_embedded), (true, false, false));
+        assert_eq!((t.impact_category, t.struck_entity_num), (TraceHitType::Entity, ENTITYNUM_WORLD));
         assert_eq!((t.cflags, t.sflags), (MASK, 7));
     }
 
@@ -420,7 +424,7 @@ mod tests {
         let world = World::new(alloc::vec![floor()]);
         let t = ground(&world, 10.0);
         assert_eq!(t.fraction, 1.0);
-        assert_eq!((t.hit_type, t.walkable, t.startsolid), (TraceHitType::None, false, false));
+        assert_eq!((t.impact_category, t.walkable, t.starts_inside), (TraceHitType::None, false, false));
     }
 
     /// Sunk 3 into the floor: in a solid, never all solid.
@@ -429,7 +433,7 @@ mod tests {
         let world = World::new(alloc::vec![floor()]);
         let p = [0.0, 0.0, -3.0];
         let t = player_trace(&world, p, p, MINS, MAXS, MASK);
-        assert_eq!((t.startsolid, t.allsolid), (true, false), "{t:?}");
+        assert_eq!((t.starts_inside, t.fully_embedded), (true, false), "{t:?}");
         assert_eq!(t.fraction, 0.0);
     }
 
@@ -442,7 +446,7 @@ mod tests {
         let reach = 14.625 / 0.965_925_8 + 0.5;
         assert!((t.fraction * 100.0 - (40.0 - reach)).abs() < 0.1, "{t:?}");
         assert!((t.normal[0] + 1.0).abs() < 1e-3, "{t:?}");
-        assert_eq!((t.walkable, t.startsolid), (false, false));
+        assert_eq!((t.walkable, t.starts_inside), (false, false));
     }
 
     /// Another player is met as a capsule (14.625 + 0.5) against its body
@@ -453,7 +457,7 @@ mod tests {
         let t = player_trace(&world, [0.0; 3], [100.0, 0.0, 0.0], MINS, MAXS, MASK);
         let reach = 14.625 + 0.5 + 14.625 / 0.965_925_8 + 0.5;
         assert!((t.fraction * 100.0 - (40.0 - reach)).abs() < 0.2, "{t:?}");
-        assert_eq!((t.hit_id, t.cflags, t.sflags), (3, 0, 0));
+        assert_eq!((t.struck_entity_num, t.cflags, t.sflags), (3, 0, 0));
     }
 
     /// The box test: a shape the move never comes near is not tested; one
@@ -476,13 +480,13 @@ mod tests {
     /// Standing on terrain: its own flags, walkable.
     #[test]
     fn standing_on_terrain() {
-        let verts: &'static [[f32; 3]] = &[[-64.0, -64.0, 0.0], [64.0, -64.0, 0.0], [0.0, 64.0, 0.0]];
+        let vertex_points: &'static [[f32; 3]] = &[[-64.0, -64.0, 0.0], [64.0, -64.0, 0.0], [0.0, 64.0, 0.0]];
         let indices: &'static [u16] = &[0, 2, 1];
         let terrain = Geom {
-            shape: Shape::Partition { verts, indices },
-            mins: [-64.0, -64.0, 0.0],
-            maxs: [64.0, 64.0, 0.0],
-            surface_flags: 9,
+            shape: Shape::Partition { vertex_points, indices },
+            lo_corner: [-64.0, -64.0, 0.0],
+            hi_corner: [64.0, 64.0, 0.0],
+            surf_bits: 9,
             key: 2,
             ..floor()
         };
@@ -498,12 +502,12 @@ mod tests {
     #[test]
     fn the_ground_trace_prefers_ground_you_can_stand_on() {
         let reach = 14.625 / 0.965_925_8 + 0.5;
-        let wall = Geom { surface_flags: 3, key: 2, ..block([reach - 0.1, -256.0, -64.0], [reach + 16.0, 256.0, 256.0]) };
+        let wall = Geom { surf_bits: 3, key: 2, ..block([reach - 0.1, -256.0, -64.0], [reach + 16.0, 256.0, 256.0]) };
         let world = World::new(alloc::vec![wall, floor()]);
         let input = setup_trace_info(MINS, MAXS, [0.0, 0.0, 0.375], [0.0, 0.0, -0.125], MASK);
         let hits = gjk_trace(&world, &TraceInput { exit_on_penetration: false, ..input }, &[]);
         let first = &hits.list[hits.first.expect("a hit")];
-        assert_eq!((first.geom.key, first.hit_time), (2, 0.0), "{first:?}");
+        assert_eq!((first.shape_data.key, first.hit_time), (2, 0.0), "{first:?}");
         assert!(!hit_walkable(first));
         let t = ground(&world, 0.125);
         assert!((t.fraction - 0.5).abs() < 0.01, "{t:?}");

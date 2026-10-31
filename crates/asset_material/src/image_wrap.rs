@@ -12,7 +12,7 @@ use crate::image_texels::{Layout, Texels};
 /// What an image is wrapped in, apart from its texels.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Wrap {
-    pub sampler_state: u8,
+    pub texture_sampling_mode: u8,
     pub is_normal: bool,
     /// A colour map of an alpha-tested material: sampled without blending.
     pub sharp: bool,
@@ -27,71 +27,55 @@ impl Wrap {
     }
 }
 
-fn texture_format(layout: Layout, linear: bool) -> TextureFormat {
-    match (layout, linear) {
-        (Layout::Rgba8, true) => TextureFormat::Rgba8Unorm,
-        (Layout::Rgba8, false) => TextureFormat::Rgba8UnormSrgb,
-        (Layout::Bc1, true) => TextureFormat::Bc1RgbaUnorm,
-        (Layout::Bc1, false) => TextureFormat::Bc1RgbaUnormSrgb,
-        (Layout::Bc2, true) => TextureFormat::Bc2RgbaUnorm,
-        (Layout::Bc2, false) => TextureFormat::Bc2RgbaUnormSrgb,
-        (Layout::Bc3, true) => TextureFormat::Bc3RgbaUnorm,
-        (Layout::Bc3, false) => TextureFormat::Bc3RgbaUnormSrgb,
-    }
+fn texture_format(layout: Layout, lin: bool) -> TextureFormat {
+    let (plain, curved) = match layout {
+        Layout::Rgba8 => (TextureFormat::Rgba8Unorm, TextureFormat::Rgba8UnormSrgb),
+        Layout::Bc1 => (TextureFormat::Bc1RgbaUnorm, TextureFormat::Bc1RgbaUnormSrgb),
+        Layout::Bc2 => (TextureFormat::Bc2RgbaUnorm, TextureFormat::Bc2RgbaUnormSrgb),
+        Layout::Bc3 => (TextureFormat::Bc3RgbaUnorm, TextureFormat::Bc3RgbaUnormSrgb),
+    };
+    [curved, plain][usize::from(lin)]
 }
 
 /// The image over `texels`, which it takes ownership of.
 pub(crate) fn build_image(texels: Texels, wrap: Wrap) -> Image {
-    let mut image = Image::new_uninit(
-        Extent3d {
-            width: texels.width,
-            height: texels.height,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        texture_format(texels.layout, wrap.linear()),
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    image.data = Some(texels.bytes);
-    image.sampler = ImageSampler::Descriptor(sampler_from_state(wrap.sampler_state, 1, wrap.sharp));
+    let Texels { width, height, layout, bytes } = texels;
+    let size = Extent3d { width, height, depth_or_array_layers: 1 };
+    let format = texture_format(layout, wrap.linear());
+    let sampling = sampler_from_state(wrap.texture_sampling_mode, 1, wrap.sharp);
+    let mut image = Image::new_uninit(size, TextureDimension::D2, format, RenderAssetUsages::RENDER_WORLD);
+    image.data = Some(bytes);
+    image.sampler = ImageSampler::Descriptor(sampling);
     image
 }
 
 /// The sampler a material's sampler-state byte asks for: bits 5 to 7 clamp
 /// the u, v and w axes, bits 0 to 2 pick the filter and bits 3 and 4 the mip
 /// filter. `sharp` samples with nearest filtering throughout.
-pub fn sampler_from_state(sampler_state: u8, levels: u32, sharp: bool) -> ImageSamplerDescriptor {
-    let address = |bit: u8| {
-        if (sampler_state >> bit) & 1 != 0 {
-            ImageAddressMode::ClampToEdge
-        } else {
-            ImageAddressMode::Repeat
-        }
+pub fn sampler_from_state(texture_sampling_mode: u8, mip_count: u32, sharp: bool) -> ImageSamplerDescriptor {
+    let address = |bit: u8| match texture_sampling_mode & (1 << bit) {
+        0 => ImageAddressMode::Repeat,
+        _ => ImageAddressMode::ClampToEdge,
     };
-    let anisotropy = match sampler_state & 0b111 {
-        _ if levels <= 1 || sharp => 1,
-        3 => 2,
-        4 => 4,
+    let mipped = mip_count > 1 && !sharp;
+    let aniso_level = match (mipped, texture_sampling_mode & 0b111) {
+        (true, 3) => 2,
+        (true, 4) => 4,
         _ => 1,
     };
-    let mip_linear = !sharp && (((sampler_state >> 3) & 0b11) == 2 || anisotropy > 1);
-    let filter = if sharp {
-        ImageFilterMode::Nearest
-    } else {
-        ImageFilterMode::Linear
+    let mip_linear = !sharp && (aniso_level > 1 || (texture_sampling_mode >> 3) & 0b11 == 2);
+    let nearest_unless = |linear: bool| match linear {
+        true => ImageFilterMode::Linear,
+        false => ImageFilterMode::Nearest,
     };
     ImageSamplerDescriptor {
         address_mode_u: address(5),
         address_mode_v: address(6),
         address_mode_w: address(7),
-        mag_filter: filter,
-        min_filter: filter,
-        mipmap_filter: if mip_linear {
-            ImageFilterMode::Linear
-        } else {
-            ImageFilterMode::Nearest
-        },
-        anisotropy_clamp: anisotropy,
+        mag_filter: nearest_unless(!sharp),
+        min_filter: nearest_unless(!sharp),
+        mipmap_filter: nearest_unless(mip_linear),
+        anisotropy_clamp: aniso_level,
         ..Default::default()
     }
 }
@@ -127,7 +111,7 @@ mod tests {
     #[test]
     fn colour_space_follows_the_wrap() {
         let wrap = |is_normal, force_linear, srgb_reads| Wrap {
-            sampler_state: 0,
+            texture_sampling_mode: 0,
             is_normal,
             sharp: false,
             force_linear,

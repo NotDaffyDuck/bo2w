@@ -1,4 +1,4 @@
-tick 201: WorldObjectSnapshot {
+tick 201: PropsSnapshot {
     as_of_ms: 10050,
     map_round_epoch: 3,
     t6_glass: [
@@ -118,7 +118,7 @@ tick 201: WorldObjectSnapshot {
     ],
     destructible_loop_sounds: [
         DestructibleLoopSound {
-            owner: ScriptModelId(
+            owner: ScriptedModel(
                 77,
             ),
             alias_index: 4,
@@ -131,7 +131,7 @@ tick 201: WorldObjectSnapshot {
             pitch: 90,
         },
         DestructibleLoopSound {
-            owner: ScriptModelId(
+            owner: ScriptedModel(
                 78,
             ),
             alias_index: 9,
@@ -145,7 +145,7 @@ tick 201: WorldObjectSnapshot {
         },
     ],
 }
-tick 202: WorldObjectSnapshot {
+tick 202: PropsSnapshot {
     as_of_ms: 10100,
     map_round_epoch: 3,
     t6_glass: [
@@ -265,7 +265,7 @@ tick 202: WorldObjectSnapshot {
     ],
     destructible_loop_sounds: [
         DestructibleLoopSound {
-            owner: ScriptModelId(
+            owner: ScriptedModel(
                 77,
             ),
             alias_index: 4,
@@ -278,7 +278,7 @@ tick 202: WorldObjectSnapshot {
             pitch: 90,
         },
         DestructibleLoopSound {
-            owner: ScriptModelId(
+            owner: ScriptedModel(
                 78,
             ),
             alias_index: 9,
@@ -292,7 +292,7 @@ tick 202: WorldObjectSnapshot {
         },
     ],
 }
-tick 203: WorldObjectSnapshot {
+tick 203: PropsSnapshot {
     as_of_ms: 10150,
     map_round_epoch: 3,
     t6_glass: [
@@ -412,7 +412,7 @@ tick 203: WorldObjectSnapshot {
     ],
     destructible_loop_sounds: [
         DestructibleLoopSound {
-            owner: ScriptModelId(
+            owner: ScriptedModel(
                 77,
             ),
             alias_index: 4,
@@ -425,7 +425,7 @@ tick 203: WorldObjectSnapshot {
             pitch: 90,
         },
         DestructibleLoopSound {
-            owner: ScriptModelId(
+            owner: ScriptedModel(
                 78,
             ),
             alias_index: 9,
@@ -439,7 +439,7 @@ tick 203: WorldObjectSnapshot {
         },
     ],
 }
-tick 204: WorldObjectSnapshot {
+tick 204: PropsSnapshot {
     as_of_ms: 10200,
     map_round_epoch: 3,
     t6_glass: [
@@ -559,7 +559,7 @@ tick 204: WorldObjectSnapshot {
     ],
     destructible_loop_sounds: [
         DestructibleLoopSound {
-            owner: ScriptModelId(
+            owner: ScriptedModel(
                 77,
             ),
             alias_index: 4,
@@ -573,7 +573,7 @@ tick 204: WorldObjectSnapshot {
         },
     ],
 }
-tick 205: WorldObjectSnapshot {
+tick 205: PropsSnapshot {
     as_of_ms: 10250,
     map_round_epoch: 3,
     t6_glass: [
@@ -706,7 +706,7 @@ tick 205: WorldObjectSnapshot {
     ],
     destructible_loop_sounds: [
         DestructibleLoopSound {
-            owner: ScriptModelId(
+            owner: ScriptedModel(
                 77,
             ),
             alias_index: 4,
@@ -720,7 +720,7 @@ tick 205: WorldObjectSnapshot {
         },
     ],
 }
-tick 400: WorldObjectSnapshot {
+tick 400: PropsSnapshot {
     as_of_ms: 10300,
     map_round_epoch: 4,
     t6_glass: [
@@ -853,7 +853,7 @@ tick 400: WorldObjectSnapshot {
     ],
     destructible_loop_sounds: [
         DestructibleLoopSound {
-            owner: ScriptModelId(
+            owner: ScriptedModel(
                 77,
             ),
             alias_index: 4,

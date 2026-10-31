@@ -1,19 +1,27 @@
-SnapshotMetaSectionBytes {
-    match_header: 21,
-    events: 11,
-    aliases: 196,
-    entity_dobjs: 2,
-    corpses: 9,
-    entities: 2,
-    script_movers: 2,
-    entity_kernel: 16,
-    item_tables: 4,
-    area_entities: 1,
-    objectives: 31,
-    world_objects: 11,
+MetaSectionSizes {
+    header_len: 21,
+    event_len: 11,
+    alias_len: 196,
+    dobj_len: 2,
+    corpse_len: 9,
+    entity_len: 2,
+    mover_len: 2,
+    kernel_len: 16,
+    item_len: 4,
+    area_len: 1,
+    objective_len: 31,
+    world_len: 11,
 }
-SnapshotMeta {
-    objectives: ObjectiveMatch {
+TickLedgerNotes {
+    phase: Warmup,
+    kind: FreeForAll,
+    prematch: Waiting {
+        spent_ms: 0,
+    },
+    match_clock_ms: 0,
+    score_limit: 0,
+    time_limit_ms: 0,
+    objectives: MatchBoard {
         scores: [
             0,
             0,
@@ -33,14 +41,6 @@ SnapshotMeta {
         missile_vision: None,
         pain_vision: None,
     },
-    phase: Warmup,
-    match_elapsed_ms: 0,
-    prematch: Waiting {
-        elapsed_ms: 0,
-    },
-    score_limit: 0,
-    time_limit_ms: 0,
-    kind: FreeForAll,
     clients: [],
     journal: [],
     entity_events: [],
@@ -94,36 +94,36 @@ SnapshotMeta {
             "Enemy team wins",
         ),
     ],
-    rng: RngDebugMeta {
+    rng: DiceTrace {
         root_seed: 81985529216486895,
         scheme: 2,
         spawn_draws: 11,
         combat_draws: 222,
         bot_draws: 3333,
     },
-    world_objects: WorldObjectSnapshot {
+    world_objects: PropsSnapshot {
         as_of_ms: 0,
         map_round_epoch: 0,
         t6_glass: [],
         destructible_loop_sounds: [],
     },
     area_entities: None,
-    entity_dobjs: [],
-    entities: [],
-    script_movers: [],
-    entity_kernel: EntityKernelSnapshot {
+    entity_kernel: FrozenSlotTable {
         slots: [],
         high_water: 26,
         free_fifo: [],
         level_time_ms: 0,
         frame_serial: 0,
     },
-    corpses: PlayerCorpsePool {
+    entities: [],
+    entity_dobjs: [],
+    script_movers: [],
+    corpses: CorpseYard {
         slots: [
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -136,9 +136,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -159,10 +159,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -175,9 +175,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -198,10 +198,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -214,9 +214,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -237,10 +237,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -253,9 +253,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -276,10 +276,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -292,9 +292,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -315,10 +315,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -331,9 +331,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -354,10 +354,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -370,9 +370,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -393,10 +393,10 @@ SnapshotMeta {
                 falling: false,
                 ground_entity_num: 2047,
             },
-            PlayerCorpseSlot {
+            CorpseBay {
                 occupied: false,
                 entnum: -1,
-                victim: ClientId(
+                victim: SeatNo(
                     0,
                 ),
                 origin: [
@@ -409,9 +409,9 @@ SnapshotMeta {
                     0.0,
                     0.0,
                 ],
-                anim: AnimPair {
-                    legs_anim: 0,
-                    torso_anim: 0,
+                anim: BodyAnims {
+                    legs: 0,
+                    torso: 0,
                 },
                 view_height_current: 0.0,
                 weapon: 0,
@@ -438,6 +438,7 @@ SnapshotMeta {
     item_ammo: [],
     item_pickups: [],
     oriented_blockers: [],
+    follows: [],
     feel: None,
     enemy_models: [],
 }

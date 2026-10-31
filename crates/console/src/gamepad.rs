@@ -1,17 +1,17 @@
 //! The gamepad: which stick does what, how a pull on the look stick becomes
 //! turning, and which pad the player is using.
 
-use std::collections::{HashMap, HashSet};
+use std::{collections::HashMap, collections::HashSet};
 
-use bevy::{
-    input::gamepad::{
-        ButtonSettings, Gamepad, GamepadAxis, GamepadButton, GamepadConnection, GamepadEvent,
-        GamepadSettings,
-    },
-    prelude::*,
-    window::PrimaryWindow,
-};
-use frame::{ActivePad, GameSettings, InputDevices, PromptStyle};
+use bevy::{input::gamepad::ButtonSettings, input::gamepad::Gamepad, input::gamepad::GamepadAxis};
+use bevy::{input::gamepad::GamepadButton, input::gamepad::GamepadConnection};
+use bevy::input::gamepad::{GamepadEvent, GamepadSettings};
+use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
+use frame::ActivePad;
+use frame::PlayerPrefsBundle;
+use frame::InputDevices;
+use frame::PromptStyle;
 
 /// What the two sticks mean once the layout has been applied.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -73,14 +73,14 @@ fn without_dead_zone(stick: Vec2, dead_zone: f32) -> Vec2 {
 }
 
 /// The two sticks as the player has set the pad up.
-pub(crate) fn route_sticks(left: Vec2, right: Vec2, settings: &GameSettings) -> Sticks {
+pub(crate) fn route_sticks(left: Vec2, right: Vec2, settings: &PlayerPrefsBundle) -> Sticks {
     StickLayout::from_setting(settings.pad_stick_layout).route(
         without_dead_zone(left, settings.pad_deadzone_left),
         without_dead_zone(right, settings.pad_deadzone_right),
     )
 }
 
-pub(crate) fn sticks(pad: &Gamepad, settings: &GameSettings) -> Sticks {
+pub(crate) fn sticks(pad: &Gamepad, settings: &PlayerPrefsBundle) -> Sticks {
     route_sticks(pad.left_stick(), pad.right_stick(), settings)
 }
 
@@ -116,7 +116,7 @@ impl LookCurve {
 
 /// The look stick's pull as turning, 0 to 1 each way, with the curve applied
 /// and the up and down flipped if the player asked for it.
-pub(crate) fn shaped_look(look: Vec2, settings: &GameSettings) -> Vec2 {
+pub(crate) fn shaped_look(look: Vec2, settings: &PlayerPrefsBundle) -> Vec2 {
     let pull = look.length();
     if pull <= f32::EPSILON {
         return Vec2::ZERO;
@@ -183,10 +183,10 @@ impl PadActivity {
         self.buttons.retain(|(pad, _), _| exists(*pad));
     }
 
-    /// Takes `value` as where `axis` rests, so a stick held off-centre from
+    /// Takes `resting` as where `axis` rests, so a stick held off-centre from
     /// the start is not a push.
-    fn rest_at(&mut self, pad: Entity, axis: GamepadAxis, value: f32) {
-        self.axes.insert((pad, axis), value);
+    fn rest_at(&mut self, pad: Entity, axis: GamepadAxis, resting: f32) {
+        self.axes.insert((pad, axis), resting);
     }
 
     /// Whether `button` has just been pulled past the point a person presses at.
@@ -210,7 +210,7 @@ impl PadActivity {
 }
 
 /// The dead zone the settings give `axis`.
-fn dead_zone_of(axis: GamepadAxis, settings: &GameSettings) -> f32 {
+fn dead_zone_of(axis: GamepadAxis, settings: &PlayerPrefsBundle) -> f32 {
     match axis {
         GamepadAxis::LeftStickX | GamepadAxis::LeftStickY => settings.pad_deadzone_left,
         _ => settings.pad_deadzone_right,
@@ -220,6 +220,9 @@ fn dead_zone_of(axis: GamepadAxis, settings: &GameSettings) -> f32 {
 /// The USB vendor ids of the makers whose pads show their own button names.
 const SONY: u16 = 0x054c;
 const MICROSOFT: u16 = 0x045e;
+/// Bigben / Nacon: their PS4 pads show up as an "Xbox 360 Controller" in
+/// their PC mode, but the buttons on them are still the PlayStation shapes.
+const BIGBEN: u16 = 0x146b;
 
 /// The button names to show: the player's choice, or the look of the pad in
 /// use, or plain ones when it cannot be told.
@@ -235,6 +238,7 @@ fn prompt_style(setting: u8, pad: Option<(Option<u16>, &str)>) -> PromptStyle {
     };
     let name = name.to_ascii_lowercase();
     if vendor == Some(SONY)
+        || vendor == Some(BIGBEN)
         || name.contains("dualshock")
         || name.contains("dualsense")
         || name == "wireless controller"
@@ -247,13 +251,21 @@ fn prompt_style(setting: u8, pad: Option<(Option<u16>, &str)>) -> PromptStyle {
     }
 }
 
-/// Whether the game takes input: while its window has focus, or when
+/// Whether the game takes input: while its window has focus, in a scripted
+/// run (the only keys it takes are the ones its script holds), or when
 /// `BO2MP_INPUT_UNFOCUSED` is set, which keeps the keys a test run holds
-/// working with the window behind others.
+/// working with the window behind others. A hidden window never has focus.
 fn takes_input(window_focused: Option<bool>) -> bool {
     static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    window_focused.unwrap_or(true)
-        || *FORCED.get_or_init(|| std::env::var_os("BO2MP_INPUT_UNFOCUSED").is_some())
+    takes_input_with(
+        window_focused,
+        crate::startup::scripted_run()
+            || *FORCED.get_or_init(|| std::env::var_os("BO2MP_INPUT_UNFOCUSED").is_some()),
+    )
+}
+
+fn takes_input_with(window_focused: Option<bool>, forced: bool) -> bool {
+    window_focused.unwrap_or(true) || forced
 }
 
 /// Follows which pad the player uses: the one they last pressed or pushed, and
@@ -263,23 +275,32 @@ pub(crate) fn track_active_pad(
     mut events: MessageReader<GamepadEvent>,
     mut active: ResMut<ActivePad>,
     mut devices: ResMut<InputDevices>,
-    settings: Res<GameSettings>,
-    windows: Query<&Window, With<PrimaryWindow>>,
+    settings: Res<PlayerPrefsBundle>,
+    screens: Query<&Window, With<PrimaryWindow>>,
     mut seen: Local<PadActivity>,
 ) {
-    devices.focused = takes_input(windows.single().ok().map(|window| window.focused));
+    devices.focused = takes_input(screens.single().ok().map(|window| window.focused));
     if active.0.is_some_and(|pad| pads.get(pad).is_err()) {
         active.0 = None;
     }
     seen.keep_only(|pad| pads.contains(pad));
     let mut just_connected = HashSet::new();
-    for event in events.read() {
-        let acting = match event {
+    for news in events.read() {
+        let acting = match news {
             GamepadEvent::Connection(change) => {
                 match &change.connection {
                     GamepadConnection::Connected { .. } => {
                         just_connected.insert(change.gamepad);
-                        if let Ok((_, pad, _)) = pads.get(change.gamepad) {
+                        if let Ok(found) = pads.get(change.gamepad) {
+                            let (_, pad, name) = found;
+                            // Which pad (its maker and model pick the button pictures).
+                            diag::info! {
+                                Ui,
+                                "gamepad connected: {:?} vendor {:04x?} product {:04x?}",
+                                name.map(|n| n.as_str()),
+                                pad.vendor_id(),
+                                pad.product_id()
+                            }
                             for axis in STICK_AXES {
                                 seen.rest_at(change.gamepad, axis, pad.get(axis).unwrap_or(0.0));
                             }
@@ -332,13 +353,14 @@ mod tests {
         gamepad::{GamepadAxisChangedEvent, GamepadButtonChangedEvent, GamepadConnectionEvent},
     };
 
-    use super::*;
+    use crate::gamepad::*;
+    use bevy::app::Update;
 
-    fn settings() -> GameSettings {
-        GameSettings {
+    fn settings() -> PlayerPrefsBundle {
+        PlayerPrefsBundle {
             pad_deadzone_left: 0.0,
             pad_deadzone_right: 0.0,
-            ..GameSettings::default()
+            ..PlayerPrefsBundle::default()
         }
     }
 
@@ -351,7 +373,7 @@ mod tests {
 
     #[test]
     fn southpaw_swaps_the_sticks() {
-        let settings = GameSettings {
+        let settings = PlayerPrefsBundle {
             pad_stick_layout: 1,
             ..settings()
         };
@@ -366,16 +388,10 @@ mod tests {
         let mut settings = settings();
         settings.pad_stick_layout = 2;
         let legacy = route_sticks(left, right, &settings);
-        assert_eq!(
-            legacy.movement,
-            Vec2::new(0.2, 0.3),
-            "left forward, right strafe"
-        );
-        assert_eq!(
-            legacy.look,
-            Vec2::new(0.1, 0.4),
-            "left turn, right up and down"
-        );
+        let expected = Vec2::new(0.2, 0.3);
+        assert_eq!(legacy.movement, expected, "left forward, right strafe");
+        let expected = Vec2::new(0.1, 0.4);
+        assert_eq!(legacy.look, expected, "left turn, right up and down");
         settings.pad_stick_layout = 3;
         let southpaw = route_sticks(left, right, &settings);
         assert_eq!(southpaw.movement, Vec2::new(0.4, 0.1));
@@ -444,7 +460,7 @@ mod tests {
 
     #[test]
     fn looking_keeps_the_direction_of_the_pull_and_shapes_its_size() {
-        let settings = GameSettings {
+        let settings = PlayerPrefsBundle {
             pad_curve: 1,
             ..settings()
         };
@@ -477,7 +493,7 @@ mod tests {
 
     #[test]
     fn a_pad_that_connects_gets_the_trigger_points_and_only_the_triggers() {
-        let mut app = App::new();
+        let mut app = App::default();
         app.add_systems(Update, bo2_trigger_thresholds);
         let pad = app
             .world_mut()
@@ -602,8 +618,15 @@ mod tests {
         assert!(takes_input(None) && takes_input(Some(true)));
     }
 
+    #[test]
+    fn a_hidden_window_takes_input_only_in_a_scripted_run() {
+        assert!(!takes_input_with(Some(false), false));
+        assert!(takes_input_with(Some(false), true));
+        assert!(takes_input_with(Some(true), false));
+    }
+
     fn tracking_app() -> (App, Entity, Entity) {
-        let mut app = App::new();
+        let mut app = App::default();
         app.add_message::<GamepadEvent>()
             .init_resource::<ActivePad>()
             .init_resource::<InputDevices>()
@@ -677,11 +700,9 @@ mod tests {
     #[test]
     fn the_prompt_style_follows_the_setting_for_the_active_pad() {
         let (mut app, first, _) = tracking_app();
-        app.world_mut().resource_mut::<GameSettings>().pad_prompts = 1;
+        app.world_mut().resource_mut::<PlayerPrefsBundle>().pad_prompts = 1;
         press(&mut app, first);
-        assert_eq!(
-            app.world().resource::<InputDevices>().style,
-            PromptStyle::Xbox
-        );
+        let expected = PromptStyle::Xbox;
+        assert_eq!(app.world().resource::<InputDevices>().style, expected);
     }
 }

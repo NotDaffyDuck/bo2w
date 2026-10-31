@@ -1,7 +1,7 @@
 //! BO2's player enums, with BO2's own numbers.
 
 /// BO2's `pmtype_t`: how the player moves this frame.
-pub mod pm_type {
+pub mod movement_mode {
     pub const NORMAL: i32 = 0;
     pub const NORMAL_LINKED: i32 = 1;
     pub const NOCLIP: i32 = 2;
@@ -18,8 +18,8 @@ pub mod pm_type {
 
     /// Dead, linked or not.
     #[must_use]
-    pub const fn is_dead(pm_type: i32) -> bool {
-        pm_type >= DEAD
+    pub const fn is_dead(movement_mode: i32) -> bool {
+        movement_mode >= DEAD
     }
 }
 
@@ -103,7 +103,7 @@ pub mod weapon_state {
 }
 
 /// BO2's `OffhandClass`.
-pub mod offhand_class {
+pub mod secondary_hand_category {
     pub const NONE: i32 = 0;
     pub const FRAG_GRENADE: i32 = 1;
     pub const SMOKE_GRENADE: i32 = 2;
@@ -151,7 +151,7 @@ pub mod action_slot {
 
 /// BO2's `objectiveState_t`.
 pub mod objective_state {
-    pub const EMPTY: i32 = 0;
+    pub const BLANK: i32 = 0;
     pub const ACTIVE: i32 = 1;
     pub const INVISIBLE: i32 = 2;
 }
@@ -203,8 +203,8 @@ mod tests {
 
     #[test]
     fn dead_is_ten_and_up() {
-        assert!(!pm_type::is_dead(pm_type::REVIVEE));
-        assert!(pm_type::is_dead(pm_type::DEAD));
-        assert!(pm_type::is_dead(pm_type::DEAD_LINKED));
+        assert!(!movement_mode::is_dead(movement_mode::REVIVEE));
+        assert!(movement_mode::is_dead(movement_mode::DEAD));
+        assert!(movement_mode::is_dead(movement_mode::DEAD_LINKED));
     }
 }

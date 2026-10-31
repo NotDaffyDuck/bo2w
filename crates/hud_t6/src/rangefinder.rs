@@ -26,9 +26,14 @@ pub const TRACE_RANGE: f32 = 8192.0;
 /// Range shown = int(dist * 0.083333) (dist / 12, in feet).
 pub const UNITS_TO_FEET: f32 = 0.083_333;
 
+/// A colour at full alpha.
+const fn opaque(r: f32, g: f32, b: f32) -> [f32; 4] {
+    [r, g, b, 1.0]
+}
+
 /// Dvar defaults.
-pub const DEFAULT_COLOR: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
-pub const ACTIVE_COLOR: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+pub const DEFAULT_COLOR: [f32; 4] = opaque(0.0, 1.0, 0.0);
+pub const ACTIVE_COLOR: [f32; 4] = opaque(1.0, 0.0, 0.0);
 pub const COLOR_CHANGE_DELAY_MS: i32 = 0;
 pub const MIN_ENEMY_SPOTTING_DIST: f32 = -1.0;
 pub const DIAMOND_INDICATOR: bool = true;
@@ -57,11 +62,11 @@ pub struct Element {
     pub src_y: f32,
     pub src_w: f32,
     pub src_h: f32,
-    pub rot: f32,
+    pub turn_matrix: f32,
 }
 
-const fn el(x: f32, y: f32, w: f32, h: f32, sx: f32, sy: f32, sw: f32, sh: f32, rot: f32) -> Element {
-    Element { x, y, w, h, src_x: sx, src_y: sy, src_w: sw, src_h: sh, rot }
+const fn el(x: f32, y: f32, w: f32, h: f32, sx: f32, sy: f32, sw: f32, sh: f32, turn_matrix: f32) -> Element {
+    Element { x, y, w, h, src_x: sx, src_y: sy, src_w: sw, src_h: sh, turn_matrix }
 }
 
 /// normalColorElms: centre, label, 4 corners.
@@ -98,17 +103,17 @@ pub fn elements(targeting: bool) -> &'static [Element] {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QuadVertex {
     pub xy: [f32; 2],
-    pub uv: [f32; 2],
+    pub tex_at: [f32; 2],
 }
 
 /// The 4 corners of an element in draw order (x,y) (x+w,y) (x+w,y+h) (x,y+h). A rotation turns
 /// the sampled atlas rect about its own centre; the screen rect stays axis-aligned.
 #[must_use]
 pub fn element_quad(e: &Element) -> [QuadVertex; 4] {
-    let (u0, v0, du1, dv1, du3, dv3) = if e.rot == 0.0 {
+    let (u0, v0, du1, dv1, du3, dv3) = if e.turn_matrix == 0.0 {
         (e.src_x, e.src_y, e.src_w, 0.0, 0.0, e.src_h)
     } else {
-        let (s, c) = libm::sincosf(e.rot * 0.017_453_292);
+        let (s, c) = libm::sincosf(e.turn_matrix * 0.017_453_292);
         let hw = e.src_w * 0.5;
         let hh = e.src_h * 0.5;
         (
@@ -124,10 +129,10 @@ pub fn element_quad(e: &Element) -> [QuadVertex; 4] {
     let (u1, v1) = (u0 + du1 * (1.0 / ATLAS_W), v0 + dv1 * (1.0 / ATLAS_H));
     let (du3, dv3) = (du3 * (1.0 / ATLAS_W), dv3 * (1.0 / ATLAS_H));
     [
-        QuadVertex { xy: [e.x, e.y], uv: [u0, v0] },
-        QuadVertex { xy: [e.x + e.w, e.y], uv: [u1, v1] },
-        QuadVertex { xy: [e.x + e.w, e.y + e.h], uv: [u1 + du3, v1 + dv3] },
-        QuadVertex { xy: [e.x, e.y + e.h], uv: [u0 + du3, v0 + dv3] },
+        QuadVertex { xy: [e.x, e.y], tex_at: [u0, v0] },
+        QuadVertex { xy: [e.x + e.w, e.y], tex_at: [u1, v1] },
+        QuadVertex { xy: [e.x + e.w, e.y + e.h], tex_at: [u1 + du3, v1 + dv3] },
+        QuadVertex { xy: [e.x, e.y + e.h], tex_at: [u0 + du3, v0 + dv3] },
     ]
 }
 
@@ -173,14 +178,15 @@ pub struct SpotLatch {
 
 impl SpotLatch {
     /// Feed one frame; returns whether the targeting list + loop sound are on.
-    pub fn update(&mut self, spotted: bool, now_ms: i32, delay_ms: i32) -> bool {
-        if !spotted {
+    pub fn feed(&mut self, seen: bool, now: i32, hold_ms: i32) -> bool {
+        if !seen {
             self.start_ms = None;
             return false;
         }
-        let start = *self.start_ms.get_or_insert(now_ms);
-        now_ms - start > delay_ms
+        let start = *self.start_ms.get_or_insert(now);
+        now - start > hold_ms
     }
+
 }
 
 /// Stance height added to the target's origin for its diamond.
@@ -215,15 +221,15 @@ pub fn stance_from_eflags(eflags: u32) -> Stance {
 /// tag_hud bone's world frame: origin and axis rows (forward, left, up).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TagHud {
-    pub origin: [f32; 3],
-    pub axis: [[f32; 3]; 3],
+    pub spot: [f32; 3],
+    pub frame: [[f32; 3]; 3],
 }
 
 impl TagHud {
     fn local(&self, p: [f32; 3]) -> [f32; 3] {
-        let d = [p[0] - self.origin[0], p[1] - self.origin[1], p[2] - self.origin[2]];
+        let d = [p[0] - self.spot[0], p[1] - self.spot[1], p[2] - self.spot[2]];
         let dot = |a: [f32; 3]| a[0] * d[0] + a[1] * d[1] + a[2] * d[2];
-        [dot(self.axis[0]), dot(self.axis[1]), dot(self.axis[2])]
+        [dot(self.frame[0]), dot(self.frame[1]), dot(self.frame[2])]
     }
 }
 
@@ -231,9 +237,9 @@ impl TagHud {
 /// the bone's x = 0 plane; y and z map to texture px (centre 256). None when the ray misses the
 /// plane between the eye and the point.
 #[must_use]
-pub fn project(tag: &TagHud, eye: [f32; 3], point: [f32; 3]) -> Option<[f32; 2]> {
+pub fn project(tag: &TagHud, eye: [f32; 3], spot: [f32; 3]) -> Option<(f32, f32)> {
     let e = tag.local(eye);
-    let d = tag.local(point);
+    let d = tag.local(spot);
     let den = e[0] - d[0];
     if libm::fabsf(den) <= 0.0001 {
         return None;
@@ -244,14 +250,14 @@ pub fn project(tag: &TagHud, eye: [f32; 3], point: [f32; 3]) -> Option<[f32; 2]>
     }
     let y = (d[1] - e[1]) * t + e[1];
     let z = (d[2] - e[2]) * t + e[2];
-    Some([(1.0 - 2.0 * y) * 0.5 * TEXTURE_SIZE, (1.0 - 2.0 * z) * 0.5 * TEXTURE_SIZE])
+    Some(((1.0 - 2.0 * y) * 0.5 * TEXTURE_SIZE, (1.0 - 2.0 * z) * 0.5 * TEXTURE_SIZE))
 }
 
 /// The diamond's texture rect (x, y, w, h), centred on the projected point.
 #[must_use]
 pub fn diamond_rect(tag: &TagHud, eye: [f32; 3], target_origin: [f32; 3], stance: Stance, size: f32) -> Option<[f32; 4]> {
     let p = [target_origin[0], target_origin[1], target_origin[2] + stance_height(stance)];
-    let [cx, cy] = project(tag, eye, p)?;
+    let (cx, cy) = project(tag, eye, p)?;
     let half = size * 0.5;
     Some([cx - half, cy - half, size, size])
 }
@@ -268,10 +274,10 @@ fn rect_quad(r: [f32; 4], uv: [f32; 4]) -> FrameQuad {
     let [x, y, w, h] = r;
     FrameQuad {
         corners: [
-            QuadVertex { xy: [x, y], uv: [uv[0], uv[1]] },
-            QuadVertex { xy: [x + w, y], uv: [uv[2], uv[1]] },
-            QuadVertex { xy: [x + w, y + h], uv: [uv[2], uv[3]] },
-            QuadVertex { xy: [x, y + h], uv: [uv[0], uv[3]] },
+            QuadVertex { xy: [x, y], tex_at: [uv[0], uv[1]] },
+            QuadVertex { xy: [x + w, y], tex_at: [uv[2], uv[1]] },
+            QuadVertex { xy: [x + w, y + h], tex_at: [uv[2], uv[3]] },
+            QuadVertex { xy: [x, y + h], tex_at: [uv[0], uv[3]] },
         ],
         textured: true,
     }
@@ -313,23 +319,23 @@ mod tests {
         let q = element_quad(&NORMAL_ELEMENTS[1]);
         assert_eq!(q[0].xy, [8.0, 85.0]);
         assert_eq!(q[2].xy, [78.0, 110.0]);
-        assert!(close(q[0].uv[0], 0.0) && close(q[0].uv[1], 53.0 / 128.0));
-        assert!(close(q[2].uv[0], 70.0 / 256.0) && close(q[2].uv[1], 78.0 / 128.0));
+        assert!(close(q[0].tex_at[0], 0.0) && close(q[0].tex_at[1], 53.0 / 128.0));
+        assert!(close(q[2].tex_at[0], 70.0 / 256.0) && close(q[2].tex_at[1], 78.0 / 128.0));
     }
 
     #[test]
     fn rotated_180_flips_the_source() {
         let q = element_quad(&NORMAL_ELEMENTS[5]);
         // Corner 0 samples the far corner of the 106,0 35x35 rect.
-        assert!(close(q[0].uv[0], 141.0 / 256.0) && close(q[0].uv[1], 35.0 / 128.0));
-        assert!(close(q[2].uv[0], 106.0 / 256.0) && close(q[2].uv[1], 0.0));
+        assert!(close(q[0].tex_at[0], 141.0 / 256.0) && close(q[0].tex_at[1], 35.0 / 128.0));
+        assert!(close(q[2].tex_at[0], 106.0 / 256.0) && close(q[2].tex_at[1], 0.0));
     }
 
     #[test]
     fn rotated_90_turns_the_source() {
         let q = element_quad(&NORMAL_ELEMENTS[4]);
-        assert!(close(q[0].uv[0], 141.0 / 256.0) && close(q[0].uv[1], 0.0));
-        assert!(close(q[1].uv[0], 141.0 / 256.0) && close(q[1].uv[1], 35.0 / 128.0));
+        assert!(close(q[0].tex_at[0], 141.0 / 256.0) && close(q[0].tex_at[1], 0.0));
+        assert!(close(q[1].tex_at[0], 141.0 / 256.0) && close(q[1].tex_at[1], 35.0 / 128.0));
     }
 
     #[test]
@@ -352,12 +358,12 @@ mod tests {
         assert!(!spotted(Some(enemy), true, 500.0, -1.0));
         assert!(!spotted(None, false, 500.0, -1.0));
         let mut l = SpotLatch::default();
-        assert!(!l.update(true, 1000, 0));
-        assert!(l.update(true, 1001, 0));
-        assert!(!l.update(false, 1002, 0));
-        assert!(!l.update(true, 1003, 100));
-        assert!(!l.update(true, 1103, 100));
-        assert!(l.update(true, 1104, 100));
+        assert!(!l.feed(true, 1000, 0));
+        assert!(l.feed(true, 1001, 0));
+        assert!(!l.feed(false, 1002, 0));
+        assert!(!l.feed(true, 1003, 100));
+        assert!(!l.feed(true, 1103, 100));
+        assert!(l.feed(true, 1104, 100));
     }
 
     #[test]
@@ -370,9 +376,10 @@ mod tests {
     #[test]
     fn straight_ahead_lands_mid_texture() {
         // tag_hud 2 units ahead of the eye, axes = world; target far down +x.
-        let tag = TagHud { origin: [2.0, 0.0, 0.0], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] };
+        let level = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let tag = TagHud { spot: [2.0, 0.0, 0.0], frame: level };
         let p = project(&tag, [0.0, 0.0, 0.0], [500.0, 0.0, 0.0]).unwrap();
-        assert!(close(p[0], 256.0) && close(p[1], 256.0));
+        assert!(close(p.0, 256.0) && close(p.1, 256.0));
         let r = diamond_rect(&tag, [0.0, 0.0, -45.0], [500.0, 0.0, -45.0], Stance::Stand, DIAMOND_SIZE).unwrap();
         assert!(r[2] == 50.0 && r[0] < 256.0 && r[0] + 50.0 > 256.0);
         // A point behind the eye never crosses the plane.
@@ -386,7 +393,7 @@ mod tests {
         assert!(!f[0].textured && f[0].corners[2].xy == [512.0, 85.0]);
         let d = f[11].corners;
         assert_eq!(d[0].xy, [10.0, 20.0]);
-        assert_eq!(d[2].uv, [DIAMOND_UV[2], DIAMOND_UV[3]]);
+        assert_eq!(d[2].tex_at, [DIAMOND_UV[2], DIAMOND_UV[3]]);
         assert_eq!(frame_quads(false, &[]).len(), 7);
     }
 }

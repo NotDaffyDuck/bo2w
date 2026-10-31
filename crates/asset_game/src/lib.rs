@@ -1,11 +1,11 @@
 //! Game rules read from the zones: weapons, impact tables, strings, teams and
 //! tracers.
 
-use asset_anim::XAnimCatalog;
-use asset_audio::SoundCatalog;
+use anim_bank::MotionClipRoster;
+use asset_audio::AudioRoster;
 use asset_core::*;
-use asset_material::{MaterialCatalog, MaterialDefinitions};
-use asset_model::{FpvMeshCatalog, ModelSkel, WorldWeaponCatalog, WorldWeaponEntry};
+use asset_material::{SurfaceShaderRoster, MaterialDefinitions};
+use asset_model::{FirstPersonMeshRoster, MeshRig, LevelWeaponRoster, LevelWeaponRecord};
 
 mod cac;
 mod families;
@@ -27,9 +27,9 @@ mod tracer_set;
 mod ui_root;
 mod weapon;
 mod weapon_anim;
-mod weapon_anim_dispatch;
+mod anim_slot_route;
 
-pub use asset_transport::read_iwd_named;
+pub use asset_transport::read_sound_pack_member;
 pub use cac::*;
 pub use families::*;
 pub use font_def::*;
@@ -49,4 +49,4 @@ pub use tracer_set::*;
 pub use ui_root::*;
 pub use weapon::*;
 pub use weapon_anim::*;
-pub use weapon_anim_dispatch::*;
+pub use anim_slot_route::*;

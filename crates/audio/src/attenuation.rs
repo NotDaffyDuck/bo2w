@@ -3,7 +3,7 @@
 //! to its far distance.
 
 /// A BO2 falloff curve holds eight `[x, y]` points and no count.
-pub(crate) const SND_CURVE_MAX_KNOTS: usize = 8;
+pub(crate) const CURVE_KNOT_CAP: usize = 8;
 
 /// Gain read off the curve at `pos`; -1 once `pos` runs past the last knot or
 /// when the curve has fewer than two knots. (The way BO2 walks its curve is

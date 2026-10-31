@@ -10,9 +10,10 @@
 //! tenths of the steepest pitch (under 27 degrees), and at BO2's settings the
 //! condition never holds. Ported as BO2 has it all the same.
 
-use game_math::{angle_normalize_360, angle_subtract};
-use crate::bridge::Pml;
-use playerstate_t6::game::PlayerState;
+use game_math::wrap_degrees;
+use game_math::degree_gap;
+use crate::bridge::TickLocals;
+use playerstate_t6::game::AvatarState;
 
 use crate::project::ground_normal;
 
@@ -60,13 +61,13 @@ impl PitchHistory {
 /// PM_CalcPlayerPitch: the ground's pitch along the player's facing, up a
 /// slope positive and down it negative. In the air, on flat ground or
 /// facing across the slope, 0.
-pub(crate) fn calc_player_pitch(ps: &PlayerState, pml: &Pml) -> f32 {
-    if pml.ground_plane == 0 {
+pub(crate) fn calc_player_pitch(avatar: &AvatarState, tick_vars: &TickLocals) -> f32 {
+    if tick_vars.standing_on_floor == 0 {
         return 0.0;
     }
-    let yaw = angle_normalize_360(ps.viewangles[1]);
-    let [ground_pitch, ground_yaw] = vectoangles(ground_normal(&pml.ground_trace));
-    let off = libm::fabsf(angle_subtract(yaw, angle_normalize_360(ground_yaw)));
+    let yaw = wrap_degrees(avatar.look_angles[1]);
+    let [ground_pitch, ground_yaw] = vectoangles(ground_normal(&tick_vars.floor_probe));
+    let off = libm::fabsf(degree_gap(yaw, wrap_degrees(ground_yaw)));
     let pitch = if off < FACING_DOWNHILL {
         -(ground_pitch + 90.0)
     } else if off > FACING_UPHILL {
@@ -75,7 +76,7 @@ pub(crate) fn calc_player_pitch(ps: &PlayerState, pml: &Pml) -> f32 {
         0.0
     };
     // Into -180..180.
-    angle_subtract(pitch, 0.0)
+    degree_gap(pitch, 0.0)
 }
 
 /// BO2's vectoangles: a direction's pitch and yaw, each 0..360. Straight up
@@ -102,29 +103,29 @@ mod tests {
     use super::*;
 
     /// The player facing `yaw`, on ground with this normal (or in the air).
-    fn pitch_on(normal: [f32; 3], yaw: f32, on_ground: bool) -> f32 {
-        let mut ps = PlayerState::ZERO;
-        ps.viewangles[1] = yaw;
-        let mut ground_trace = [0; 11];
+    fn pitch_on(normal: [f32; 3], yaw: f32, grounded_now: bool) -> f32 {
+        let mut avatar = AvatarState::ZERO;
+        avatar.look_angles[1] = yaw;
+        let mut floor_probe = [0; 11];
         for (i, n) in normal.iter().enumerate() {
-            ground_trace[1 + i] = n.to_bits();
+            floor_probe[1 + i] = n.to_bits();
         }
-        let on = u32::from(on_ground);
-        let pml = Pml {
-            forward: [0.0; 3],
-            right: [0.0; 3],
-            up: [0.0; 3],
-            frametime: 0.05,
-            msec: 50,
+        let on = u32::from(grounded_now);
+        let tick_vars = TickLocals {
+            fwd_axis: Default::default(),
+            right_axis: Default::default(),
+            up_axis: [0.0; 3],
+            step_millis_elapsed: 0.05,
+            frame_ms: 50,
             walking: on,
-            ground_plane: on,
-            almost_ground_plane: on,
-            ground_trace,
-            previous_origin: [0.0; 3],
-            previous_velocity: [0.0; 3],
-            holdrand: 0,
+            standing_on_floor: on,
+            near_floor_contact: on,
+            floor_probe,
+            prior_tick_position: [0.0; 3],
+            prior_tick_speed_vec: [0.0; 3],
+            frame_seed: 0_i32,
         };
-        calc_player_pitch(&ps, &pml)
+        calc_player_pitch(&avatar, &tick_vars)
     }
 
     fn pitch(normal: [f32; 3], yaw: f32) -> f32 {

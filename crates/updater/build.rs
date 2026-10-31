@@ -10,7 +10,7 @@ const CA_ENV: &str = "BO2MP_UPDATER_CA_CERT";
 /// Written when no certificate was given. It is not PEM, so the updater finds
 /// no certificate in it and says how to rebuild.
 const NO_CA_MARKER: &str =
-    "BO2MP updater built without BO2MP_UPDATER_CA_CERT; use `make launcher windows`\n";
+    "BO2MP updater was built without BO2MP_UPDATER_CA_CERT; rebuild it with `make launcher windows`\n";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");

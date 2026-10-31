@@ -1,53 +1,53 @@
 //! Sun shadow atlas geometry, clip-plane storage and the sun sprite ramp.
 
 use render_frame::{
-    SUN_SHADOW_CASTER_TECH, SUN_SHADOW_FORCED_PROFILE, SUN_SHADOW_MAX_CLIP_PLANES,
-    SUN_SHADOW_PARTITION_COUNT, SunShadowAtlasProfile, SunShadowCasterLists, SunShadowClipPlanes,
-    SunShadowViewport, angular_lerp,
+    SUN_CASTER_TECH, DAYLIGHT_SHADOW_FORCED_PROFILE, SUN_SHADOW_MAX_CLIP_PLANES,
+    SUNLIGHT_CASCADE_TOTAL, DaylightShadowAtlasProfile, DaylightShadowCasterLists, SunShadowClipPlanes,
+    SunlightShadowRegion, angular_lerp,
 };
 
 #[test]
 fn the_large_atlas_is_two_wide_and_the_small_one_four() {
-    let large = SunShadowAtlasProfile::Large;
-    assert_eq!(large.render_target_id(), 10);
-    assert_eq!(large.partition_size(), 0x400);
-    assert_eq!(large.atlas_columns(), 2);
-    assert_eq!(large.atlas_width(), 0x800);
-    let small = SunShadowAtlasProfile::Small;
-    assert_eq!(small.render_target_id(), 11);
-    assert_eq!(small.partition_size(), 0x200);
-    assert_eq!(small.atlas_columns(), 4);
-    assert_eq!(small.atlas_width(), 0x800);
+    let large = DaylightShadowAtlasProfile::Large;
+    assert_eq!(large.target_surface_code(), 10);
+    assert_eq!(large.split_size(), 0x400);
+    assert_eq!(large.atlas_tiles_across(), 2);
+    assert_eq!(large.atlas_px_width(), 0x800);
+    let small = DaylightShadowAtlasProfile::Small;
+    assert_eq!(small.target_surface_code(), 11);
+    assert_eq!(small.split_size(), 0x200);
+    assert_eq!(small.atlas_tiles_across(), 4);
+    assert_eq!(small.atlas_px_width(), 0x800);
 }
 
 #[test]
 fn partitions_stack_down_the_first_column() {
-    let large = SunShadowAtlasProfile::Large;
+    let large = DaylightShadowAtlasProfile::Large;
     assert_eq!(
-        large.partition_viewport(0),
-        Some(SunShadowViewport { x: 0, y: 0, width: 0x400, height: 0x400 })
+        large.slice_rect(0),
+        Some(SunlightShadowRegion { x: 0, y: 0, width: 0x400, height: 0x400 })
     );
     assert_eq!(
-        large.partition_viewport(1),
-        Some(SunShadowViewport { x: 0, y: 0x400, width: 0x400, height: 0x400 })
+        large.slice_rect(1),
+        Some(SunlightShadowRegion { x: 0, y: 0x400, width: 0x400, height: 0x400 })
     );
-    assert_eq!(large.partition_viewport(SUN_SHADOW_PARTITION_COUNT), None);
+    assert_eq!(large.slice_rect(SUNLIGHT_CASCADE_TOTAL), None);
     assert_eq!(
-        SunShadowAtlasProfile::Small.partition_viewport(1).map(|v| (v.y, v.width)),
+        DaylightShadowAtlasProfile::Small.slice_rect(1).map(|v| (v.y, v.width)),
         Some((0x200, 0x200))
     );
 }
 
 #[test]
 fn the_forced_profile_is_the_large_one() {
-    assert_eq!(SUN_SHADOW_FORCED_PROFILE, SunShadowAtlasProfile::Large);
-    assert_eq!(SUN_SHADOW_PARTITION_COUNT, 2);
-    assert_eq!(SUN_SHADOW_CASTER_TECH, lighting_t6::TECHNIQUE_SUN_SHADOW_CASTER);
+    assert_eq!(DAYLIGHT_SHADOW_FORCED_PROFILE, DaylightShadowAtlasProfile::Large);
+    assert_eq!(SUNLIGHT_CASCADE_TOTAL, 2);
+    assert_eq!(SUN_CASTER_TECH, lighting_t6::TECHNIQUE_SUN_SHADOW_CASTER);
 }
 
 #[test]
 fn clip_planes_fill_up_and_then_refuse() {
-    let mut planes = SunShadowClipPlanes::EMPTY;
+    let mut planes = SunShadowClipPlanes::BLANK;
     assert!(planes.is_empty());
     assert_eq!(planes.len(), 0);
     for i in 0..SUN_SHADOW_MAX_CLIP_PLANES {
@@ -63,9 +63,9 @@ fn clip_planes_fill_up_and_then_refuse() {
 
 #[test]
 fn caster_lists_start_empty_for_both_partitions() {
-    let lists = SunShadowCasterLists::default();
+    let lists = DaylightShadowCasterLists::default();
     assert_eq!(lists.partitions.len(), 2);
-    assert!(lists.partitions.iter().all(|p| p.world_surfs.is_empty()));
+    assert!(lists.partitions.iter().all(|p| p.level_faces.is_empty()));
     assert_eq!(lists, lists.clone());
 }
 

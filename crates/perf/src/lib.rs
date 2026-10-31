@@ -7,10 +7,10 @@
 //! to a counter skips that work as well.
 
 mod events;
-mod marks;
+mod hooks;
 
 pub use events::*;
-pub use marks::{Counter, Span, SpanGuard};
+pub use hooks::{Counter, Span, TimedStretchCloser};
 
 /// Whether anything is listening to the hooks.
 #[inline]
@@ -73,13 +73,13 @@ mod tests {
 
     #[test]
     fn hooks_take_their_values_and_return() {
-        let guard = Span::FramesWallFrameMs.enter();
+        let open_span = Span::FrameClockMillis.enter();
         Span::TocLoad.begin();
         Span::TocLoad.end();
-        Counter::CounterDraws.emit(12.0);
-        Counter::RenderGpuFrameMs.emit_at(4.5, frames::open_index());
-        drop(guard);
-        world_ready(1);
+        Counter::TallyDrawCalls.emit(12.0);
+        Counter::DrawGpuWholeMillis.emit_at(4.5, frames::open_index());
+        drop(open_span);
+        level_ready(1);
         swap(7, "begin", "mp_raid");
     }
 }

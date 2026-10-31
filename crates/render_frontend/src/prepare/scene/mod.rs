@@ -2,18 +2,18 @@
 //! visibility, model lighting, and the world's GPU data.
 
 pub mod camera;
-pub mod cell_frustum_cmds;
+pub mod cell_cone_jobs;
 pub mod cull;
-pub mod frustum;
-pub mod gfx_scene;
-pub mod model_lighting_atlas;
-pub mod model_lighting_cache;
-pub mod smodel_geom_cache;
-pub mod smodel_lighting;
+pub mod view_planes;
+pub mod visual_stage;
+pub mod model_illum_atlas;
+pub mod model_illum_cache;
+pub mod prop_geom_memo;
+pub mod prop_light_slots;
 pub mod spawn;
-pub mod view_parms;
+pub mod eye_parms;
 pub mod world;
-pub mod world_gpu;
-pub mod world_images;
-pub mod world_occupancy;
-pub mod world_plan;
+pub mod level_gpu;
+pub mod level_pictures;
+pub mod level_presence;
+pub mod level_plan;

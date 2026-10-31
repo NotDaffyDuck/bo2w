@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-const MAGIC: &[u8; 8] = b"\x80GSC\r\n\x00\x06";
+const FORMAT_TAG: &[u8; 8] = b"\x80GSC\r\n\x00\x06";
 
 /// Opcodes by value (Black Ops II, PC).
 #[allow(dead_code)]
@@ -86,7 +86,7 @@ pub mod op {
     pub const JUMP_ON_TRUE: u8 = 0x3c;
     pub const JUMP_ON_FALSE_EXPR: u8 = 0x3d;
     pub const JUMP_ON_TRUE_EXPR: u8 = 0x3e;
-    pub const JUMP: u8 = 0x3f;
+    pub const LEAP: u8 = 0x3f;
     pub const JUMP_BACK: u8 = 0x40;
     pub const INC: u8 = 0x41;
     pub const DEC: u8 = 0x42;
@@ -289,8 +289,8 @@ pub fn op_name(code: u8) -> &'static str {
 pub enum GscValue {
     Undefined,
     Int(i32),
-    Float(f32),
-    Str(String),
+    Num(f32),
+    Quoted(String),
     Vec3([f32; 3]),
     /// The result of call `n` (`GscRun::calls[n]`).
     Call(usize),
@@ -302,7 +302,7 @@ pub enum GscValue {
 impl GscValue {
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Self::Str(s) => Some(s),
+            Self::Quoted(s) => Some(s),
             _ => None,
         }
     }
@@ -310,7 +310,7 @@ impl GscValue {
     pub fn as_f32(&self) -> Option<f32> {
         match *self {
             Self::Int(i) => Some(i as f32),
-            Self::Float(f) => Some(f),
+            Self::Num(f) => Some(f),
             _ => None,
         }
     }
@@ -324,7 +324,7 @@ impl GscValue {
 
     fn key(&self) -> String {
         match self {
-            Self::Str(s) => s.clone(),
+            Self::Quoted(s) => s.clone(),
             Self::Int(i) => i.to_string(),
             _ => "?".to_owned(),
         }
@@ -382,7 +382,7 @@ impl GscRun {
         self.calls
             .iter()
             .enumerate()
-            .filter(move |(_, c)| c.name().eq_ignore_ascii_case(name))
+            .filter(move |&(_, c)| c.name().eq_ignore_ascii_case(name))
     }
 
     /// The fields written into the object call `n` returned.
@@ -438,6 +438,14 @@ fn u32_at(b: &[u8], o: usize) -> Result<u32, String> {
         .ok_or_else(|| format!("u32 at {o:#x} past the end"))
 }
 
+/// `n` consecutive little-endian code addresses starting at `o`.
+fn address_list(b: &[u8], o: usize, n: usize) -> Result<Vec<usize>, String> {
+    (o..o + 4 * n)
+        .step_by(4)
+        .map(|at| u32_at(b, at).map(|v| v as usize))
+        .collect()
+}
+
 fn cstr_at(b: &[u8], o: usize) -> Result<String, String> {
     let tail = b.get(o..).ok_or_else(|| format!("string at {o:#x} past the end"))?;
     let end = tail.iter().position(|&c| c == 0).ok_or("unterminated string")?;
@@ -460,7 +468,7 @@ pub struct GscOp {
 pub enum GscArg {
     None,
     Int(i32),
-    Float(f32),
+    Num(f32),
     Vec3([f32; 3]),
     /// A string operand, with its operand address.
     Str(String, usize),
@@ -474,16 +482,17 @@ pub enum GscArg {
 
 impl GscObject {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.get(..8) != Some(MAGIC.as_slice()) {
+        if bytes.get(..8) != Some(FORMAT_TAG.as_slice()) {
             return Err("not a Black Ops II script object".into());
         }
         let b = bytes;
-        let include_off = u32_at(b, 0x0c)? as usize;
-        let code = u32_at(b, 0x14)? as usize;
-        let strings_off = u32_at(b, 0x18)? as usize;
-        let exports_off = u32_at(b, 0x1c)? as usize;
-        let imports_off = u32_at(b, 0x20)? as usize;
-        let code_size = u32_at(b, 0x2c)? as usize;
+        let header_word = |at: usize| u32_at(b, at).map(|w| w as usize);
+        let include_off = header_word(0x0c)?;
+        let code = header_word(0x14)?;
+        let strings_off = header_word(0x18)?;
+        let exports_off = header_word(0x1c)?;
+        let imports_off = header_word(0x20)?;
+        let code_size = header_word(0x2c)?;
         let name = cstr_at(b, usize::from(u16_at(b, 0x30)?))?;
         let n_strings = usize::from(u16_at(b, 0x32)?);
         let n_exports = usize::from(u16_at(b, 0x34)?);
@@ -517,8 +526,7 @@ impl GscObject {
             } else {
                 format!("{}::{name}", cstr_at(b, ns)?)
             };
-            for k in 0..n {
-                let at = u32_at(b, o + 4 * k)? as usize;
+            for at in address_list(b, o, n)? {
                 imports.insert(at, (full.clone(), params));
                 import_flags.insert(at, flags);
             }
@@ -535,9 +543,7 @@ impl GscObject {
             let s = cstr_at(b, usize::from(u16_at(b, o)?))?;
             let n = usize::from(*b.get(o + 2).ok_or("short string ref")?);
             o += 4;
-            for k in 0..n {
-                strings.insert(u32_at(b, o + 4 * k)? as usize, s.clone());
-            }
+            strings.extend(address_list(b, o, n)?.into_iter().map(|at| (at, s.clone())));
             o += 4 * n;
         }
         if o > b.len() {
@@ -557,13 +563,11 @@ impl GscObject {
 
     /// The code of export `i`: from its address to the next export's.
     fn function_span(&self, i: usize) -> (usize, usize) {
-        let start = self.exports[i].address;
-        let end = self
-            .exports
-            .get(i + 1)
-            .map_or(self.code_end, |e| e.address)
-            .min(self.bytes.len());
-        (start, end)
+        let [here, rest @ ..] = &self.exports[i..] else {
+            panic!("export {i} out of range");
+        };
+        let stop = rest.first().map_or(self.code_end, |next| next.address);
+        (here.address, stop.min(self.bytes.len()))
     }
 
     /// Decode export `i`. Stops at an unknown opcode (the padding after a
@@ -619,7 +623,7 @@ impl GscObject {
                     pc = align(pc, 4);
                     let Ok(v) = u32_at(b, pc) else { break };
                     pc += 4;
-                    GscArg::Float(f32::from_bits(v))
+                    GscArg::Num(f32::from_bits(v))
                 }
                 op::GET_VECTOR => {
                     pc = align(pc, 4);
@@ -670,7 +674,7 @@ impl GscObject {
                     let Ok(target) = u32_at(b, pc) else { break };
                     pc += 4;
                     match self.imports.get(&at) {
-                        Some((name, params)) => GscArg::Call(name.clone(), *params),
+                        Some(entry) => GscArg::Call(entry.0.clone(), entry.1),
                         None => GscArg::Call(format!("local@{target:#x}"), 0),
                     }
                 }
@@ -678,7 +682,7 @@ impl GscObject {
                 | op::JUMP_ON_TRUE
                 | op::JUMP_ON_FALSE_EXPR
                 | op::JUMP_ON_TRUE_EXPR
-                | op::JUMP
+                | op::LEAP
                 | op::JUMP_BACK => {
                     pc = align(pc, 2);
                     let Ok(v) = u16_at(b, pc) else { break };
@@ -761,7 +765,7 @@ struct Walk<'a> {
     stack: Vec<Slot>,
     locals: Vec<GscValue>,
     field_object: GscValue,
-    target: Option<Ref>,
+    pending_ref: Option<Ref>,
 }
 
 impl<'a> Walk<'a> {
@@ -771,11 +775,11 @@ impl<'a> Walk<'a> {
             stack: Vec::new(),
             locals: Vec::new(),
             field_object: GscValue::Other,
-            target: None,
+            pending_ref: None,
         }
     }
 
-    fn push(&mut self, v: GscValue) {
+    fn push_value(&mut self, v: GscValue) {
         self.stack.push(Slot::Value(v));
     }
 
@@ -806,7 +810,7 @@ impl<'a> Walk<'a> {
             .unwrap_or(GscValue::Other)
     }
 
-    fn set_local(&mut self, n: usize, v: GscValue) {
+    fn assign_scoped(&mut self, n: usize, v: GscValue) {
         if let Some(i) = self.locals.len().checked_sub(n + 1)
             && let Some(slot) = self.locals.get_mut(i)
         {
@@ -815,12 +819,12 @@ impl<'a> Walk<'a> {
     }
 
     fn assign(&mut self, run: &mut GscRun, value: GscValue) {
-        let Some(target) = self.target.take() else {
+        let Some(target) = self.pending_ref.take() else {
             return;
         };
         let (base, path) = match target.base {
             RefBase::Local(n) if target.path.is_empty() => {
-                self.set_local(n, value);
+                self.assign_scoped(n, value);
                 return;
             }
             RefBase::Local(n) => (self.local(n), target.path),
@@ -870,31 +874,31 @@ impl<'a> Walk<'a> {
             match o.op {
                 op::END | op::RETURN => {
                     self.stack.clear();
-                    self.target = None;
+                    self.pending_ref = None;
                 }
-                op::GET_UNDEFINED => self.push(GscValue::Undefined),
-                op::GET_ZERO => self.push(GscValue::Int(0)),
+                op::GET_UNDEFINED => self.push_value(GscValue::Undefined),
+                op::GET_ZERO => self.push_value(GscValue::Int(0)),
                 op::GET_BYTE
                 | op::GET_NEG_BYTE
                 | op::GET_UNSIGNED_SHORT
                 | op::GET_NEG_UNSIGNED_SHORT
-                | op::GET_INTEGER => self.push(GscValue::Int(int(&o.arg))),
+                | op::GET_INTEGER => self.push_value(GscValue::Int(int(&o.arg))),
                 op::GET_FLOAT => {
-                    if let GscArg::Float(f) = o.arg {
-                        self.push(GscValue::Float(f));
+                    if let GscArg::Num(f) = o.arg {
+                        self.push_value(GscValue::Num(f));
                     }
                 }
                 op::GET_STRING | op::GET_ISTRING => {
                     if let GscArg::Str(s, _) = &o.arg {
-                        self.push(GscValue::Str(s.clone()));
+                        self.push_value(GscValue::Quoted(s.clone()));
                     }
                 }
                 op::GET_VECTOR => {
                     if let GscArg::Vec3(v) = o.arg {
-                        self.push(GscValue::Vec3(v));
+                        self.push_value(GscValue::Vec3(v));
                     }
                 }
-                op::GET_LEVEL => self.push(GscValue::Level),
+                op::GET_LEVEL => self.push_value(GscValue::Level),
                 op::GET_SELF
                 | op::GET_GAME
                 | op::GET_ANIM
@@ -902,12 +906,31 @@ impl<'a> Walk<'a> {
                 | op::GET_FUNCTION
                 | op::GET_HASH
                 | op::EMPTY_ARRAY
-                | op::GET_TIME
-                | op::VECTOR_CONSTANT => self.push(GscValue::Other),
+                | op::GET_TIME => self.push_value(GscValue::Other),
+                // bo2zm: a vector of -1/0/1 parts, two bits each (x high),
+                // as the script VM reads it: createfx angles are written
+                // `270 * VectorConstant`, so without it every one read 0.
+                op::VECTOR_CONSTANT => {
+                    let flags = int(&o.arg);
+                    let c = |b: i32| match b & 3 {
+                        1 => -1.0,
+                        2 => 1.0,
+                        _ => 0.0,
+                    };
+                    self.push_value(GscValue::Vec3([c(flags >> 4), c(flags >> 2), c(flags)]));
+                }
+                op::VECTOR_SCALE => {
+                    let v = self.pop().as_vec3();
+                    let s = self.pop().as_f32();
+                    match (v, s) {
+                        (Some(v), Some(s)) => self.push_value(GscValue::Vec3(v.map(|c| c * s))),
+                        _ => self.push_value(GscValue::Other),
+                    }
+                }
                 op::GET_LEVEL_OBJECT => self.field_object = GscValue::Level,
                 op::GET_SELF_OBJECT | op::GET_ANIM_OBJECT => self.field_object = GscValue::Other,
                 op::GET_GAME_REF => {
-                    self.target = Some(Ref {
+                    self.pending_ref = Some(Ref {
                         base: RefBase::Value(GscValue::Other),
                         path: Vec::new(),
                     });
@@ -920,41 +943,41 @@ impl<'a> Walk<'a> {
                 }
                 op::EVAL_LOCAL_VARIABLE_CACHED => {
                     let v = self.local(int(&o.arg) as usize);
-                    self.push(v);
+                    self.push_value(v);
                 }
                 op::EVAL_LOCAL_VARIABLE_REF_CACHED | op::EVAL_LOCAL_ARRAY_REF_CACHED => {
-                    self.target = Some(Ref {
+                    self.pending_ref = Some(Ref {
                         base: RefBase::Local(int(&o.arg) as usize),
                         path: Vec::new(),
                     });
                 }
                 op::SAFE_SET_VARIABLE_FIELD_CACHED => {
                     let v = self.pop();
-                    self.set_local(int(&o.arg) as usize, v);
+                    self.assign_scoped(int(&o.arg) as usize, v);
                 }
                 op::SAFE_SET_WAITTILL_VARIABLE_FIELD_CACHED => {
-                    self.set_local(int(&o.arg) as usize, GscValue::Other);
+                    self.assign_scoped(int(&o.arg) as usize, GscValue::Other);
                 }
                 op::EVAL_ARRAY => {
                     self.pop();
                     self.pop();
-                    self.push(GscValue::Other);
+                    self.push_value(GscValue::Other);
                 }
                 op::EVAL_ARRAY_REF => {
                     let key = self.pop().key();
-                    if let Some(t) = self.target.as_mut() {
+                    if let Some(t) = self.pending_ref.as_mut() {
                         t.path.push(key);
                     }
                 }
                 op::CLEAR_ARRAY => {
                     self.pop();
-                    self.target = None;
+                    self.pending_ref = None;
                 }
                 op::CAST_FIELD_OBJECT => self.field_object = self.pop(),
-                op::EVAL_FIELD_VARIABLE => self.push(GscValue::Other),
+                op::EVAL_FIELD_VARIABLE => self.push_value(GscValue::Other),
                 op::EVAL_FIELD_VARIABLE_REF => {
                     if let GscArg::Str(field, _) = &o.arg {
-                        self.target = Some(Ref {
+                        self.pending_ref = Some(Ref {
                             base: RefBase::Value(self.field_object.clone()),
                             path: vec![field.clone()],
                         });
@@ -978,7 +1001,7 @@ impl<'a> Walk<'a> {
                             op::CALL_BUILTIN_METHOD | op::SCRIPT_METHOD_CALL | op::SCRIPT_METHOD_THREAD_CALL
                         );
                         let v = self.call(run, name, *params, method);
-                        self.push(v);
+                        self.push_value(v);
                     }
                 }
                 op::SCRIPT_FUNCTION_CALL_POINTER
@@ -992,7 +1015,7 @@ impl<'a> Walk<'a> {
                     if self.stack.last() == Some(&Slot::Mark) {
                         self.stack.pop();
                     }
-                    self.push(GscValue::Other);
+                    self.push_value(GscValue::Other);
                 }
                 op::DEC_TOP | op::SAFE_DEC_TOP | op::WAIT | op::REAL_WAIT | op::SWITCH => {
                     self.pop();
@@ -1021,7 +1044,7 @@ impl<'a> Walk<'a> {
                 | op::GET_DVAR_COLOR_ALPHA
                 | op::FIRST_ARRAY_KEY => {
                     self.pop();
-                    self.push(GscValue::Other);
+                    self.push_value(GscValue::Other);
                 }
                 op::BIT_OR
                 | op::BIT_XOR
@@ -1039,11 +1062,10 @@ impl<'a> Walk<'a> {
                 | op::MULTIPLY
                 | op::DIVIDE
                 | op::MODULUS
-                | op::VECTOR_SCALE
                 | op::NEXT_ARRAY_KEY => {
                     self.pop();
                     self.pop();
-                    self.push(GscValue::Other);
+                    self.push_value(GscValue::Other);
                 }
                 op::VECTOR => {
                     // Components are pushed last first: x is on top.
@@ -1051,8 +1073,8 @@ impl<'a> Walk<'a> {
                     let y = self.pop().as_f32();
                     let z = self.pop().as_f32();
                     match (x, y, z) {
-                        (Some(x), Some(y), Some(z)) => self.push(GscValue::Vec3([x, y, z])),
-                        _ => self.push(GscValue::Other),
+                        (Some(x), Some(y), Some(z)) => self.push_value(GscValue::Vec3([x, y, z])),
+                        _ => self.push_value(GscValue::Other),
                     }
                 }
                 op::WAIT_TILL | op::END_ON => self.pop_n(2),
@@ -1066,7 +1088,7 @@ impl<'a> Walk<'a> {
                         self.stack.pop();
                     }
                 }
-                op::INC | op::DEC => self.target = None,
+                op::INC | op::DEC => self.pending_ref = None,
                 _ => {}
             }
         }
@@ -1079,7 +1101,7 @@ pub struct PlacedFx {
     /// `oneshotfx`, `loopfx`, `exploder` (the create function's kind).
     pub kind: String,
     /// The effect table key (`level._effect[fxid]`).
-    pub fxid: String,
+    pub fx_key: String,
     pub origin: [f32; 3],
     pub angles: [f32; 3],
     /// Seconds: negative = already running that long (pre-roll); for a
@@ -1104,6 +1126,9 @@ pub struct MapScriptFacts {
     /// The default ambient room's tone (`declareambientroom(room, true)`,
     /// `setambientroomtone(room, alias, ...)`).
     pub room_tone: Option<String>,
+    /// The ambient rooms' echoes (`setambientroomreverb(room, preset, dry,
+    /// wet)`): room, preset, dry, wet; the default room first.
+    pub room_echoes: Vec<(String, String, f32, f32)>,
     /// Sounds a loop plays now and then at one of a few places
     /// (`wait randomintrange(a, b); playsound(0, alias, place[...])`):
     /// alias, wait range in seconds, places.
@@ -1140,25 +1165,25 @@ impl MapScriptFacts {
                 };
                 let mut fx = PlacedFx {
                     kind: kind.to_owned(),
-                    fxid: call.args.first().and_then(GscValue::as_str).unwrap_or("").to_owned(),
-                    origin: [0.0; 3],
-                    angles: [0.0; 3],
+                    fx_key: call.args.first().and_then(GscValue::as_str).unwrap_or("").to_owned(),
+                    origin: Default::default(),
+                    angles: Default::default(),
                     delay: 0.0,
                     exploder: None,
                 };
-                for (field, value) in run.fields_of(n) {
-                    match field {
+                for (fkey, value) in run.fields_of(n) {
+                    match fkey {
                         "v.origin" => fx.origin = value.as_vec3().unwrap_or(fx.origin),
                         "v.angles" => fx.angles = value.as_vec3().unwrap_or(fx.angles),
                         "v.delay" => fx.delay = value.as_f32().unwrap_or(fx.delay),
                         "v.fxid" => {
                             if let Some(id) = value.as_str() {
-                                fx.fxid = id.to_owned();
+                                fx.fx_key = id.to_owned();
                             }
                         }
                         "v.exploder" => {
                             fx.exploder = match value {
-                                GscValue::Str(s) => Some(s.clone()),
+                                GscValue::Quoted(s) => Some(s.clone()),
                                 GscValue::Int(i) => Some(i.to_string()),
                                 _ => Some("?".to_owned()),
                             }
@@ -1182,6 +1207,21 @@ impl MapScriptFacts {
                     && let Some(alias) = call.args.get(1).and_then(GscValue::as_str)
                 {
                     facts.room_tone = Some(alias.to_owned());
+                }
+            }
+            for (_, call) in run.calls_named("setambientroomreverb") {
+                let (Some(room), Some(preset)) = (
+                    call.args.first().and_then(GscValue::as_str),
+                    call.args.get(1).and_then(GscValue::as_str),
+                ) else {
+                    continue;
+                };
+                let at = |i: usize| call.args.get(i).and_then(GscValue::as_f32).unwrap_or(1.0);
+                let row = (room.to_owned(), preset.to_owned(), at(2), at(3));
+                if Some(room) == default_room.as_deref() {
+                    facts.room_echoes.insert(0, row);
+                } else {
+                    facts.room_echoes.push(row);
                 }
             }
             for (_, call) in run.calls_named("snd_play_auto_fx") {
@@ -1218,11 +1258,11 @@ impl MapScriptFacts {
                 }
             }
             for (_, call) in run.calls_named("playloopat") {
-                if let (Some(alias), Some(origin)) = (
+                if let (Some(sound), Some(origin)) = (
                     call.args.first().and_then(GscValue::as_str),
                     call.args.get(1).and_then(GscValue::as_vec3),
                 ) {
-                    facts.loops_at.push((alias.to_owned(), origin));
+                    facts.loops_at.push((sound.to_owned(), origin));
                 }
             }
         }
@@ -1238,7 +1278,7 @@ mod tests {
     /// storing the result's `v["k"] = 5`.
     fn tiny() -> Vec<u8> {
         let mut b = vec![0u8; 0x40];
-        b[..8].copy_from_slice(MAGIC);
+        b[..8].copy_from_slice(FORMAT_TAG);
         let mut strings = Vec::new();
         let mut push_str = |b: &mut Vec<u8>, s: &str| {
             let at = b.len();
@@ -1349,7 +1389,7 @@ mod tests {
         assert_eq!(run.calls[0].function, "f");
         assert_eq!(
             run.calls[0].args,
-            vec![GscValue::Str("a".into()), GscValue::Vec3([1.0, 2.0, 3.0])]
+            vec![GscValue::Quoted("a".into()), GscValue::Vec3([1.0, 2.0, 3.0])]
         );
         let fields: Vec<_> = run.fields_of(0).collect();
         assert_eq!(fields, vec![("v.k", &GscValue::Int(5))]);

@@ -1,0 +1,13 @@
+# E: the knife held as a weapon (knife_held_mp, swings itself): swing 450 ms, hit at 50 ms, then straight to idle
+# (no quick raise).
+msec 50
+spawn knife_held_mp
+hold melee
+run 1
+expect state MELEE_INIT
+release melee
+run 1
+expect state MELEE_FIRE
+run 8
+expect state READY
+expect weapon knife_held_mp

@@ -37,9 +37,9 @@ pub struct T6AnimCommand {
     pub part: T6AnimPart,
     /// Index into [`T6PlayerAnims::anims`].
     pub anim: u16,
-    pub blend_ms: Option<i32>,
+    pub crossfade_millis: Option<i32>,
     pub blend_out_ms: Option<i32>,
-    pub duration_ms: Option<i32>,
+    pub play_ms: Option<i32>,
     /// `weaponTimeScale`: the animation plays over the weapon's own time
     /// for the action (its raise or drop time), not its own length.
     pub weapon_time_scale: bool,
@@ -139,8 +139,8 @@ pub struct T6PlayerAnims {
     /// The `playerAnimType` names in `playeranimtypes.txt` order (a weapon's
     /// `playerAnimType` is its place here).
     pub anim_types: Vec<String>,
-    moves: Vec<(String, Vec<Item>)>,
-    events: Vec<(String, Vec<Item>)>,
+    move_blocks: Vec<(String, Vec<Item>)>,
+    event_blocks: Vec<(String, Vec<Item>)>,
     /// `set <cond> <alias> = ...`: (cond, alias, condition it stands for).
     defines: Vec<(String, String, Cond)>,
 }
@@ -155,9 +155,9 @@ enum Tok {
     Eol,
 }
 
-fn tokenize(text: &str) -> Vec<Tok> {
+fn split_tokens(script_text: &str) -> Vec<Tok> {
     let mut out = Vec::new();
-    for line in text.lines() {
+    for line in script_text.lines() {
         let line = match line.find("//") {
             Some(i) => &line[..i],
             None => line,
@@ -204,7 +204,7 @@ impl T6PlayerAnims {
             .map(|a| speeds.iter().find(|(n, _)| n == a).map_or(0.0, |(_, v)| *v))
             .collect();
         let mut ladder = vec![false; self.anims.len()];
-        for (movetype, items) in &self.moves {
+        for (movetype, items) in &self.move_blocks {
             if movetype == "climbup" || movetype == "climbdown" {
                 for c in items.iter().flat_map(|i| &i.commands) {
                     let i = usize::from(c.anim);
@@ -222,12 +222,13 @@ impl T6PlayerAnims {
     pub fn parse(script: &str, anim_types: &str) -> Result<Self, String> {
         let mut out = Self {
             anim_types: anim_types
-                .split_whitespace()
+                .split(char::is_whitespace)
+                .filter(|word| !word.is_empty())
                 .map(str::to_ascii_lowercase)
                 .collect(),
             ..Self::default()
         };
-        let toks = tokenize(script);
+        let script_words = split_tokens(script);
         let mut i = 0usize;
         #[derive(PartialEq)]
         enum Section {
@@ -237,8 +238,8 @@ impl T6PlayerAnims {
             Events,
         }
         let mut section = Section::None;
-        while i < toks.len() {
-            match &toks[i] {
+        while i < script_words.len() {
+            match &script_words[i] {
                 Tok::Eol | Tok::Comma => i += 1,
                 Tok::Word(w) if w == "DEFINES" => {
                     section = Section::Defines;
@@ -255,8 +256,8 @@ impl T6PlayerAnims {
                 Tok::Word(w) if section == Section::Defines => {
                     // One line: `set <cond> <alias> = v AND v` or a `#...`.
                     let mut line = Vec::new();
-                    while i < toks.len() && toks[i] != Tok::Eol {
-                        if let Tok::Word(w) = &toks[i] {
+                    while i < script_words.len() && script_words[i] != Tok::Eol {
+                        if let Tok::Word(w) = &script_words[i] {
                             line.push(w.to_ascii_lowercase());
                         }
                         i += 1;
@@ -269,15 +270,15 @@ impl T6PlayerAnims {
                 Tok::Word(w) if section == Section::Animations && w == "STATE" => {
                     // STATE COMBAT { <move> { items } ... }
                     i += 1;
-                    while i < toks.len() && toks[i] != Tok::Open {
+                    while i < script_words.len() && script_words[i] != Tok::Open {
                         i += 1;
                     }
                     i += 1;
                     loop {
-                        while i < toks.len() && toks[i] == Tok::Eol {
+                        while i < script_words.len() && script_words[i] == Tok::Eol {
                             i += 1;
                         }
-                        match toks.get(i) {
+                        match script_words.get(i) {
                             None => break,
                             Some(Tok::Close) => {
                                 i += 1;
@@ -286,8 +287,8 @@ impl T6PlayerAnims {
                             Some(Tok::Word(name)) => {
                                 let name = name.to_ascii_lowercase();
                                 i += 1;
-                                let items = out.parse_block(&toks, &mut i)?;
-                                out.moves.push((name, items));
+                                let items = out.parse_block(&script_words, &mut i)?;
+                                out.move_blocks.push((name, items));
                             }
                             Some(t) => return Err(format!("movement list: unexpected {t:?}")),
                         }
@@ -298,13 +299,13 @@ impl T6PlayerAnims {
                     i += 1;
                     if name == "forceload" {
                         // A list of names, not conditions.
-                        let mut depth = 0;
-                        while i < toks.len() {
-                            match toks[i] {
-                                Tok::Open => depth += 1,
+                        let mut nesting = 0;
+                        while i < script_words.len() {
+                            match script_words[i] {
+                                Tok::Open => nesting += 1,
                                 Tok::Close => {
-                                    depth -= 1;
-                                    if depth <= 0 {
+                                    nesting -= 1;
+                                    if nesting <= 0 {
                                         i += 1;
                                         break;
                                     }
@@ -315,23 +316,23 @@ impl T6PlayerAnims {
                         }
                         continue;
                     }
-                    let items = out.parse_block(&toks, &mut i)?;
-                    out.events.push((name, items));
+                    let items = out.parse_block(&script_words, &mut i)?;
+                    out.event_blocks.push((name, items));
                 }
                 _ => i += 1,
             }
         }
-        if out.moves.is_empty() {
+        if out.move_blocks.is_empty() {
             return Err("no movement types".into());
         }
         // The engine's own picks beside the script's: the mantle's climb up
         // to a ledge (by its height) and the fast-mantle copies.
         for height in [57, 51, 45, 39, 33, 27, 21] {
-            out.anim_index(&format!("mp_mantle_up_{height}"));
-            out.anim_index(&format!("mp_mantle_up_{height}_fast"));
+            out.clip_slot(&format!("mp_mantle_up_{height}"));
+            out.clip_slot(&format!("mp_mantle_up_{height}_fast"));
         }
         for over in ["high", "mid", "low"] {
-            out.anim_index(&format!("mp_mantle_over_{over}_fast"));
+            out.clip_slot(&format!("mp_mantle_over_{over}_fast"));
         }
         Ok(out)
     }
@@ -345,7 +346,7 @@ impl T6PlayerAnims {
             return Err(format!("expected {{, found {:?}", toks.get(*i)));
         }
         *i += 1;
-        let mut items = Vec::new();
+        let mut item_list = Vec::new();
         loop {
             while *i < toks.len() && toks[*i] == Tok::Eol {
                 *i += 1;
@@ -354,13 +355,13 @@ impl T6PlayerAnims {
                 None => return Err("unclosed block".into()),
                 Some(Tok::Close) => {
                     *i += 1;
-                    return Ok(items);
+                    return Ok(item_list);
                 }
                 // A bare `{ }` with no conditions: commands that always
                 // play (none in the shipped script, kept for safety).
                 Some(Tok::Open) => {
                     let commands = self.parse_commands(toks, i)?;
-                    items.push(Item {
+                    item_list.push(Item {
                         conds: Vec::new(),
                         commands,
                     });
@@ -391,7 +392,7 @@ impl T6PlayerAnims {
                         conds.push(self.cond_from(&name, &g[1..]));
                     }
                     let commands = self.parse_commands(toks, i)?;
-                    items.push(Item { conds, commands });
+                    item_list.push(Item { conds, commands });
                 }
             }
         }
@@ -416,13 +417,13 @@ impl T6PlayerAnims {
                 "both" => T6AnimPart::Both,
                 _ => return,
             };
-            let anim = this.anim_index(&words[1]);
+            let anim = this.clip_slot(&words[1]);
             let mut command = T6AnimCommand {
                 part,
                 anim,
-                blend_ms: None,
+                crossfade_millis: None,
                 blend_out_ms: None,
-                duration_ms: None,
+                play_ms: None,
                 weapon_time_scale: false,
                 grenade_anim: false,
                 anim_rate: None,
@@ -432,9 +433,9 @@ impl T6PlayerAnims {
                 let key = words[k].to_ascii_lowercase();
                 let value = words.get(k + 1).and_then(|v| v.parse::<i32>().ok());
                 match key.as_str() {
-                    "blendtime" => command.blend_ms = value,
+                    "blendtime" => command.crossfade_millis = value,
                     "blendouttime" => command.blend_out_ms = value,
-                    "duration" => command.duration_ms = value,
+                    "duration" => command.play_ms = value,
                     "animrate" => {
                         command.anim_rate = words.get(k + 1).and_then(|v| v.parse::<f32>().ok()).filter(|r| *r > 0.0);
                     }
@@ -474,13 +475,17 @@ impl T6PlayerAnims {
         }
     }
 
-    fn anim_index(&mut self, name: &str) -> u16 {
-        let lower = name.to_ascii_lowercase();
-        if let Some(i) = self.anims.iter().position(|a| *a == lower) {
-            return i as u16;
-        }
-        self.anims.push(lower);
-        (self.anims.len() - 1) as u16
+    /// The slot of the clip called `clip` (any case), added at the end the first time it is named.
+    fn clip_slot(&mut self, clip: &str) -> u16 {
+        let folded = clip.to_ascii_lowercase();
+        let slot = match self.anims.iter().position(|known| *known == folded) {
+            Some(found) => found,
+            None => {
+                self.anims.push(folded);
+                self.anims.len() - 1
+            }
+        };
+        slot as u16
     }
 
     /// A condition from its name and value words (`a AND b`, `all NOT a`,
@@ -519,7 +524,7 @@ impl T6PlayerAnims {
     }
 
     /// The animation's name for a packed value (`None` for none).
-    pub fn name_of(&self, packed: i32) -> Option<&str> {
+    pub fn anim_name(&self, packed: i32) -> Option<&str> {
         let n = packed & T6_ANIM_INDEX_MASK;
         if n == 0 {
             return None;
@@ -539,46 +544,44 @@ impl T6PlayerAnims {
 
     /// The first command naming this animation (its blend and duration).
     pub fn command_of(&self, anim: u16) -> Option<&T6AnimCommand> {
-        self.moves
+        self.move_blocks
             .iter()
-            .chain(&self.events)
+            .chain(&self.event_blocks)
             .flat_map(|(_, items)| items)
-            .flat_map(|item| &item.commands)
+            .flat_map(|draw_entry| &draw_entry.commands)
             .find(|c| c.anim == anim)
     }
 
     /// The `playerAnimType` name of a weapon's type number.
     pub fn anim_type_name(&self, index: i32) -> &str {
-        usize::try_from(index)
-            .ok()
-            .and_then(|i| self.anim_types.get(i))
-            .map_or("default", String::as_str)
+        let slot: Option<usize> = index.try_into().ok();
+        slot.and_then(|i| self.anim_types.get(i)).map_or("default", String::as_str)
     }
 
     pub fn has_move(&self, movetype: &str) -> bool {
-        self.moves.iter().any(|(m, _)| m == movetype)
+        self.move_blocks.iter().any(|(m, _)| m == movetype)
     }
 
     pub fn has_event(&self, event: &str) -> bool {
-        self.events.iter().any(|(e, _)| e == event)
+        self.event_blocks.iter().any(|(e, _)| e == event)
     }
 
     /// The commands of the first item of a movement type that matches:
     /// `None` when nothing matched (or no such type), else its commands
     /// (empty = matched, plays nothing).
     pub fn pick_move(&self, movetype: &str, facts: &T6AnimFacts<'_>) -> Option<&[T6AnimCommand]> {
-        let (_, items) = self.moves.iter().find(|(m, _)| m == movetype)?;
+        let (_, items) = self.move_blocks.iter().find(|(m, _)| m == movetype)?;
         pick(items, facts)
     }
 
-    pub fn pick_event(&self, event: &str, facts: &T6AnimFacts<'_>) -> Option<&[T6AnimCommand]> {
-        let (_, items) = self.events.iter().find(|(e, _)| e == event)?;
+    pub fn pick_event(&self, cue: &str, facts: &T6AnimFacts<'_>) -> Option<&[T6AnimCommand]> {
+        let (_, items) = self.event_blocks.iter().find(|(e, _)| e == cue)?;
         pick(items, facts)
     }
 
     /// Every command of every block: (an event block, the block's name, the command).
     pub fn commands(&self) -> impl Iterator<Item = (bool, &str, &T6AnimCommand)> {
-        let blocks = self.moves.iter().map(|b| (false, b)).chain(self.events.iter().map(|b| (true, b)));
+        let blocks = self.move_blocks.iter().map(|b| (false, b)).chain(self.event_blocks.iter().map(|b| (true, b)));
         blocks.flat_map(|(event, (name, items))| {
             items
                 .iter()
@@ -586,11 +589,11 @@ impl T6PlayerAnims {
         })
     }
 
-    pub fn report_line(&self) -> String {
+    pub fn status_line(&self) -> String {
         format!(
             "t6 playeranim.script: {} movement types, {} events, {} animations, {} anim types",
-            self.moves.len(),
-            self.events.len(),
+            self.move_blocks.len(),
+            self.event_blocks.len(),
             self.anims.len(),
             self.anim_types.len()
         )
@@ -605,7 +608,7 @@ fn pick<'s>(items: &'s [Item], facts: &T6AnimFacts<'_>) -> Option<&'s [T6AnimCom
 }
 
 fn cond_holds(cond: &Cond, facts: &T6AnimFacts<'_>) -> bool {
-    let value = match cond.name.as_str() {
+    let shown = match cond.name.as_str() {
         "playeranimtype" => facts.anim_type,
         "weaponclass" => facts.weapon_class,
         "stance" => facts.stance,
@@ -624,13 +627,13 @@ fn cond_holds(cond: &Cond, facts: &T6AnimFacts<'_>) -> bool {
         // Mounted guns and vehicles: states these players are never in.
         _ => return false,
     };
-    if value.is_empty() {
+    if shown.is_empty() {
         return false;
     }
     if let Some(but) = &cond.all_but {
-        return !but.iter().any(|v| v == value);
+        return !but.iter().any(|v| v == shown);
     }
-    cond.values.iter().any(|v| v == value)
+    cond.values.iter().any(|v| v == shown)
 }
 
 /// player_slopeAnimAngle: the average ground pitch (degrees) past which the
@@ -687,8 +690,8 @@ pub fn t6_anim_duration(packed: i32) -> Option<f32> {
 /// The grenade or piece of equipment in his hand for a torso animation
 /// that handles it (the script's grenadeAnim: a throw, a plant), packed in
 /// bits 24..31 of a torso value (its weapon index, 1..255).
-pub fn t6_with_offhand(packed: i32, weapon: u32) -> i32 {
-    let w = weapon.min(255) as i32;
+pub fn t6_with_offhand(packed: i32, weapon_id: u32) -> i32 {
+    let w = weapon_id.min(255) as i32;
     (packed & 0x00ff_ffff) | (w << 24)
 }
 
@@ -709,20 +712,22 @@ pub fn t6_anim_index(packed: i32) -> Option<u16> {
     (n != 0).then(|| (n - 1) as u16)
 }
 
-/// A weapon's class (the engine's legacy-numbered class) in the script's words.
-pub fn t6_weapon_class_name(engine_class: i32) -> &'static str {
-    match engine_class {
+/// A weapon's BO2 `weapClass_t` (raw, as the weapon def stores it) in the script's words.
+pub fn t6_weapon_class_name(weap_class: i32) -> &'static str {
+    match weap_class {
         0 => "rifle",
-        1 => "sniper",
-        2 => "mg",
-        3 => "smg",
-        4 => "spread",
-        5 => "pistol",
-        6 => "grenade",
-        7 => "rocketlauncher",
-        8 => "turret",
-        10 => "non-player",
-        11 => "item",
+        1 => "mg",
+        2 => "smg",
+        3 => "spread",
+        4 => "pistol",
+        5 => "grenade",
+        6 => "rocketlauncher",
+        7 => "turret",
+        8 => "non-player",
+        9 => "gas",
+        10 => "item",
+        11 => "melee",
+        13 => "pistol_spread",
         _ => "rifle",
     }
 }
@@ -730,8 +735,8 @@ pub fn t6_weapon_class_name(engine_class: i32) -> &'static str {
 /// The 4-way direction of a move (`forward`, `backward`, `left`, `right`)
 /// from the velocity and the view's yaw (degrees).
 pub fn t6_move_direction(velocity: [f32; 3], yaw_deg: f32) -> &'static str {
-    let speed = (velocity[0] * velocity[0] + velocity[1] * velocity[1]).sqrt();
-    if speed < 1.0 {
+    let pace = (velocity[0] * velocity[0] + velocity[1] * velocity[1]).sqrt();
+    if pace < 1.0 {
         return "forward";
     }
     let heading = velocity[1].atan2(velocity[0]).to_degrees();
@@ -755,6 +760,18 @@ pub fn t6_move_direction(velocity: [f32; 3], yaw_deg: f32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn weapon_class_names_follow_bo2_raw_numbers() {
+        assert_eq!(t6_weapon_class_name(1), "mg");
+        assert_eq!(t6_weapon_class_name(2), "smg");
+        assert_eq!(t6_weapon_class_name(4), "pistol");
+        assert_eq!(t6_weapon_class_name(5), "grenade");
+        assert_eq!(t6_weapon_class_name(9), "gas");
+        assert_eq!(t6_weapon_class_name(10), "item");
+        assert_eq!(t6_weapon_class_name(11), "melee");
+        assert_eq!(t6_weapon_class_name(13), "pistol_spread");
+    }
+
     use super::*;
 
     const SCRIPT: &str = "DEFINES\nset movestatus moving = walk AND run\nset playerAnimType grenadeonly = all NOT m203 NOT briefcase\n#ADD_VEHICLE x\nANIMATIONS\nSTATE COMBAT\n{\n\tidle\n\t{\n\t\tplayerAnimType hold, stance prone\n\t\t{\n\t\t\tboth pb_prone_hold grenadeAnim\n\t\t}\n\t\tweaponclass pistol AND pistol_spread\n\t\t{\n\t\t\tboth pb_stand_alert_pistol\n\t\t}\n\t\tdefault // two handed\n\t\t{\n\t\t\tboth pb_stand_alert\n\t\t}\n\t}\n}\nEVENTS\nfireweapon\n{\n\tmounted mg42\n\t{\n\t}\n\tplayerAnimType grenadeonly, movestatus moving\n\t{\n\t\ttorso pt_stand_shoot blendTime 200 duration 150\n\t}\n}\nforceload\n{\n\thead\n\tpf_death\n}\n";
@@ -775,8 +792,8 @@ mod tests {
         f.movestatus = "run";
         let fire = s.pick_event("fireweapon", &f).unwrap();
         assert_eq!(fire[0].part, T6AnimPart::Torso);
-        assert_eq!(fire[0].duration_ms, Some(150));
-        assert_eq!(fire[0].blend_ms, Some(200));
+        assert_eq!(fire[0].play_ms, Some(150));
+        assert_eq!(fire[0].crossfade_millis, Some(200));
         f.anim_type = "m203";
         assert!(s.pick_event("fireweapon", &f).is_none());
         assert!(!s.has_event("forceload"));
@@ -805,8 +822,8 @@ mod tests {
 
     #[test]
     fn next_weapon_and_fast_mantle() {
-        const NEXT: &str = "DEFINES\nANIMATIONS\nSTATE COMBAT\n{\n\tmantle_up_21\n\t{\n\t\tperk fastmantle\n\t\t{\n\t\t\tlegs mp_mantle_up_21_fast animrate 2.5\n\t\t}\n\t\t// DEFAULT\n\t\tdefault \n\t\t{\n\t\t\tlegs mp_mantle_up_21\n\t\t}\n\t}\n}\nEVENTS\ndropweapon\n{\n\triotshieldnext\n\t{\n\t\ttorso pt_putaway2shield_raise weaponTimeScale\n\t}\n\tdefault\n\t{\n\t\ttorso pt_stand_putaway weaponTimeScale\n\t}\n}\nprone_to_crouch\n{\n\tnextweaponclass pistol AND pistol_spread\n\t{\n\t\tboth pb_prone2crouch_pistol\n\t}\n\tdefault\n\t{\n\t\tboth pb_prone2crouch\n\t}\n}\n";
-        let s = T6PlayerAnims::parse(NEXT, "none\ndefault").unwrap();
+        const MINT_COUNTER: &str = "DEFINES\nANIMATIONS\nSTATE COMBAT\n{\n\tmantle_up_21\n\t{\n\t\tperk fastmantle\n\t\t{\n\t\t\tlegs mp_mantle_up_21_fast animrate 2.5\n\t\t}\n\t\t// DEFAULT\n\t\tdefault \n\t\t{\n\t\t\tlegs mp_mantle_up_21\n\t\t}\n\t}\n}\nEVENTS\ndropweapon\n{\n\triotshieldnext\n\t{\n\t\ttorso pt_putaway2shield_raise weaponTimeScale\n\t}\n\tdefault\n\t{\n\t\ttorso pt_stand_putaway weaponTimeScale\n\t}\n}\nprone_to_crouch\n{\n\tnextweaponclass pistol AND pistol_spread\n\t{\n\t\tboth pb_prone2crouch_pistol\n\t}\n\tdefault\n\t{\n\t\tboth pb_prone2crouch\n\t}\n}\n";
+        let s = T6PlayerAnims::parse(MINT_COUNTER, "none\ndefault").unwrap();
         let name = |c: &T6AnimCommand| s.anims[usize::from(c.anim)].clone();
         let mut f = T6AnimFacts::default();
         // The fast mantle's own clip, on the legs alone at BO2's rate.

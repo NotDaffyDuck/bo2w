@@ -6,11 +6,14 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
-use fx::{FxGap, FxGenerateVertsOut, FxSpriteInstance, FxSystemHost};
-use render_fx::present::FxVertsGaps;
-use render_fx::{CombatFxDump, FxJournalCursor, HostFxDlights, HostFxPostLights};
+use fx::{EffectHole, CornerBuildOutput, EffectSpriteInstance, EffectSystemHost};
+use render_fx::effect_play::EffectVertexHoles;
+use render_fx::{
+    BeamFate, BattleEffectsSnapshot, EffectJournalCursor, EffectsDynamicLightSet, PostEffectLightSet, JournalCount,
+    ModelDrop, PostLightFate,
+};
 
-use crate::assemble::drawsurf::{FxCodeMeshPlan, FxModelDrawPlan, FxParticleCloudPlan};
+use crate::assemble::draw_items::{FxCodeDrawPlan, FxModelDrawList, FxCloudDrawPlan};
 
 /// How many material rows and nearest sprites the report lists.
 const LISTED: usize = 12;
@@ -22,20 +25,20 @@ pub(super) struct FrameTally {
 }
 
 pub(super) struct DumpInput<'a> {
-    pub host: &'a FxSystemHost,
-    pub out: &'a FxGenerateVertsOut,
-    pub verts_gaps: &'a FxVertsGaps,
+    pub host: &'a EffectSystemHost,
+    pub out: &'a CornerBuildOutput,
+    pub vertices_gaps: &'a EffectVertexHoles,
     pub tally: FrameTally,
     pub camera: &'a Transform,
     /// Sprites inside this distance are counted as "near".
-    pub radius: f32,
-    pub model_plan: &'a FxModelDrawPlan,
-    pub plan: &'a FxCodeMeshPlan,
-    pub spark_plan: &'a FxParticleCloudPlan,
-    pub dlights: &'a HostFxDlights,
-    pub post_lights: &'a HostFxPostLights,
-    pub cursor: &'a FxJournalCursor,
-    pub combat: &'a CombatFxDump,
+    pub rad: f32,
+    pub model_plan: &'a FxModelDrawList,
+    pub plan: &'a FxCodeDrawPlan,
+    pub spark_plan: &'a FxCloudDrawPlan,
+    pub dlights: &'a EffectsDynamicLightSet,
+    pub after_lights: &'a PostEffectLightSet,
+    pub cursor: &'a EffectJournalCursor,
+    pub combat: &'a BattleEffectsSnapshot,
 }
 
 pub(super) fn write_fx_dump(input: &DumpInput) {
@@ -44,12 +47,12 @@ pub(super) fn write_fx_dump(input: &DumpInput) {
     }
     let eye = input.camera.translation.to_array();
     let facing = input.camera.forward().as_vec3();
-    let radius = input.radius.max(1.0);
+    let radius = input.rad.max(1.0);
 
     let rows = material_rows(&input.out.sprites, eye);
     diag::info!(
         World,
-        "fx_dump cam={:.0},{:.0},{:.0} facing={:.2},{:.2},{:.2} radius={radius:.0} materials: {}",
+        "fx_dump eye={:.0},{:.0},{:.0} facing={:.2},{:.2},{:.2} radius={radius:.0} materials: {}",
         eye[0],
         eye[1],
         eye[2],
@@ -75,80 +78,83 @@ pub(super) fn write_fx_dump(input: &DumpInput) {
 fn frame_lines(input: &DumpInput) -> Vec<String> {
     let DumpInput {
         host,
-        out,
-        verts_gaps: gaps,
+        out: built,
+        vertices_gaps: gaps,
         tally,
         model_plan,
         plan,
         spark_plan,
         dlights,
-        post_lights,
+        after_lights,
         cursor,
         combat,
         ..
     } = input;
+    let counted = |kind| cursor.tally_of(kind);
+    let beams = |fate| combat.beams.count_of(fate);
+    let post = |fate| after_lights.count(fate);
     vec![
         format!(
             "fx_dump sprites={} drawn={} no_material={} trails={} trails_drawn={} clouds_skipped={} \
              codemesh_draws={} spark_draws={} spark_no_material={} no_ordinal={} not_emissive={}",
-            out.sprites.len(),
+            built.sprites.len(),
             tally.sprites_drawn,
-            cursor.draw_miss_material,
-            out.trail_meshes.len(),
+            counted(JournalCount::UnboundDraws),
+            built.trail_strips.len(),
             tally.trails_drawn,
-            out.skipped_cloud,
-            plan.draws.len(),
-            spark_plan.draws.len(),
-            spark_plan.miss_material,
-            cursor.skipped_no_ordinal,
-            cursor.skipped_not_emissive,
+            built.cloud_skips,
+            plan.runs.len(),
+            spark_plan.runs.len(),
+            spark_plan.unmatched_materials,
+            counted(JournalCount::MeshNoOrdinal),
+            counted(JournalCount::MeshNotEmissive),
         ),
         format!(
             "fx_dump left_out no_lookup={} unsupported={} other_type={} null_handler={} \
              no_trail_def={} dormant={} trail_code_mesh_gap={} \
              lookup[no_def={} no_elem={} no_material_visual={} no_size0={} size0<=0={} \
              no_size1={} size1<=0={}]",
-            out.skipped_no_lookup,
-            out.skipped_unsupported_type,
-            out.skipped_other_type,
-            out.skipped_null_handler,
-            out.skipped_no_trail_def,
-            out.skipped_dormant,
-            host.gaps.hits(FxGap::TrailCodeMesh),
-            gaps.no_def,
-            gaps.no_elem,
-            gaps.no_material_visual,
-            gaps.no_size0_sample,
-            gaps.size0_not_positive,
-            gaps.no_size1_sample,
-            gaps.size1_not_positive,
+            built.lookup_misses,
+            built.unsupported_kind_skips,
+            built.other_kind_skips,
+            built.no_handler_skips,
+            built.no_ribbon_def_skips,
+            built.dormant_skips,
+            host.gaps.hit_total(EffectHole::StreakProceduralMesh),
+            gaps.without_definition,
+            gaps.without_element,
+            gaps.without_material_look,
+            gaps.no_first_extent_sample,
+            gaps.first_extent_nonpositive_total,
+            gaps.no_second_extent_sample,
+            gaps.second_extent_nonpositive_total,
         ),
         format!(
             "fx_dump models={} drawn={} skipped[model={} catalog={} pose={} lod={} culled={} \
              material={} lighting={} flags={}]",
-            out.models.len(),
+            built.models.len(),
             model_plan.draws().len(),
-            out.skipped_model,
-            model_plan.skipped_no_catalog,
-            model_plan.skipped_no_pose,
-            model_plan.skipped_no_lod,
-            model_plan.skipped_culled,
-            model_plan.skipped_no_material,
-            model_plan.skipped_no_lighting,
-            model_plan.skipped_render_fx_flags,
+            built.model_skips,
+            model_plan.dropped.count_of(ModelDrop::NoCatalog),
+            model_plan.dropped.count_of(ModelDrop::NoPose),
+            model_plan.dropped.count_of(ModelDrop::NoLod),
+            model_plan.dropped.count_of(ModelDrop::Culled),
+            model_plan.dropped.count_of(ModelDrop::NoMaterial),
+            model_plan.dropped.count_of(ModelDrop::NoLighting),
+            model_plan.dropped.count_of(ModelDrop::RenderFlags),
         ),
         format!(
             "fx_dump lights omni={} spot={} scene={} omni_skipped={} spot_skipped={} cap_full={} \
              post[drawn={} short={} no_material={}] vis_blockers[write={} read={}]",
-            out.omni_lights.len(),
-            out.spot_lights.len(),
+            built.omni_lights.len(),
+            built.spot_lights.len(),
             dlights.scene.len(),
-            out.skipped_omni_light,
-            out.skipped_spot_light,
-            dlights.cap_full,
-            post_lights.drawn,
-            post_lights.skipped_short,
-            post_lights.miss_material,
+            built.omni_light_skips,
+            built.skipped_cone_light,
+            dlights.over_cap(),
+            post(PostLightFate::Drawn),
+            post(PostLightFate::TooShort),
+            post(PostLightFate::Unbound),
             host.vis_blocker_write.count,
             host.vis_blocker_read.count,
         ),
@@ -157,24 +163,24 @@ fn frame_lines(input: &DumpInput) -> Vec<String> {
              missing[material={} colour={} unprepared={} ordinal={} emissive={}] \
              skipped[interval={} short={} no_def={}] last[name={:?} material={:?} bind={:?} \
              colour={:?} speed={:?} beam_length={:?}]",
-            combat.tracer_live,
-            combat.beam_queued,
-            combat.beam_drawn,
-            combat.tracer_spawned,
-            combat.beam_miss_material,
-            combat.beam_miss_color,
-            combat.beam_miss_unprepared,
-            combat.beam_miss_ordinal,
-            combat.beam_miss_emissive,
-            combat.tracer_skip_interval,
-            combat.tracer_skip_short,
-            combat.tracer_skip_no_def,
-            combat.last_tracer_name,
-            combat.last_tracer_material,
-            combat.last_tracer_bind,
-            combat.last_tracer_has_color,
-            combat.last_tracer_speed,
-            combat.last_tracer_beam_length,
+            combat.streak_live,
+            beams(BeamFate::Queued),
+            beams(BeamFate::Drawn),
+            counted(JournalCount::TracerSpawned),
+            beams(BeamFate::NoMaterial),
+            beams(BeamFate::NoColor),
+            beams(BeamFate::Unprepared),
+            beams(BeamFate::NoOrdinal),
+            beams(BeamFate::NoGlow),
+            counted(JournalCount::TracerSkippedInterval),
+            counted(JournalCount::TracerSkippedShort),
+            counted(JournalCount::TracerSkippedNoDef),
+            combat.sample.name,
+            combat.sample.shader,
+            combat.sample.bind,
+            combat.sample.has_color,
+            combat.sample.speed,
+            combat.sample.ray_extent,
         ),
     ]
 }
@@ -184,18 +190,18 @@ fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
 }
 
 /// Every sprite with its distance from `eye`, nearest first.
-fn nearest_first(sprites: &[FxSpriteInstance], eye: [f32; 3]) -> Vec<(f32, &FxSpriteInstance)> {
-    let mut ranked: Vec<_> = sprites
+fn nearest_first(sprites: &[EffectSpriteInstance], eye: [f32; 3]) -> Vec<(f32, &EffectSpriteInstance)> {
+    let mut by_rank: Vec<_> = sprites
         .iter()
-        .map(|sprite| (distance(sprite.origin, eye), sprite))
+        .map(|sprite| (distance(sprite.where_at, eye), sprite))
         .collect();
-    ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-    ranked
+    by_rank.sort_by(|a, b| a.0.total_cmp(&b.0));
+    by_rank
 }
 
 /// One row per material, nearest material first: its name, how many sprites
 /// use it, the closest of them and the highest alpha among them.
-fn material_rows(sprites: &[FxSpriteInstance], eye: [f32; 3]) -> Vec<String> {
+fn material_rows(sprites: &[EffectSpriteInstance], eye: [f32; 3]) -> Vec<String> {
     struct Stats<'a> {
         name: &'a str,
         count: usize,
@@ -203,20 +209,16 @@ fn material_rows(sprites: &[FxSpriteInstance], eye: [f32; 3]) -> Vec<String> {
         top_alpha: u8,
     }
     let mut by_material: HashMap<Option<usize>, Stats> = HashMap::new();
-    for sprite in sprites {
-        let stats = by_material.entry(sprite.material_index).or_insert(Stats {
-            name: sprite.material_name.as_ref(),
-            count: 0,
-            nearest: f32::INFINITY,
-            top_alpha: 0,
-        });
+    for seen in sprites {
+        let fresh = Stats { name: seen.surface_title.as_ref(), count: 0, nearest: f32::INFINITY, top_alpha: 0 };
+        let stats = by_material.entry(seen.shader_at).or_insert(fresh);
         stats.count += 1;
-        stats.nearest = stats.nearest.min(distance(sprite.origin, eye));
-        stats.top_alpha = stats.top_alpha.max(sprite.color_rgba[3]);
+        stats.nearest = stats.nearest.min(distance(seen.where_at, eye));
+        stats.top_alpha = stats.top_alpha.max(seen.rgba_tint[3]);
     }
-    let mut rows: Vec<_> = by_material.into_iter().collect();
-    rows.sort_by(|a, b| a.1.nearest.total_cmp(&b.1.nearest));
-    rows.into_iter()
+    let mut row_list: Vec<_> = by_material.into_iter().collect();
+    row_list.sort_by(|a, b| a.1.nearest.total_cmp(&b.1.nearest));
+    row_list.into_iter()
         .map(|(material, stats)| {
             let id = material.map_or_else(|| "-".to_string(), |id| id.to_string());
             format!(
@@ -227,21 +229,17 @@ fn material_rows(sprites: &[FxSpriteInstance], eye: [f32; 3]) -> Vec<String> {
         .collect()
 }
 
-fn describe_sprite(sprite: &FxSpriteInstance, dist: f32, eye: [f32; 3], facing: Vec3) -> String {
-    let ahead = (Vec3::from_array(sprite.origin) - Vec3::from_array(eye)).dot(facing) > 0.0;
-    let [r, g, b, a] = sprite.color_rgba;
+/// One near sprite as a report line: distance, whether it is in front of the
+/// camera, colour, size, kind, names, position, flags and atlas size.
+fn describe_sprite(shown: &EffectSpriteInstance, dist: f32, eye: [f32; 3], facing: Vec3) -> String {
+    let ahead = (Vec3::from_array(shown.where_at) - Vec3::from_array(eye)).dot(facing) > 0.0;
+    let [r, g, b, a] = shown.rgba_tint;
+    let [x, y, z] = shown.where_at;
+    let (size, kind, flags) = (shown.start_extent, shown.shape_kind, shown.bit_word);
+    let (def, mat, cells) = (&shown.definition_name, &shown.surface_title, shown.atlas.entry_tally);
     format!(
-        "dist={dist:.0} ahead={ahead} rgba={r},{g},{b},{a} size={:.1} type={} def={} mat={} \
-         origin={:.0},{:.0},{:.0} flags=0x{:x} atlas_entries={}",
-        sprite.size0,
-        sprite.elem_type,
-        sprite.def_name,
-        sprite.material_name,
-        sprite.origin[0],
-        sprite.origin[1],
-        sprite.origin[2],
-        sprite.flags,
-        sprite.atlas.entry_count,
+        "dist={dist:.0} ahead={ahead} rgba={r},{g},{b},{a} size={size:.1} type={kind} def={def} mat={mat} \
+         origin={x:.0},{y:.0},{z:.0} flags=0x{flags:x} atlas_entries={cells}"
     )
 }
 
@@ -249,27 +247,27 @@ fn describe_sprite(sprite: &FxSpriteInstance, dist: f32, eye: [f32; 3], facing: 
 mod tests {
     use super::*;
 
-    fn sprite_at(origin: [f32; 3], material: Option<usize>, name: &str, alpha: u8) -> FxSpriteInstance {
-        FxSpriteInstance {
-            origin,
-            size0: 1.0,
-            size1: 0.0,
-            color_rgba: [10, 20, 30, alpha],
-            elem_type: 0,
-            def_name: "def".into(),
-            catalog_index: 0,
-            def_index: 0,
-            material_name: name.into(),
-            material_index: material,
-            axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            rotation_rad: 0.0,
-            vel_dir: [0.0, 0.0, 1.0],
-            atlas: fx_t6::runtime::FxSpriteAtlasUv::FULL,
-            flags: 0x42,
+    fn sprite_at(origin: [f32; 3], slot: Option<usize>, name: &str, alpha: u8) -> EffectSpriteInstance {
+        EffectSpriteInstance {
+            where_at: origin,
+            start_extent: 1.0,
+            second_extent: 0.0,
+            rgba_tint: [10, 20, 30, alpha],
+            definition_name: "def".into(),
+            shape_kind: 0_u8,
+            ledger_index: 0,
+            definition_slot: 0,
+            surface_title: name.into(),
+            shader_at: slot,
+            turn_rows: [Vec3::X, Vec3::Y, Vec3::Z].map(|unit| unit.to_array()),
+            spin_rad: 0.0,
+            move_dir: [0.0, 0.0, 1.0],
+            atlas: fx_t6::runtime::BillboardSheetCell::FULL,
+            bit_word: 0x42,
             line: false,
-            lighting_sample: [0; 3],
-            lighting_frac: 0,
-            packed_lighting_src: fx::FxPackedLightingSrc::White,
+            lit_sample: [0; 3],
+            shading_blend: 0,
+            packed_lighting_src: fx::BakedShadeSource::White,
         }
     }
 

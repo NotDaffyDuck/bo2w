@@ -1,11 +1,11 @@
 //! The command line as `cargo xtask master` and the deploy scripts use it: the
 //! systemd unit text, and the refusals for missing or unknown arguments.
 
-use std::process::{Command, Output};
+use std::process;
 
-fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_bo2mp-master"))
-        .args(args)
+fn run(argv: &[&str]) -> process::Output {
+    process::Command::new(env!("CARGO_BIN_EXE_bo2mp-master"))
+        .args(argv)
         .output()
         .expect("launch bo2mp-master")
 }

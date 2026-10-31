@@ -3,11 +3,11 @@
 use alloc::vec::Vec;
 use playerstate_t6::button;
 
-use crate::names::{HOLD_NAMES, HOLD_PAIR_LIMIT, INPUT_COMMAND_NAMES, key_up_command_id};
-use crate::{KEY_COUNT, Kbutton, KbuttonSet, KeyState};
+use crate::bind_ids::{HOLD_COMMANDS, HOLD_ID_END, BIND_COMMAND_TABLE, release_action_number};
+use crate::{KEYBOARD_SLOTS, HeldKeyLatch, HeldKeyLatchBank, KeyPressRecord};
 
-pub(crate) const CROUCH: i32 = button::CROUCH as i32;
-pub(crate) const PRONE: i32 = button::PRONE as i32;
+pub(crate) const DUCK_BUTTON_BIT: i32 = button::DUCK_BUTTON_BIT as i32;
+pub(crate) const LYING_FLAT: i32 = button::LYING_FLAT as i32;
 
 /// Black Ops II's cl_stanceHoldTime: the stance button held this long goes prone (or up from
 /// prone) instead of crouching.
@@ -79,18 +79,18 @@ pub struct Holds {
 }
 
 #[derive(Clone, Debug)]
-pub struct ClientInput {
-    pub keys: [KeyState; KEY_COUNT],
-    pub kb: KbuttonSet,
+pub struct PlayerIntentFeed {
+    pub keys: [KeyPressRecord; KEYBOARD_SLOTS],
+    pub pressed_key_latch: HeldKeyLatchBank,
     /// The aim toggle; holding the speed key flips it.
-    pub using_ads: bool,
-    /// The stance the client keeps asking for: `button::CROUCH`, `button::PRONE`, or 0 to stand.
-    pub stance_latch: i32,
+    pub scoped_in: bool,
+    /// The stance the client keeps asking for: `button::DUCK_BUTTON_BIT`, `button::LYING_FLAT`, or 0 to stand.
+    pub posture_hold: i32,
     /// Switch-weapon presses waiting for the client: true is next, false previous.
-    pub weapon_cycles: Vec<bool>,
+    pub gun_swap_steps: Vec<bool>,
     /// Set and cleared by the client: the next command lets go of a grenade being held
     /// without throwing it.
-    pub offhand_hold_cancel: bool,
+    pub throw_grip_abort: bool,
     /// Set and cleared by the client: the next command sends Black Ops II's offhand-switch
     /// button (a switch-weapon press that cancels a held grenade).
     pub offhand_switch_t6: bool,
@@ -102,7 +102,7 @@ pub struct ClientInput {
     /// see whether it is a dive.
     pub sprinting: bool,
     /// Set each frame by the client: the gun in hand forbids prone.
-    pub weapon_blocks_prone: bool,
+    pub gun_forbids_lying: bool,
     /// The client should switch to the inventory weapon (a held switch-weapon key, or
     /// `inventory`).
     pub inventory_request: bool,
@@ -114,20 +114,20 @@ pub struct ClientInput {
     pub holds: Holds,
 }
 
-impl Default for ClientInput {
+impl Default for PlayerIntentFeed {
     fn default() -> Self {
         Self {
-            keys: [KeyState::default(); KEY_COUNT],
-            kb: KbuttonSet::default(),
-            using_ads: false,
-            stance_latch: 0,
-            weapon_cycles: Vec::new(),
-            offhand_hold_cancel: false,
+            keys: [KeyPressRecord::default(); KEYBOARD_SLOTS],
+            pressed_key_latch: HeldKeyLatchBank::default(),
+            scoped_in: false,
+            posture_hold: 0,
+            gun_swap_steps: Vec::new(),
+            throw_grip_abort: false,
             offhand_switch_t6: false,
             action_slots: Vec::new(),
             center_view: false,
             sprinting: false,
-            weapon_blocks_prone: false,
+            gun_forbids_lying: false,
             inventory_request: false,
             change_seat_press: false,
             jam_fire_time: None,
@@ -136,8 +136,8 @@ impl Default for ClientInput {
     }
 }
 
-pub fn set_ads(client: &mut ClientInput, ads: bool) {
-    client.using_ads = ads;
+pub fn set_ads(client: &mut PlayerIntentFeed, ads: bool) {
+    client.scoped_in = ads;
 }
 
 /// A hold command's key going down or up.
@@ -146,52 +146,52 @@ struct Edge {
     down: bool,
     key: i32,
     now: i32,
-    frame_msec: u32,
+    tick_span_ms: u32,
 }
 
 impl Edge {
-    fn apply(self, held: &mut Kbutton) {
+    fn apply(self, held: &mut HeldKeyLatch) {
         if self.down {
             held.press(self.key, self.now);
         } else {
-            held.release(self.key, self.now, self.frame_msec);
+            held.release(self.key, self.now, self.tick_span_ms);
         }
     }
 }
 
-/// Runs bound command `cmd_id` for `key` at `now_msec`.
-pub fn input_cmd(client: &mut ClientInput, cmd_id: u32, key: i32, now_msec: i32, frame_msec: u32) {
-    if cmd_id == 0 {
+/// Runs bound command `cmd_id` for `key` at `present_tick_ms`.
+pub fn input_cmd(client: &mut PlayerIntentFeed, binding_id: u32, key: i32, present_tick_ms: i32, tick_span_ms: u32) {
+    if binding_id == 0 {
         return;
     }
-    if cmd_id < HOLD_PAIR_LIMIT {
+    if binding_id < HOLD_ID_END {
         let edge = Edge {
-            down: cmd_id % 2 == 1,
+            down: binding_id % 2 == 1,
             key,
-            now: now_msec,
-            frame_msec,
+            now: present_tick_ms,
+            tick_span_ms,
         };
-        hold_command(client, HOLD_NAMES[(cmd_id as usize - 1) / 2], edge);
-    } else if let Some(name) = INPUT_COMMAND_NAMES.get(cmd_id as usize) {
-        once_command(client, name, now_msec);
+        hold_command(client, HOLD_COMMANDS[(binding_id as usize - 1) / 2], edge);
+    } else if let Some(name) = BIND_COMMAND_TABLE.get(binding_id as usize) {
+        once_command(client, name, present_tick_ms);
     }
 }
 
-fn hold_command(client: &mut ClientInput, what: &str, edge: Edge) {
-    let kb = &mut client.kb;
+fn hold_command(client: &mut PlayerIntentFeed, what: &str, edge: Edge) {
+    let pressed_key_latch = &mut client.pressed_key_latch;
     match what {
         "attack" => {
             if edge.down {
                 jam_roll(client, edge.key, edge.now);
             } else {
                 client.holds.fire_down = false;
-                edge.apply(&mut client.kb.jam);
+                edge.apply(&mut client.pressed_key_latch.jam);
             }
-            edge.apply(&mut client.kb.attack);
+            edge.apply(&mut client.pressed_key_latch.attack);
         }
         "breath_sprint" => {
-            edge.apply(&mut kb.holdbreath);
-            edge.apply(&mut kb.sprint);
+            edge.apply(&mut pressed_key_latch.holdbreath);
+            edge.apply(&mut pressed_key_latch.sprint);
         }
         "usereload" | "activate" | "reload" => {
             if edge.down {
@@ -200,29 +200,29 @@ fn hold_command(client: &mut ClientInput, what: &str, edge: Edge) {
                 client.holds.use_tap.up(edge.now);
             }
             edge.apply(match what {
-                "usereload" => &mut kb.usereload,
-                "activate" => &mut kb.activate,
-                _ => &mut kb.reload,
+                "usereload" => &mut pressed_key_latch.usereload,
+                "activate" => &mut pressed_key_latch.activate,
+                _ => &mut pressed_key_latch.reload,
             });
         }
         "speed_throw" => {
             if edge.down {
-                client.using_ads = false;
+                client.scoped_in = false;
             }
-            edge.apply(&mut kb.speed);
-            edge.apply(&mut kb.throw_btn);
+            edge.apply(&mut pressed_key_latch.speed);
+            edge.apply(&mut pressed_key_latch.throw_btn);
         }
         "toggleads_throw" => {
             if edge.down {
-                client.using_ads = !client.using_ads;
+                client.scoped_in = !client.scoped_in;
             }
-            edge.apply(&mut kb.throw_btn);
+            edge.apply(&mut pressed_key_latch.throw_btn);
         }
         "stance" => {
-            let was_active = kb.stance.active;
-            edge.apply(&mut kb.stance);
-            let active = kb.stance.active;
-            if active != was_active {
+            let previously_on = pressed_key_latch.stance.active;
+            edge.apply(&mut pressed_key_latch.stance);
+            let active = pressed_key_latch.stance.active;
+            if active != previously_on {
                 stance_button(client, active, edge.now);
             }
         }
@@ -233,7 +233,7 @@ fn hold_command(client: &mut ClientInput, what: &str, edge: Edge) {
             }
         }
         plain => {
-            if let Some(held) = plain_button(kb, plain) {
+            if let Some(held) = plain_button(pressed_key_latch, plain) {
                 edge.apply(held);
             }
         }
@@ -241,47 +241,47 @@ fn hold_command(client: &mut ClientInput, what: &str, edge: Edge) {
 }
 
 /// The hold commands that do nothing but hold their own button.
-fn plain_button<'a>(kb: &'a mut KbuttonSet, what: &str) -> Option<&'a mut Kbutton> {
+fn plain_button<'a>(pressed_key_latch: &'a mut HeldKeyLatchBank, what: &str) -> Option<&'a mut HeldKeyLatch> {
     Some(match what {
-        "melee" => &mut kb.melee,
-        "frag" => &mut kb.frag,
-        "smoke" => &mut kb.smoke,
-        "gostand" => &mut kb.gostand,
-        "forward" => &mut kb.forward,
-        "back" => &mut kb.back,
-        "moveleft" => &mut kb.moveleft,
-        "moveright" => &mut kb.moveright,
-        "movedown" => &mut kb.movedown,
-        "left" => &mut kb.left,
-        "right" => &mut kb.right,
-        "lookup" => &mut kb.lookup,
-        "lookdown" => &mut kb.lookdown,
-        "strafe" => &mut kb.strafe,
-        "holdbreath" => &mut kb.holdbreath,
-        "prone" => &mut kb.prone,
-        "mlook" => &mut kb.mlook,
-        "sprint" => &mut kb.sprint,
-        "scores" => &mut kb.scores,
-        "talk" => &mut kb.talk,
+        "melee" => &mut pressed_key_latch.melee,
+        "frag" => &mut pressed_key_latch.frag,
+        "smoke" => &mut pressed_key_latch.smoke,
+        "gostand" => &mut pressed_key_latch.gostand,
+        "forward" => &mut pressed_key_latch.forward,
+        "back" => &mut pressed_key_latch.back,
+        "moveleft" => &mut pressed_key_latch.moveleft,
+        "moveright" => &mut pressed_key_latch.moveright,
+        "movedown" => &mut pressed_key_latch.movedown,
+        "left" => &mut pressed_key_latch.left,
+        "right" => &mut pressed_key_latch.right,
+        "lookup" => &mut pressed_key_latch.lookup,
+        "lookdown" => &mut pressed_key_latch.lookdown,
+        "strafe" => &mut pressed_key_latch.strafe,
+        "holdbreath" => &mut pressed_key_latch.holdbreath,
+        "prone" => &mut pressed_key_latch.prone,
+        "mlook" => &mut pressed_key_latch.mlook,
+        "sprint" => &mut pressed_key_latch.sprint,
+        "scores" => &mut pressed_key_latch.scores,
+        "talk" => &mut pressed_key_latch.talk,
         _ => return None,
     })
 }
 
-fn once_command(client: &mut ClientInput, name: &str, now: i32) {
+fn once_command(client: &mut PlayerIntentFeed, name: &str, now: i32) {
     let toggle = |latch: i32, stance: i32| if latch == stance { 0 } else { stance };
     match name {
         "weapnext" | "weapprev" => {
             let next = name == "weapnext";
-            client.weapon_cycles.push(next);
+            client.gun_swap_steps.push(next);
             client.change_seat_press |= next;
         }
         "centerview" => client.center_view = true,
-        "togglecrouch" => client.stance_latch = toggle(client.stance_latch, CROUCH),
-        "toggleprone" => client.stance_latch = toggle(client.stance_latch, PRONE),
-        "goprone" => client.stance_latch = PRONE,
-        "gocrouch" => client.stance_latch = CROUCH,
-        "toggleads" => client.using_ads = !client.using_ads,
-        "leaveads" => client.using_ads = false,
+        "togglecrouch" => client.posture_hold = toggle(client.posture_hold, DUCK_BUTTON_BIT),
+        "toggleprone" => client.posture_hold = toggle(client.posture_hold, LYING_FLAT),
+        "goprone" => client.posture_hold = LYING_FLAT,
+        "gocrouch" => client.posture_hold = DUCK_BUTTON_BIT,
+        "toggleads" => client.scoped_in = !client.scoped_in,
+        "leaveads" => client.scoped_in = false,
         // Down: a hold starts unless one is already running. Up: a hold not yet taken by
         // `weapnext_hold` was a tap, which is the next weapon.
         "+weapnext_inventory" => {
@@ -292,7 +292,7 @@ fn once_command(client: &mut ClientInput, name: &str, now: i32) {
         }
         "-weapnext_inventory" => {
             if client.holds.weapnext.take().is_some() {
-                client.weapon_cycles.push(true);
+                client.gun_swap_steps.push(true);
             }
         }
         "inventory" => client.inventory_request = true,
@@ -315,7 +315,7 @@ pub(crate) fn jam_chance(dt: i32, window: i32) -> i32 {
 /// The anti-macro roll on a fresh fire press, before the fire button itself goes down: inside
 /// the gun's jam window the jam button goes down when the clock's last two digits fall under
 /// the chance. A fresh press is then marked, jam or not.
-fn jam_roll(client: &mut ClientInput, key: i32, now: i32) {
+fn jam_roll(client: &mut PlayerIntentFeed, key: i32, now: i32) {
     let Some(window) = client.jam_fire_time else {
         return;
     };
@@ -324,7 +324,7 @@ fn jam_roll(client: &mut ClientInput, key: i32, now: i32) {
     }
     let dt = now.wrapping_sub(client.holds.last_fire);
     if window > 0 && dt < window && now % 100 < jam_chance(dt, window) {
-        client.kb.jam.press(key, now);
+        client.pressed_key_latch.jam.press(key, now);
     }
     client.holds.fire_down = true;
     client.holds.last_fire = now;
@@ -334,48 +334,48 @@ fn jam_roll(client: &mut ClientInput, key: i32, now: i32) {
 /// Down remembers the stance it left and crouches at once, unless sprinting: then the press
 /// waits to be a dive. Up after a waiting press crouches (a gun that forbids prone keeps the
 /// stance); up after a press made crouched stands.
-pub(crate) fn stance_button(client: &mut ClientInput, down: bool, now: i32) {
-    if client.kb.prone.active || client.kb.movedown.active {
+pub(crate) fn stance_button(client: &mut PlayerIntentFeed, down: bool, now: i32) {
+    if client.pressed_key_latch.prone.active || client.pressed_key_latch.movedown.active {
         return;
     }
     if down {
-        client.holds.stance = Some((client.stance_latch, now));
+        client.holds.stance = Some((client.posture_hold, now));
         if !client.sprinting {
-            client.stance_latch = CROUCH;
+            client.posture_hold = DUCK_BUTTON_BIT;
         }
         return;
     }
     let Some((from, _)) = client.holds.stance.take() else {
         return;
     };
-    if from == CROUCH {
-        client.stance_latch = 0;
-    } else if client.stance_latch == from && !client.weapon_blocks_prone {
-        client.stance_latch = CROUCH;
+    if from == DUCK_BUTTON_BIT {
+        client.posture_hold = 0;
+    } else if client.posture_hold == from && !client.gun_forbids_lying {
+        client.posture_hold = DUCK_BUTTON_BIT;
     }
 }
 
 /// A stance press held long enough: while sprinting it dives; otherwise it goes prone, or
 /// stands when it started prone.
-pub(crate) fn stance_hold(client: &mut ClientInput, now: i32) {
+pub(crate) fn stance_hold(client: &mut PlayerIntentFeed, now: i32) {
     let Some((from, since)) = client.holds.stance else {
         return;
     };
     let held = now.wrapping_sub(since);
     let latch = if client.sprinting {
-        (held >= DIVE_HOLD_MS).then_some(PRONE)
+        (held >= DIVE_HOLD_MS).then_some(LYING_FLAT)
     } else {
-        (held >= STANCE_HOLD_MS).then_some(if from == PRONE { 0 } else { PRONE })
+        (held >= STANCE_HOLD_MS).then_some(if from == LYING_FLAT { 0 } else { LYING_FLAT })
     };
     if let Some(latch) = latch {
-        client.stance_latch = latch;
+        client.posture_hold = latch;
         client.holds.stance = None;
     }
 }
 
 /// The switch-weapon key held long enough takes the inventory weapon; its release then does
 /// nothing.
-pub(crate) fn weapnext_hold(client: &mut ClientInput, now: i32) {
+pub(crate) fn weapnext_hold(client: &mut PlayerIntentFeed, now: i32) {
     let Some(since) = client.holds.weapnext else {
         return;
     };
@@ -385,15 +385,15 @@ pub(crate) fn weapnext_hold(client: &mut ClientInput, now: i32) {
     }
 }
 
-/// Key `key_num` goes down or up: its binding runs, or the up half of it.
+/// Key `digit_for_key` goes down or up: its binding runs, or the up half of it.
 pub fn key_event(
-    client: &mut ClientInput,
-    key_num: usize,
+    client: &mut PlayerIntentFeed,
+    digit_for_key: usize,
     down: bool,
-    now_msec: i32,
-    frame_msec: u32,
+    present_tick_ms: i32,
+    tick_span_ms: u32,
 ) {
-    let Some(state) = client.keys.get_mut(key_num) else {
+    let Some(state) = client.keys.get_mut(digit_for_key) else {
         return;
     };
     state.down = u8::from(down);
@@ -401,16 +401,16 @@ pub fn key_event(
     let run = if down {
         Some(binding).filter(|&id| id != 0)
     } else {
-        key_up_command_id(binding)
+        release_action_number(binding)
     };
     if let Some(id) = run {
-        input_cmd(client, id, key_num as i32, now_msec, frame_msec);
+        input_cmd(client, id, digit_for_key as i32, present_tick_ms, tick_span_ms);
     }
 }
 
 /// A key bound to going down a stance (crouch, prone, or a toggle or go command for either)
 /// is held now.
-pub fn lower_key_held(client: &ClientInput) -> bool {
+pub fn lower_key_held(client: &PlayerIntentFeed) -> bool {
     const LOWER: [&str; 7] = [
         "+stance",
         "+movedown",
@@ -422,7 +422,7 @@ pub fn lower_key_held(client: &ClientInput) -> bool {
     ];
     client.keys.iter().any(|key| {
         key.down != 0
-            && INPUT_COMMAND_NAMES
+            && BIND_COMMAND_TABLE
                 .get(key.binding as usize)
                 .is_some_and(|name| LOWER.contains(name))
     })

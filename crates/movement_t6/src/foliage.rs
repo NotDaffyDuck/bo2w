@@ -10,8 +10,9 @@
 //! BO2 reads the five numbers from dvars (`bg_foliagesnd_*`); these are
 //! their defaults, which MP never changes.
 
-use crate::bridge::{GroundTraceInput, MoveBounds, add_predictable_event};
-use playerstate_t6::game::{PM_TYPE_DEAD, PlayerState};
+use crate::bridge::{SweepAsk, HullExtents, queue_forecast_happening};
+use playerstate_t6::game::MOVE_KIND_DEAD;
+use playerstate_t6::game::AvatarState;
 
 use crate::gjk::Bo2Collision;
 
@@ -34,41 +35,41 @@ const RESET_INTERVAL_MS: i32 = 500;
 /// After the frame's move and footsteps: rustle if he is going fast enough
 /// and his box is in foliage, at the speed's pace.
 pub(crate) fn foliage_sounds<C: Bo2Collision>(
-    ps: &mut PlayerState,
-    server_time: i32,
-    bounds: MoveBounds,
-    collision: &C,
+    avatar: &mut AvatarState,
+    authority_clock_ms: i32,
+    bounds: HullExtents,
+    solids: &C,
 ) {
     // The footsteps' speed, which a dead player never sets.
-    let xyspeed = if ps.pm_type >= PM_TYPE_DEAD {
+    let ground_velocity = if avatar.movement_mode >= MOVE_KIND_DEAD {
         0.0
     } else {
-        libm::sqrtf(ps.velocity[0] * ps.velocity[0] + ps.velocity[1] * ps.velocity[1])
+        libm::sqrtf(avatar.velocity[0] * avatar.velocity[0] + avatar.velocity[1] * avatar.velocity[1])
     };
-    if xyspeed < MIN_SPEED {
-        if ps.foliage_sound_time.wrapping_add(RESET_INTERVAL_MS) < server_time {
-            ps.foliage_sound_time = 0;
+    if ground_velocity < MIN_SPEED {
+        if avatar.foliage_sound_time.wrapping_add(RESET_INTERVAL_MS) < authority_clock_ms {
+            avatar.foliage_sound_time = 0;
         }
         return;
     }
-    let frac = ((xyspeed - MIN_SPEED) / (MAX_SPEED - MIN_SPEED)).min(1.0);
+    let frac = ((ground_velocity - MIN_SPEED) / (MAX_SPEED - MIN_SPEED)).min(1.0);
     let interval =
         SLOW_INTERVAL_MS + ((FAST_INTERVAL_MS - SLOW_INTERVAL_MS) as f32 * frac) as i32;
-    if ps.foliage_sound_time.wrapping_add(interval) >= server_time {
+    if avatar.foliage_sound_time.wrapping_add(interval) >= authority_clock_ms {
         return;
     }
-    let mins = bounds.mins.map(|v| v * 0.75);
-    let maxs = [bounds.maxs[0] * 0.75, bounds.maxs[1] * 0.75, bounds.maxs[2] * 0.9];
-    let hit = collision.trace(GroundTraceInput {
-        start: ps.origin,
-        end: ps.origin,
-        mins,
-        maxs,
-        tracemask: CONTENTS_FOLIAGE,
+    let box_lo = bounds.lo_corner.map(|v| v * 0.75);
+    let box_hi = [bounds.hi_corner[0] * 0.75, bounds.hi_corner[1] * 0.75, bounds.hi_corner[2] * 0.9];
+    let strike = solids.trace(SweepAsk {
+        start: avatar.origin,
+        end: avatar.origin,
+        lo_corner: box_lo,
+        hi_corner: box_hi,
+        collide_filter: CONTENTS_FOLIAGE,
     });
-    if hit.startsolid {
-        add_predictable_event(ps, EV_FOLIAGE_SOUND, 0);
-        ps.foliage_sound_time = server_time;
+    if strike.starts_inside {
+        queue_forecast_happening(avatar, EV_FOLIAGE_SOUND, 0);
+        avatar.foliage_sound_time = authority_clock_ms;
     }
 }
 
@@ -76,12 +77,12 @@ pub(crate) fn foliage_sounds<C: Bo2Collision>(
 mod tests {
     use super::*;
     use core::cell::Cell;
-    use crate::bridge::CollisionBackend;
+    use crate::bridge::SolidProbe;
     use trace_t6::Trace;
 
     /// A bush filling x 100..200 (any y, z); records the last box traced.
     struct Bush {
-        last: Cell<Option<GroundTraceInput>>,
+        last: Cell<Option<SweepAsk>>,
     }
 
     impl Bush {
@@ -92,112 +93,110 @@ mod tests {
 
     impl Bo2Collision for Bush {}
 
-    impl CollisionBackend for Bush {
-        fn trace(&self, input: GroundTraceInput) -> Trace {
+    impl SolidProbe for Bush {
+        fn trace(&self, input: SweepAsk) -> Trace {
             self.last.set(Some(input));
-            let lo = input.start[0] + input.mins[0];
-            let hi = input.start[0] + input.maxs[0];
-            let inside = input.tracemask & CONTENTS_FOLIAGE != 0 && hi > 100.0 && lo < 200.0;
-            Trace {
-                fraction: if inside { 0.0 } else { 1.0 },
-                startsolid: inside,
-                allsolid: inside,
-                ..Trace::default()
+            let lo = input.start[0] + input.lo_corner[0];
+            let hi = input.start[0] + input.hi_corner[0];
+            let inside = input.collide_filter & CONTENTS_FOLIAGE != 0 && hi > 100.0 && lo < 200.0;
+            if !inside {
+                return Trace::new();
             }
+            Trace { fraction: 0.0, starts_inside: true, fully_embedded: true, ..Trace::new() }
         }
     }
 
-    const STAND: MoveBounds = MoveBounds {
-        mins: [-15.0, -15.0, 0.0],
-        maxs: [15.0, 15.0, 70.0],
-        tracemask: 0x0281_0011,
+    const UPRIGHT: HullExtents = HullExtents {
+        lo_corner: [-15.0_f32, -15.0, 0.0],
+        hi_corner: [15.0_f32, 15.0, 70.0],
+        collide_filter: 0x0281_0011,
     };
 
-    fn runner(x: f32, speed: f32) -> PlayerState {
-        let mut ps = PlayerState::ZERO;
-        ps.origin = [x, 0.0, 0.0];
-        ps.velocity = [speed, 0.0, 0.0];
-        ps
+    fn runner(x: f32, speed: f32) -> AvatarState {
+        let mut avatar = AvatarState::ZERO;
+        avatar.origin = [x, 0.0, 0.0];
+        avatar.velocity = [speed, 0.0, 0.0];
+        avatar
     }
 
-    fn rustles(ps: &PlayerState) -> i32 {
-        i32::from(ps.predictable_event_sequence)
+    fn rustles(avatar: &AvatarState) -> i32 {
+        i32::from(avatar.predictable_event_sequence)
     }
 
     #[test]
     fn running_through_a_bush_rustles_every_half_second() {
         let bush = Bush::new();
-        let mut ps = runner(150.0, 250.0);
-        foliage_sounds(&mut ps, 10_000, STAND, &bush);
-        assert_eq!(rustles(&ps), 1);
-        assert_eq!(ps.predictable_events[0], EV_FOLIAGE_SOUND);
-        assert_eq!(ps.predictable_event_parms[0], 0);
-        assert_eq!(ps.foliage_sound_time, 10_000);
-        foliage_sounds(&mut ps, 10_500, STAND, &bush);
-        assert_eq!(rustles(&ps), 1, "not before the half second is over");
-        foliage_sounds(&mut ps, 10_501, STAND, &bush);
-        assert_eq!(rustles(&ps), 2);
+        let mut avatar = runner(150.0, 250.0);
+        foliage_sounds(&mut avatar, 10_000, UPRIGHT, &bush);
+        assert_eq!(rustles(&avatar), 1);
+        assert_eq!(avatar.predictable_events[0], EV_FOLIAGE_SOUND);
+        assert_eq!(avatar.predictable_event_parms[0], 0);
+        assert_eq!(avatar.foliage_sound_time, 10_000);
+        foliage_sounds(&mut avatar, 10_500, UPRIGHT, &bush);
+        assert_eq!(rustles(&avatar), 1, "not before the half second is over");
+        foliage_sounds(&mut avatar, 10_501, UPRIGHT, &bush);
+        assert_eq!(rustles(&avatar), 2);
     }
 
     #[test]
     fn a_slow_walk_rustles_every_one_and_a_half_seconds() {
         let bush = Bush::new();
-        let mut ps = runner(150.0, 40.0);
-        foliage_sounds(&mut ps, 10_000, STAND, &bush);
-        foliage_sounds(&mut ps, 11_400, STAND, &bush);
-        assert_eq!(rustles(&ps), 1);
-        foliage_sounds(&mut ps, 11_501, STAND, &bush);
-        assert_eq!(rustles(&ps), 2);
+        let mut avatar = runner(150.0, 40.0);
+        foliage_sounds(&mut avatar, 10_000, UPRIGHT, &bush);
+        foliage_sounds(&mut avatar, 11_400, UPRIGHT, &bush);
+        assert_eq!(rustles(&avatar), 1);
+        foliage_sounds(&mut avatar, 11_501, UPRIGHT, &bush);
+        assert_eq!(rustles(&avatar), 2);
         // Halfway between the speeds, halfway between the paces.
-        let mut ps = runner(150.0, 110.0);
-        foliage_sounds(&mut ps, 10_000, STAND, &bush);
-        foliage_sounds(&mut ps, 11_000, STAND, &bush);
-        assert_eq!(rustles(&ps), 1);
-        foliage_sounds(&mut ps, 11_001, STAND, &bush);
-        assert_eq!(rustles(&ps), 2);
+        let mut avatar = runner(150.0, 110.0);
+        foliage_sounds(&mut avatar, 10_000, UPRIGHT, &bush);
+        foliage_sounds(&mut avatar, 11_000, UPRIGHT, &bush);
+        assert_eq!(rustles(&avatar), 1);
+        foliage_sounds(&mut avatar, 11_001, UPRIGHT, &bush);
+        assert_eq!(rustles(&avatar), 2);
     }
 
     #[test]
     fn the_box_is_smaller_than_him_and_looks_for_foliage_only() {
         let bush = Bush::new();
-        let mut ps = runner(150.0, 250.0);
-        foliage_sounds(&mut ps, 10_000, STAND, &bush);
+        let mut avatar = runner(150.0, 250.0);
+        foliage_sounds(&mut avatar, 10_000, UPRIGHT, &bush);
         let traced = bush.last.get().expect("traced");
         assert_eq!(traced.start, traced.end);
-        assert_eq!(traced.mins, [-11.25, -11.25, 0.0]);
-        assert_eq!(traced.maxs, [11.25, 11.25, 63.0]);
-        assert_eq!(traced.tracemask, CONTENTS_FOLIAGE);
+        assert_eq!(traced.lo_corner, [-11.25, -11.25, 0.0]);
+        assert_eq!(traced.hi_corner, [11.25, 11.25, 63.0]);
+        assert_eq!(traced.collide_filter, CONTENTS_FOLIAGE);
         // Out of the bush: the edge of his own box would touch, the smaller
         // one does not.
-        let mut ps = runner(88.0, 250.0);
-        foliage_sounds(&mut ps, 10_000, STAND, &bush);
-        assert_eq!(rustles(&ps), 0);
-        assert_eq!(ps.foliage_sound_time, 0);
+        let mut avatar = runner(88.0, 250.0);
+        foliage_sounds(&mut avatar, 10_000, UPRIGHT, &bush);
+        assert_eq!(rustles(&avatar), 0);
+        assert_eq!(avatar.foliage_sound_time, 0);
     }
 
     #[test]
     fn standing_still_clears_the_clock_after_half_a_second() {
         let bush = Bush::new();
-        let mut ps = runner(150.0, 250.0);
-        foliage_sounds(&mut ps, 10_000, STAND, &bush);
-        ps.velocity = [30.0, 0.0, 0.0];
-        foliage_sounds(&mut ps, 10_400, STAND, &bush);
-        assert_eq!(ps.foliage_sound_time, 10_000);
-        foliage_sounds(&mut ps, 10_501, STAND, &bush);
-        assert_eq!(ps.foliage_sound_time, 0);
+        let mut avatar = runner(150.0, 250.0);
+        foliage_sounds(&mut avatar, 10_000, UPRIGHT, &bush);
+        avatar.velocity = [30.0, 0.0, 0.0];
+        foliage_sounds(&mut avatar, 10_400, UPRIGHT, &bush);
+        assert_eq!(avatar.foliage_sound_time, 10_000);
+        foliage_sounds(&mut avatar, 10_501, UPRIGHT, &bush);
+        assert_eq!(avatar.foliage_sound_time, 0);
         // The next push rustles at once.
-        ps.velocity = [40.0, 0.0, 0.0];
-        foliage_sounds(&mut ps, 10_550, STAND, &bush);
-        assert_eq!(rustles(&ps), 2);
+        avatar.velocity = [40.0, 0.0, 0.0];
+        foliage_sounds(&mut avatar, 10_550, UPRIGHT, &bush);
+        assert_eq!(rustles(&avatar), 2);
         assert!(bush.last.get().is_some());
     }
 
     #[test]
     fn the_dead_never_rustle() {
         let bush = Bush::new();
-        let mut ps = runner(150.0, 250.0);
-        ps.pm_type = PM_TYPE_DEAD;
-        foliage_sounds(&mut ps, 10_000, STAND, &bush);
-        assert_eq!(rustles(&ps), 0);
+        let mut avatar = runner(150.0, 250.0);
+        avatar.movement_mode = MOVE_KIND_DEAD;
+        foliage_sounds(&mut avatar, 10_000, UPRIGHT, &bush);
+        assert_eq!(rustles(&avatar), 0);
     }
 }

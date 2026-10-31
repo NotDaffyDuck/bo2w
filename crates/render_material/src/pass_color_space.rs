@@ -1,20 +1,20 @@
-use asset_core::AssetNamespace;
-use lighting_t6::is_lit_remap_slot;
+use asset_core::AssetCategoryScope;
+use lighting_t6::slot_is_lit_substitute;
 
 /// How a pass encodes the colors it writes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum PassColorSpace {
+pub enum PassColorEncoding {
     #[default]
     Linear,
-    GammaEncoded,
+    NonlinearEncoded,
     Unknown,
 }
 
-pub fn pass_color_space(namespace: AssetNamespace, tech_slot: u8) -> PassColorSpace {
-    match namespace {
-        AssetNamespace::T5 if is_lit_remap_slot(tech_slot) => PassColorSpace::GammaEncoded,
-        AssetNamespace::T5 => PassColorSpace::Unknown,
+pub fn pass_color_space(scope: AssetCategoryScope, tech_slot: u8) -> PassColorEncoding {
+    match scope {
+        AssetCategoryScope::T5 if slot_is_lit_substitute(tech_slot) => PassColorEncoding::NonlinearEncoded,
+        AssetCategoryScope::T5 => PassColorEncoding::Unknown,
         // bo2zm: Black Ops II passes are not measured yet.
-        AssetNamespace::T6 => PassColorSpace::Unknown,
+        AssetCategoryScope::T6 => PassColorEncoding::Unknown,
     }
 }

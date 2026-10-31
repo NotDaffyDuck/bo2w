@@ -3,9 +3,12 @@
 
 use std::path::Path;
 
-use asset_transport::{GamesRoot, find_runtime_zone, find_zone_file, zone_game_for_path};
+use asset_core::AssetCategoryScope;
+use asset_transport::GameInstallDir;
+use asset_transport::locate_runtime_zone;
+use asset_transport::title_of_zone_path;
 
-use crate::{AssetNamespace, SoundCatalog};
+use crate::sound_bank::AudioRoster;
 
 /// The zones every match reads sound from, in order. A zone that is not
 /// required may be absent without a word to the player.
@@ -18,51 +21,48 @@ const RUNTIME_ZONES: [(&str, bool); 5] = [
 ];
 
 /// Every Black Ops II sound belongs to the one namespace.
-pub fn namespace_for_zone(_games: &GamesRoot, _zone: &str) -> AssetNamespace {
-    AssetNamespace::T6
+pub fn zone_sound_namespace(_games: &GameInstallDir, _zone: &str) -> AssetCategoryScope {
+    AssetCategoryScope::T6
 }
 
 /// A zone that gave no sound, and why.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SoundZoneGap {
-    pub namespace: AssetNamespace,
+pub struct SoundZoneMiss {
+    pub namespace: AssetCategoryScope,
     pub zone: String,
-    pub reason: String,
+    pub why: String,
 }
 
-impl SoundZoneGap {
+impl SoundZoneMiss {
     fn line(&self) -> String {
-        format!(
-            "sound bank gap: {} `{}` — {}",
-            self.namespace.as_str(),
-            self.zone,
-            self.reason
-        )
+        let Self { namespace, zone, why } = self;
+        let space = namespace.as_str();
+        format!("sound bank gap: {space} `{zone}` — {why}")
     }
 }
 
 /// A finished catalog and the zones it is missing.
 #[derive(Default)]
-pub struct LoadedSoundBank {
-    pub catalog: SoundCatalog,
-    pub gaps: Vec<SoundZoneGap>,
+pub struct InMemoryAudioBank {
+    pub catalog: AudioRoster,
+    pub gaps: Vec<SoundZoneMiss>,
 }
 
-impl LoadedSoundBank {
-    pub fn gap_lines(&self) -> Vec<String> {
-        self.gaps.iter().map(SoundZoneGap::line).collect()
+impl InMemoryAudioBank {
+    pub fn hole_rows(&self) -> Vec<String> {
+        Vec::from_iter(self.gaps.iter().map(|gap| gap.line()))
     }
 }
 
 /// What the runtime zones gave before the map's own zone is added.
 pub struct SoundSources {
-    gaps: Vec<SoundZoneGap>,
+    gaps: Vec<SoundZoneMiss>,
 }
 
 /// Why a zone file's sound could not be read. Black Ops II sound banks are
 /// not read from zone files yet, so a readable zone still gives nothing.
 fn unread_reason(zone_path: &Path) -> String {
-    match zone_game_for_path(zone_path) {
+    match title_of_zone_path(zone_path) {
         Some(_) => format!(
             "{}: Black Ops II sound banks are not read yet (bo2zm)",
             zone_path.display()
@@ -71,22 +71,19 @@ fn unread_reason(zone_path: &Path) -> String {
     }
 }
 
-fn gap_of(zone: &str, reason: String) -> SoundZoneGap {
-    SoundZoneGap {
-        namespace: AssetNamespace::T6,
-        zone: zone.to_owned(),
-        reason,
-    }
+fn gap_of(zone: &str, why: String) -> SoundZoneMiss {
+    SoundZoneMiss { namespace: AssetCategoryScope::T6, zone: String::from(zone), why }
 }
 
 /// Looks for each runtime zone beside the map's zone file `map`.
-pub fn gather_sound_sources(games: &GamesRoot, map: &Path) -> SoundSources {
-    let mut gaps = Vec::new();
+pub fn gather_sound_sources(games: &GameInstallDir, map: &Path) -> SoundSources {
+    let mut gaps: Vec<SoundZoneMiss> = vec![];
     for (name, required) in RUNTIME_ZONES {
-        match find_runtime_zone(games, map, name) {
-            Ok(zone) => gaps.push(gap_of(name, unread_reason(&zone.path))),
-            Err(error) if required => gaps.push(gap_of(name, error)),
-            Err(error) => diag::info!(Zone, "sound bank: T6 {name} missing ({error})"),
+        let found = locate_runtime_zone(games, map, name);
+        match (found, required) {
+            (Ok(zone), _) => gaps.push(gap_of(name, unread_reason(&zone.path))),
+            (Err(error), true) => gaps.push(gap_of(name, error)),
+            (Err(error), false) => diag::info!(Zone, "sound bank: T6 {name} missing ({error})"),
         }
     }
     SoundSources { gaps }
@@ -97,45 +94,32 @@ pub fn gather_sound_sources(games: &GamesRoot, map: &Path) -> SoundSources {
 pub fn compose_sound_bank(
     sources: SoundSources,
     zone: &str,
-    namespace: AssetNamespace,
-    map: Result<SoundCatalog, String>,
-) -> LoadedSoundBank {
-    let mut bank = LoadedSoundBank {
-        catalog: SoundCatalog::default(),
-        gaps: sources.gaps,
-    };
+    namespace: AssetCategoryScope,
+    map: Result<AudioRoster, String>,
+) -> InMemoryAudioBank {
+    let mut bank = InMemoryAudioBank { catalog: Default::default(), gaps: sources.gaps };
     match map {
-        Ok(map) => {
-            diag::info!(
-                Zone,
-                "sound bank: map zone {zone} ({}) — {} rawfiles, {} aliases",
-                namespace.as_str(),
-                map.rawfiles.len(),
-                map.sounds.len()
-            );
-            bank.catalog.absorb_missing_aliases(map);
+        Ok(from_map) => {
+            let ns_name = namespace.as_str();
+            let (raw_count, alias_count) = (from_map.rawfiles.len(), from_map.sounds.len());
+            diag::info!(Zone, "sound bank: {zone} gave {raw_count} raw files and {alias_count} aliases ({ns_name})");
+            bank.catalog.merge_missing(from_map);
         }
-        Err(error) => bank.gaps.push(SoundZoneGap {
-            namespace,
-            zone: zone.to_owned(),
-            reason: error,
-        }),
+        Err(why) => bank.gaps.push(SoundZoneMiss { namespace, zone: zone.into(), why }),
     }
     bank.catalog.publish();
-    for gap in &bank.gaps {
-        diag::warn!(Zone, "{}", gap.line());
-    }
+    bank.gaps.iter().for_each(|entry| diag::warn!(Zone, "{}", entry.line()));
     bank
 }
 
 /// Loads the sound of a multiplayer map's zones. Nothing is read from the
 /// zone files yet, so the catalog comes back empty with every zone listed
 /// as a gap.
-pub fn load_mp_sound_bank(games: &GamesRoot, zone: &str) -> Result<LoadedSoundBank, String> {
-    let found = find_zone_file(games, zone)?;
+pub fn read_mp_sound_bank(games: &GameInstallDir, zone: &str) -> Result<InMemoryAudioBank, String> {
+    let found = asset_transport::locate_zone_file(games, zone)?;
     let sources = gather_sound_sources(games, &found.path);
     let map = Err(unread_reason(&found.path));
-    Ok(compose_sound_bank(sources, zone, AssetNamespace::T6, map))
+    Ok(compose_sound_bank(sources, zone, AssetCategoryScope::T6, map))
 }
 
 #[cfg(test)]
@@ -148,32 +132,29 @@ mod tests {
         let bank = compose_sound_bank(
             sources,
             "mp_x",
-            AssetNamespace::T6,
+            AssetCategoryScope::T6,
             Err("no such zone".to_owned()),
         );
         assert!(bank.catalog.sounds.is_empty());
-        assert!(bank.catalog.revision() > 0);
-        let namespace = AssetNamespace::T6.as_str();
+        assert!(bank.catalog.generation() > 0);
+        let namespace = AssetCategoryScope::T6.as_str();
         assert_eq!(
-            bank.gap_lines(),
+            bank.hole_rows(),
             [format!("sound bank gap: {namespace} `mp_x` — no such zone")]
         );
     }
 
     #[test]
     fn the_map_zone_fills_in_the_catalog() {
-        let mut map = SoundCatalog::default();
-        map.add_sound(crate::CapturedSound {
-            name: "wind".to_owned(),
-            aliases: Vec::new(),
-        });
+        let mut map = AudioRoster::default();
+        map.add_sound(crate::SnapshotSoundEntry { name: "wind".to_owned(), aliases: vec![] });
         let bank = compose_sound_bank(
             SoundSources { gaps: Vec::new() },
             "mp_x",
-            AssetNamespace::T6,
+            AssetCategoryScope::T6,
             Ok(map),
         );
         assert!(bank.gaps.is_empty());
-        assert!(bank.catalog.sound("wind").is_some());
+        assert!(bank.catalog.entry_named("wind").is_some());
     }
 }

@@ -1,10 +1,10 @@
 //! Where the menus find their own assets.
 
-use asset_transport::{GamesRoot, find_zone_file, game_root_for_zone};
+use asset_transport::{GameInstallDir, locate_zone_file, install_root_of_zone};
 
 /// The games root the menus read from: whichever one holds the multiplayer
 /// common zone.
-pub fn ui_games_root(games: &GamesRoot) -> Result<GamesRoot, String> {
-    let common = find_zone_file(games, "t6:common_mp")?;
-    game_root_for_zone(&common.path).map(GamesRoot)
+pub fn ui_games_root(games: &GameInstallDir) -> Result<GameInstallDir, String> {
+    let common = locate_zone_file(games, "t6:common_mp")?;
+    install_root_of_zone(&common.path).map(GameInstallDir)
 }

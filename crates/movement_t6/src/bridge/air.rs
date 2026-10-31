@@ -2,10 +2,10 @@
 
 /// How the air move is tuned.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AirMoveContext {
+pub struct AirborneStepArgs {
     /// Spectators move at this multiple of their normal speed.
-    pub player_spectate_speed_scale: f32,
+    pub observer_pace_ratio: f32,
     /// A shell-shocked player falls scaled by this, plus the bias below.
-    pub shellshock_gravity_scale: f32,
-    pub shellshock_gravity_bias: f32,
+    pub concussed_fall_ratio: f32,
+    pub concussed_fall_offset: f32,
 }

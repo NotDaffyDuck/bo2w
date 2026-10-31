@@ -4,15 +4,22 @@
 use bevy::prelude::*;
 
 pub mod audio;
-pub mod input;
+mod input;
 pub mod menu;
 
-pub use audio::{UiPlayMusic, UiPlaySound, UiStopMusic};
-pub use input::{UiBindRequest, UiBindingCapture};
-pub use menu::{
-    GamePaused, HostMatchRules, LuiMenus, MenuDims, UiExecCommand, UiMenuDvars, UiPartyState,
-    WorldBlur, WorldDim,
-};
+pub use audio::{MenuSongStart, MenuCueStart, MenuSongHalt};
+pub use input::UiBindRequest;
+pub use input::UiBindingCapture;
+pub use menu::GamePaused;
+pub use menu::HostMatchRules;
+pub use menu::LuiMenus;
+pub use menu::MenuDims;
+pub use menu::ScriptScreenFilter;
+pub use menu::UiExecCommand;
+pub use menu::UiMenuDvars;
+pub use menu::UiPartyState;
+pub use menu::WorldBlur;
+pub use menu::WorldDim;
 
 /// Adds every UI resource and message type to the app.
 pub fn register_ui_contracts(app: &mut App) {
@@ -25,9 +32,9 @@ pub fn register_ui_contracts(app: &mut App) {
         .init_resource::<UiBindingCapture>()
         .init_resource::<UiPartyState>()
         .add_message::<UiBindRequest>()
-        .add_message::<UiPlaySound>()
-        .add_message::<UiPlayMusic>()
-        .add_message::<UiStopMusic>()
+        .add_message::<MenuCueStart>()
+        .add_message::<MenuSongStart>()
+        .add_message::<MenuSongHalt>()
         .add_message::<UiExecCommand>();
 }
 
@@ -56,9 +63,9 @@ mod tests {
         register_ui_contracts(&mut app);
         let world = app.world();
         assert!(world.contains_resource::<Messages<UiBindRequest>>());
-        assert!(world.contains_resource::<Messages<UiPlaySound>>());
-        assert!(world.contains_resource::<Messages<UiPlayMusic>>());
-        assert!(world.contains_resource::<Messages<UiStopMusic>>());
+        assert!(world.contains_resource::<Messages<MenuCueStart>>());
+        assert!(world.contains_resource::<Messages<MenuSongStart>>());
+        assert!(world.contains_resource::<Messages<MenuSongHalt>>());
         assert!(world.contains_resource::<Messages<UiExecCommand>>());
     }
 

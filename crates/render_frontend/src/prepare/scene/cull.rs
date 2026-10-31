@@ -2,292 +2,538 @@
 //! portals, which of their surfaces and static models are inside the view
 //! frustum, and the draw items that result.
 
+use std::ops::Range;
+
+use asset_world::CameraSpanKind;
+use bevy::ecs::system::SystemParam;
 use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
 use dpvs_t6::{
-    AabbCullStats, AabbTreeCull, BspDrawSurfCensus, BspDrawSurfRun, CellClip, DpvsPlanes,
-    DpvsVisData, GfxDrawSurf, VisBits, add_aabb_tree_surfaces_in_frustum,
-    add_bsp_draw_surfs_camera, cell_caster_row_words, msb_get, or_caster_rows_for_visible,
-    smodel_cull_dist_hides, words_for_bits,
+    AabbHideStats, BoxTreeVisibilityWalk, WorldFaceRun, CellClip, SortedDraw,
+    LevelTreeFacetDrawCensus, VisibilityBitView, VisibilityCellPlanes, VisibilityResultSet,
+    queue_world_faces_for_view, admit_box_tree_surfaces_inside_frustum, cell_caster_bitset_width,
+    merge_caster_rows_of_visible, top_bit_get, prop_beyond_cull_range, word_span,
 };
 
-use crate::assemble::drawsurf::list::{CONTENT_ID_SEED, mix_content_bytes, mix_content_id};
-use crate::prepare::scene::view_parms::{PreparedSceneView, RLockPvs};
-use crate::prepare::scene::world::{
-    WorldCull, WorldDpvs, WorldDrawItem, WorldDrawItemKind, WorldScene,
+use crate::assemble::draw_items::list::{CONTENT_KEY_SEED, blend_content_id, fold_content_bytes};
+use crate::prepare::scene::eye_parms::{FrozenVisibilitySet, StagedStageEye};
+use crate::{
+    LevelDrawItem, LevelDrawItemKind, LevelHide, LevelSight, LevelStage,
 };
 
-/// What the last visibility pass saw and produced. Counters are for the log
-/// and the diagnostics; the vectors are the pass's products, which later
-/// systems read.
+/// What the last visibility pass saw and produced. The plain fields are read
+/// by the draw-surf builders and the render diagnostics; `view`, `aabb`,
+/// `triangle_split` and the two portal/eye counters only feed this file's
+/// log line.
 #[derive(Resource, Clone, Debug, Default)]
-pub struct DpvsFrameStats {
-    /// The cell the eye is in, if it is in one.
-    pub eye_cell: Option<usize>,
-    /// Frames in which the eye was in no cell (cumulative).
-    pub eye_cell_unresolved: u32,
-    pub visible_cells: u32,
-    pub portals_frustum_skipped: u32,
-
-    pub aabb_nodes_visited: u32,
-    pub aabb_planes_dropped: u32,
-    pub surfaces_rejected_by_bounds: u32,
-    pub surfaces_admitted_unbounded: u32,
-    pub smodels_rejected_by_bounds: u32,
-    pub smodels_admitted_unbounded: u32,
-
-    pub bsp_visible_surfaces: u32,
-    pub bsp_admitted_surfaces: u32,
-    pub bsp_run_n: u32,
-    pub bsp_input_gap_n: u32,
-    pub bsp_ranges_unavailable: u32,
-
+pub struct SightFrameStats {
+    pub cells_seen: u32,
+    pub bsp_shown: u32,
+    pub bsp_accepted: u32,
+    pub bsp_runs: u32,
+    pub bsp_input_gaps: u32,
+    pub bsp_unranged: u32,
     pub keys: u32,
-    pub material_ordinal_refused: u32,
     pub rebinds: u32,
     pub surfaces: u32,
     pub triangles: u32,
-    pub lightmapped_triangles: u32,
-    pub fallback_triangles: u32,
-    pub unculled_triangles: u32,
-    pub single_cell: bool,
-    pub aspect: f32,
-    pub fov_deg: f32,
-
-    pub cell_static_started: Option<std::time::Instant>,
-
-    pub submitted_batches: u32,
-    pub rewritten_index_bytes: u64,
-    pub visibility_changes: u32,
-
-    /// 1 once the frame had a prepared view to cull against.
-    pub view_prepared: u8,
-    /// 1 while the PVS lock holds the culling view still.
-    pub lock_pvs: u8,
+    pub unhidden_triangles: u32,
+    pub batches_sent: u32,
+    pub index_bytes_rewritten: u64,
+    pub vis_flips: u32,
 
     /// Per static model: 1 if visible.
-    pub smodel_vis: Vec<u8>,
-    /// Content hash of `smodel_vis`.
-    pub smodel_vis_id: u64,
-
+    pub prop_vis: Vec<u8>,
+    /// Content hash of `prop_vis`.
+    pub prop_vis_id: u64,
     /// World surfaces that were visible but had no draw-surf word.
-    pub g0_world_surfs: Vec<u16>,
-
-    pub frustum_planes: Vec<[f32; 4]>,
-
-    /// Bit set of visible cells (`cell_vis_count` cells).
-    pub cell_vis: Vec<u32>,
-    pub cell_vis_count: usize,
+    pub g0_level_facets: Vec<u16>,
+    pub view_volume_planes: Vec<[f32; 4]>,
+    /// Bit set of visible cells (`room_vis_tally` cells).
+    pub room_vis: Vec<u32>,
+    pub room_vis_tally: usize,
     /// The clip planes each visible cell was first reached through.
-    pub cell_clips: Vec<CellClip>,
-    /// Every cell is visible (the eye is outside the world).
-    pub cell_vis_all: bool,
+    pub room_clips: Vec<CellClip>,
+
+    /// How the view of this frame stood; reset with the products.
+    pub view: CullViewFacts,
+    /// Bounds-tree counters of the camera pass.
+    pub aabb: AabbHideStats,
+    /// Drawn triangles: (lightmapped batches, fallback batches).
+    pub triangle_split: (u32, u32),
+    /// Portals the walk dropped because they lay outside the frustum.
+    pub portal_clip_skips: u32,
+    /// Frames, all told, in which the eye stood in no cell.
+    pub eyeless_frames: u32,
 }
 
-/// `BO2MP_SINGLE_CELL=1` shows only the eye's own cell (a debugging aid).
-fn single_cell_from_env() -> bool {
-    matches!(
-        std::env::var("BO2MP_SINGLE_CELL").as_deref(),
-        Ok("1" | "true" | "yes")
-    )
+/// The view a visibility pass culled against.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CullViewFacts {
+    /// The frame had a prepared view.
+    pub prepared: bool,
+    /// The PVS lock held the culling view still.
+    pub pvs_locked: bool,
+    /// The cell holding the eye; None outside the world or in a script shot.
+    pub eye_room: Option<usize>,
+    /// Every cell counted as visible.
+    pub every_cell: bool,
+    /// Only the eye's own cell was shown (`BO2MP_SINGLE_CELL`).
+    pub only_eye_cell: bool,
+    pub width_per_height: f32,
+    pub fov_degrees: f32,
 }
 
 #[derive(Component)]
-pub struct WorldMeshEntity;
+pub struct PropEntity;
 
 #[derive(Component)]
-pub struct StaticModelEntity;
+pub struct ScriptedPropEntity;
 
-#[derive(Component)]
-pub struct ScriptModelEntity;
-
-pub use render_scene::DynEntModelEntity;
+pub use render_scene::DynamicPropModelEntity;
 
 /// Tag of a `script_model` game object the map's scripts left in place.
 #[derive(Component)]
-pub struct ScriptModelGameObject(pub String);
+pub struct ScriptModelActorItem(pub String);
+
+/// A yes-word (`1`, `true`, `yes`) in environment variable `name`.
+fn env_says_yes(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|word| ["1", "true", "yes"].contains(&word.as_str()))
+}
 
 /// True when the static model in `slot` is too far from `eye` to draw.
 /// Without an eye nothing is skipped; a slot with no distance never hides.
-pub(crate) fn smodel_cull_dist_skips_slot(
-    cull_dists: &[u16],
-    slot: usize,
-    origin: [f32; 3],
-    eye: Option<Vec3>,
-    scale_last: Option<f32>,
+pub(crate) fn prop_hide_dist_skips_slot(
+    hide_dists: &[u16],
+    seat: usize,
+    pos: [f32; 3],
+    eye_pos: Option<Vec3>,
+    last_scale: Option<f32>,
 ) -> bool {
-    let Some(eye) = eye else {
-        return false;
-    };
-    let cull_dist = cull_dists.get(slot).copied().unwrap_or(0);
-    let offset = eye - Vec3::from_array(origin);
-    smodel_cull_dist_hides(cull_dist, offset.length_squared(), scale_last)
+    eye_pos.is_some_and(|eye| {
+        let limit = hide_dists.get(seat).copied().unwrap_or_default();
+        prop_beyond_cull_range(limit, eye.distance_squared(Vec3::from(pos)), last_scale)
+    })
 }
 
 /// How the linked portals look from `eye` (`render_frame::portal_eyes`).
 fn portal_looks(eye: Vec3) -> Vec<render_frame::portal_eyes::PortalLook> {
     use render_frame::portal_eyes::PortalEnd;
-    let ends: Vec<PortalEnd> = sim::guest::portals()
+    let ends: Vec<PortalEnd> = sim::guest_arms::portals()
         .iter()
         .map(|p| PortalEnd {
             centre: Vec3::from_array(p.centre),
-            normal: Vec3::from_array(p.normal).normalize_or(Vec3::Z),
-            up: Vec3::from_array(p.up).normalize_or(Vec3::Y),
+            normal: Vec3::from_array(p.face_dir).normalize_or(Vec3::Z),
+            up: Vec3::from_array(p.up_dir).normalize_or(Vec3::Y),
             orange: p.orange,
-            linked: p.linked,
+            linked: p.paired,
             pair: p.pair,
         })
         .collect();
     render_frame::portal_eyes::choose_looks(&ends, eye)
 }
 
+/// The walk's view of the world's cells: one `dpvs_t6::Cell` per cell, its
+/// portals laid out back to back. Portals with no hull axes (a world in the
+/// older format) are left out.
+fn walk_cells(sight: &LevelSight) -> (Vec<dpvs_t6::Cell>, Vec<dpvs_t6::Portal>) {
+    let mut portals: Vec<dpvs_t6::Portal> = Vec::new();
+    let mut cells: Vec<dpvs_t6::Cell> = (0..sight.cells_n)
+        .map_while(|cell| sight.portals_per_room.get(cell))
+        .map(|own| {
+            let portal_start = portals.len() as u32;
+            let usable = own
+                .iter()
+                .filter_map(|door| Some((door, door.hull_axes_dir?)));
+            for (door, hull_axes_dir) in usable {
+                portals.push(dpvs_t6::Portal {
+                    hull_axes_dir,
+                    cell: door.adjacent_cell,
+                    plane: door.split,
+                    vertex_first: door.vertex_first as u32,
+                    vertex_tally: door.vertex_tally as u32,
+                });
+            }
+            dpvs_t6::Cell {
+                portal_start,
+                portal_opening_total: portals.len() as u32 - portal_start,
+                ..Default::default()
+            }
+        })
+        .collect();
+    cells.resize(sight.cells_n, dpvs_t6::Cell::default());
+    (cells, portals)
+}
+
 /// bo2zm: BO2's portal walk (`dpvs_t6`) from `start_cell`. Sets the bit of
-/// every cell the walk reached and returns each reached cell's clip planes,
-/// those of its first visit. A portal without hull axes (a world in the
-/// older format) is left out of the walk.
+/// every cell the walk reached and returns each cell's clip planes (those of
+/// its first visit; empty for cells not reached).
 fn t6_walk(
-    dpvs: &WorldDpvs,
+    sight: &LevelSight,
     start_cell: usize,
     params: &dpvs_t6::WalkParams<'_>,
-    vis: &mut VisBits<'_>,
-) -> (Vec<CellClip>, dpvs_t6::WalkStats) {
-    let mut cells = Vec::with_capacity(dpvs.cell_count);
-    let mut portals = Vec::new();
-    for source in dpvs.portals_per_cell.iter().take(dpvs.cell_count) {
-        let first = portals.len();
-        portals.extend(source.iter().filter_map(|p| {
-            Some(dpvs_t6::Portal {
-                plane: p.plane,
-                cell: p.neighbor,
-                vert_start: p.vert_start as u32,
-                vert_count: p.vert_count as u32,
-                hull_axis: p.hull_axis?,
-            })
-        }));
-        cells.push(dpvs_t6::Cell {
-            portal_start: first as u32,
-            portal_count: (portals.len() - first) as u32,
-            ..Default::default()
-        });
-    }
-    cells.resize(dpvs.cell_count, dpvs_t6::Cell::default());
-    let planes: Vec<[f32; 4]> = dpvs
-        .planes
+    seen: &mut VisibilityBitView<'_>,
+) -> (Vec<CellClip>, dpvs_t6::TraversalTally) {
+    let (cells, portals) = walk_cells(sight);
+    let plane_rows: Vec<[f32; 4]> = sight
+        .plane_set
         .iter()
-        .map(|p| [p.normal[0], p.normal[1], p.normal[2], p.dist])
+        .map(|p| {
+            let [x, y, z] = p.normal;
+            [x, y, z, p.offset]
+        })
         .collect();
-    let world = dpvs_t6::DpvsWorld {
-        cells: &cells,
-        portals: &portals,
-        verts: &dpvs.portal_verts,
-        planes: &planes,
-        nodes: &dpvs.nodes,
-    };
-    let mut scratch = dpvs_t6::WalkScratch::default();
-    let stats = dpvs_t6::visit_portals(&world, start_cell, params, &mut scratch);
-
-    let mut clips = vec![CellClip::EMPTY; dpvs.cell_count];
-    for (cell, clip) in clips.iter_mut().enumerate() {
-        if !scratch.cell_visible(cell) {
-            continue;
-        }
-        vis.set(cell);
-        if let Some(first_visit) = scratch.first_visit_clip(cell) {
-            *clip = first_visit;
-        }
-    }
-    (clips, stats)
+    let mut work_buf = dpvs_t6::TraversalScratchpad::default();
+    let walked = dpvs_t6::visit_portals(
+        &dpvs_t6::DpvsWorld {
+            cells: &cells,
+            portals: &portals,
+            vertex_points: &sight.portal_vertices,
+            planes: &plane_rows,
+            nodes: sight.node_list.as_slice(),
+        },
+        start_cell,
+        params,
+        &mut work_buf,
+    );
+    let clips = (0..sight.cells_n)
+        .map(|room| match work_buf.cell_visible(room) {
+            false => CellClip::BLANK,
+            true => {
+                seen.set(room);
+                work_buf.first_visit_clip(room).unwrap_or(CellClip::BLANK)
+            }
+        })
+        .collect();
+    (clips, walked)
 }
 
-/// Marks the surfaces and models of the bounds tree `tree` (one per cell,
-/// then some for submodels) that lie inside `frustum`.
-fn gather_tree(
-    dpvs: &WorldDpvs,
-    tree: usize,
-    frustum: &[[f32; 4]],
-    vis_data: &mut DpvsVisData<'_>,
-    stats: &mut AabbCullStats,
-) {
-    let Some(nodes) = dpvs.aabb_trees.get(tree) else {
-        return;
-    };
-    let input = AabbTreeCull {
+/// The cull input of bounds tree `tree` (one per cell, then some for
+/// submodels), or None past the last tree.
+fn tree_input(sight: &LevelSight, tree: usize) -> Option<BoxTreeVisibilityWalk<'_>> {
+    let nodes = sight.box_trees.get(tree)?;
+    let prop_indexes = sight
+        .aabb_prop_indices
+        .get(tree)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    Some(BoxTreeVisibilityWalk {
         nodes,
-        smodel_indexes: dpvs
-            .aabb_smodel_indices
-            .get(tree)
-            .map_or(&[][..], Vec::as_slice),
-        sorted_surf_index: &dpvs.sorted_surf_index,
-        surfaces_bounds: &dpvs.surface_bounds,
-        smodel_bounds: &dpvs.smodel_bounds,
-    };
-    add_aabb_tree_surfaces_in_frustum(&input, frustum, vis_data, stats);
+        prop_indexes,
+        sorted_facet_index: &sight.sorted_facet_index,
+        face_spans: &sight.facet_bounds,
+        prop_spans: sight.prop_bounds.as_slice(),
+    })
 }
 
-/// The trees past the last cell hold surfaces no cell lists (submodels).
-fn gather_submodel_trees(
-    dpvs: &WorldDpvs,
-    frustum: &[[f32; 4]],
-    vis_data: &mut DpvsVisData<'_>,
-    stats: &mut AabbCullStats,
+/// Marks what the bounds trees `trees` hold inside `frustum`.
+fn gather_trees(
+    sight: &LevelSight,
+    trees: impl IntoIterator<Item = usize>,
+    cut_planes: &[[f32; 4]],
+    marks: &mut VisibilityResultSet<'_>,
+    counters: &mut AabbHideStats,
 ) {
-    for tree in dpvs.cell_count..dpvs.aabb_trees.len() {
-        gather_tree(dpvs, tree, frustum, vis_data, stats);
+    for input in trees.into_iter().filter_map(|tree| tree_input(sight, tree)) {
+        admit_box_tree_surfaces_inside_frustum(&input, cut_planes, marks, counters);
     }
+}
+
+/// The trees past the last cell hold the surfaces no cell lists (submodels).
+fn submodel_trees(sight: &LevelSight) -> Range<usize> {
+    sight.cells_n..sight.box_trees.len()
 }
 
 /// True while the local player is in a script-driven shot (the match's
 /// intermission).
 fn in_script_camera(
-    snapshot: Option<&net::PresentedSnapshot>,
-    client: Option<&net::LocalPresentClient>,
+    snapshot: Option<&net::ShownWorldFrame>,
+    client: Option<&net::HostViewClient>,
 ) -> bool {
     let (Some(snapshot), Some(client)) = (snapshot, client) else {
         return false;
     };
     snapshot
         .player(client.0)
-        .is_some_and(|ps| ps.pm_type == playerstate_t6::game::PM_TYPE_INTERMISSION)
+        .is_some_and(|ps| ps.movement_mode == playerstate_t6::game::MOVE_MODE_INTERLUDE)
 }
 
 /// `BO2MP_DPVS_LOG=1`: once a second, where the eye is and whether a script
 /// camera looks.
 fn log_eye_cell(eye: [f32; 3], cell: Option<usize>, script_camera: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LOGGED_SECOND: AtomicU64 = AtomicU64::new(0);
     if std::env::var_os("BO2MP_DPVS_LOG").is_none() {
         return;
     }
-    static LAST_SECOND: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
-    let second = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let Ok(mut last) = LAST_SECOND.lock() else {
-        return;
-    };
-    if *last == second {
+    let now = std::time::SystemTime::UNIX_EPOCH
+        .elapsed()
+        .map_or(0, |since| since.as_secs());
+    if LOGGED_SECOND.swap(now, Ordering::Relaxed) == now {
         return;
     }
-    *last = second;
+    let [x, y, z] = eye;
     diag::info!(
         World,
-        "bo2zm dpvs: eye ({:.0} {:.0} {:.0}) cell {:?} script camera {script_camera}",
-        eye[0],
-        eye[1],
-        eye[2],
-        cell
+        "bo2zm dpvs: eye ({x:.0} {y:.0} {z:.0}) cell {cell:?} script camera {script_camera}"
     );
 }
 
-/// Forgets the last frame's products.
-fn clear_products(stats: &mut DpvsFrameStats) {
-    stats.frustum_planes.clear();
-    stats.smodel_vis.clear();
-    stats.smodel_vis_id = 0;
-    stats.cell_vis.clear();
-    stats.cell_vis_count = 0;
-    stats.cell_clips.clear();
-    stats.cell_vis_all = false;
-    stats.view_prepared = 0;
-    stats.lock_pvs = 0;
+/// How far `eye` is from the box `b` (0 inside it).
+fn distance_to_box(eye: [f32; 3], b: dpvs_t6::Bounds) -> f32 {
+    let (mid, half) = (b.mid(), b.half());
+    let out: [f32; 3] = core::array::from_fn(|k| ((eye[k] - mid[k]).abs() - half[k]).max(0.0));
+    (out[0] * out[0] + out[1] * out[1] + out[2] * out[2]).sqrt()
+}
+
+/// `BO2MP_WALL_LOG=1`: twice a second, the map surfaces within 256 units of
+/// the eye that lie in the view but the portal walk left out (marked by a cull
+/// over every cell, not by the walk's cells), and how far the eye is in front
+/// of the near plane. A wall that vanishes up close with none dropped here was
+/// lost later (near plane or draw); one counted here was lost to the walk.
+fn log_near_walls_dropped(
+    sight: &LevelSight,
+    view: &CullView,
+    reach: &CellReach,
+    walked: &VisibilityResultSet<'_>,
+    portal_looks: usize,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LOGGED_AT: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::UNIX_EPOCH
+        .elapsed()
+        .map_or(0, |since| since.as_millis() as u64 / 500);
+    if LOGGED_AT.swap(now, Ordering::Relaxed) == now {
+        return;
+    }
+    let mut facet_vis = vec![0u8; walked.facet_vis.len()];
+    let mut prop_vis = vec![0u8; walked.prop_vis.len()];
+    let mut all = VisibilityResultSet { facet_vis: &mut facet_vis, prop_vis: &mut prop_vis };
+    let mut ignored = AabbHideStats::default();
+    gather_trees(sight, (0..sight.cells_n).chain(submodel_trees(sight)), &view.clip_planes, &mut all, &mut ignored);
+    let eye = view.eye.to_array();
+    let (mut near, mut dropped, mut closest) = (0u32, Vec::new(), f32::MAX);
+    // The closest flat surface (a box under 2 units thick), seen or not.
+    let mut nearest_flat = f32::MAX;
+    for (facet, bounds) in sight.facet_bounds.iter().enumerate() {
+        let d = distance_to_box(eye, *bounds);
+        if bounds.half().iter().any(|&h| h < 1.0) {
+            nearest_flat = nearest_flat.min(d);
+        }
+        if d > 256.0 || all.facet_vis.get(facet).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        near += 1;
+        if walked.facet_vis.get(facet).copied().unwrap_or(0) == 0 {
+            closest = closest.min(d);
+            dropped.push((facet, d));
+        }
+    }
+    dropped.sort_by(|a, b| a.1.total_cmp(&b.1));
+    // Which cell's tree holds each of the closest dropped surfaces.
+    let owner_of = |facet: usize| {
+        (0..sight.cells_n).find(|&cell| {
+            let mut one = vec![0u8; walked.facet_vis.len()];
+            let mut none = vec![0u8; walked.prop_vis.len()];
+            let mut out = VisibilityResultSet { facet_vis: &mut one, prop_vis: &mut none };
+            gather_trees(sight, std::iter::once(cell), &view.clip_planes, &mut out, &mut AabbHideStats::default());
+            out.facet_vis.get(facet).copied().unwrap_or(0) != 0
+        })
+    };
+    // The eye cell's doorways: the cell beyond, the doorway plane's n.eye and d, its corners.
+    let doors: Vec<String> = reach
+        .eye_room
+        .and_then(|room| sight.portals_per_room.get(room))
+        .map(|own| {
+            own.iter()
+                .map(|door| {
+                    let [a, b, c, d] = door.split;
+                    let along = a * eye[0] + b * eye[1] + c * eye[2];
+                    let corners = &sight.portal_vertices[door.vertex_first..door.vertex_first + door.vertex_tally];
+                    let mid = corners.iter().fold([0.0f32; 3], |m, v| [m[0] + v[0], m[1] + v[1], m[2] + v[2]]);
+                    let n = corners.len().max(1) as f32;
+                    format!(
+                        "to {} n.eye {along:.0} d {d:.0} mid ({:.0} {:.0} {:.0}) corners {}",
+                        door.adjacent_cell,
+                        mid[0] / n,
+                        mid[1] / n,
+                        mid[2] / n,
+                        corners.len()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let near_plane = view.clip_planes.first().map_or(f32::NAN, |p| p[0] * eye[0] + p[1] * eye[1] + p[2] * eye[2] + p[3]);
+    let cells_seen = reach.bits.iter().map(|w| w.count_ones()).sum::<u32>();
+    let [x, y, z] = eye;
+    let rays = rays_through_doors(sight, view, reach);
+    let sample: Vec<String> = dropped
+        .iter()
+        .take(4)
+        .map(|&(facet, d)| {
+            let b = sight.facet_bounds[facet];
+            let (m, h) = (b.mid(), b.half());
+            format!(
+                "#{facet} {d:.0} away in cell {:?} at ({:.0} {:.0} {:.0}) half ({:.0} {:.0} {:.0})",
+                owner_of(facet),
+                m[0],
+                m[1],
+                m[2],
+                h[0],
+                h[1],
+                h[2]
+            )
+        })
+        .collect();
+    diag::info!(
+        World,
+        "bo2mp walls: eye ({x:.0} {y:.0} {z:.0}) cell {:?} cells seen {cells_seen}/{} portal looks {portal_looks}; near surfaces in view {near}, walk dropped {} (closest {:.0}); eye to near plane {near_plane:.2}, nearest flat surface {nearest_flat:.1}; {}; doors {}; {} rays reach {} cells, unwalked [{}]",
+        reach.eye_room,
+        sight.cells_n,
+        dropped.len(),
+        if dropped.is_empty() { 0.0 } else { closest },
+        sample.join(", "),
+        doors.join(" | "),
+        rays.0,
+        rays.1,
+        rays.2.join(", ")
+    );
+}
+
+/// Rays from the eye across the view, out to 512 units: a ray goes from cell to cell only
+/// through a doorway between them and stops at a wall. Returns each cell a ray reaches
+/// that the walk did not mark, with the doorway it came through and how far away.
+fn rays_through_doors(sight: &LevelSight, view: &CullView, reach: &CellReach) -> (usize, usize, Vec<String>) {
+    let Some(start) = reach.eye_room else {
+        return (0, 0, Vec::new());
+    };
+    let finder = VisibilityCellPlanes {
+        leaf_cells: sight.cells_n as u32,
+        nodes: sight.node_list.as_slice(),
+        planes: sight.plane_set.as_slice(),
+    };
+    let eye = view.eye.to_array();
+    let walked = |cell: usize| reach.bits.get(cell / 32).is_some_and(|w| w & (1 << (cell % 32)) != 0);
+    let mut missed: Vec<(usize, usize, f32, [f32; 3])> = Vec::new();
+    let (mut rays, mut reached) = (0usize, vec![start]);
+    const RAYS: usize = 6000;
+    for i in 0..RAYS {
+        // Fibonacci sphere; keep the directions inside the view.
+        let z = 1.0 - 2.0 * (i as f32 + 0.5) / RAYS as f32;
+        let r = (1.0 - z * z).max(0.0).sqrt();
+        let a = i as f32 * 2.399_963;
+        let dir = [r * a.cos(), r * a.sin(), z];
+        let probe = [eye[0] + dir[0] * 16.0, eye[1] + dir[1] * 16.0, eye[2] + dir[2] * 16.0];
+        if view.clip_planes.iter().any(|p| p[0] * probe[0] + p[1] * probe[1] + p[2] * probe[2] + p[3] < 0.0) {
+            continue;
+        }
+        rays += 1;
+        let mut cell = start;
+        let mut t = 0.0f32;
+        while t < 512.0 {
+            let t1 = t + 2.0;
+            let at = [eye[0] + dir[0] * t1, eye[1] + dir[1] * t1, eye[2] + dir[2] * t1];
+            let Some(next) = finder.cell_holding(at) else {
+                break;
+            };
+            if next != cell {
+                let door = sight.portals_per_room.get(cell).and_then(|own| {
+                    own.iter().find(|door| {
+                        usize::from(door.adjacent_cell) == next
+                            && ray_meets_door(eye, dir, door.split, &sight.portal_vertices[door.vertex_first..door.vertex_first + door.vertex_tally], t - 2.0, t1 + 2.0)
+                    })
+                });
+                let Some(door) = door else {
+                    break;
+                };
+                if !walked(next) && !missed.iter().any(|m| m.0 == next) {
+                    let corners = &sight.portal_vertices[door.vertex_first..door.vertex_first + door.vertex_tally];
+                    let mid = corners.iter().fold([0.0f32; 3], |m, v| [m[0] + v[0], m[1] + v[1], m[2] + v[2]]);
+                    let n = corners.len().max(1) as f32;
+                    missed.push((next, cell, t1, [mid[0] / n, mid[1] / n, mid[2] / n]));
+                }
+                if !reached.contains(&next) {
+                    reached.push(next);
+                }
+                cell = next;
+            }
+            t = t1;
+        }
+    }
+    let missed = missed
+        .iter()
+        .map(|(to, from, t, m)| format!("{to} via door {from}->{to} at ({:.0} {:.0} {:.0}) {t:.0} away", m[0], m[1], m[2]))
+        .collect();
+    (rays, reached.len(), missed)
+}
+
+/// Whether the ray `eye + dir * t`, for t in `lo..hi`, passes through the doorway `corners`
+/// on `split` (1 unit of slack at the edges).
+fn ray_meets_door(eye: [f32; 3], dir: [f32; 3], split: [f32; 4], corners: &[[f32; 3]], lo: f32, hi: f32) -> bool {
+    let [a, b, c, d] = split;
+    let along = a * dir[0] + b * dir[1] + c * dir[2];
+    if along.abs() < 1e-6 || corners.len() < 3 {
+        return false;
+    }
+    let t = -(a * eye[0] + b * eye[1] + c * eye[2] + d) / along;
+    if t < lo || t > hi {
+        return false;
+    }
+    let hit = [eye[0] + dir[0] * t, eye[1] + dir[1] * t, eye[2] + dir[2] * t];
+    let n = [a, b, c];
+    let sub = |p: [f32; 3], q: [f32; 3]| [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+    let cross = |p: [f32; 3], q: [f32; 3]| [p[1] * q[2] - p[2] * q[1], p[2] * q[0] - p[0] * q[2], p[0] * q[1] - p[1] * q[0]];
+    let dot = |p: [f32; 3], q: [f32; 3]| p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
+    let mut sign = 0.0f32;
+    for (i, &v) in corners.iter().enumerate() {
+        let w = corners[(i + 1) % corners.len()];
+        let out = cross(n, sub(w, v));
+        let len = dot(out, out).sqrt().max(1e-6);
+        let side = dot(out, sub(hit, v)) / len;
+        if sign == 0.0 {
+            sign = if dot(out, sub(corners[(i + 2) % corners.len()], v)) >= 0.0 { 1.0 } else { -1.0 };
+        }
+        if side * sign < -1.0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Forgets the last frame's products; the counters stay.
+fn clear_products(stats: &mut SightFrameStats) {
+    let SightFrameStats {
+        prop_vis,
+        prop_vis_id,
+        view_volume_planes,
+        room_vis,
+        room_vis_tally,
+        room_clips,
+        view,
+        ..
+    } = stats;
+    prop_vis.clear();
+    view_volume_planes.clear();
+    room_vis.clear();
+    room_clips.clear();
+    *prop_vis_id = 0;
+    *room_vis_tally = 0;
+    *view = CullViewFacts::default();
+}
+
+/// The brush model a script mover entity shows, if it shows one.
+fn shown_brush_model(rt: &net::ClientEntityPoseState) -> Option<u32> {
+    use entity_t6::script_mover::{ScriptMoverDraw, script_mover_draw};
+    let state = &rt.upcoming_condition;
+    let mover = rt.present_in_newer_frame() && state.e_type == entity_t6::et::SCRIPTMOVER;
+    // eFlags2 arrives with BO2's EntityState; no demo-hide flag until then.
+    let draws_brush = mover
+        && script_mover_draw(state.lerp.e_flags, 0, state.solid, false, false)
+            == ScriptMoverDraw::BrushModel;
+    draws_brush
+        .then(|| u32::try_from(state.index).ok())
+        .flatten()
 }
 
 /// codmp: a Black Ops II submodel is drawn only while a live entity shows
@@ -296,36 +542,19 @@ fn clear_products(stats: &mut DpvsFrameStats) {
 /// so the surfaces of every other submodel are marked invisible.
 fn hide_unshown_brush_models(
     brushes: &[asset_world::T6BrushSurfaces],
-    surface_vis: &mut [u8],
-    entities: &Query<&net::CEntityRuntime>,
+    facet_vis: &mut [u8],
+    entities: &Query<&net::ClientEntityPoseState>,
 ) {
     if brushes.is_empty() {
         return;
     }
-    let shown: HashSet<u32> = entities
-        .iter()
-        .filter(|rt| {
-            rt.in_next_snap()
-                && rt.next_state.e_type == entity_t6::et::SCRIPTMOVER
-                // eFlags2 arrives with BO2's EntityState; no demo-hide flag until then.
-                && entity_t6::script_mover::script_mover_draw(
-                    rt.next_state.lerp.e_flags,
-                    0,
-                    rt.next_state.solid,
-                    false,
-                    false,
-                ) == entity_t6::script_mover::ScriptMoverDraw::BrushModel
-        })
-        .filter_map(|rt| u32::try_from(rt.next_state.index).ok())
-        .collect();
-    for brush in brushes {
-        if shown.contains(&brush.brush_model) {
-            continue;
-        }
-        let len = surface_vis.len();
-        let first = (brush.first_surf as usize).min(len);
-        let last = (first + brush.surface_count as usize).min(len);
-        surface_vis[first..last].fill(0);
+    let shown: HashSet<u32> = entities.iter().filter_map(shown_brush_model).collect();
+    let end = facet_vis.len();
+    let clamp = |at: usize| at.min(end);
+    for hidden in brushes.iter().filter(|b| !shown.contains(&b.solid_model)) {
+        let from = clamp(hidden.lead_skin as usize);
+        let to = clamp(from + hidden.facet_tally as usize);
+        facet_vis[from..to].fill(0);
     }
 }
 
@@ -333,569 +562,734 @@ fn hide_unshown_brush_models(
 #[derive(Default)]
 struct DrawTally {
     surfaces: u32,
-    rebinds: u32,
     lightmapped_tris: u32,
     fallback_tris: u32,
-    batch_visible: Vec<bool>,
+    /// Batches at least one drawn surface belongs to.
+    batches_touched: u32,
 }
 
 /// The hash of the draw items: their count, then each item's identity.
-fn draw_items_content_id(cull: &WorldCull) -> u64 {
-    let mut id = CONTENT_ID_SEED;
-    mix_content_id(&mut id, cull.draw_items.len() as u64);
-    for item in &cull.draw_items {
-        mix_draw_item_id(&mut id, item, cull.draw_item_surfs(item));
-    }
+fn draw_items_content_id(cull: &LevelHide) -> u64 {
+    let mut id = CONTENT_KEY_SEED;
+    blend_content_id(&mut id, cull.draw_batch_list.len() as u64);
+    cull.draw_batch_list
+        .iter()
+        .for_each(|item| mix_draw_item_id(&mut id, item, cull.draw_item_surfs(item)));
     id
 }
 
-/// Counts the surfaces, material changes and triangles of `cull.draw_items`
-/// and notes which batches they touch.
-fn tally(cull: &WorldCull) -> DrawTally {
-    let mut tally = DrawTally {
-        batch_visible: vec![false; cull.batch_count as usize],
-        ..DrawTally::default()
-    };
-    let mut previous_material: Option<u16> = None;
-    for item in &cull.draw_items {
-        let material = GfxDrawSurf::from_packed(item.key).material_sorted_index();
-        if previous_material != Some(material) {
-            tally.rebinds += 1;
-            previous_material = Some(material);
+/// Counts the surfaces and triangles `cull.draw_batch_list` draw and the batches
+/// they touch. Surfaces with no batch range or no indices are not counted.
+fn tally(cull: &LevelHide) -> DrawTally {
+    let mut touched = vec![false; cull.batches_n as usize];
+    let mut sum = DrawTally::default();
+    let drawn = cull
+        .draw_batch_list
+        .iter()
+        .flat_map(|item| cull.draw_item_surfs(item))
+        .filter_map(|&surf| cull.facet_batch_ranges.get(usize::from(surf)))
+        .filter(|&&(_, _, index_count)| index_count != 0);
+    for &(batch, _, index_count) in drawn {
+        sum.surfaces = sum.surfaces.saturating_add(1);
+        if let Some(flag) = touched.get_mut(batch) {
+            *flag = true;
         }
-        for &surf in cull.draw_item_surfs(item) {
-            let Some(&(batch, _, index_count)) = cull.surface_batch_ranges.get(usize::from(surf))
-            else {
-                continue;
-            };
-            if index_count == 0 {
-                continue;
-            }
-            tally.surfaces = tally.surfaces.saturating_add(1);
-            if let Some(seen) = tally.batch_visible.get_mut(batch) {
-                *seen = true;
-            }
-            let triangles = index_count / 3;
-            if cull.batch_lightmapped.get(batch).copied().unwrap_or(false) {
-                tally.lightmapped_tris = tally.lightmapped_tris.saturating_add(triangles);
-            } else {
-                tally.fallback_tris = tally.fallback_tris.saturating_add(triangles);
-            }
-        }
+        let lit = cull.batch_lightbaked.get(batch).copied().unwrap_or(false);
+        let lane = if lit {
+            &mut sum.lightmapped_tris
+        } else {
+            &mut sum.fallback_tris
+        };
+        *lane = lane.saturating_add(index_count / 3);
     }
-    tally
+    sum.batches_touched = touched.into_iter().filter(|&t| t).count() as u32;
+    sum
 }
 
-pub fn apply_dpvs_cull(
-    mut scene: ResMut<WorldScene>,
-    mut stats: ResMut<DpvsFrameStats>,
-    mut published_vis: ResMut<render_scene::PublishedCellVis>,
-    prepared: Res<PreparedSceneView>,
-    lock_pvs: Res<RLockPvs>,
-    presented: (
-        Option<Res<net::PresentedSnapshot>>,
-        Option<Res<net::LocalPresentClient>>,
-    ),
-    entities: Query<&net::CEntityRuntime>,
-) {
-    let _span = perf::Span::RenderCullCpuMs.enter();
+/// The view the cull runs against, read once (the PVS lock may hold it).
+struct CullView {
+    eye: Vec3,
+    forward: Vec3,
+    clip_planes: Vec<[f32; 4]>,
+    /// The camera's planes as the start cell tests portals: the near plane
+    /// moved back to the eye (see `start_planes`).
+    start_planes: Vec<[f32; 4]>,
+    bevels: Option<dpvs_t6::Bevels>,
+    fov: f32,
+    width_per_height: f32,
+}
+
+impl CullView {
+    fn read(lock: &FrozenVisibilitySet, live: &StagedStageEye) -> Self {
+        let (fov, width_per_height) = lock.walk_lens(live);
+        let (eye, forward) = (lock.walk_eye(live), lock.walk_forward(live));
+        let clip_planes = lock.walk_planes(live).to_vec();
+        Self {
+            eye,
+            forward,
+            start_planes: start_planes(&clip_planes, eye, forward),
+            clip_planes,
+            bevels: lock.walk_bevels(live),
+            fov,
+            width_per_height,
+        }
+    }
+
+    /// The portal walk's parameters for this view.
+    fn walk_params(&self) -> dpvs_t6::WalkParams<'_> {
+        let eye = self.eye.to_array();
+        dpvs_t6::WalkParams {
+            eye,
+            view_plane: dpvs_t6::facing_plane(self.forward.to_array(), eye),
+            planes: &self.start_planes,
+            near: self.clip_planes.first().copied(),
+            far: self.clip_planes.get(1).copied(),
+            walk_limit: 0,
+            bevels: self.bevels.as_ref(),
+            force_invisible: None,
+            occluders: &[],
+        }
+    }
+}
+
+/// bo2mp: the start cell's portal planes with the near plane (`r_znear`
+/// ahead) swapped for the plane through the eye. Against the near plane a
+/// doorway less than that far ahead lies wholly behind it and the room past
+/// it went undrawn for that frame (frostbite's cheese shop, 10-29 clip at
+/// 73 s). Children still end with the near plane pulled back to their portal.
+fn start_planes(clip_planes: &[[f32; 4]], eye: Vec3, forward: Vec3) -> Vec<[f32; 4]> {
+    let mut planes = clip_planes.to_vec();
+    if let Some(first) = planes.first_mut() {
+        *first = dpvs_t6::facing_plane(forward.to_array(), eye.to_array());
+    }
+    planes
+}
+
+/// Which cells the eye reaches, and how.
+struct CellReach {
+    eye_room: Option<usize>,
+    bits: Vec<u32>,
+    clips: Option<Vec<CellClip>>,
+    clip_skips: u32,
+}
+
+impl CellReach {
+    fn visible_cells(&mut self, cell_count: usize) -> Vec<usize> {
+        let bits = VisibilityBitView::new(&mut self.bits);
+        (0..cell_count).filter(|&cell| bits.get(cell)).collect()
+    }
+
+    fn mark_all(&mut self, cells_n: usize) {
+        let mut bits = VisibilityBitView::new(&mut self.bits);
+        (0..cells_n).for_each(|cell| bits.set(cell));
+    }
+}
+
+/// Finds the eye's cell and walks the portals from it. A script camera or an
+/// eye in no cell sees every cell; `only_eye_cell` keeps just the eye's.
+fn reach_cells(
+    sight: &LevelSight,
+    view: &CullView,
+    script_camera: bool,
+    only_eye_cell: bool,
+) -> CellReach {
+    let eye_at = view.eye.to_array();
+    let finder = VisibilityCellPlanes {
+        leaf_cells: sight.cells_n as u32,
+        nodes: sight.node_list.as_slice(),
+        planes: sight.plane_set.as_slice(),
+    };
+    let located = finder.cell_holding(eye_at);
+    log_eye_cell(eye_at, located, script_camera);
+
+    let mut reach = CellReach {
+        eye_room: located.filter(|_| !script_camera),
+        bits: vec![0; word_span(sight.cells_n.max(1))],
+        clips: None,
+        clip_skips: 0,
+    };
+    let Some(start) = reach.eye_room else {
+        reach.mark_all(sight.cells_n);
+        return reach;
+    };
+    let mut bits = VisibilityBitView::new(&mut reach.bits);
+    if only_eye_cell {
+        bits.set(start);
+    } else {
+        let (clips, walked) = t6_walk(sight, start, &view.walk_params(), &mut bits);
+        reach.clips = Some(clips);
+        reach.clip_skips = walked.skipped_by_clip_total;
+    }
+    reach
+}
+
+/// The view frustum seen from behind each linked portal's far end, its near
+/// plane swapped for the exit plane.
+fn look_frustums(
+    cut_planes: &[[f32; 4]],
+    looks: &[render_frame::portal_eyes::PortalLook],
+) -> Vec<Vec<[f32; 4]>> {
+    looks
+        .iter()
+        .map(|look| {
+            let mut moved = render_frame::portal_eyes::move_planes(cut_planes, &look.through);
+            if let Some(first) = moved.first_mut() {
+                *first = look.exit_plane.to_array();
+            }
+            moved
+        })
+        .collect()
+}
+
+/// Adds field by field, saturating; `entry_record_total` is not summed.
+fn add_census(total: &mut LevelTreeFacetDrawCensus, part: &LevelTreeFacetDrawCensus) {
+    for (sum, add) in [
+        (&mut total.span_total, part.span_total),
+        (&mut total.seen_total, part.seen_total),
+        (&mut total.accepted_total, part.accepted_total),
+        (&mut total.runs_seen, part.runs_seen),
+        (&mut total.input_gap_tally, part.input_gap_tally),
+    ] {
+        *sum = sum.saturating_add(add);
+    }
+}
+
+/// Empties `list` and refills it with `zeroes` zero bytes.
+fn zero_fill(list: &mut Vec<u8>, zeroes: usize) {
+    list.clear();
+    list.resize(zeroes, 0);
+}
+
+/// Empties the lists a cull pass fills.
+fn start_frame_lists(cull: &mut LevelHide) {
+    let facet_tally = cull.facet_batch_ranges.len();
+    let model_count = cull.prop_entities.len();
+    zero_fill(&mut cull.facet_vis, facet_tally);
+    zero_fill(&mut cull.prop_vis, model_count);
+    for surfs in [&mut cull.item_surfs, &mut cull.g0_facets] {
+        surfs.clear();
+    }
+    cull.draw_batch_list.clear();
+}
+
+/// What `apply_sight_hide` reads and writes.
+#[derive(SystemParam)]
+pub struct DpvsCullFrame<'w, 's> {
+    stage: ResMut<'w, LevelStage>,
+    stats: ResMut<'w, SightFrameStats>,
+    published: ResMut<'w, render_scene::ExportedCellVisibility>,
+    live_view: Res<'w, StagedStageEye>,
+    pvs_lock: Res<'w, FrozenVisibilitySet>,
+    snapshot: Option<Res<'w, net::ShownWorldFrame>>,
+    viewer_seat: Option<Res<'w, net::HostViewClient>>,
+    movers: Query<'w, 's, &'static net::ClientEntityPoseState>,
+}
+
+pub fn apply_sight_hide(frame: DpvsCullFrame) {
+    let _span = perf::Span::DrawHideCpuMillis.enter();
+    let DpvsCullFrame {
+        stage: mut scene,
+        mut stats,
+        mut published,
+        live_view,
+        pvs_lock,
+        snapshot,
+        viewer_seat: own_client,
+        movers,
+    } = frame;
     // bo2zm M3: a script camera (the intermission shot of Nuketown's
     // game-over rocket flying down from the sky) sees every cell, as from
     // outside the world: from high over the map no portal leads to the town.
-    let script_camera = in_script_camera(presented.0.as_deref(), presented.1.as_deref());
+    let script_camera = in_script_camera(snapshot.as_deref(), own_client.as_deref());
 
     clear_products(&mut stats);
-    *published_vis = render_scene::PublishedCellVis::default();
+    *published = Default::default();
     render_frame::portal_eyes::set_looks(Vec::new());
 
-    let Some(cull) = scene.cull.as_mut() else {
+    let has_draws = |c: &&mut LevelHide| c.batches_n != 0 || !c.prop_entities.is_empty();
+    let Some(cull) = scene.culling.as_mut().filter(has_draws) else {
         return;
     };
-    if cull.batch_count == 0 && cull.static_model_entities.is_empty() {
+    if !live_view.primed {
         return;
     }
-    if !prepared.ready {
+    let stats = &mut *stats;
+    stats.view.prepared = true;
+    stats.view.pvs_locked = pvs_lock.enabled && pvs_lock.frozen.is_some();
+
+    let view = CullView::read(&pvs_lock, &live_view);
+    if cull.dpvs.cells_n == 0 {
         return;
     }
-    stats.view_prepared = 1;
-    stats.lock_pvs = u8::from(lock_pvs.enabled && lock_pvs.frozen.is_some());
+    stats.view_volume_planes.clone_from(&view.clip_planes);
 
-    let eye_pos = lock_pvs.dpvs_eye(&prepared);
-    let eye = eye_pos.to_array();
-    let (fov, aspect) = lock_pvs.dpvs_fov_aspect(&prepared);
-    let dpvs = &cull.dpvs;
-    if dpvs.cell_count == 0 {
-        return;
+    let only_eye_cell = env_says_yes("BO2MP_SINGLE_CELL");
+    let mut reach = reach_cells(&cull.dpvs, &view, script_camera, only_eye_cell);
+    if let Some(clips) = reach.clips.take() {
+        stats.room_clips = clips;
     }
-    let frustum = lock_pvs.dpvs_frustum(&prepared).to_vec();
-    stats.frustum_planes.clone_from(&frustum);
-
-    // Which cells are visible.
-    let tree = DpvsPlanes {
-        planes: &dpvs.planes,
-        nodes: &dpvs.nodes,
-        cell_count: dpvs.cell_count as u32,
-    };
-    let eye_cell = tree.cell_for_point(eye).filter(|_| !script_camera);
-    log_eye_cell(eye, tree.cell_for_point(eye), script_camera);
-    let single_cell = single_cell_from_env();
-
-    let mut words = vec![0u32; words_for_bits(dpvs.cell_count.max(1))];
-    let mut vis = VisBits::new(&mut words);
-    let mut portals_frustum_skipped = 0;
-    match eye_cell {
-        Some(cell) if single_cell => vis.set(cell),
-        Some(cell) => {
-            let bevels = lock_pvs.dpvs_portal_bevels(&prepared);
-            let params = dpvs_t6::WalkParams {
-                eye,
-                view_plane: dpvs_t6::view_plane(lock_pvs.dpvs_forward(&prepared).to_array(), eye),
-                planes: &frustum,
-                near: frustum.first().copied(),
-                far: frustum.get(1).copied(),
-                walk_limit: 0,
-                bevels: bevels.as_ref(),
-                force_invisible: None,
-                occluders: &[],
-            };
-            let (clips, walk) = t6_walk(dpvs, cell, &params, &mut vis);
-            stats.cell_clips = clips;
-            portals_frustum_skipped = walk.skip_clip;
-        }
-        None => (0..dpvs.cell_count).for_each(|cell| vis.set(cell)),
-    }
-
-    // Reset the per-frame lists the passes below fill.
-    cull.surface_vis.clear();
-    cull.surface_vis.resize(cull.surface_batch_ranges.len(), 0);
-    cull.smodel_vis.clear();
-    cull.smodel_vis.resize(cull.static_model_entities.len(), 0);
-    cull.draw_items.clear();
-    cull.item_surfs.clear();
-    cull.g0_surfs.clear();
-    stats.g0_world_surfs.clear();
+    start_frame_lists(cull);
+    stats.g0_level_facets.clear();
 
     // What an eye behind the other end of each linked portal would see.
-    let looks = if script_camera {
-        Vec::new()
-    } else {
-        portal_looks(eye_pos)
+    let looks = match script_camera {
+        true => Vec::new(),
+        false => portal_looks(view.eye),
     };
-    let look_frustums: Vec<Vec<[f32; 4]>> = looks
-        .iter()
-        .map(|look| {
-            let mut planes = render_frame::portal_eyes::move_planes(&frustum, &look.through);
-            if let Some(near) = planes.first_mut() {
-                *near = look.exit_plane.to_array();
-            }
-            planes
-        })
-        .collect();
+    let through_portals = look_frustums(&view.clip_planes, &looks);
 
-    let mut aabb = AabbCullStats::default();
-    {
-        let mut vis_data = DpvsVisData {
-            surface_vis: &mut cull.surface_vis,
-            smodel_vis: &mut cull.smodel_vis,
-        };
-        for cell in 0..dpvs.cell_count {
-            if vis.get(cell) {
-                gather_tree(dpvs, cell, &frustum, &mut vis_data, &mut aabb);
-            }
-        }
-        gather_submodel_trees(dpvs, &frustum, &mut vis_data, &mut aabb);
-        // That eye stands behind a wall, outside the cells the walk starts
-        // from, so the walk would drop the ground right past the exit.
-        // Every cell is offered to the moved frustum instead; it culls by
-        // bounds.
-        for through in &look_frustums {
-            for cell in 0..dpvs.cell_count {
-                vis.set(cell);
-                gather_tree(dpvs, cell, through, &mut vis_data, &mut aabb);
-            }
-            gather_submodel_trees(dpvs, through, &mut vis_data, &mut aabb);
-        }
+    let sight = &cull.dpvs;
+    let mut aabb = AabbHideStats::default();
+    let mut marks = VisibilityResultSet {
+        facet_vis: &mut cull.facet_vis,
+        prop_vis: &mut cull.prop_vis,
+    };
+    let in_view = reach.visible_cells(sight.cells_n);
+    let camera_trees = in_view.into_iter().chain(submodel_trees(sight));
+    gather_trees(
+        sight,
+        camera_trees,
+        &view.clip_planes,
+        &mut marks,
+        &mut aabb,
+    );
+    if env_says_yes("BO2MP_WALL_LOG") {
+        log_near_walls_dropped(sight, &view, &reach, &marks, through_portals.len());
+    }
+    // That eye stands behind a wall, outside the cells the walk starts
+    // from, so the walk would drop the ground right past the exit. Every
+    // cell is offered to the moved frustum instead; it culls by bounds.
+    if !through_portals.is_empty() {
+        reach.mark_all(sight.cells_n);
+    }
+    for moved in &through_portals {
+        let every_tree = (0..sight.cells_n).chain(submodel_trees(sight));
+        gather_trees(sight, every_tree, moved, &mut marks, &mut aabb);
     }
     render_frame::portal_eyes::set_looks(looks);
 
-    hide_unshown_brush_models(&cull.t6_brush_surfaces, &mut cull.surface_vis, &entities);
+    hide_unshown_brush_models(&cull.t6_brush_surfaces, &mut cull.facet_vis, &movers);
 
     // The camera's draw items, one range kind at a time.
-    let mut census = BspDrawSurfCensus::default();
-    for range in dpvs.camera_ranges.iter() {
-        let part = append_camera_bsp_range(
-            range.kind,
-            range.begin,
-            range.end,
-            &mut cull.surface_vis,
-            &cull.capture.packed_draw_surfs,
-            &mut cull.bsp_run_scratch,
-            &mut cull.item_surfs,
-            &mut cull.draw_items,
-            &mut cull.g0_surfs,
-        );
-        census.range_n = census.range_n.saturating_add(part.range_n);
-        census.visible_n = census.visible_n.saturating_add(part.visible_n);
-        census.admitted_n = census.admitted_n.saturating_add(part.admitted_n);
-        census.run_n = census.run_n.saturating_add(part.run_n);
-        census.input_gap_n = census.input_gap_n.saturating_add(part.input_gap_n);
-    }
-    stats.bsp_visible_surfaces = census.visible_n;
-    stats.bsp_admitted_surfaces = census.admitted_n;
-    stats.bsp_run_n = census.run_n;
-    stats.bsp_input_gap_n = census.input_gap_n;
-    stats.material_ordinal_refused = census.input_gap_n;
-
-    let totals = tally(cull);
-    cull.draw_items_id = draw_items_content_id(cull);
-
-    // Publish.
-    stats.eye_cell = eye_cell;
-    if eye_cell.is_none() {
-        stats.eye_cell_unresolved = stats.eye_cell_unresolved.saturating_add(1);
-    }
-    stats.visible_cells = vis.count_ones();
-    drop(vis);
-    stats.cell_vis.clone_from(&words);
-    stats.cell_vis_count = dpvs.cell_count;
-    stats.cell_vis_all = eye_cell.is_none();
-    cull.cell_vis.clone_from(&words);
-    cull.cell_vis_all = eye_cell.is_none();
-    *published_vis = render_scene::PublishedCellVis {
-        words,
-        cell_count: dpvs.cell_count,
-        vis_all: eye_cell.is_none(),
+    let mut census = LevelTreeFacetDrawCensus::default();
+    let mut out = CameraOut {
+        vis: &mut cull.facet_vis,
+        word_list: &cull.capture.compact_facet_draws,
+        runs: &mut cull.level_tree_run_scratch,
+        item_surfs: &mut cull.item_surfs,
+        items: &mut cull.draw_batch_list,
+        unworded: &mut cull.g0_facets,
     };
-    stats.portals_frustum_skipped = portals_frustum_skipped;
-    stats.aabb_nodes_visited = aabb.nodes_visited;
-    stats.aabb_planes_dropped = aabb.planes_dropped;
-    stats.surfaces_rejected_by_bounds = aabb.surfaces_rejected_by_bounds;
-    stats.surfaces_admitted_unbounded = aabb.surfaces_admitted_unbounded;
-    stats.smodels_rejected_by_bounds = aabb.smodels_rejected_by_bounds;
-    stats.smodels_admitted_unbounded = aabb.smodels_admitted_unbounded;
-    stats.keys = cull.draw_items.len() as u32;
-    stats.g0_world_surfs.clone_from(&cull.g0_surfs);
-    stats.rebinds = totals.rebinds;
-    stats.surfaces = totals.surfaces;
-    stats.triangles = totals.lightmapped_tris.saturating_add(totals.fallback_tris);
-    stats.lightmapped_triangles = totals.lightmapped_tris;
-    stats.fallback_triangles = totals.fallback_tris;
-    stats.unculled_triangles = (cull.packed_indices.len() / 3) as u32;
-    stats.single_cell = single_cell;
-    stats.aspect = aspect;
-    stats.fov_deg = fov.to_degrees();
+    for range in sight.camera_spans.iter() {
+        add_census(&mut census, &out.append(range.kind, range.from..range.until));
+    }
 
-    let submitted = totals.batch_visible.iter().filter(|seen| **seen).count() as u32;
-    perf::Counter::CounterSubmittedBatches.emit(f64::from(submitted));
-    stats.submitted_batches = submitted;
-    stats.rewritten_index_bytes = 0;
-    stats.visibility_changes = 0;
-    stats.smodel_vis.extend_from_slice(&cull.smodel_vis);
-    let mut smodel_id = CONTENT_ID_SEED;
-    mix_content_bytes(&mut smodel_id, &cull.smodel_vis);
-    stats.smodel_vis_id = smodel_id;
+    let sum = tally(cull);
+    cull.draw_batch_list_id = draw_items_content_id(cull);
+    let every_cell = reach.eye_room.is_none();
+    cull.room_vis.clone_from(&reach.bits);
+    cull.room_vis_all = every_cell;
+
+    perf::Counter::TallySentBatches.emit(f64::from(sum.batches_touched));
+    let mut smodel_hash = CONTENT_KEY_SEED;
+    fold_content_bytes(&mut smodel_hash, &cull.prop_vis);
+    let earlier = std::mem::take(stats);
+    *stats = SightFrameStats {
+        view: CullViewFacts {
+            eye_room: reach.eye_room,
+            every_cell,
+            only_eye_cell,
+            width_per_height: view.width_per_height,
+            fov_degrees: view.fov.to_degrees(),
+            ..earlier.view
+        },
+        eyeless_frames: earlier.eyeless_frames.saturating_add(u32::from(every_cell)),
+        cells_seen: VisibilityBitView::new(&mut reach.bits).set_total(),
+        portal_clip_skips: reach.clip_skips,
+        aabb,
+        room_vis: reach.bits.clone(),
+        room_vis_tally: sight.cells_n,
+        bsp_shown: census.seen_total,
+        bsp_accepted: census.accepted_total,
+        bsp_runs: census.runs_seen,
+        bsp_input_gaps: census.input_gap_tally,
+        keys: cull.draw_batch_list.len() as u32,
+        g0_level_facets: cull.g0_facets.clone(),
+        rebinds: draw_item_rebinds(&cull.draw_batch_list),
+        surfaces: sum.surfaces,
+        triangles: sum.lightmapped_tris.saturating_add(sum.fallback_tris),
+        triangle_split: (sum.lightmapped_tris, sum.fallback_tris),
+        unhidden_triangles: (cull.compact_indices.len() / 3) as u32,
+        batches_sent: sum.batches_touched,
+        index_bytes_rewritten: 0,
+        vis_flips: 0,
+        prop_vis: cull.prop_vis.clone(),
+        prop_vis_id: smodel_hash,
+        ..earlier
+    };
+    *published = render_scene::ExportedCellVisibility {
+        cells_in: sight.cells_n,
+        sight_all: every_cell,
+        words: reach.bits,
+    };
+}
+
+/// True the first time it is asked about `flag`.
+fn first_time(flag: &mut bool) -> bool {
+    !std::mem::replace(flag, true)
 }
 
 /// Logs the tags of the `script_model` props the scripts kept, once.
-pub(crate) fn log_script_model_gaps_once(
-    props: Query<&ScriptModelGameObject>,
-    mut done: Local<bool>,
+pub(crate) fn log_script_model_gaps_one_time(
+    props: Query<&ScriptModelActorItem>,
+    mut logged: Local<bool>,
 ) {
-    if *done || props.is_empty() {
+    if props.is_empty() || !first_time(&mut logged) {
         return;
     }
-    *done = true;
-    let mut tags: Vec<&str> = props.iter().map(|prop| prop.0.as_str()).collect();
-    tags.sort_unstable();
-    tags.dedup();
+    let kept = props.iter().count();
+    let tags: Vec<&str> = props
+        .iter()
+        .map(|prop| prop.0.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     diag::info!(
         World,
-        "script_model gameobjects after _gameobjects::main: {} props kept, tags={:?}",
-        props.iter().count(),
-        tags
+        "script_model gameobjects after _gameobjects::main: {kept} props kept, tags={tags:?}"
     );
 }
 
+/// The once-only culling log line, as `name=value` pairs.
+fn dpvs_log_fields(s: &SightFrameStats) -> Vec<(&'static str, String)> {
+    let a = &s.aabb;
+    let (lit, fallback) = s.triangle_split;
+    vec![
+        ("eye_cell", format!("{:?}", s.view.eye_room)),
+        ("unresolved", s.eyeless_frames.to_string()),
+        ("visible_cells", s.cells_seen.to_string()),
+        ("portals_frustum_skipped", s.portal_clip_skips.to_string()),
+        ("aabb_nodes", a.nodes_walked.to_string()),
+        ("planes_dropped", a.planes_discarded.to_string()),
+        (
+            "surf_rejected_by_bounds",
+            a.facets_rejected_by_bounds.to_string(),
+        ),
+        ("surf_unbounded", a.facets_admitted_unbounded.to_string()),
+        (
+            "smodel_rejected_by_bounds",
+            a.props_rejected_by_bounds.to_string(),
+        ),
+        ("smodel_unbounded", a.props_admitted_unbounded.to_string()),
+        ("bsp_visible", s.bsp_shown.to_string()),
+        ("bsp_admitted", s.bsp_accepted.to_string()),
+        ("bsp_runs", s.bsp_runs.to_string()),
+        ("bsp_input_gap", s.bsp_input_gaps.to_string()),
+        (
+            "bsp_ranges_unavailable",
+            s.bsp_unranged.to_string(),
+        ),
+        ("keys", s.keys.to_string()),
+        // Every input gap is a refused material ordinal.
+        ("ordinal_refused", s.bsp_input_gaps.to_string()),
+        ("g0_world", s.g0_level_facets.len().to_string()),
+        ("rebinds", s.rebinds.to_string()),
+        ("surfaces", s.surfaces.to_string()),
+        (
+            "tris",
+            format!(
+                "{}/{} (lightmapped={lit} fallback={fallback})",
+                s.triangles, s.unhidden_triangles
+            ),
+        ),
+        ("single_cell", s.view.only_eye_cell.to_string()),
+        ("batches", s.batches_sent.to_string()),
+        ("rewrite_bytes", s.index_bytes_rewritten.to_string()),
+        ("vis_chg", s.vis_flips.to_string()),
+        ("aspect", format!("{:.3}", s.view.width_per_height)),
+        ("fov_deg", format!("{:.1}", s.view.fov_degrees)),
+    ]
+}
+
 /// Logs the first frame's culling numbers, once.
-pub(crate) fn log_dpvs_stats_once(stats: Res<DpvsFrameStats>, mut done: Local<bool>) {
-    if *done || stats.unculled_triangles == 0 {
+pub(crate) fn log_sight_stats_once(stats: Res<SightFrameStats>, mut logged: Local<bool>) {
+    if stats.unhidden_triangles == 0 || !first_time(&mut logged) {
         return;
     }
-    *done = true;
-    let s = &*stats;
-    diag::info!(
-        World,
-        "dpvs frame: eye_cell={:?} unresolved={} visible_cells={} portals_frustum_skipped={} \
-         aabb_nodes={} planes_dropped={} surf_rejected_by_bounds={} surf_unbounded={} \
-         smodel_rejected_by_bounds={} smodel_unbounded={} bsp_visible={} bsp_admitted={} \
-         bsp_runs={} bsp_input_gap={} bsp_ranges_unavailable={} keys={} ordinal_refused={} \
-         g0_world={} rebinds={} surfaces={} tris={}/{} (lightmapped={} fallback={}) \
-         single_cell={} batches={} rewrite_bytes={} vis_chg={} aspect={:.3} fov_deg={:.1}",
-        s.eye_cell,
-        s.eye_cell_unresolved,
-        s.visible_cells,
-        s.portals_frustum_skipped,
-        s.aabb_nodes_visited,
-        s.aabb_planes_dropped,
-        s.surfaces_rejected_by_bounds,
-        s.surfaces_admitted_unbounded,
-        s.smodels_rejected_by_bounds,
-        s.smodels_admitted_unbounded,
-        s.bsp_visible_surfaces,
-        s.bsp_admitted_surfaces,
-        s.bsp_run_n,
-        s.bsp_input_gap_n,
-        s.bsp_ranges_unavailable,
-        s.keys,
-        s.material_ordinal_refused,
-        s.g0_world_surfs.len(),
-        s.rebinds,
-        s.surfaces,
-        s.triangles,
-        s.unculled_triangles,
-        s.lightmapped_triangles,
-        s.fallback_triangles,
-        s.single_cell,
-        s.submitted_batches,
-        s.rewritten_index_bytes,
-        s.visibility_changes,
-        s.aspect,
-        s.fov_deg,
-    );
+    let line = dpvs_log_fields(&stats)
+        .into_iter()
+        .map(|pair| format!("{}={}", pair.0, pair.1))
+        .collect::<Vec<_>>()
+        .join(" ");
+    diag::info!(World, "dpvs frame: {line}");
 }
 
 /// Marks the surfaces a shadow-casting view sees: the cells a camera sees
 /// plus the cells that can cast into them, each culled to `frustum`. Returns
-/// the cull counters and how many cells were offered. `draw_msb` receives the
+/// the cull counters and how many cells were offered. `draw_top_bit` receives the
 /// cells offered, as a most-significant-bit-first bit set.
-pub(crate) fn add_world_surfaces_frustum_only(
-    dpvs: &WorldDpvs,
-    frustum: &[[f32; 4]],
-    camera_cell_vis_lsb: &[u32],
-    camera_vis_all: bool,
-    surface_vis: &mut [u8],
-    smodel_vis: &mut [u8],
-    draw_msb: &mut Vec<u32>,
-) -> (AabbCullStats, u32) {
-    let mut aabb = AabbCullStats::default();
-    let mut vis_data = DpvsVisData {
-        surface_vis,
-        smodel_vis,
+pub(crate) fn add_level_facets_view_volume_only(
+    sight: &LevelSight,
+    cut_planes: &[[f32; 4]],
+    camera_room_vis_lsb: &[u32],
+    camera_sight_all: bool,
+    facet_vis: &mut [u8],
+    prop_vis: &mut [u8],
+    draw_top_bit: &mut Vec<u32>,
+) -> (AabbHideStats, u32) {
+    draw_top_bit.clear();
+    draw_top_bit.resize(cell_caster_bitset_width(sight.cells_n), 0);
+    // No caster table: every cell may cast.
+    let every_cell = sight.room_caster_bits.is_empty();
+    let offered = if every_cell {
+        sight.cells_n as u32
+    } else {
+        merge_caster_rows_of_visible(
+            &sight.room_caster_bits,
+            sight.cells_n,
+            camera_room_vis_lsb,
+            camera_sight_all,
+            draw_top_bit.as_mut_slice(),
+        )
     };
-    draw_msb.clear();
-    draw_msb.resize(cell_caster_row_words(dpvs.cell_count), 0);
-
-    if dpvs.cell_caster_bits.is_empty() {
-        // No caster table: every cell may cast.
-        for cell in 0..dpvs.cell_count {
-            gather_tree(dpvs, cell, frustum, &mut vis_data, &mut aabb);
-        }
-        return (aabb, dpvs.cell_count as u32);
-    }
-    let offered = or_caster_rows_for_visible(
-        &dpvs.cell_caster_bits,
-        dpvs.cell_count,
-        camera_cell_vis_lsb,
-        camera_vis_all,
-        &mut draw_msb[..],
-    );
-    for cell in 0..dpvs.cell_count {
-        if msb_get(draw_msb, cell) {
-            gather_tree(dpvs, cell, frustum, &mut vis_data, &mut aabb);
-        }
-    }
-    (aabb, offered)
+    let rows: &[u32] = draw_top_bit;
+    let casters = (0..sight.cells_n).filter(|&cell| every_cell || top_bit_get(rows, cell));
+    let mut counters = AabbHideStats::default();
+    let mut marks = VisibilityResultSet {
+        facet_vis,
+        prop_vis,
+    };
+    gather_trees(sight, casters, cut_planes, &mut marks, &mut counters);
+    (counters, offered)
 }
 
-/// Turns one camera surface range into draw items. Surfaces marked visible
-/// but lacking a draw-surf word are unmarked and listed in `g0_surfs`. A
-/// range that does not fit the tables counts as an input gap and adds no
-/// items.
-fn append_camera_bsp_range(
-    kind: asset_world::CameraRangeKind,
-    begin: u32,
-    end: u32,
-    surface_vis: &mut [u8],
-    draw_surfs: &[GfxDrawSurf],
-    runs: &mut Vec<BspDrawSurfRun<asset_world::CameraRangeKind>>,
-    item_surfs: &mut Vec<u16>,
-    draw_items: &mut Vec<WorldDrawItem>,
-    g0_surfs: &mut Vec<u16>,
-) -> BspDrawSurfCensus {
-    if end < begin {
-        return BspDrawSurfCensus {
-            input_gap_n: 1,
-            ..BspDrawSurfCensus::default()
-        };
-    }
-    let range_n = end - begin;
-    let (Ok(first), Ok(last)) = (usize::try_from(begin), usize::try_from(end)) else {
-        return BspDrawSurfCensus {
-            range_n,
-            input_gap_n: range_n.max(1),
-            ..BspDrawSurfCensus::default()
-        };
-    };
-    if last > surface_vis.len() || last > draw_surfs.len() {
-        let visible_n = surface_vis
-            .get(first..surface_vis.len().min(last))
-            .map_or(0, |seen| seen.iter().filter(|v| **v != 0).count() as u32);
-        return BspDrawSurfCensus {
-            range_n,
-            visible_n,
-            input_gap_n: range_n.max(1),
-            ..BspDrawSurfCensus::default()
-        };
-    }
-
-    let mut missing_word = 0u32;
-    for surf in first..last {
-        if surface_vis[surf] == 0 || draw_surfs[surf].packed != 0 {
-            continue;
-        }
-        surface_vis[surf] = 0;
-        missing_word = missing_word.saturating_add(1);
-        if let Ok(surf) = u16::try_from(surf) {
-            g0_surfs.push(surf);
-        }
-    }
-
-    runs.clear();
-    let mut census =
-        add_bsp_draw_surfs_camera(kind, begin, end, surface_vis, draw_surfs, item_surfs, runs);
-    census.visible_n = census.visible_n.saturating_add(missing_word);
-    census.input_gap_n = census.input_gap_n.saturating_add(missing_word);
-
-    let mut entry_first = 0u16;
-    for run in runs.iter() {
-        let head = item_surfs[run.list_start as usize];
-        if !run.extends_entry {
-            entry_first = head;
-        }
-        draw_items.push(WorldDrawItem {
-            key: run.draw_surf.packed,
-            surf: head,
-            run: run.len,
-            list_start: run.list_start,
-            entry_first,
-            kind: WorldDrawItemKind::Bsp(run.kind),
-        });
-    }
-    census
+/// The tables the camera's draw items are built from, and where they go.
+struct CameraOut<'a> {
+    /// Per world surface: nonzero while visible.
+    vis: &'a mut [u8],
+    /// Per world surface: its draw-surf word (0 for none).
+    word_list: &'a [SortedDraw],
+    runs: &'a mut Vec<WorldFaceRun<CameraSpanKind>>,
+    item_surfs: &'a mut Vec<u16>,
+    items: &'a mut Vec<LevelDrawItem>,
+    /// Visible surfaces that had no draw-surf word.
+    unworded: &'a mut Vec<u16>,
 }
 
-/// The sort key of world surface `surf` drawn with its colour pass: the
+/// The census of a camera range that is wholly an input gap.
+fn gap_census(span_total: u32, seen_total: u32) -> LevelTreeFacetDrawCensus {
+    LevelTreeFacetDrawCensus {
+        span_total,
+        seen_total,
+        input_gap_tally: span_total.max(1),
+        ..Default::default()
+    }
+}
+
+impl CameraOut<'_> {
+    /// The surface slots `span` covers, or, when it does not fit the tables,
+    /// the census of the input gap it is.
+    fn slots(&self, span: &Range<u32>) -> Result<Range<usize>, LevelTreeFacetDrawCensus> {
+        let Some(span_total) = span.end.checked_sub(span.start) else {
+            return Err(gap_census(0, 0));
+        };
+        let (Ok(start), Ok(end)) = (usize::try_from(span.start), usize::try_from(span.end)) else {
+            return Err(gap_census(span_total, 0));
+        };
+        if end <= self.vis.len().min(self.word_list.len()) {
+            return Ok(start..end);
+        }
+        let marked = self
+            .vis
+            .get(start..end.min(self.vis.len()))
+            .map_or(0, |bytes| bytes.iter().filter(|&&b| b != 0).count() as u32);
+        Err(gap_census(span_total, marked))
+    }
+
+    /// Unmarks the visible surfaces of `slots` that have no draw-surf word
+    /// and lists them; returns how many there were.
+    fn drop_unworded(&mut self, slots: Range<usize>) -> u32 {
+        let first = slots.start;
+        let pairs = self.vis[slots.clone()].iter_mut().zip(&self.word_list[slots]);
+        let mut dropped = 0u32;
+        for (step, (mark, word)) in pairs.enumerate() {
+            if *mark == 0 || word.packed != 0 {
+                continue;
+            }
+            *mark = 0;
+            dropped = dropped.saturating_add(1);
+            self.unworded.extend(u16::try_from(first + step).ok());
+        }
+        dropped
+    }
+
+    /// Turns the runs of the last range into draw items.
+    fn push_run_items(&mut self) {
+        let mut entry = 0u16;
+        let surfs: &[u16] = self.item_surfs;
+        self.items.extend(self.runs.iter().map(|run| {
+            let head = surfs[run.list_start as usize];
+            // A run that extends the entry before it keeps that entry's head.
+            entry = if run.extends_entry { entry } else { head };
+            LevelDrawItem {
+                key: run.facet_draw.packed,
+                facet_ix: head,
+                batch_run: run.len,
+                list_start: run.list_start,
+                entry_first: entry,
+                kind: LevelDrawItemKind::Bsp(run.kind),
+            }
+        }));
+    }
+
+    /// Turns one camera surface range into draw items. Surfaces marked
+    /// visible but lacking a draw-surf word are unmarked and listed in
+    /// `unworded`. A range that does not fit the tables counts as an input
+    /// gap and adds no items.
+    fn append(&mut self, kind: CameraSpanKind, span: Range<u32>) -> LevelTreeFacetDrawCensus {
+        let slots = match self.slots(&span) {
+            Ok(slots) => slots,
+            Err(gap) => return gap,
+        };
+        let unworded = self.drop_unworded(slots);
+        self.runs.clear();
+        let (first, last) = (span.start, span.end);
+        let mut census = queue_world_faces_for_view(
+            kind,
+            first,
+            last,
+            self.vis,
+            self.word_list,
+            self.item_surfs,
+            self.runs,
+        );
+        // They were seen, but draw nothing: gaps in the input.
+        census.seen_total = census.seen_total.saturating_add(unworded);
+        census.input_gap_tally = census.input_gap_tally.saturating_add(unworded);
+        self.push_run_items();
+        census
+    }
+}
+
+/// The sort key of world surface `facet` drawn with its colour pass: the
 /// draw-surf word the world capture holds, else the material's baked key with
 /// the surface's scene light index put in. None for a surface with no material
 /// or no key.
-pub(crate) fn packed_world_colour_key(
-    cull: &WorldCull,
-    surf: usize,
-    baked_material_keys: &[Option<u64>],
-    batch_primary_lights: &[u8],
+pub(crate) fn compact_level_colour_key(
+    cull: &LevelHide,
+    facet: usize,
+    baked_material_ids: &[Option<u64>],
+    batch_key_lights: &[u8],
 ) -> Option<u64> {
-    let material = cull.surface_materials.get(surf).copied().flatten()?;
-    if let Some(word) = cull.capture.packed_draw_surfs.get(surf) {
-        if word.packed != 0 {
-            return Some(word.packed);
-        }
-    }
-    let baked = baked_material_keys.get(material.order()).copied().flatten()?;
-    let light = match cull.surface_primary_lights.get(surf) {
-        Some(&light) => light,
-        None => cull
-            .surface_batch_ranges
-            .get(surf)
-            .and_then(|&(batch, _, _)| batch_primary_lights.get(batch).copied())
-            .unwrap_or(0),
+    let material = cull.facet_materials.get(facet).copied().flatten()?;
+    let batch_light = || {
+        let &(batch, _, _) = cull.facet_batch_ranges.get(facet)?;
+        batch_key_lights.get(batch).copied()
     };
-    Some(crate::assemble::drawsurf::with_scene_light_index(baked, light))
+    let baked_with_light = || {
+        let baked = baked_material_ids
+            .get(material.order())
+            .copied()
+            .flatten()?;
+        let own_light = cull.facet_key_lights.get(facet).copied();
+        let light = own_light.or_else(batch_light).unwrap_or(0);
+        Some(crate::assemble::draw_items::scene_light_index_of(
+            baked, light,
+        ))
+    };
+    cull.capture
+        .compact_facet_draws
+        .get(facet)
+        .map(|word| word.packed)
+        .filter(|&packed| packed != 0)
+        .or_else(baked_with_light)
 }
 
-/// Adds one draw item per surface of a brush model's span `start_surf..` that
-/// is not in `already`, drawing it with its colour key. Returns how many items
+/// Adds one draw item per surface of a brush model's span `start_facet..` that
+/// is not in `drawn`, drawing it with its colour key. Returns how many items
 /// were added and how many surfaces had no key.
-pub(crate) fn append_bmodel_colour_span(
-    cull: &mut WorldCull,
-    start_surf: u16,
-    surface_count: u16,
-    already: &mut HashSet<u16>,
-    baked_material_keys: &[Option<u64>],
-    batch_primary_lights: &[u8],
+pub(crate) fn append_solid_model_colour_span(
+    cull: &mut LevelHide,
+    start_facet: u16,
+    facet_tally: u16,
+    drawn: &mut HashSet<u16>,
+    baked_material_ids: &[Option<u64>],
+    batch_key_lights: &[u8],
 ) -> (u32, u32) {
-    let (mut added, mut refused) = (0u32, 0u32);
-    let first = usize::from(start_surf);
-    for surf in first..first.saturating_add(usize::from(surface_count)) {
-        let Ok(surf16) = u16::try_from(surf) else {
+    let from = usize::from(start_facet);
+    let span = from..from.saturating_add(usize::from(facet_tally));
+    let fresh: Vec<u16> = span
+        .filter_map(|surf| u16::try_from(surf).ok())
+        .filter(|&surf| drawn.insert(surf))
+        .collect();
+    let mut keyless = 0u32;
+    let before = cull.draw_batch_list.len();
+    for surf in fresh {
+        let facet = surf as usize;
+        let found = compact_level_colour_key(cull, facet, baked_material_ids, batch_key_lights);
+        let Some(colour_key) = found else {
+            keyless += 1;
             continue;
         };
-        if !already.insert(surf16) {
-            continue;
-        }
-        let Some(key) =
-            packed_world_colour_key(cull, surf, baked_material_keys, batch_primary_lights)
-        else {
-            refused += 1;
-            continue;
-        };
-        cull.draw_items.push(WorldDrawItem {
-            key,
-            surf: surf16,
-            run: 1,
-            list_start: cull.item_surfs.len() as u32,
-            entry_first: surf16,
-            kind: WorldDrawItemKind::BModel,
+        let list_start = cull.item_surfs.len() as u32;
+        cull.item_surfs.push(surf);
+        cull.draw_batch_list.push(LevelDrawItem {
+            key: colour_key,
+            facet_ix: surf,
+            batch_run: 1,
+            list_start,
+            entry_first: surf,
+            kind: LevelDrawItemKind::BModel,
         });
-        cull.item_surfs.push(surf16);
-        added += 1;
     }
-    (added, refused)
+    ((cull.draw_batch_list.len() - before) as u32, keyless)
 }
 
-/// Recomputes `cull.draw_items_id` after draw items were added by hand.
-pub(crate) fn refresh_draw_items_id(cull: &mut WorldCull) {
-    cull.draw_items_id = draw_items_content_id(cull);
+/// Recomputes `cull.draw_batch_list_id` after draw items were added by hand.
+pub(crate) fn refresh_draw_items_id(cull: &mut LevelHide) {
+    cull.draw_batch_list_id = draw_items_content_id(cull);
+}
+
+/// The code a draw item's kind adds to its identity.
+fn kind_code(kind: LevelDrawItemKind) -> u64 {
+    match kind {
+        LevelDrawItemKind::BModel => 3,
+        LevelDrawItemKind::Bsp(range) => match range {
+            CameraSpanKind::LitOpaque => 0,
+            CameraSpanKind::LitTrans => 1,
+            CameraSpanKind::Emissive => 2,
+            CameraSpanKind::Decal => 4,
+        },
+    }
 }
 
 /// Folds one draw item into a content hash: key, entry, length, surfaces,
 /// then the kind.
-fn mix_draw_item_id(id: &mut u64, item: &WorldDrawItem, item_surfs: &[u16]) {
-    use asset_world::CameraRangeKind::{Decal, Emissive, LitOpaque, LitTrans};
-    mix_content_id(id, item.key);
-    mix_content_id(id, u64::from(item.entry_first));
-    mix_content_id(id, u64::from(item.run));
-    for &surf in item_surfs {
-        mix_content_id(id, u64::from(surf));
+fn mix_draw_item_id(id: &mut u64, item: &LevelDrawItem, item_surfs: &[u16]) {
+    let head = [item.key, u64::from(item.entry_first), u64::from(item.batch_run)];
+    let surfs = item_surfs.iter().map(|&surf| u64::from(surf));
+    for word in head.into_iter().chain(surfs).chain([kind_code(item.kind)]) {
+        blend_content_id(id, word);
     }
-    let kind_code = match item.kind {
-        WorldDrawItemKind::Bsp(LitOpaque) => 0,
-        WorldDrawItemKind::Bsp(LitTrans) => 1,
-        WorldDrawItemKind::Bsp(Emissive) => 2,
-        WorldDrawItemKind::BModel => 3,
-        WorldDrawItemKind::Bsp(Decal) => 4,
-    };
-    mix_content_id(id, kind_code);
 }
 
 /// How many times drawing `items` in order switches material.
 #[must_use]
-pub(crate) fn draw_item_rebinds(items: &[WorldDrawItem]) -> u32 {
-    let mut rebinds = 0u32;
-    let mut previous: Option<u16> = None;
-    for item in items {
-        let material = GfxDrawSurf::from_packed(item.key).material_sorted_index();
-        if previous != Some(material) {
-            rebinds = rebinds.saturating_add(1);
-            previous = Some(material);
-        }
-    }
-    rebinds
+pub(crate) fn draw_item_rebinds(items: &[LevelDrawItem]) -> u32 {
+    let mut materials = items
+        .iter()
+        .map(|item| SortedDraw::unpack_from_bits(item.key).material_draw_rank_slot());
+    let Some(mut bound) = materials.next() else {
+        return 0;
+    };
+    let switches = materials
+        .filter(|&material| std::mem::replace(&mut bound, material) != material)
+        .count();
+    u32::try_from(switches).map_or(u32::MAX, |n| n.saturating_add(1))
 }
 
 #[cfg(test)]
 mod tests {
-    use asset_world::CameraRangeKind;
-
     use super::*;
 
     /// A draw-surf word that sorts on `material` alone.
@@ -903,332 +1297,303 @@ mod tests {
         material << 32
     }
 
-    fn surfs(keys: &[u64]) -> Vec<GfxDrawSurf> {
-        keys.iter().map(|&k| GfxDrawSurf::from_packed(k)).collect()
+    fn words(keys: &[u64]) -> Vec<SortedDraw> {
+        keys.iter()
+            .copied()
+            .map(SortedDraw::unpack_from_bits)
+            .collect()
     }
 
-    struct Out {
-        runs: Vec<BspDrawSurfRun<CameraRangeKind>>,
+    /// The lists one or more camera ranges were appended to.
+    #[derive(Default)]
+    struct Lists {
+        runs: Vec<WorldFaceRun<CameraSpanKind>>,
         item_surfs: Vec<u16>,
-        items: Vec<WorldDrawItem>,
+        items: Vec<LevelDrawItem>,
         g0: Vec<u16>,
     }
 
-    impl Out {
-        fn new() -> Self {
-            Self {
-                runs: Vec::new(),
-                item_surfs: Vec::new(),
-                items: Vec::new(),
-                g0: Vec::new(),
-            }
-        }
-
-        fn range(
+    impl Lists {
+        fn append(
             &mut self,
-            kind: CameraRangeKind,
-            begin: u32,
-            end: u32,
-            vis: &mut [u8],
-            draw_surfs: &[GfxDrawSurf],
-        ) -> BspDrawSurfCensus {
-            append_camera_bsp_range(
-                kind,
-                begin,
-                end,
-                vis,
-                draw_surfs,
-                &mut self.runs,
-                &mut self.item_surfs,
-                &mut self.items,
-                &mut self.g0,
-            )
+            kind: CameraSpanKind,
+            span: Range<u32>,
+            marks: &mut [u8],
+            table: &[SortedDraw],
+        ) -> LevelTreeFacetDrawCensus {
+            CameraOut {
+                vis: marks,
+                word_list: table,
+                runs: &mut self.runs,
+                item_surfs: &mut self.item_surfs,
+                items: &mut self.items,
+                unworded: &mut self.g0,
+            }
+            .append(kind, span)
         }
     }
 
-    fn item(key: u64, kind: WorldDrawItemKind) -> WorldDrawItem {
-        WorldDrawItem {
+    fn item(key: u64, kind: LevelDrawItemKind) -> LevelDrawItem {
+        LevelDrawItem {
             key,
-            surf: 0,
-            run: 1,
+            facet_ix: 0,
+            batch_run: 1,
             list_start: 0,
             entry_first: 0,
             kind,
         }
     }
 
+    fn skips(
+        dists: &[u16],
+        seat: usize,
+        at: [f32; 3],
+        eye_pos: Option<Vec3>,
+        scale: Option<f32>,
+    ) -> bool {
+        prop_hide_dist_skips_slot(dists, seat, at, eye_pos, scale)
+    }
+
     #[test]
     fn a_model_with_no_eye_or_no_distance_is_never_skipped() {
-        let dists = [100u16, 0];
         let far = [10_000.0, 0.0, 0.0];
-        assert!(!smodel_cull_dist_skips_slot(&dists, 0, far, None, None));
-        assert!(!smodel_cull_dist_skips_slot(
-            &dists,
-            1,
-            far,
-            Some(Vec3::ZERO),
-            None
-        ));
+        let table = [100u16, 0];
+        assert!(!skips(&table, 0, far, None, None));
+        assert!(!skips(&table, 1, far, Some(Vec3::ZERO), None));
         // A slot past the table has no distance either.
-        assert!(!smodel_cull_dist_skips_slot(
-            &dists,
-            9,
-            far,
-            Some(Vec3::ZERO),
-            None
-        ));
+        assert!(!skips(&table, 9, far, Some(Vec3::ZERO), None));
     }
 
     #[test]
     fn a_model_beyond_its_distance_is_skipped() {
-        let dists = [100u16];
-        let eye = Some(Vec3::new(0.0, 0.0, 0.0));
-        assert!(!smodel_cull_dist_skips_slot(
-            &dists,
-            0,
-            [99.0, 0.0, 0.0],
-            eye,
-            None
-        ));
-        assert!(smodel_cull_dist_skips_slot(
-            &dists,
-            0,
-            [100.0, 0.0, 0.0],
-            eye,
-            None
-        ));
-        // Distance counts in all three axes.
-        assert!(smodel_cull_dist_skips_slot(
-            &dists,
-            0,
-            [60.0, 60.0, 60.0],
-            eye,
-            None
-        ));
+        let eye = Some(Vec3::ZERO);
+        let cases = [
+            ([99.0, 0.0, 0.0], false),
+            ([100.0, 0.0, 0.0], true),
+            // Distance counts in all three axes.
+            ([60.0, 60.0, 60.0], true),
+        ];
+        for (at, hidden) in cases {
+            assert_eq!(skips(&[100], 0, at, eye, None), hidden, "{at:?}");
+        }
     }
 
     #[test]
     fn the_lod_scale_stretches_the_distance_a_model_is_judged_at() {
-        let dists = [100u16];
-        let eye = Some(Vec3::ZERO);
         let at = [60.0, 0.0, 0.0];
-        assert!(!smodel_cull_dist_skips_slot(&dists, 0, at, eye, None));
-        assert!(smodel_cull_dist_skips_slot(&dists, 0, at, eye, Some(2.0)));
+        assert!(!skips(&[100], 0, at, Some(Vec3::ZERO), None));
+        assert!(skips(&[100], 0, at, Some(Vec3::ZERO), Some(2.0)));
     }
 
     #[test]
     fn clearing_the_products_keeps_the_counters() {
-        let mut stats = DpvsFrameStats {
-            frustum_planes: vec![[0.0, 0.0, 1.0, 0.0]],
-            smodel_vis: vec![1, 0],
-            smodel_vis_id: 7,
-            cell_vis: vec![3],
-            cell_vis_count: 2,
-            cell_clips: vec![CellClip::EMPTY],
-            cell_vis_all: true,
-            view_prepared: 1,
-            lock_pvs: 1,
-            eye_cell_unresolved: 4,
+        let mut stats = SightFrameStats {
+            view_volume_planes: vec![[0.0, 0.0, 1.0, 0.0]],
+            prop_vis: vec![1, 0],
+            prop_vis_id: 7,
+            room_vis: vec![3],
+            room_vis_tally: 2,
+            room_clips: vec![CellClip::BLANK],
+            view: CullViewFacts {
+                every_cell: true,
+                prepared: true,
+                pvs_locked: true,
+                ..CullViewFacts::default()
+            },
+            eyeless_frames: 4,
             keys: 9,
-            ..DpvsFrameStats::default()
+            ..SightFrameStats::default()
         };
         clear_products(&mut stats);
-        assert!(stats.frustum_planes.is_empty());
-        assert!(stats.smodel_vis.is_empty());
-        assert_eq!(stats.smodel_vis_id, 0);
-        assert!(stats.cell_vis.is_empty());
-        assert_eq!(stats.cell_vis_count, 0);
-        assert!(stats.cell_clips.is_empty());
-        assert!(!stats.cell_vis_all);
-        assert_eq!((stats.view_prepared, stats.lock_pvs), (0, 0));
+        assert!(stats.view_volume_planes.is_empty() && stats.prop_vis.is_empty());
+        assert!(stats.room_vis.is_empty() && stats.room_clips.is_empty());
+        assert_eq!((stats.prop_vis_id, stats.room_vis_tally), (0, 0));
+        let view = stats.view;
+        assert!(!view.every_cell && !view.prepared && !view.pvs_locked);
         // The running count of frames with no eye cell is not a product.
-        assert_eq!(stats.eye_cell_unresolved, 4);
-        assert_eq!(stats.keys, 9);
+        assert_eq!((stats.eyeless_frames, stats.keys), (4, 9));
     }
 
     #[test]
     fn rebinds_count_the_material_changes_in_draw_order() {
-        let bsp = WorldDrawItemKind::Bsp(CameraRangeKind::LitOpaque);
+        let bsp = LevelDrawItemKind::Bsp(CameraSpanKind::LitOpaque);
         assert_eq!(draw_item_rebinds(&[]), 0);
-        let items = [
-            item(key(1), bsp),
-            item(key(1), bsp),
-            item(key(2), bsp),
-            item(key(1), bsp),
-        ];
+        let items: Vec<_> = [1, 1, 2, 1].map(|m| item(key(m), bsp)).into();
         assert_eq!(draw_item_rebinds(&items), 3);
         assert_eq!(draw_item_rebinds(&items[..2]), 1);
     }
 
+    fn identity(it: &LevelDrawItem, surfs: &[u16]) -> u64 {
+        let mut id = CONTENT_KEY_SEED;
+        mix_draw_item_id(&mut id, it, surfs);
+        id
+    }
+
     #[test]
     fn a_draw_items_identity_follows_its_key_length_surfaces_and_kind() {
-        let base = item(key(1), WorldDrawItemKind::Bsp(CameraRangeKind::LitOpaque));
-        let id = |it: &WorldDrawItem, surfs: &[u16]| {
-            let mut id = CONTENT_ID_SEED;
-            mix_draw_item_id(&mut id, it, surfs);
-            id
-        };
-        let same = id(&base, &[4, 5]);
-        assert_eq!(same, id(&base, &[4, 5]));
-        assert_ne!(same, id(&base, &[4, 6]));
-        assert_ne!(same, id(&item(key(2), base.kind), &[4, 5]));
-        assert_ne!(
-            same,
-            id(
-                &WorldDrawItem {
-                    run: 2,
-                    ..base
-                },
-                &[4, 5]
-            )
-        );
-        assert_ne!(
-            same,
-            id(
-                &WorldDrawItem {
+        let base = item(key(1), LevelDrawItemKind::Bsp(CameraSpanKind::LitOpaque));
+        let reference = identity(&base, &[4, 5]);
+        assert_eq!(reference, identity(&base, &[4, 5]));
+        let changed = [
+            identity(&base, &[4, 6]),
+            identity(&item(key(2), base.kind), &[4, 5]),
+            identity(&LevelDrawItem { batch_run: 2, ..base }, &[4, 5]),
+            identity(
+                &LevelDrawItem {
                     entry_first: 4,
                     ..base
                 },
-                &[4, 5]
-            )
-        );
+                &[4, 5],
+            ),
+        ];
+        assert!(changed.iter().all(|&other| other != reference));
     }
 
     #[test]
     fn every_kind_of_draw_item_has_its_own_identity() {
-        let mut ids = Vec::new();
-        for kind in [
-            WorldDrawItemKind::Bsp(CameraRangeKind::LitOpaque),
-            WorldDrawItemKind::Bsp(CameraRangeKind::LitTrans),
-            WorldDrawItemKind::Bsp(CameraRangeKind::Emissive),
-            WorldDrawItemKind::Bsp(CameraRangeKind::Decal),
-            WorldDrawItemKind::BModel,
-        ] {
-            let mut id = CONTENT_ID_SEED;
-            mix_draw_item_id(&mut id, &item(key(1), kind), &[1]);
-            ids.push(id);
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), 5);
+        let kinds = [
+            LevelDrawItemKind::Bsp(CameraSpanKind::LitOpaque),
+            LevelDrawItemKind::Bsp(CameraSpanKind::LitTrans),
+            LevelDrawItemKind::Bsp(CameraSpanKind::Emissive),
+            LevelDrawItemKind::Bsp(CameraSpanKind::Decal),
+            LevelDrawItemKind::BModel,
+        ];
+        let distinct: std::collections::HashSet<u64> = kinds
+            .iter()
+            .map(|&kind| identity(&item(key(1), kind), &[1]))
+            .collect();
+        assert_eq!(distinct.len(), kinds.len());
     }
 
     #[test]
     fn a_range_turns_into_one_item_per_run_of_equal_keys() {
-        let draw_surfs = surfs(&[key(1), key(1), key(2), key(1)]);
-        let mut vis = [1u8; 4];
-        let mut out = Out::new();
-        let census = out.range(CameraRangeKind::LitOpaque, 0, 4, &mut vis, &draw_surfs);
-        assert_eq!(census.range_n, 4);
-        assert_eq!(census.visible_n, 4);
-        assert_eq!(census.admitted_n, 4);
-        assert_eq!(census.run_n, 3);
-        assert_eq!(census.input_gap_n, 0);
-        assert_eq!(out.item_surfs, [0, 1, 2, 3]);
-        let shape: Vec<_> = out
+        let table = words(&[key(1), key(1), key(2), key(1)]);
+        let mut marks = [1u8; 4];
+        let mut lists = Lists::default();
+        let census = lists.append(CameraSpanKind::LitOpaque, 0..4, &mut marks, &table);
+        let counts = (
+            census.span_total,
+            census.seen_total,
+            census.accepted_total,
+            census.runs_seen,
+        );
+        assert_eq!(counts, (4, 4, 4, 3));
+        assert_eq!(census.input_gap_tally, 0);
+        assert_eq!(lists.item_surfs, [0, 1, 2, 3]);
+        let shape: Vec<_> = lists
             .items
             .iter()
-            .map(|it| (it.surf, it.run, it.list_start, it.entry_first, it.key))
+            .map(|it| (it.facet_ix, it.batch_run, it.list_start, it.entry_first, it.key))
             .collect();
         assert_eq!(
             shape,
-            [(0, 2, 0, 0, key(1)), (2, 1, 2, 2, key(2)), (3, 1, 3, 3, key(1))]
+            [
+                (0, 2, 0, 0, key(1)),
+                (2, 1, 2, 2, key(2)),
+                (3, 1, 3, 3, key(1))
+            ]
         );
-        assert!(out.items.iter().all(|it| it.kind == WorldDrawItemKind::Bsp(CameraRangeKind::LitOpaque)));
-        assert!(out.g0.is_empty());
+        let opaque = LevelDrawItemKind::Bsp(CameraSpanKind::LitOpaque);
+        assert!(lists.items.iter().all(|it| it.kind == opaque));
+        assert!(lists.g0.is_empty());
     }
 
     #[test]
     fn a_surface_that_is_not_visible_is_left_out_and_does_not_split_a_run() {
-        let draw_surfs = surfs(&[key(1), key(1), key(1)]);
-        let mut vis = [1u8, 0, 1];
-        let mut out = Out::new();
-        let census = out.range(CameraRangeKind::LitTrans, 0, 3, &mut vis, &draw_surfs);
-        assert_eq!(census.visible_n, 2);
-        assert_eq!(out.item_surfs, [0, 2]);
-        assert_eq!(out.items.len(), 1);
-        assert_eq!(out.items[0].run, 2);
+        let table = words(&[key(1); 3]);
+        let mut marks = [1u8, 0, 1];
+        let mut lists = Lists::default();
+        let census = lists.append(CameraSpanKind::LitTrans, 0..3, &mut marks, &table);
+        assert_eq!(census.seen_total, 2);
+        assert_eq!(lists.item_surfs, [0, 2]);
+        let runs: Vec<_> = lists.items.iter().map(|it| it.batch_run).collect();
+        assert_eq!(runs, [2]);
     }
 
     #[test]
     fn a_visible_surface_with_no_draw_surf_word_is_unmarked_and_listed() {
-        let draw_surfs = surfs(&[key(1), 0, key(1)]);
-        let mut vis = [1u8; 3];
-        let mut out = Out::new();
-        let census = out.range(CameraRangeKind::LitOpaque, 0, 3, &mut vis, &draw_surfs);
-        assert_eq!(vis, [1, 0, 1]);
-        assert_eq!(out.g0, [1]);
-        assert_eq!(out.item_surfs, [0, 2]);
+        let table = words(&[key(1), 0, key(1)]);
+        let mut marks = [1u8; 3];
+        let mut lists = Lists::default();
+        let census = lists.append(CameraSpanKind::LitOpaque, 0..3, &mut marks, &table);
+        assert_eq!(marks, [1, 0, 1]);
+        assert_eq!(lists.g0, [1]);
+        assert_eq!(lists.item_surfs, [0, 2]);
         // It was seen, but it is a gap in the input and draws nothing.
-        assert_eq!(census.visible_n, 3);
-        assert_eq!(census.admitted_n, 2);
-        assert_eq!(census.input_gap_n, 1);
+        let counts = (
+            census.seen_total,
+            census.accepted_total,
+            census.input_gap_tally,
+        );
+        assert_eq!(counts, (3, 2, 1));
     }
 
     #[test]
     fn a_run_past_128_surfaces_continues_the_same_entry() {
         let n = 130usize;
-        let draw_surfs = surfs(&vec![key(5); n]);
-        let mut vis = vec![1u8; n];
-        let mut out = Out::new();
-        let census = out.range(CameraRangeKind::Emissive, 0, n as u32, &mut vis, &draw_surfs);
-        assert_eq!(census.run_n, 2);
-        assert_eq!(census.entry_n, 1);
-        assert_eq!(out.items.len(), 2);
-        assert_eq!((out.items[0].run, out.items[1].run), (128, 2));
-        assert_eq!((out.items[0].surf, out.items[1].surf), (0, 128));
+        let table = words(&vec![key(5); n]);
+        let mut marks = vec![1u8; n];
+        let mut lists = Lists::default();
+        let census = lists.append(CameraSpanKind::Emissive, 0..n as u32, &mut marks, &table);
+        assert_eq!((census.runs_seen, census.entry_record_total), (2, 1));
+        let shape: Vec<_> = lists
+            .items
+            .iter()
+            .map(|it| (it.batch_run, it.facet_ix, it.entry_first, it.list_start))
+            .collect();
         // The second run shares its entry's first surface.
-        assert_eq!(out.items[0].entry_first, 0);
-        assert_eq!(out.items[1].entry_first, 0);
-        assert_eq!(out.items[1].list_start, 128);
+        assert_eq!(shape, [(128, 0, 0, 0), (2, 128, 0, 128)]);
     }
 
     #[test]
     fn a_new_range_starts_a_new_entry() {
-        let draw_surfs = surfs(&[key(1), key(1), key(1), key(1)]);
-        let mut vis = [1u8; 4];
-        let mut out = Out::new();
-        out.range(CameraRangeKind::LitOpaque, 0, 2, &mut vis, &draw_surfs);
-        out.range(CameraRangeKind::Decal, 2, 4, &mut vis, &draw_surfs);
-        assert_eq!(out.items.len(), 2);
-        assert_eq!(out.items[1].entry_first, 2);
-        assert_eq!(out.items[1].list_start, 2);
-        assert_eq!(out.items[1].kind, WorldDrawItemKind::Bsp(CameraRangeKind::Decal));
+        let table = words(&[key(1); 4]);
+        let mut marks = [1u8; 4];
+        let mut lists = Lists::default();
+        lists.append(CameraSpanKind::LitOpaque, 0..2, &mut marks, &table);
+        lists.append(CameraSpanKind::Decal, 2..4, &mut marks, &table);
+        let [_, second] = lists.items[..] else {
+            panic!("expected two items, got {}", lists.items.len());
+        };
+        assert_eq!((second.entry_first, second.list_start), (2, 2));
+        assert_eq!(second.kind, LevelDrawItemKind::Bsp(CameraSpanKind::Decal));
     }
 
     #[test]
     fn a_range_that_ends_before_it_begins_is_one_input_gap() {
-        let draw_surfs = surfs(&[key(1)]);
-        let mut vis = [1u8];
-        let mut out = Out::new();
-        let census = out.range(CameraRangeKind::LitOpaque, 3, 1, &mut vis, &draw_surfs);
-        assert_eq!(census.input_gap_n, 1);
-        assert_eq!(census.range_n, 0);
-        assert!(out.items.is_empty());
-        assert_eq!(vis, [1]);
+        let table = words(&[key(1)]);
+        let mut marks = [1u8];
+        let mut lists = Lists::default();
+        #[allow(clippy::reversed_empty_ranges)]
+        let census = lists.append(CameraSpanKind::LitOpaque, 3..1, &mut marks, &table);
+        assert_eq!((census.input_gap_tally, census.span_total), (1, 0));
+        assert!(lists.items.is_empty());
+        assert_eq!(marks, [1]);
     }
 
     #[test]
     fn a_range_past_the_tables_adds_nothing_and_counts_every_surface() {
-        let draw_surfs = surfs(&[key(1), key(1), key(1)]);
-        let mut vis = [1u8, 0, 1];
-        let mut out = Out::new();
-        let census = out.range(CameraRangeKind::LitOpaque, 0, 5, &mut vis, &draw_surfs);
-        assert_eq!(census.range_n, 5);
-        assert_eq!(census.visible_n, 2);
-        assert_eq!(census.input_gap_n, 5);
-        assert_eq!(census.admitted_n, 0);
-        assert!(out.items.is_empty());
-        assert!(out.item_surfs.is_empty());
+        let table = words(&[key(1); 3]);
+        let mut marks = [1u8, 0, 1];
+        let mut lists = Lists::default();
+        let census = lists.append(CameraSpanKind::LitOpaque, 0..5, &mut marks, &table);
+        let counts = (
+            census.span_total,
+            census.seen_total,
+            census.input_gap_tally,
+            census.accepted_total,
+        );
+        assert_eq!(counts, (5, 2, 5, 0));
+        assert!(lists.items.is_empty() && lists.item_surfs.is_empty());
     }
 
     #[test]
     fn an_empty_range_adds_nothing() {
-        let draw_surfs = surfs(&[key(1)]);
-        let mut vis = [1u8];
-        let mut out = Out::new();
-        let census = out.range(CameraRangeKind::LitOpaque, 1, 1, &mut vis, &draw_surfs);
-        assert_eq!(census, BspDrawSurfCensus::default());
-        assert!(out.items.is_empty());
+        let table = words(&[key(1)]);
+        let mut marks = [1u8];
+        let mut lists = Lists::default();
+        let census = lists.append(CameraSpanKind::LitOpaque, 1..1, &mut marks, &table);
+        assert_eq!(census, LevelTreeFacetDrawCensus::default());
+        assert!(lists.items.is_empty());
     }
 }

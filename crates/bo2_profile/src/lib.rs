@@ -17,11 +17,13 @@
 //! `<slot>attachment<n>` the attachment's number in that weapon's own list
 //! (1 first, 0 none), a grenade's `<slot>count` the count.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 /// The class slots (the menus' CoD.CACUtility.loadoutSlotNames and the
 /// attachment, option and count slots beside them).
+/// The second weapon's slot name, which its own slots extend.
+const SECOND_WEAPON: &str = "secondary";
+
 pub const SLOTS: [&str; 24] = [
     "primary",
     "primaryattachment1",
@@ -29,7 +31,7 @@ pub const SLOTS: [&str; 24] = [
     "primaryattachment3",
     "primarycamo",
     "primaryreticle",
-    "secondary",
+    SECOND_WEAPON,
     "secondaryattachment1",
     "secondaryattachment2",
     "secondarycamo",
@@ -111,12 +113,10 @@ pub const UNLOCK_TOKENS: &str = "unlocks.0";
 /// One `mp/statstable.csv` row.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Item {
-    pub index: i32,
-    pub group: String,
-    pub name: String,
-    pub reference: String,
-    pub image: String,
-    pub desc: String,
+    /// Row number, then the group it is listed under (`weapon_smg`, `specialty`, ...).
+    pub index: i32, pub group: String,
+    /// Shown name, the code name, the icon and the description string.
+    pub name: String, pub reference: String, pub image: String, pub desc: String,
     /// The attachments a weapon takes, in the order the menus number them
     /// (1 first).
     pub attachments: Vec<String>,
@@ -139,11 +139,8 @@ pub struct Item {
 /// One `mp/attachmenttable.csv` row.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Attachment {
-    pub index: i32,
-    pub reference: String,
-    pub name: String,
-    pub image: String,
-    pub desc: String,
+    pub index: i32, pub reference: String,
+    pub name: String, pub image: String, pub desc: String,
     pub cost: i32,
     /// The attachments it goes with on one gun, by reference (column 11:
     /// BO2's `compatibleAttachments`).
@@ -154,14 +151,14 @@ pub struct Attachment {
 #[derive(Clone, Debug, PartialEq)]
 pub enum StatValue {
     Num(f32),
-    Str(String),
+    Text(String),
 }
 
 impl StatValue {
     pub fn as_num(&self) -> Option<f32> {
         match self {
             StatValue::Num(n) => Some(*n),
-            StatValue::Str(s) => s.trim().parse().ok(),
+            StatValue::Text(s) => s.trim().parse().ok(),
         }
     }
 }
@@ -176,7 +173,7 @@ fn int(row: &[String], i: usize) -> i32 {
 
 /// A number as the stats file writes it (whole numbers without a point).
 fn number_text(n: f32) -> String {
-    if n == n.trunc() && n.abs() < 1e9 { format!("{}", n as i64) } else { format!("{n}") }
+    if n == n.trunc() && n.abs() < 1e9 { (n as i64).to_string() } else { n.to_string() }
 }
 
 /// The items, the attachments and his stats.
@@ -187,10 +184,12 @@ pub struct Profile {
     pub attachments: Vec<Attachment>,
     /// His stats by path (see the crate notes).
     pub stats: HashMap<String, StatValue>,
-    /// A stat changed since the owner last saved (`take_dirty`).
     pub dirty: bool,
     /// The class set `loadout_*` read (`LOCAL_MATCH_SET` unless set).
     pub match_set: String,
+    /// His team (BO2's `team_t`): a preset class (`PRESET_CLASS_FIRST` on)
+    /// is read from the match's presets for it, `cacLoadouts[team]`.
+    pub team: i32,
     /// mp/rankTable.csv's ranks (`set_rank_table`).
     pub ranks: Vec<RankRow>,
     /// Console lines a stats command leaves for its owner to run next, in
@@ -220,7 +219,7 @@ impl Profile {
     /// classes filled into every class set (only slots `stats` lacks: read
     /// his file with `load_text` first), the class names from `localize`
     /// (`CLASS_SLOT1` -> "Custom 1").
-    pub fn from_tables(
+    pub fn out_of_charts(
         statstable: &[Vec<String>],
         attachmenttable: &[Vec<String>],
         localize: &dyn Fn(&str) -> Option<String>,
@@ -251,7 +250,7 @@ impl Profile {
             let mut classes: Vec<(String, Vec<String>)> = Vec::new();
             for w in cell(row, 11).split_whitespace() {
                 if w.starts_with("class_") || w == "all" {
-                    classes.push((w.to_owned(), Vec::new()));
+                    classes.push((w.to_owned(), vec![]));
                 } else if let Some(last) = classes.last_mut() {
                     last.1.push(w.to_owned());
                 }
@@ -306,7 +305,7 @@ impl Profile {
                 }
                 let loc = format!("CLASS_SLOT{}", n + 1);
                 let name = localize(&loc).unwrap_or(loc);
-                self.stats.entry(format!("{set}.customclassname.{n}")).or_insert(StatValue::Str(name));
+                self.stats.entry(format!("{set}.customclassname.{n}")).or_insert(StatValue::Text(name));
             }
         }
         // A match's preset classes (the class menu's default classes,
@@ -320,7 +319,7 @@ impl Profile {
                     self.stats.entry(format!("{set}.customclass.{n}.{slot}")).or_insert(StatValue::Num(v as f32));
                 }
                 let name = localize(loc).unwrap_or_else(|| (*loc).to_owned());
-                self.stats.entry(format!("{set}.customclassname.{n}")).or_insert(StatValue::Str(name));
+                self.stats.entry(format!("{set}.customclassname.{n}")).or_insert(StatValue::Text(name));
             }
         }
         // A new profile's stats were never reset: no "Your online stats
@@ -334,11 +333,12 @@ impl Profile {
     /// A default class's slots: (slot, item index or count). `class` is a
     /// statstable class name (`class_custom_smg`, `class_smg`).
     pub fn default_class(&self, class: &str) -> Vec<(String, i32)> {
-        let mut out: Vec<(String, i32)> = Vec::new();
+        let mut out: Vec<(String, i32)> = vec![];
         for it in &self.items {
-            let Some((_, words)) = it.classes.iter().find(|(c, _)| c == class) else { continue };
+            let Some(class_entry) = it.classes.iter().find(|(name, _)| name == class) else { continue };
+            let words = &class_entry.1;
             let slot = it.slot.as_str();
-            match slot {
+            match it.slot.as_str() {
                 "primary" | "secondary" | "primarygrenade" | "specialgrenade" => {
                     out.push((slot.to_owned(), it.index));
                     if slot.ends_with("grenade") {
@@ -382,8 +382,8 @@ impl Profile {
         self.stat(path).and_then(StatValue::as_num).unwrap_or(0.0)
     }
 
-    pub fn set_stat(&mut self, path: String, v: StatValue) {
-        self.stats.insert(path, v);
+    pub fn set_stat(&mut self, stat_path: String, v: StatValue) {
+        self.stats.insert(stat_path, v);
         self.dirty = true;
     }
 
@@ -442,7 +442,7 @@ impl Profile {
     /// attachment (`reflex`).
     pub fn attachment(&self, item: i32, n: i32) -> Option<&Attachment> {
         let reference = if n <= 0 {
-            "none".to_owned()
+            String::from("none")
         } else {
             self.item(item)?.attachments.get(n as usize - 1)?.clone()
         };
@@ -462,8 +462,8 @@ impl Profile {
     /// BG_AreAttachmentsCompatible): none goes with anything; otherwise
     /// both must be in the table and each list the other, so none goes
     /// with itself.
-    pub fn attachments_compatible(&self, a: &str, b: &str) -> bool {
-        let (Some(a), Some(b)) = (self.attachment_ref(a), self.attachment_ref(b)) else { return false };
+    pub fn attachments_compatible(&self, first: &str, second: &str) -> bool {
+        let (Some(a), Some(b)) = (self.attachment_ref(first), self.attachment_ref(second)) else { return false };
         if a.reference == "none" || b.reference == "none" {
             return true;
         }
@@ -473,30 +473,23 @@ impl Profile {
     /// His stats as text, one `path<TAB>value` per line (text starts with
     /// `s:`), sorted: the local stats file.
     pub fn to_text(&self) -> String {
-        let mut lines: Vec<String> = self
-            .stats
-            .iter()
-            .map(|(k, v)| match v {
-                StatValue::Num(n) => format!("{k}\t{}", number_text(*n)),
-                StatValue::Str(t) => format!("{k}\ts:{t}"),
-            })
-            .collect();
-        lines.sort();
-        lines.join("\n") + "\n"
+        let row = |(k, v): (&String, &StatValue)| match v {
+            StatValue::Num(n) => format!("{k}\t{}", number_text(*n)),
+            StatValue::Text(t) => format!("{k}\ts:{t}"),
+        };
+        let mut lines: Vec<String> = self.stats.iter().map(row).collect();
+        lines.sort_unstable(); let mut text = lines.join("\n"); text += "\n";
+        text
     }
 
     /// Stats from a file written by `to_text`.
     pub fn stats_from_text(text: &str) -> HashMap<String, StatValue> {
-        let mut out = HashMap::new();
-        for line in text.lines() {
-            let Some((k, v)) = line.split_once('\t') else { continue };
-            let value = match v.strip_prefix("s:") {
-                Some(t) => StatValue::Str(t.to_owned()),
-                None => v.trim().parse::<f32>().map_or_else(|_| StatValue::Str(v.to_owned()), StatValue::Num),
-            };
-            out.insert(k.to_owned(), value);
-        }
-        out
+        // Lines with no tab are skipped; a number that does not parse stays text.
+        let read = |v: &str| match v.strip_prefix("s:") {
+            Some(t) => StatValue::Text(t.to_owned()),
+            None => v.trim().parse::<f32>().map_or_else(|_| StatValue::Text(v.to_owned()), StatValue::Num),
+        };
+        text.lines().filter_map(|row| row.split_once('\t')).map(|(k, v)| (k.to_owned(), read(v))).collect()
     }
 
     /// His stats file (none yet = no stats).
@@ -515,11 +508,19 @@ impl Profile {
     }
 
     // The server's answers for a player's class (`class` = the class
-    // number the scripts pass, 0 the first custom class), in `match_set`.
+    // number the scripts pass, 0 the first custom class), in `match_set`;
+    // a preset class (10-14, CLASS_SMG to CLASS_SNIPER) in the match's
+    // presets for his team, as the class menu reads them.
 
     /// `getloadoutitem(class, slot)`: the slot's item index (0 = none).
     pub fn loadout_item(&self, class: i32, slot: &str) -> i32 {
-        self.stat_num(&Profile::class_key(&self.match_set, class, slot)) as i32
+        let key = if class >= PRESET_CLASS_FIRST {
+            let set = format!("gametypesettings.cacloadouts.{}", self.team.clamp(0, 2));
+            Profile::class_key(&set, class - PRESET_CLASS_FIRST, slot)
+        } else {
+            Profile::class_key(&self.match_set, class, slot)
+        };
+        self.stat_num(&key) as i32
     }
 
     /// Whether he has picked scorestreaks (Clear All counts: none picked):
@@ -551,8 +552,8 @@ impl Profile {
             })
             .collect();
         let picked: Vec<&str> = atts.iter().map(|a| a.reference.as_str()).collect();
-        if let Some(name) = dual_wield_weapon_name(&it.reference, &picked) {
-            return name;
+        if let Some(dual) = dual_wield_weapon_name(&it.reference, &picked) {
+            return dual;
         }
         atts.sort_by(|a, b| a.index.cmp(&b.index).then_with(|| a.reference.cmp(&b.reference)));
         atts.dedup_by(|a, b| a.reference == b.reference);
@@ -567,7 +568,7 @@ impl Profile {
     /// `getloadoutperks(class)`: the specialties of the class's perks
     /// (specialty1-6), each perk's `specialty_*` names in table order.
     pub fn loadout_perks(&self, class: i32) -> Vec<String> {
-        let mut out = Vec::new();
+        let mut out = vec![];
         for n in 1..=6 {
             let i = self.loadout_item(class, &format!("specialty{n}"));
             if let Some(it) = self.item(i).filter(|it| it.group == "specialty") {
@@ -625,8 +626,8 @@ pub fn gun_xp_path(item: i32) -> String {
 /// reward XP (4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GunLevel {
-    pub rank: i32,
-    pub xp: i32,
+    /// The level, and the XP it starts at.
+    pub rank: i32, pub xp: i32,
     pub attachment: String,
     pub reward_xp: i32,
 }
@@ -761,7 +762,7 @@ impl Profile {
         self.ranks = ranktable
             .iter()
             .filter_map(|r| {
-                let id = cell(r, 0).parse::<i32>().ok()?;
+                let id: i32 = cell(r, 0).parse().ok()?;
                 let min_xp = cell(r, 2).parse::<f32>().ok()?;
                 let max_xp = cell(r, 7).parse::<f32>().ok()?;
                 let words = cell(r, 17);
@@ -909,7 +910,7 @@ impl Profile {
         let Some(verb) = words.first().map(|w| w.to_ascii_lowercase()) else { return false };
         let n = |i: usize| words.get(i).and_then(|w| w.parse::<i32>().ok());
         let text = |key: &str| localize(&key.to_ascii_uppercase()).unwrap_or_else(|| key.to_owned());
-        match verb.as_str() {
+        match &*verb {
             "equipdefaultclass" | "equipdefaultclasstoprofile" | "equipdefaultcustommatchclass" => {
                 let (Some(class), Some(name)) = (n(1), words.get(2)) else { return false };
                 let set = match verb.as_str() {
@@ -925,12 +926,12 @@ impl Profile {
                     return false;
                 };
                 let path = format!("{}.{}.{i}", set.to_ascii_lowercase(), field.to_ascii_lowercase());
-                self.set_stat(path, StatValue::Str(text(key)));
+                self.set_stat(path, StatValue::Text(text(key)));
                 true
             }
             "setprofilelocclass" => {
                 let (Some(i), Some(key)) = (n(1), words.get(2)) else { return false };
-                self.set_stat(format!("profile.cacloadouts.customclassname.{i}"), StatValue::Str(text(key)));
+                self.set_stat(format!("profile.cacloadouts.customclassname.{i}"), StatValue::Text(text(key)));
                 true
             }
             "statwriteddl" => {
@@ -946,15 +947,15 @@ impl Profile {
                 true
             }
             "statsetbyname" => {
-                let (Some(name), Some(value)) = (words.get(1), words.get(2).and_then(|w| w.parse::<f32>().ok())) else {
+                let (Some(stat), Some(value)) = (words.get(1), words.get(2).and_then(|w| w.parse::<f32>().ok())) else {
                     return false;
                 };
-                self.set_stat(format!("playerstatslist.{}.statvalue", name.to_ascii_lowercase()), StatValue::Num(value));
+                self.set_stat(format!("playerstatslist.{}.statvalue", stat.to_ascii_lowercase()), StatValue::Num(value));
                 true
             }
             "setpublicmatchclasssetnamefromlocstring" => {
                 let (Some(i), Some(key)) = (n(1), words.get(2)) else { return false };
-                self.set_stat(format!("{PUBLIC_CLASS_SETS}.{i}.name"), StatValue::Str(text(key)));
+                self.set_stat(format!("{PUBLIC_CLASS_SETS}.{i}.name"), StatValue::Text(text(key)));
                 true
             }
             // A public class set becomes a copy of the public classes, or
@@ -974,7 +975,7 @@ impl Profile {
                 } else {
                     for c in 0..10 {
                         let name = text(&format!("CLASS_SLOT{}", c + 1));
-                        self.stats.insert(format!("{to}name.{c}"), StatValue::Str(name));
+                        self.stats.insert(format!("{to}name.{c}"), StatValue::Text(name));
                     }
                 }
                 self.dirty = true;
@@ -1011,13 +1012,12 @@ struct Saver {
 
 fn saver() -> Option<&'static Saver> {
     static SAVER: std::sync::OnceLock<Option<Saver>> = std::sync::OnceLock::new();
-    SAVER
-        .get_or_init(|| {
+    SAVER.get_or_init(|| {
             let (tx, rx) = std::sync::mpsc::channel::<(std::path::PathBuf, SaveJob, Option<SaveDone>)>();
             let pending = std::sync::Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
             let left = pending.clone();
             std::thread::Builder::new()
-                .name("bo2mp stats saver".into())
+                .name(String::from("bo2mp stats saver"))
                 .spawn(move || {
                     while let Ok(first) = rx.recv() {
                         let mut jobs = vec![first];
@@ -1030,7 +1030,7 @@ fn saver() -> Option<&'static Saver> {
                             let at = match files.iter().position(|(f, _, _)| *f == path) {
                                 Some(at) => at,
                                 None => {
-                                    files.push((path, None, Vec::new()));
+                                    files.push((path, None, vec![]));
                                     files.len() - 1
                                 }
                             };
@@ -1075,11 +1075,11 @@ pub fn save_in_background(path: &Path, job: SaveJob, done: Option<SaveDone>) {
         Ok(tx) => tx.send((path.to_path_buf(), job, done)).err().map(|e| e.0),
         Err(_) => Some((path.to_path_buf(), job, done)),
     };
-    if let Some((path, job, done)) = unsent {
+    if let Some((file, job, done)) = unsent {
         if let Ok(mut n) = s.pending.0.lock() {
             *n = n.saturating_sub(1);
         }
-        write_now(&path, job, done);
+        write_now(&file, job, done);
     }
 }
 
@@ -1143,7 +1143,7 @@ mod gun_level_tests {
             ("itemstats.13.xp.statvalue".to_owned(), StatValue::Num(50.0)),
             ("itemstats.13.xp".to_owned(), StatValue::Num(900.0)),
         ]);
-        let p = Profile::from_tables(&[], &[], &|_| None, stats);
+        let p = Profile::out_of_charts(&[], &[], &|_| None, stats);
         assert_eq!(p.stat_num("itemstats.12.xp"), 400.0);
         assert_eq!(p.stat_num("itemstats.13.xp"), 900.0);
     }
@@ -1177,7 +1177,17 @@ mod tests {
             row(&[(0, "2"), (4, "dualclip")]),
             row(&[(0, "21"), (4, "reflex")]),
         ];
-        Profile::from_tables(&stats, &atts, &|k| (k == "CLASS_SLOT1").then(|| "Custom 1".to_owned()), HashMap::new())
+        Profile::out_of_charts(&stats, &atts, &|k| (k == "CLASS_SLOT1").then(|| "Custom 1".to_owned()), HashMap::new())
+    }
+
+    #[test]
+    fn a_preset_class_reads_his_teams_presets() {
+        let mut p = sample();
+        p.stats.insert("gametypesettings.cacloadouts.2.customclass.4.primary".to_owned(), StatValue::Num(31.0));
+        p.team = 2;
+        assert_eq!(p.loadout_weapon(14, "primary"), "hk416_mp");
+        p.team = 1;
+        assert_ne!(p.loadout_weapon(14, "primary"), "hk416_mp");
     }
 
     #[test]
@@ -1185,7 +1195,7 @@ mod tests {
         let p = sample();
         assert_eq!(p.loadout_item(0, "primary"), 31);
         assert_eq!(p.loadout_item(0, "specialgrenadecount"), 2);
-        assert_eq!(p.stat("profile.cacloadouts.customclassname.0"), Some(&StatValue::Str("Custom 1".into())));
+        assert_eq!(p.stat("profile.cacloadouts.customclassname.0"), Some(&StatValue::Text("Custom 1".into())));
         assert_eq!(p.loadout_weapon(0, "primary"), "hk416_mp");
         assert_eq!(p.loadout_perks(0), vec!["specialty_immunecounteruav", "specialty_immuneemp"]);
     }
@@ -1226,7 +1236,7 @@ mod tests {
             row(&[(0, "11"), (2, "weapon_assault"), (4, "type25"), (10, "4")]),
             row(&[(0, "12"), (2, "weapon_assault"), (4, "xpr"), (10, "30")]),
         ];
-        let mut p = Profile::from_tables(&stats, &[], &|_| None, HashMap::new());
+        let mut p = Profile::out_of_charts(&stats, &[], &|_| None, HashMap::new());
         // A new profile (rank 0, shown as level 1): only rank-0 items.
         assert!(!p.locked(10, false) && p.locked(11, false) && p.locked(12, false));
         // Private matches free everything.
@@ -1246,22 +1256,23 @@ mod tests {
             row(&[(0, "12"), (2, "weapon_assault"), (4, "xpr"), (10, "30"), (13, "primary"), (17, "token")]),
         ];
         let loc = |k: &str| (k == "CLASS_SLOT1").then(|| "Custom 1".to_owned());
-        let mut p = Profile::from_tables(&stats, &[], &loc, HashMap::new());
+        let mut p = Profile::out_of_charts(&stats, &[], &loc, HashMap::new());
         for (k, v) in [(RANK, 54.0), (RANK_XP, 1249100.0), (UNLOCK_TOKENS, 3.0), ("itemstats.12.purchased", 1.0)] {
             p.set_stat(k.to_owned(), StatValue::Num(v));
         }
         p.set_stat(Profile::class_key("cacloadouts", 0, "primary"), StatValue::Num(12.0));
         p.set_stat(Profile::class_key("cacloadouts", 0, "primaryattachment2"), StatValue::Num(2.0));
-        p.set_stat("cacloadouts.customclassname.0".to_owned(), StatValue::Str("Mine".into()));
+        p.set_stat("cacloadouts.customclassname.0".to_owned(), StatValue::Text("Mine".into()));
         assert!(p.purchased(12, false) && !p.locked(12, false));
-        for line in [
+        let lines = [
             "equipdefaultclass 0 class_custom_assault",
             "setStatFromLocString cacloadouts customclassname 0 CLASS_SLOT1",
             "PrestigeStatsReset",
             "statwriteddl playerstatslist rankxp statvalue 0",
             "statwriteddl playerstatslist rank statvalue 0",
             "prestigerequest",
-        ] {
+        ];
+        for line in lines.into_iter() {
             assert!(p.run_stat_command(line, 11, &loc), "{line}");
         }
         assert!(!p.run_stat_command("statwriteddl cacloadouts loadoutVersion ( dvarint( classVersionNumber ) )", 11, &loc));
@@ -1270,7 +1281,7 @@ mod tests {
         assert_eq!(p.tokens(), 3, "unspent unlock tokens stay");
         assert_eq!(p.stat_num(&Profile::class_key("cacloadouts", 0, "primary")), 31.0);
         assert_eq!(p.stat(&Profile::class_key("cacloadouts", 0, "primaryattachment2")), None);
-        assert_eq!(p.stat("cacloadouts.customclassname.0"), Some(&StatValue::Str("Custom 1".into())));
+        assert_eq!(p.stat("cacloadouts.customclassname.0"), Some(&StatValue::Text("Custom 1".into())));
         // One prestige token, spent on the XPR: unlocked and his for good.
         assert_eq!((p.prestige_tokens(), p.prestige_token_spent()), (1, false));
         assert!(p.permanently_unlock(12));
@@ -1306,7 +1317,7 @@ mod tests {
             row(&[(0, "31"), (2, "weapon_assault"), (4, "hk416"), (10, "0"), (11, "class_custom_assault"), (13, "primary")]),
             row(&[(0, "12"), (2, "weapon_assault"), (4, "xpr"), (10, "3"), (13, "primary"), (17, "token")]),
         ];
-        let mut p = Profile::from_tables(&stats, &[], &|_| None, HashMap::new());
+        let mut p = Profile::out_of_charts(&stats, &[], &|_| None, HashMap::new());
         p.set_rank_table(&rank_rows());
         for (k, v) in [(PLEVEL, 1.0), (RANK, 4.0), (RANK_XP, 6000.0), (UNLOCK_TOKENS, 1.0), ("itemstats.12.purchased", 1.0)] {
             p.set_stat(k.to_owned(), StatValue::Num(v));
@@ -1364,17 +1375,17 @@ mod tests {
         let loc = |k: &str| (k == "CLASS_SLOT1").then(|| "Custom 1".to_owned());
         let mut p = prestiged();
         p.set_stat(STAT_RESET_COUNT.to_owned(), StatValue::Num(2.0));
-        p.set_stat("profile.cacloadouts.customclassname.0".to_owned(), StatValue::Str("Mine".into()));
+        p.set_stat("profile.cacloadouts.customclassname.0".to_owned(), StatValue::Text("Mine".into()));
         p.set_stat("gametypesettings.timelimit".to_owned(), StatValue::Num(10.0));
-        p.set_stat("cacloadouts.customclassname.0".to_owned(), StatValue::Str("Mine".into()));
-        p.set_stat("classsets.cacloadouts.3.name".to_owned(), StatValue::Str("Set".into()));
+        p.set_stat("cacloadouts.customclassname.0".to_owned(), StatValue::Text("Mine".into()));
+        p.set_stat("classsets.cacloadouts.3.name".to_owned(), StatValue::Text("Set".into()));
         assert!(p.run_stat_command("PrestigeStatsResetAll", 11, &loc));
         assert_eq!((p.plevel(), p.rank(), p.tokens(), p.stat_num(RANK_XP)), (0, 0, 0, 0.0));
         assert!(!p.purchased(12, false) && p.prestige_tokens() == 0);
-        assert_eq!(p.stat("cacloadouts.customclassname.0"), Some(&StatValue::Str("Custom 1".into())));
+        assert_eq!(p.stat("cacloadouts.customclassname.0"), Some(&StatValue::Text("Custom 1".into())));
         assert_eq!(p.stat_num(&Profile::class_key("cacloadouts", 0, "primary")), 31.0);
         assert_eq!(p.stat("classsets.cacloadouts.3.name"), None);
-        assert_eq!(p.stat("profile.cacloadouts.customclassname.0"), Some(&StatValue::Str("Mine".into())));
+        assert_eq!(p.stat("profile.cacloadouts.customclassname.0"), Some(&StatValue::Text("Mine".into())));
         assert_eq!(p.stat_num("gametypesettings.timelimit"), 10.0);
         assert_eq!(
             p.take_followups(),
@@ -1419,22 +1430,23 @@ mod tests {
         p.set_stat("classsets.cacloadouts.current".to_owned(), StatValue::Num(3.0));
         p.set_stat("classsets.cacloadouts.0.customclass.0.primary".to_owned(), StatValue::Num(12.0));
         p.set_stat("classsets.cacloadouts.2.customclass.1.primary".to_owned(), StatValue::Num(12.0));
-        for line in [
+        let lines = [
             "statwriteddl publicMatchClassSetIndex 0",
             "setPublicMatchClassSetNameFromLocString 0 CLASS_SET1",
             "copyToPublicMatchClassSet 0",
             "zeroPublicMatchClassSet 2",
             "statsetbyname RANKXP 0",
             "equipdefaultcustommatchclass 0 class_custom_assault",
-        ] {
+        ];
+        for line in lines.into_iter() {
             assert!(p.run_stat_command(line, 11, &loc), "{line}");
         }
         assert_eq!(p.stat_num("classsets.cacloadouts.current"), 0.0);
-        assert_eq!(p.stat("classsets.cacloadouts.0.name"), Some(&StatValue::Str("CLASS_SET1".into())));
+        assert_eq!(p.stat("classsets.cacloadouts.0.name"), Some(&StatValue::Text("CLASS_SET1".into())));
         assert_eq!(p.stat_num("classsets.cacloadouts.0.customclass.0.primary"), 31.0, "a copy of the public classes");
         assert_eq!(p.stat("classsets.cacloadouts.0.customclassname.0"), p.stat("cacloadouts.customclassname.0"));
         assert_eq!(p.stat("classsets.cacloadouts.2.customclass.1.primary"), None, "emptied");
-        assert_eq!(p.stat("classsets.cacloadouts.2.customclassname.9"), Some(&StatValue::Str("Custom 10".into())));
+        assert_eq!(p.stat("classsets.cacloadouts.2.customclassname.9"), Some(&StatValue::Text("Custom 10".into())));
         assert_eq!(p.stat_num(RANK_XP), 0.0);
         assert_eq!(p.stat_num(&Profile::class_key("custommatchcacloadouts", 0, "primary")), 31.0);
     }
@@ -1460,7 +1472,7 @@ mod tests {
             att("20", "reflex", "dualclip"),
             row(&[(0, "1"), (2, "weaponoption"), (4, "camo_multicam"), (11, "acog")]),
         ];
-        let p = Profile::from_tables(&[], &atts, &|_| None, HashMap::new());
+        let p = Profile::out_of_charts(&[], &atts, &|_| None, HashMap::new());
         assert!(p.attachments_compatible("acog", "dualclip") && p.attachments_compatible("dualclip", "acog"));
         // A list word is its base attachment.
         assert!(p.attachments_compatible("reflex_pistol", "dualclip"));

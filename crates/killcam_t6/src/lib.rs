@@ -4,17 +4,16 @@
 //! killcam flag is non-zero (killcam_begin and killcam_end fire on the edges).
 //!
 //! What differs from MW2: a 2 MiB archive buffer (MW2 32 MiB), 12 killcam entity types with
-//! per-type camera tuning, a 300 ms blend between camera entities with a capsule trace, and
-//! BO2's own grenade and entity weapon lists. The script timings live in _killcam.gsc's
-//! bytecode, which was not decoded; `script` keeps MW2's values until they are.
+//! per-type camera tuning, and a 300 ms blend between camera entities with a capsule trace.
+//! The killcam's timings and its grenade and entity weapon lists are BO2's own compiled
+//! _killcam.gsc and _globallogic_player.gsc, which the scripts run themselves.
 #![forbid(unsafe_code)]
 
-pub mod archive;
-pub mod camera;
-pub mod script;
+pub mod snap_history;
+pub mod kill_view;
 
-pub use archive::{
-    ARCHIVE_BUFFER_BYTES, ARCHIVE_FRAMES, SERVER_FPS, SERVER_FRAME_MS, SNAPSHOT_TIME_CACHE,
+pub use snap_history::{
+    HISTORY_RING_BYTES, HISTORY_FRAMES, TICKS_PER_SECOND, TICK_MS, SNAP_TIME_SLOTS,
     frame_still_archived, replay_frame,
 };
-pub use camera::{BLEND_MS, CamTuning, ExplosiveCam, FollowCam, KillcamEntityType, blend_view};
+pub use kill_view::{BLEND_MS, CamTuning, ExplosiveCam, FollowCam, KillcamEntityType, blend_view};

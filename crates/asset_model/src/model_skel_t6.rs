@@ -1,259 +1,311 @@
 //! bo2zm: Black Ops II models with their skeletons, as the engine's
-//! skinned model (`ModelSkel`) — viewmodel guns and arms, world guns.
+//! skinned model (`MeshRig`) — viewmodel guns and arms, world guns.
 //!
 //! Vertices are BO2's `GfxPackedVertex` (32 bytes): position, binormal
-//! sign, colour R,G,B,A, texcoord half2, normal and tangent packed 10:10:10
+//! sign, colour R,G,B,A, uv_semantic half2, normal and tangent packed 10:10:10
 //! signed. The model keeps each row as BO2 wrote it. Rigid vertex lists and
 //! blend weights use the same bone units (64 bytes per bone) as legacy and
 //! Black Ops.
 
-use bevy::math::{Quat, Vec3};
+use asset_core::TraversalMaterialSlot;
+use asset_t6::T6_PACKED_VERTEX;
+use asset_t6::short_float_to_full;
+use bevy::math::f32::Quat;
+use bevy::math::f32::Vec3;
+use xmodel_runtime::PoseDonorModel;
 
-use asset_t6::{T6_PACKED_VERTEX, half_to_f32, unpack_unit_vec};
-use xmodel_runtime::ModelPoseSrc;
+use crate::CornerWeights;
+use crate::JointAttachment;
+use crate::MeshRig;
 
-use crate::{BoneBind, ModelSkel, VertSkin, WalkLocalMaterialIndex};
-
-const BONE_STRIDE: u16 = 64;
+const BYTES_PER_BONE: u16 = 1 << 6;
 /// A BO2 vertex's extra bone weight is a u16 share of 65536.
 const BLEND_WEIGHT_SCALE: f32 = 1.0 / 65536.0;
 
-fn rd_u32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
+/// One packed vertex row, read as little-endian words.
+#[derive(Clone, Copy)]
+struct Row<'a>(&'a [u8]);
 
-fn rd_f32(b: &[u8], at: usize) -> f32 {
-    f32::from_bits(rd_u32(b, at))
-}
-
-fn normalized(v: [f32; 3]) -> [f32; 3] {
-    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if l > 1e-6 {
-        [v[0] / l, v[1] / l, v[2] / l]
-    } else {
-        [0.0, 0.0, 1.0]
+impl Row<'_> {
+    fn word(self, pos: usize) -> u32 {
+        let window: [u8; 4] = self.0[pos..pos + 4].try_into().expect("a four-byte window");
+        u32::from_le_bytes(window)
     }
+
+    fn float(self, pos: usize) -> f32 {
+        f32::from_bits(self.word(pos))
+    }
+}
+
+/// A direction of length one; a vector too short to have one points up.
+fn unit_or_up(v: Vec3) -> [f32; 3] {
+    let len = v.length();
+    let direction = if len > 1e-6 { v / len } else { Vec3::Z };
+    direction.to_array()
+}
+
+/// The two ends of a box as (middle, half-lengths), the convention every
+/// model skeleton uses.
+fn mid_half(ends: ([f32; 3], [f32; 3])) -> ([f32; 3], [f32; 3]) {
+    let low = Vec3::from_array(ends.0);
+    let high = Vec3::from_array(ends.1);
+    (((low + high) * 0.5).to_array(), ((high - low) * 0.5).to_array())
+}
+
+/// A vertex held to one bone at full weight.
+fn rigid_skin(bone: u16) -> CornerWeights {
+    let mut skin = CornerWeights::default();
+    skin.joints[0] = bone;
+    skin.weights[0] = 1.0;
+    skin
+}
+
+/// The bone a byte offset into the bone table names; `None` when the offset
+/// is not a whole bone or the model has no such bone.
+fn bone_index(offset: u16, bone_total: usize) -> Option<u16> {
+    let whole = offset % BYTES_PER_BONE == 0;
+    let index = offset / BYTES_PER_BONE;
+    (whole && usize::from(index) < bone_total).then_some(index)
+}
+
+/// One weighted vertex from its blend words: the first bone alone, then a
+/// (bone, share) pair for each further bone. The first bone keeps whatever
+/// the others leave of the whole.
+fn weighted_skin(words: &[u16], bone_total: usize) -> Option<CornerWeights> {
+    let (&first, pairs) = words.split_first()?;
+    let mut skin = rigid_skin(bone_index(first, bone_total)?);
+    for (slot, pair) in (1..).zip(pairs.chunks_exact(2)) {
+        skin.joints[slot] = bone_index(pair[0], bone_total)?;
+        skin.pull_u16[slot] = pair[1];
+        skin.weights[slot] = f32::from(pair[1]) * BLEND_WEIGHT_SCALE;
+    }
+    skin.weights[0] = skin.weights[1..]
+        .iter()
+        .fold(1.0, |rest, share| rest - share);
+    Some(skin)
 }
 
 /// Per-vertex bone influences of one surface: weighted vertices first (by
 /// influence count), then the rigid vertex lists. `None` when a bone
 /// offset is not a whole bone or names a bone the model lacks.
-fn surface_skins(srf: &asset_t6::XSurfaceRef, num_bones: usize) -> Option<Vec<VertSkin>> {
-    let n = usize::from(srf.vert_count);
-    let mut skins = vec![
-        VertSkin {
-            bones: [0; 4],
-            weights: [1.0, 0.0, 0.0, 0.0],
-            ..Default::default()
-        };
-        n
-    ];
-    let bone_at = |raw: u16| -> Option<u16> {
-        if raw % BONE_STRIDE != 0 {
-            return None;
-        }
-        let bone = raw / BONE_STRIDE;
-        ((bone as usize) < num_bones).then_some(bone)
-    };
-    let mut vertex = 0usize;
-    let mut cursor = 0usize;
-    for (bucket, &count) in srf.blend_counts.iter().enumerate() {
-        let influences = bucket + 1;
+fn surface_skins(surf: &asset_t6::XSurfaceRef, bone_total: usize) -> Option<Vec<CornerWeights>> {
+    let vert_total = usize::from(surf.vertex_tally);
+    let mut skins = Vec::with_capacity(vert_total);
+    let mut unread: &[u16] = &surf.blend;
+    for (extra_bones, &count) in surf.blend_counts.iter().enumerate() {
+        let span = 2 * extra_bones + 1;
         for _ in 0..count.max(0) {
-            let words = 1 + (influences - 1) * 2;
-            let w = srf.blend.get(cursor..cursor + words)?;
-            cursor += words;
-            let mut skin = VertSkin {
-                bones: [bone_at(w[0])?, 0, 0, 0],
-                ..Default::default()
-            };
-            let mut remaining = 1.0f32;
-            for extra in 1..influences {
-                let b = w[1 + (extra - 1) * 2];
-                let raw = w[2 + (extra - 1) * 2];
-                let weight = f32::from(raw) * BLEND_WEIGHT_SCALE;
-                skin.bones[extra] = bone_at(b)?;
-                skin.weights[extra] = weight;
-                skin.weight_u16[extra] = raw;
-                remaining -= weight;
-            }
-            skin.weights[0] = remaining;
-            *skins.get_mut(vertex)? = skin;
-            vertex += 1;
+            let (words, rest) = unread.split_at_checked(span)?;
+            unread = rest;
+            skins.push(weighted_skin(words, bone_total)?);
         }
     }
-    for &(bone_offset, run, _, _) in &srf.vert_lists {
-        let bone = bone_at(bone_offset)?;
-        for _ in 0..run {
-            if vertex >= n {
-                break;
-            }
-            skins[vertex] = VertSkin {
-                bones: [bone, 0, 0, 0],
-                weights: [1.0, 0.0, 0.0, 0.0],
-                ..Default::default()
-            };
-            vertex += 1;
-        }
+    if skins.len() > vert_total {
+        return None;
     }
-    Some(skins)
+    for &(first_byte, run, _, _) in &surf.vert_lists {
+        let held = rigid_skin(bone_index(first_byte, bone_total)?);
+        let room = vert_total - skins.len();
+        skins.extend(std::iter::repeat_n(held, usize::from(run).min(room)));
+    }
+    skins.resize(vert_total, rigid_skin(0));
+    let finished = skins;
+    Some(finished)
+}
+
+/// A surface whose vertex bytes cover its count and whose indices all name
+/// one of its vertices.
+fn surface_is_sound(surf: &asset_t6::XSurfaceRef) -> bool {
+    let vert_total = usize::from(surf.vertex_tally);
+    surf.vertex_points.len() >= vert_total * T6_PACKED_VERTEX
+        && surf.indices.iter().all(|&ix| usize::from(ix) < vert_total)
+}
+
+/// Adds one surface's vertices and indices after the others already in
+/// `bone_rig`; says where they landed, each as (first, count).
+fn append_surface(
+    bone_rig: &mut MeshRig,
+    surf: &asset_t6::XSurfaceRef,
+    skins: &[CornerWeights],
+) -> ((usize, usize), (usize, usize)) {
+    let first_vertex = bone_rig.positions.len();
+    let first_index = bone_rig.indices.len();
+    for (row, &skin) in surf.vertex_points.chunks_exact(T6_PACKED_VERTEX).zip(skins) {
+        let fields = Row(row);
+        let uv_semantic = fields.word(20);
+        bone_rig.positions.push([0, 4, 8].map(|at| fields.float(at)));
+        let squeezed_facing = asset_t6::decode_unit_normal(fields.word(24));
+        bone_rig.surface_directions
+            .push(unit_or_up(Vec3::from_array(squeezed_facing)));
+        bone_rig.colors.push(std::array::from_fn(|chan| {
+            f32::from(row[16 + chan]) / 255.0
+        }));
+        let halves = [uv_semantic & 0xffff, uv_semantic >> 16];
+        bone_rig.texcoord_set.push(halves.map(|half| short_float_to_full(half as u16)));
+        bone_rig.compact_vertices
+            .push(row.try_into().expect("a whole packed vertex"));
+        bone_rig.vert_skin.push(skin);
+    }
+    let shift = first_vertex as u32;
+    bone_rig.indices
+        .extend(surf.indices.iter().map(|&ix| shift + u32::from(ix)));
+    (
+        (first_vertex, skins.len()),
+        (first_index, surf.indices.len()),
+    )
+}
+
+/// What a model keeps once per surface.
+struct SurfaceMeta {
+    vertex_points: (usize, usize),
+    indices: (usize, usize),
+    part_bits: [u32; 5],
+    deformed: bool,
+    list_count: u32,
+    material: Option<TraversalMaterialSlot>,
+}
+
+/// The bind pose and local pose the runtime animates from.
+fn pose_source(model: &asset_t6::XModelRef) -> PoseDonorModel {
+    PoseDonorModel {
+        name: String::from(&*model.name),
+        skeleton_joint_total: model.joint_labels.len(),
+        top_joint_total: usize::from(model.top_joint_total),
+        size_scale: 1.0,
+        fixed_size_parts: Default::default(),
+        joint_labels: model.joint_labels.clone(),
+        ancestor_chain: model.ancestor_chain.clone(),
+        rotation_quaternions: model.rotation_quaternions.clone(),
+        shift_offset: model.shift_offset.clone(),
+        foundation_surface: model
+            .foundation_surface
+            .iter()
+            .map(|&(quat, shift_offset)| (Quat::from_array(quat), Vec3::from_array(shift_offset)))
+            .collect(),
+    }
+}
+
+/// bo2zm M3: hit boxes per bone (what bullets hit on a zombie); a bone
+/// without a box has none.
+fn bone_hit_boxes(model: &asset_t6::XModelRef) -> Vec<Option<xmodel_runtime::BoneHitShape>> {
+    let classes = model
+        .body_part_category
+        .iter()
+        .copied()
+        .chain(std::iter::repeat(0));
+    let infos = model
+        .bone_info
+        .iter()
+        .copied()
+        .chain(std::iter::repeat(None));
+    infos
+        .zip(classes)
+        .take(model.joint_labels.len())
+        .map(|(info, class)| {
+            let (lo, hi, reach_squared) = info?;
+            let (mid, half) = mid_half((lo, hi));
+            Some(xmodel_runtime::BoneHitShape {
+                midpoint: mid,
+                half_ext: half,
+                reach_squared,
+                body_part_category: class,
+            })
+        })
+        .collect()
+}
+
+/// bo2mp: the collision surfaces a bullet hits (BO2's DObjGeomTraceline
+/// runs XModelTraceLineAnimated on them). Without them a destructible
+/// car stopped bullets on rough bone boxes. T6 keeps each surface's
+/// mins/maxs where legacy keeps (mid, half).
+fn collision_surfaces(model: &asset_t6::XModelRef) -> Vec<xmodel_runtime::SurfaceHitMesh> {
+    let as_record = |surf: &asset_t6::XModelCollSurfRef| {
+        let (mid, half) = mid_half((surf.lo_corner, surf.hi_corner));
+        let contents = surf.contents;
+        let face_property_bits = surf.face_property_bits;
+        let triangle_list = surf
+            .triangle_list
+            .iter()
+            .map(|&[plane, surface_tangent, surface_bitangent]| xmodel_runtime::HitTriangle { plane, surface_tangent, surface_bitangent });
+        let triangle_list: Vec<_> = triangle_list.collect();
+        let half_size = half.map(|len| len.max(0.0));
+        u16::try_from(surf.joint_position)
+            .ok()
+            .map(|bone| xmodel_runtime::SurfaceHitMesh {
+                bone,
+                contents,
+                face_property_bits,
+                midpoint: mid,
+                half_ext: half_size,
+                triangle_list,
+            })
+    };
+    model.collision_faces.iter().filter_map(as_record).collect()
 }
 
 /// A BO2 model (first LOD) as the engine's skinned model. `material` maps a
 /// surface's material to the catalog it was linked into.
 pub fn capture_model_skel_t6(
     model: &asset_t6::XModelRef,
-    material: impl Fn(asset_t6::AssetKey) -> Option<usize>,
-) -> Option<ModelSkel> {
-    let num_bones = model.bone_names.len();
-    if num_bones == 0 || model.base_mat.len() != num_bones {
+    material: impl Fn(asset_t6::AssetIdentity) -> Option<usize>,
+) -> Option<MeshRig> {
+    let skeleton_joint_total = model.joint_labels.len();
+    if skeleton_joint_total == 0 || model.foundation_surface.len() != skeleton_joint_total {
         return None;
     }
-    let bones: Vec<BoneBind> = model
-        .base_mat
-        .iter()
-        .map(|(q, t)| BoneBind { quat: *q, trans: *t })
-        .collect();
-    let find = |name: &str| model.bone_names.iter().position(|b| b == name);
-    let num_root_bones = usize::from(model.num_root_bones);
-    let pose = ModelPoseSrc {
-        name: model.name.clone(),
-        num_bones,
-        num_root_bones,
-        scale: 1.0,
-        no_scale_part_bits: [0; 5],
-        bone_names: model.bone_names.clone(),
-        parent_list: model.parent_list.clone(),
-        quats: model.quats.clone(),
-        trans: model.trans.clone(),
-        base_mat: bones
-            .iter()
-            .map(|b| {
-                (
-                    Quat::from_xyzw(b.quat[0], b.quat[1], b.quat[2], b.quat[3]),
-                    Vec3::from_array(b.trans),
-                )
-            })
-            .collect(),
-    };
 
-    let mut positions = Vec::new();
-    let mut normals = Vec::new();
-    let mut colors = Vec::new();
-    let mut uvs = Vec::new();
-    let mut indices = Vec::new();
-    let mut surface_materials = Vec::with_capacity(model.lod0.len());
-    let mut surface_vertex_ranges = Vec::with_capacity(model.lod0.len());
-    let mut surface_index_ranges = Vec::with_capacity(model.lod0.len());
-    let mut surface_part_bits = Vec::with_capacity(model.lod0.len());
-    let mut surface_deformed = Vec::with_capacity(model.lod0.len());
-    let mut surface_vert_list_count = Vec::with_capacity(model.lod0.len());
-    let mut vert_skin = Vec::new();
-    let mut packed_vertices = Vec::new();
-    for srf in &model.lod0 {
-        let n = usize::from(srf.vert_count);
-        if srf.verts.len() < n * T6_PACKED_VERTEX || srf.indices.iter().any(|&i| usize::from(i) >= n) {
+    let mut bone_rig = MeshRig::default();
+    let mut metas = Vec::with_capacity(model.lod0.len());
+    for surf in &model.lod0 {
+        if !surface_is_sound(surf) {
             return None;
         }
-        let skins = surface_skins(srf, num_bones)?;
-        let base = positions.len();
-        let index_start = indices.len();
-        for (v, skin) in srf.verts.chunks_exact(T6_PACKED_VERTEX).take(n).zip(&skins) {
-            positions.push([rd_f32(v, 0), rd_f32(v, 4), rd_f32(v, 8)]);
-            normals.push(normalized(unpack_unit_vec(rd_u32(v, 24))));
-            colors.push([v[16], v[17], v[18], v[19]].map(|c| f32::from(c) / 255.0));
-            let tex = rd_u32(v, 20);
-            uvs.push([half_to_f32(tex as u16), half_to_f32((tex >> 16) as u16)]);
-            packed_vertices.push(<[u8; T6_PACKED_VERTEX]>::try_from(v).expect("chunks_exact row"));
-            vert_skin.push(*skin);
-        }
-        indices.extend(srf.indices.iter().map(|&i| base as u32 + u32::from(i)));
-        surface_vertex_ranges.push((base, n));
-        surface_index_ranges.push((index_start, indices.len() - index_start));
-        surface_part_bits.push(srf.part_bits);
-        surface_deformed.push(Some(srf.flags & 0x80 != 0));
-        surface_vert_list_count.push(Some(srf.vert_lists.len() as u32));
-        surface_materials.push(
-            srf.material
+        let skins = surface_skins(surf, skeleton_joint_total)?;
+        let (vertex_points, indices) = append_surface(&mut bone_rig, surf, &skins);
+        metas.push(SurfaceMeta {
+            vertex_points,
+            indices,
+            part_bits: surf.piece_mask,
+            deformed: surf.flags & 0x80 != 0,
+            list_count: surf.vert_lists.len() as u32,
+            material: surf
+                .material
                 .and_then(&material)
-                .map(WalkLocalMaterialIndex::from_walk),
-        );
+                .map(TraversalMaterialSlot::from_walk),
+        });
     }
-    let surfaces = surface_vertex_ranges.len();
-    Some(ModelSkel {
-        name: model.name.clone(),
-        bones,
-        // bo2zm M3: hit boxes per bone (what bullets hit on a zombie).
-        bone_collision: (0..num_bones)
-            .map(|b| {
-                let (mins, maxs, radius_sq) = (*model.bone_info.get(b)?)?;
-                Some(xmodel_runtime::BoneCollision {
-                    midpoint: std::array::from_fn(|k| (mins[k] + maxs[k]) * 0.5),
-                    half_size: std::array::from_fn(|k| (maxs[k] - mins[k]) * 0.5),
-                    radius_sq,
-                    part_classification: model.part_classification.get(b).copied().unwrap_or(0),
-                })
-            })
-            .collect(),
-        bone_names: model.bone_names.clone(),
-        tag_view: find("tag_view"),
-        tag_weapon: find("tag_weapon"),
-        pose: Some(pose),
-        positions,
-        normals,
-        colors,
-        uvs,
-        indices,
-        surface_materials,
-        surface_vertex_ranges,
-        surface_index_ranges,
-        surface_part_bits,
-        surface_deformed,
-        surface_vert_list_count,
-        vert_skin,
-        packed_vertices,
-        radius: Some(model.radius),
-        // (mid, half), the convention every model skeleton uses.
-        bounds: Some((
-            std::array::from_fn(|k| (model.mins[k] + model.maxs[k]) * 0.5),
-            std::array::from_fn(|k| (model.maxs[k] - model.mins[k]) * 0.5),
-        )),
-        contents: Some(model.contents),
-        // bo2mp: the collision surfaces a bullet hits (BO2's DObjGeomTraceline
-        // runs XModelTraceLineAnimated on them). Without them a destructible
-        // car stopped bullets on rough bone boxes. T6 keeps each surface's
-        // mins/maxs where legacy keeps (mid, half).
-        coll_lod: model.coll_lod,
-        coll_surfs: model
-            .coll_surfs
-            .iter()
-            .filter_map(|s| {
-                Some(xmodel_runtime::CollSurfCollision {
-                    bone: u16::try_from(s.bone_idx).ok()?,
-                    contents: s.contents,
-                    surf_flags: s.surf_flags,
-                    midpoint: std::array::from_fn(|k| (s.mins[k] + s.maxs[k]) * 0.5),
-                    half_size: std::array::from_fn(|k| ((s.maxs[k] - s.mins[k]) * 0.5).max(0.0)),
-                    tris: s
-                        .tris
-                        .iter()
-                        .map(|t| xmodel_runtime::CollTri {
-                            plane: t[0],
-                            svec: t[1],
-                            tvec: t[2],
-                        })
-                        .collect(),
-                })
-            })
-            .collect(),
-        collmap: t6_collmap(model),
-        lod: Some(crate::ModelLodSelector::T5 {
-            num_lods: 1,
-            lod_dist: [0.0; 4],
-        }),
-        lod_smc: None,
-        lod_surf_span: [(0, surfaces as u16), (0, 0), (0, 0), (0, 0)],
-    })
+    bone_rig.facet_materials = metas.iter().map(|meta| meta.material).collect();
+    bone_rig.facet_vertex_ranges = metas.iter().map(|meta| meta.vertex_points).collect();
+    bone_rig.facet_index_ranges = metas.iter().map(|meta| meta.indices).collect();
+    bone_rig.face_parts = metas.iter().map(|meta| meta.part_bits).collect();
+    bone_rig.bent = metas.iter().map(|meta| Some(meta.deformed)).collect();
+    bone_rig.vert_lists = metas.iter().map(|meta| Some(meta.list_count)).collect();
+    bone_rig.detail_face_extent[0] = (0, metas.len() as u16);
+
+    let find = |wanted: &str| model.joint_labels.iter().position(|have| have == wanted);
+    bone_rig.name = String::from(&*model.name);
+    bone_rig.bones = model
+        .foundation_surface
+        .iter()
+        .map(|&(quat, shift_offset)| JointAttachment { spin: quat, shift_offset })
+        .collect();
+    bone_rig.joint_hit_volume = bone_hit_boxes(model);
+    bone_rig.joint_labels = model.joint_labels.clone();
+    bone_rig.eye_joint = find("tag_view");
+    bone_rig.gun_joint = find("tag_weapon");
+    bone_rig.pose = Some(pose_source(model));
+    bone_rig.radius = Some(model.radius);
+    bone_rig.bounds = Some(mid_half((model.lo_corner, model.hi_corner)));
+    bone_rig.light_offset = Some(model.lighting_origin_offset);
+    bone_rig.contents = Some(model.contents);
+    bone_rig.collision_detail_tier = model.collision_detail_tier;
+    bone_rig.collision_faces = collision_surfaces(model);
+    bone_rig.collmap = t6_collmap(model);
+    bone_rig.lod = Some(crate::ModelDetailSelector::T5 {
+        detail_tier_total: 1,
+        tier_reach: [0.0; 4],
+    });
+    Some(bone_rig)
 }
 
 /// bo2mp: the model's physics collmap as boxes. A brush piece is its bounds
@@ -262,28 +314,74 @@ pub fn capture_model_skel_t6(
 /// piece is a box of its own axes, middle and half-lengths (a stand-in for
 /// a cylinder or capsule).
 fn t6_collmap(model: &asset_t6::XModelRef) -> Option<xmodel_runtime::ModelCollmap> {
-    if model.collmap.is_empty() && model.collmap_contents == 0 {
+    const UNIT_AXES: [[f32; 3]; 3] = [Vec3::X.to_array(), Vec3::Y.to_array(), Vec3::Z.to_array()];
+    if model.collmap_contents == 0 && model.collmap.is_empty() {
         return None;
     }
     let boxes = model
         .collmap
         .iter()
-        .map(|g| match g.brush {
-            Some((mins, maxs, _)) if g.ty == 2 => xmodel_runtime::CollmapBox {
-                center: std::array::from_fn(|k| (mins[k] + maxs[k]) * 0.5),
-                axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-                half: std::array::from_fn(|k| (maxs[k] - mins[k]) * 0.5),
-            },
-            _ => xmodel_runtime::CollmapBox {
-                center: g.offset,
-                axis: g.orientation,
-                half: g.half_lengths,
-            },
-        })
-        .collect();
+        .map(|piece| match piece.brush.filter(|_| piece.ty == 2) {
+            Some((lo, hi, _)) => {
+                let (mid, half) = mid_half((lo, hi));
+                (mid, UNIT_AXES, half)
+            }
+            None => (piece.offset, piece.orientation, piece.half_lengths),
+        });
     Some(xmodel_runtime::ModelCollmap {
-        contents: model.contents | model.collmap_contents,
-        boxes,
+        contents: model.collmap_contents | model.contents,
+        boxes: boxes
+            .map(|(center, axis, half)| xmodel_runtime::CollmapBox { center, axis, half })
+            .collect(),
         brush_verts: model.collmap_brush_verts.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_vectors_point_up_and_others_have_length_one() {
+        assert_eq!(unit_or_up(Vec3::ZERO), [0.0, 0.0, 1.0]);
+        assert_eq!(unit_or_up(Vec3::new(0.0, 3.0, 4.0)), [0.0, 0.6, 0.8]);
+    }
+
+    #[test]
+    fn bone_offsets_must_be_whole_bones_the_model_has() {
+        assert_eq!(bone_index(128, 3), Some(2));
+        assert_eq!(bone_index(130, 3), None);
+        assert_eq!(bone_index(192, 3), None);
+    }
+
+    #[test]
+    fn the_first_bone_keeps_what_the_others_leave() {
+        let skin = weighted_skin(&[0, 64, 16384, 128, 16384], 4).expect("a good vertex");
+        assert_eq!(skin.joints, [0, 1, 2, 0]);
+        assert_eq!(skin.weights, [0.5, 0.25, 0.25, 0.0]);
+        assert_eq!(skin.pull_u16, [0, 16384, 16384, 0]);
+        assert!(weighted_skin(&[0, 640, 100], 4).is_none());
+    }
+
+    #[test]
+    fn rigid_lists_fill_what_the_weighted_vertices_left() {
+        let surf = asset_t6::XSurfaceRef {
+            vertex_tally: 4,
+            blend_counts: [1, 0, 0, 0],
+            blend: vec![64],
+            vert_lists: vec![(128, 9, 0, 0)],
+            ..Default::default()
+        };
+        let skins = surface_skins(&surf, 3).expect("skins");
+        let bones: Vec<u16> = skins.iter().map(|skin| skin.joints[0]).collect();
+        assert_eq!(bones, [1, 2, 2, 2]);
+    }
+
+    #[test]
+    fn boxes_are_kept_as_middle_and_half_lengths() {
+        assert_eq!(
+            mid_half(([-1.0, 0.0, 2.0], [3.0, 4.0, 2.0])),
+            ([1.0, 2.0, 2.0], [2.0, 2.0, 0.0])
+        );
+    }
 }

@@ -5,22 +5,22 @@
 use std::marker::PhantomData;
 
 /// Marker for one catalog's index space.
-pub trait IndexSpace: Copy + Eq + std::hash::Hash + std::fmt::Debug + 'static {}
+pub trait KeyDomain: Copy + Eq + std::hash::Hash + std::fmt::Debug + 'static {}
 
 /// Position of an entry in the catalog named by `S`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CatalogIndex<S: IndexSpace> {
-    slot: usize,
+pub struct CatalogSlot<S: KeyDomain> {
+    seq: usize,
     space: PhantomData<S>,
 }
 
-impl<S: IndexSpace> CatalogIndex<S> {
-    pub fn from_order(slot: usize) -> Self {
-        Self { slot, space: PhantomData }
+impl<S: KeyDomain> CatalogSlot<S> {
+    pub fn from_sequence(seq: usize) -> Self {
+        Self { seq, space: PhantomData }
     }
 
     pub fn order(self) -> usize {
-        self.slot
+        self.seq
     }
 }
 
@@ -29,32 +29,32 @@ macro_rules! catalog_spaces {
         $(
             #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
             pub enum $space {}
-            impl IndexSpace for $space {}
-            pub type $index = CatalogIndex<$space>;
+            impl KeyDomain for $space {}
+            pub type $index = CatalogSlot<$space>;
         )*
     };
 }
 
 catalog_spaces! {
-    MaterialSpace => MaterialIndex,
-    TracerSpace => TracerIndex,
-    FxSpace => FxIndex,
-    FxModelSpace => FxModelIndex,
-    LoadedSoundSpace => LoadedSoundIndex,
-    SoundAliasSpace => SoundAliasIndex,
-    XAnimSpace => XAnimIndex,
-    MapXModelSpace => MapXModelIndex,
-    ProjectileModelSpace => ProjectileModelIndex,
-    FpvMeshSpace => FpvMeshIndex,
-    WorldWeaponSpace => WorldWeaponIndex,
+    SurfaceShaderSpace => SurfaceMaterialId,
+    TracerRange => TracerSlot,
+    FxRange => FxSlot,
+    FxModelRange => FxModelSlot,
+    LoadedSoundRange => LoadedSoundSlot,
+    SoundAliasRange => SoundAliasSlot,
+    XAnimRange => XAnimSlot,
+    MapXModelRange => MapXModelSlot,
+    ProjectileModelRange => ProjectileModelSlot,
+    FpvMeshRange => FpvMeshSlot,
+    WorldWeaponRange => WorldWeaponSlot,
 }
 
 /// A material's position inside one zone walk, before the walk's materials
 /// are merged into the shared catalog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct WalkLocalMaterialIndex(usize);
+pub struct TraversalMaterialSlot(usize);
 
-impl WalkLocalMaterialIndex {
+impl TraversalMaterialSlot {
     pub fn from_walk(slot: usize) -> Self {
         Self(slot)
     }
@@ -70,8 +70,8 @@ mod tests {
 
     #[test]
     fn index_keeps_its_slot() {
-        assert_eq!(MaterialIndex::from_order(7).order(), 7);
-        assert!(FxIndex::from_order(1) < FxIndex::from_order(2));
-        assert_eq!(WalkLocalMaterialIndex::from_walk(3).get(), 3);
+        assert_eq!(SurfaceMaterialId::from_sequence(7).order(), 7);
+        assert!(FxSlot::from_sequence(1) < FxSlot::from_sequence(2));
+        assert_eq!(TraversalMaterialSlot::from_walk(3).get(), 3);
     }
 }

@@ -1,8 +1,8 @@
 //! The gun states movement reads: Black Ops II's own numbers, from the gun
-//! brain (weapon_t6) through `PlayerState::weapon_state_t6`. With no gun brain
+//! brain (weapon_t6) through `AvatarState::weapon_state_t6`. With no gun brain
 //! (-1, a world without BO2's weapons) the gun reads as ready.
 
-use playerstate_t6::game::PlayerState;
+use playerstate_t6::game::AvatarState;
 
 /// BO2's gun state numbers (the gun brain's `weapon_t6::state`).
 pub(crate) mod t6 {
@@ -31,41 +31,41 @@ pub(crate) mod t6 {
 }
 
 /// The gun's state in BO2's numbers; ready with no BO2 gun brain.
-pub(crate) fn state(ps: &PlayerState) -> i32 {
-    ps.weapon_state_t6.max(t6::READY)
+pub(crate) fn state(avatar: &AvatarState) -> i32 {
+    avatar.weapon_state_t6.max(t6::READY)
 }
 
 /// A knife, a grenade or detonator, or the riot shield at work (BO2's states
 /// 19 to 34): no sprint starts, and a running one ends.
-pub(crate) fn knife_offhand_or_shield(ps: &PlayerState) -> bool {
-    (t6::MELEE_INIT..=t6::RIOTSHIELD_END).contains(&state(ps))
+pub(crate) fn knife_offhand_or_shield(avatar: &AvatarState) -> bool {
+    (t6::MELEE_INIT..=t6::RIOTSHIELD_END).contains(&state(avatar))
 }
 
 /// Putting night vision on or taking it off.
-pub(crate) fn night_vision(ps: &PlayerState) -> bool {
-    matches!(state(ps), t6::NIGHTVISION_WEAR | t6::NIGHTVISION_REMOVE)
+pub(crate) fn night_vision(avatar: &AvatarState) -> bool {
+    matches!(state(avatar), t6::NIGHTVISION_WEAR | t6::NIGHTVISION_REMOVE)
 }
 
 /// The riot shield being raised, planted or put away (BO2's states 30 to 34).
-pub(crate) fn riot_shield(ps: &PlayerState) -> bool {
-    (t6::RIOTSHIELD_PREPARE..=t6::RIOTSHIELD_END).contains(&state(ps))
+pub(crate) fn riot_shield(avatar: &AvatarState) -> bool {
+    (t6::RIOTSHIELD_PREPARE..=t6::RIOTSHIELD_END).contains(&state(avatar))
 }
 
 /// The gun lowered (BO2's states 56 to 58): no sprint starts, and a running
 /// one ends.
-pub(crate) fn low_ready(ps: &PlayerState) -> bool {
-    (t6::LOWREADY_RAISE..=t6::LOWREADY_DROP).contains(&state(ps))
+pub(crate) fn low_ready(avatar: &AvatarState) -> bool {
+    (t6::LOWREADY_RAISE..=t6::LOWREADY_DROP).contains(&state(avatar))
 }
 
 /// Reloading, by BO2's whole reload (not a dual-wield gun's one-hand reload).
-pub(crate) fn reloading(ps: &PlayerState) -> bool {
-    (t6::RELOADING..=t6::RELOAD_QUICK_EMPTY).contains(&state(ps))
+pub(crate) fn reloading(avatar: &AvatarState) -> bool {
+    (t6::RELOADING..=t6::RELOAD_QUICK_EMPTY).contains(&state(avatar))
 }
 
 /// The gun lets a prone player's crawl hold go: ready, raising, dropping, or
 /// in the reload itself.
-pub(crate) fn lets_the_crawl_hold_go(ps: &PlayerState) -> bool {
-    matches!(state(ps), t6::READY..=t6::DROPPING_ALTSWITCH | t6::RELOADING)
+pub(crate) fn lets_the_crawl_hold_go(avatar: &AvatarState) -> bool {
+    matches!(state(avatar), t6::READY..=t6::DROPPING_ALTSWITCH | t6::RELOADING)
 }
 
 /// What a crawl does to the gun (BO2's PM_InteruptWeaponWithProneMove).
@@ -83,8 +83,8 @@ pub(crate) enum Crawl {
 }
 
 /// BO2's PM_InteruptWeaponWithProneMove.
-pub(crate) fn crawl(ps: &PlayerState) -> Crawl {
-    match state(ps) {
+pub(crate) fn crawl(avatar: &AvatarState) -> Crawl {
+    match state(avatar) {
         t6::READY..=t6::DROPPING_ALTSWITCH
         | t6::RECHAMBER_START
         | t6::RECHAMBERING
@@ -103,18 +103,18 @@ pub(crate) fn crawl(ps: &PlayerState) -> Crawl {
 mod tests {
     use super::*;
 
-    fn bo2(state: i32) -> PlayerState {
-        let mut ps = PlayerState::ZERO;
-        ps.weapon_state_t6 = state;
-        ps
+    fn bo2(state: i32) -> AvatarState {
+        let mut avatar = AvatarState::ZERO;
+        avatar.weapon_state_t6 = state;
+        avatar
     }
 
     #[test]
     fn no_bo2_gun_brain_reads_as_ready() {
-        assert_eq!(PlayerState::ZERO.weapon_state_t6, -1);
-        assert_eq!(state(&PlayerState::ZERO), t6::READY);
-        assert_eq!(crawl(&PlayerState::ZERO), Crawl::GoesAhead);
-        assert!(!reloading(&PlayerState::ZERO) && lets_the_crawl_hold_go(&PlayerState::ZERO));
+        assert_eq!(AvatarState::ZERO.weapon_state_t6, -1);
+        assert_eq!(state(&AvatarState::ZERO), t6::READY);
+        assert_eq!(crawl(&AvatarState::ZERO), Crawl::GoesAhead);
+        assert!(!reloading(&AvatarState::ZERO) && lets_the_crawl_hold_go(&AvatarState::ZERO));
     }
 
     #[test]
@@ -139,7 +139,7 @@ mod tests {
         for s in 30..=34 {
             assert!(riot_shield(&bo2(s)), "BO2 state {s}");
         }
-        assert!(!riot_shield(&bo2(29)) && !riot_shield(&bo2(35)) && !riot_shield(&PlayerState::ZERO));
+        assert!(!riot_shield(&bo2(29)) && !riot_shield(&bo2(35)) && !riot_shield(&AvatarState::ZERO));
     }
 
     #[test]

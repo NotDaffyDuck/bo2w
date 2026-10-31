@@ -5,12 +5,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 use asset_t6::{ImageRef, ImageSource, PackSet, ZoneCapture, capture_zone};
 
-const DEFAULT_ZONE: &str =
-    r"C:\Program Files (x86)\Steam\steamapps\common\Call of Duty Black Ops II\zone\all\zm_nuked.ff";
+fn default_zone() -> PathBuf {
+    bo2zm_tools::zone_file("zm_nuked.ff")
+}
 
 /// An IEEE half float.
 fn half_f32(bits: u16) -> f32 {
@@ -24,10 +24,69 @@ fn half_f32(bits: u16) -> f32 {
     }
 }
 
+/// One 4x4 block as 16 RGBA texels. Two-channel blocks fill red and green and
+/// leave blue clear.
+fn decode_block(format: ipak_t6::IwiFormat, src: &[u8]) -> [u8; 64] {
+    let mut cell = [0u8; 4 * 16];
+    match format {
+        ipak_t6::IwiFormat::Dxt1 => bcdec_rs::bc1(src, &mut cell, 16),
+        ipak_t6::IwiFormat::Dxt3 => bcdec_rs::bc2(src, &mut cell, 16),
+        ipak_t6::IwiFormat::Dxt5 => bcdec_rs::bc3(src, &mut cell, 16),
+        _ => {
+            let mut rg = [0u8; 32];
+            bcdec_rs::bc5(src, &mut rg, 8, false);
+            for (texel, pair) in cell.chunks_exact_mut(4).zip(rg.chunks_exact(2)) {
+                texel.copy_from_slice(&[pair[0], pair[1], 0, 255]);
+            }
+        }
+    }
+    cell
+}
+
+fn le_f32(bytes: &[u8], at: usize) -> f32 {
+    f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap_or_default())
+}
+
+/// The first `len` bytes of the vertex that corner `c` of triangle `t` of
+/// `srf` points at (vertices are 36 bytes apiece), if the tables reach it.
+fn corner_bytes<'a>(
+    world: &'a asset_t6::WorldRef,
+    srf: &asset_t6::WorldSurface,
+    t: usize,
+    c: usize,
+    len: usize,
+) -> Option<&'a [u8]> {
+    let index = *world.indices.get(srf.base_index as usize + t * 3 + c)?;
+    let start = srf.vertex_data_offset0 as usize + usize::from(index) * 36;
+    world.vd0.get(start..start + len)
+}
+
+fn placements(world: &asset_t6::WorldRef) -> std::slice::Iter<'_, asset_t6::StaticModel> {
+    world.prop_set.iter()
+}
+
+const FAR: f32 = f32::MAX;
+
+/// Triangle `t` of `srf` as three world positions; `None` when any corner
+/// falls outside the index or vertex tables.
+fn tri_positions(
+    world: &asset_t6::WorldRef,
+    srf: &asset_t6::WorldSurface,
+    t: usize,
+) -> Option<[[f32; 3]; 3]> {
+    let corners: Option<Vec<[f32; 3]>> = (0..3)
+        .map(|c| corner_bytes(world, srf, t, c, 12).map(|v| [0, 4, 8].map(|o| le_f32(v, o))))
+        .collect();
+    corners?.try_into().ok()
+}
+
 /// `R_HashString`: case-folded, xor with 33 times the running hash.
 fn hash(name: &str) -> u32 {
-    name.bytes()
-        .fold(0u32, |h, c| u32::from(c | 0x20) ^ h.wrapping_mul(33))
+    let mut h = 0u32;
+    for c in name.bytes() {
+        h = h.wrapping_mul(33) ^ u32::from(c | 0x20);
+    }
+    h
 }
 
 const SLOT_NAMES: [&str; 24] = [
@@ -59,33 +118,30 @@ const SLOT_NAMES: [&str; 24] = [
 
 /// An image's pixel format: from its pack IWI or its zone load def.
 fn image_format(packs: &PackSet, image: &ImageRef) -> String {
-    match packs.locate(image) {
-        Some(ImageSource::Pack(i, entry)) => match packs.packs[i].read(entry).and_then(|b| {
-            ipak_t6::parse_iwi(&b)
-                .map_err(|e| e.to_string())
-                .map(|iwi| format!("{:?}", iwi.format))
-        }) {
-            Ok(f) => f,
-            Err(e) => format!("unreadable ({e})"),
-        },
-        Some(ImageSource::Embedded) => format!(
-            "in zone, dxgi {}",
-            image.embedded.as_ref().map_or(0, |e| e.dxgi_format)
-        ),
-        Some(ImageSource::Empty) => "no pixels".to_owned(),
-        None => "missing".to_owned(),
+    let Some(source) = packs.locate(image) else {
+        return "missing".to_owned();
+    };
+    if let ImageSource::Pack(i, entry) = source {
+        let read = packs.packs[i].read(entry);
+        return read
+            .and_then(|bytes| ipak_t6::parse_iwi(&bytes).map(|iwi| format!("{:?}", iwi.format)).map_err(|e| e.to_string()))
+            .unwrap_or_else(|e| format!("unreadable ({e})"));
     }
+    if let ImageSource::Embedded = source {
+        let dxgi = image.embedded.as_ref().map_or(0, |e| e.dxgi_format);
+        return format!("in zone, dxgi {dxgi}");
+    }
+    "no pixels".to_owned()
 }
 
-fn main() -> ExitCode {
-    let path = std::env::args()
-        .nth(1)
-        .map_or_else(|| PathBuf::from(DEFAULT_ZONE), PathBuf::from);
+fn main() -> std::process::ExitCode {
+    let given = std::env::args().nth(1);
+    let path = given.map_or_else(default_zone, PathBuf::from);
     match run(&path) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => std::process::ExitCode::from(0),
         Err(e) => {
             eprintln!("t6mat: {e}");
-            ExitCode::FAILURE
+            std::process::ExitCode::from(1)
         }
     }
 }
@@ -95,13 +151,13 @@ fn run(path: &Path) -> Result<(), String> {
     // T6MAT_ANIM=<substring>: animations whose name contains it: frames,
     // rate, length and the root translation keys.
     if let Ok(want) = std::env::var("T6MAT_ANIM") {
-        for a in capture.xanims.iter().filter(|a| a.name.contains(&want)) {
-            let secs = f32::from(a.numframes) / a.framerate.max(0.001);
+        for a in capture.animation_refs.iter().filter(|a| a.name.contains(&want)) {
+            let secs = f32::from(a.frame_total) / a.frame_rate_hz.max(0.001);
             println!(
                 "xanim {} frames {} rate {} = {:.3} s loop {} delta {} keys {}",
                 a.name,
-                a.numframes,
-                a.framerate,
+                a.frame_total,
+                a.frame_rate_hz,
                 secs,
                 a.looping,
                 a.delta,
@@ -110,7 +166,7 @@ fn run(path: &Path) -> Result<(), String> {
             for (f, p) in &a.delta_trans {
                 println!(
                     "   frame {f:>3} t {:.3}s  [{:.2}, {:.2}, {:.2}]",
-                    f32::from(*f) / a.framerate.max(0.001),
+                    f32::from(*f) / a.frame_rate_hz.max(0.001),
                     p[0],
                     p[1],
                     p[2]
@@ -142,18 +198,18 @@ fn run(path: &Path) -> Result<(), String> {
         // T6MAT_TECH=1: match the technique set's name instead.
         let by_tech = std::env::var_os("T6MAT_TECH").is_some();
         for m in capture.materials.iter().filter(|m| {
-            let ts = m.technique_set.map(|t| capture.technique_sets[t.index].name.as_str());
+            let ts = m.method_set.map(|t| capture.technique_sets[t.index].name.as_str());
             if by_tech { ts.is_some_and(|n| n.contains(&want)) } else { m.name.contains(&want) }
         }) {
-            let ts = m.technique_set.map_or("-".to_owned(), |t| {
+            let ts = m.method_set.map_or("-".to_owned(), |t| {
                 capture.technique_sets[t.index].name.clone()
             });
             println!(
                 "material {} techset {ts} sort {} flags {:#x} state_flags {:#x}",
-                m.name, m.sort_key, m.surface_flags, m.state_flags
+                m.name, m.sort_rank, m.surf_bits, m.condition_bits
             );
             for (slot, &entry) in m.state_bits_entry.iter().enumerate() {
-                if let Some(&bits) = m.state_bits.get(usize::from(entry)) {
+                if let Some(&bits) = m.state_words.get(usize::from(entry)) {
                     println!(
                         "   state t{slot}: {:?}",
                         asset_t6::capture::DrawState::decode(bits)
@@ -161,13 +217,13 @@ fn run(path: &Path) -> Result<(), String> {
                 }
             }
             for t in &m.textures {
-                let slot = names.get(&t.name_hash).copied().unwrap_or("?");
+                let slot = names.get(&t.label_digest).copied().unwrap_or("?");
                 let img = t.image.map(|k| &capture.images[k.index]);
                 println!(
                     "   tex {slot:<14} {:#010x} sem {} samp {:#04x} {}",
-                    t.name_hash,
+                    t.label_digest,
                     t.semantic,
-                    t.sampler_state,
+                    t.texture_sampling_mode,
                     img.map_or("-".to_owned(), |i| format!(
                         "{} {}x{} embedded {}",
                         i.name,
@@ -181,9 +237,9 @@ fn run(path: &Path) -> Result<(), String> {
                     && let Ok(bytes) = packs.packs[pi].read(entry)
                     && let Ok(iwi) = ipak_t6::parse_iwi(&bytes)
                 {
-                    let (w, h) = (iwi.width as usize, iwi.height as usize);
+                    let (iw, ih) = (iwi.texel_width as usize, iwi.height as usize);
                     let data = iwi.level(0);
-                    let mut rgba = vec![0u8; w * h * 4];
+                    let mut rgba = vec![0u8; iw * ih * 4];
                     let block = match iwi.format {
                         ipak_t6::IwiFormat::Dxt1 => 8,
                         ipak_t6::IwiFormat::Dxt3
@@ -195,33 +251,19 @@ fn run(path: &Path) -> Result<(), String> {
                         let n = rgba.len().min(data.len());
                         rgba[..n].copy_from_slice(&data[..n]);
                     } else {
-                        let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
+                        let (bw, bh) = (iw.div_ceil(4), ih.div_ceil(4));
                         for by in 0..bh {
                             for bx in 0..bw {
                                 let o = (by * bw + bx) * block;
                                 let Some(src) = data.get(o..o + block) else {
                                     continue;
                                 };
-                                let mut tile = [0u8; 64];
-                                match iwi.format {
-                                    ipak_t6::IwiFormat::Dxt1 => bcdec_rs::bc1(src, &mut tile, 16),
-                                    ipak_t6::IwiFormat::Dxt3 => bcdec_rs::bc2(src, &mut tile, 16),
-                                    ipak_t6::IwiFormat::Dxt5 => bcdec_rs::bc3(src, &mut tile, 16),
-                                    _ => {
-                                        let mut rg = [0u8; 32];
-                                        bcdec_rs::bc5(src, &mut rg, 8, false);
-                                        for k in 0..16 {
-                                            tile[k * 4] = rg[k * 2];
-                                            tile[k * 4 + 1] = rg[k * 2 + 1];
-                                            tile[k * 4 + 3] = 255;
-                                        }
-                                    }
-                                }
+                                let tile = decode_block(iwi.format, src);
                                 for ty in 0..4 {
                                     for tx in 0..4 {
                                         let (x, y) = (bx * 4 + tx, by * 4 + ty);
-                                        if x < w && y < h {
-                                            let d = (y * w + x) * 4;
+                                        if x < iw && y < ih {
+                                            let d = (y * iw + x) * 4;
                                             let t = (ty * 4 + tx) * 4;
                                             rgba[d..d + 4].copy_from_slice(&tile[t..t + 4]);
                                         }
@@ -245,7 +287,7 @@ fn run(path: &Path) -> Result<(), String> {
                     let _ = std::fs::create_dir_all(dir);
                     if let Ok(file) = std::fs::File::create(&out) {
                         let mut enc =
-                            png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+                            png::Encoder::new(std::io::BufWriter::new(file), iw as u32, ih as u32);
                         enc.set_color(png::ColorType::Rgba);
                         enc.set_depth(png::BitDepth::Eight);
                         if let Ok(mut wr) = enc.write_header() {
@@ -255,15 +297,13 @@ fn run(path: &Path) -> Result<(), String> {
                     println!("      -> {} ({:?})", out.display(), iwi.format);
                 }
             }
-            for (h, n, v) in &m.constants {
-                println!("   const {n:<20} {h:#010x} {v:?}");
+            for (ih, n, v) in &m.constants {
+                println!("   const {n:<20} {ih:#010x} {v:?}");
             }
-            let mut seen = std::collections::BTreeSet::new();
-            for (slot, &e) in m.state_bits_entry.iter().enumerate() {
-                if e == 0xff || !seen.insert(e) {
-                    continue;
-                }
-                if let Some(bits) = m.state_bits.get(usize::from(e)) {
+            let mut seen = std::collections::BTreeSet::default();
+            let firsts = m.state_bits_entry.iter().copied().enumerate().filter(|&(_, e)| e != 0xff && seen.insert(e));
+            for (slot, e) in firsts {
+                if let Some(bits) = m.state_words.get(usize::from(e)) {
                     println!(
                         "   state slot {slot} entry {e}: {:?}",
                         asset_t6::DrawState::decode(*bits)
@@ -278,7 +318,7 @@ fn run(path: &Path) -> Result<(), String> {
     // T6MAT_RAW=<dir>: list this zone's rawfiles and write them there.
     if let Ok(dir) = std::env::var("T6MAT_RAW") {
         for (name, bytes) in &capture.raw_files {
-            println!("rawfile {name} ({} bytes)", bytes.len());
+            println!("rawfile {name} ({len} bytes)", len = bytes.len());
             if !dir.is_empty() {
                 let flat: String = name
                     .chars()
@@ -294,7 +334,7 @@ fn run(path: &Path) -> Result<(), String> {
                 if let Err(e) =
                     std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&out, bytes))
                 {
-                    println!("  write {}: {e}", out.display());
+                    println!("  write {}: {e}", out.to_string_lossy());
                 }
             }
         }
@@ -314,11 +354,11 @@ fn run(path: &Path) -> Result<(), String> {
         for srf in &world.surfaces {
             let Some(k) = srf.material else { continue };
             let m = &capture.materials[k.index];
-            let t = m.technique_set.map_or(String::new(), |t| {
+            let t = m.method_set.map_or(String::new(), |t| {
                 capture.technique_sets[t.index].name.clone()
             });
-            let layered = t.split('_').any(|w| {
-                let b = w.as_bytes();
+            let layered = t.split('_').any(|iw| {
+                let b = iw.as_bytes();
                 b.len() >= 3
                     && matches!(b[0], b'b' | b'm')
                     && (b'1'..=b'3').contains(&b[1])
@@ -326,9 +366,9 @@ fn run(path: &Path) -> Result<(), String> {
             });
             // T6MAT_TINTS=multiply: instead, the materials with multiply
             // layers but no blend layer (drawn tinted before fix list 2).
-            let multiply_only = !t.split('_').any(|w| w.starts_with("b1"))
-                && t.split('_').any(|w| {
-                    let b = w.as_bytes();
+            let multiply_only = !t.split('_').any(|iw| iw.starts_with("b1"))
+                && t.split('_').any(|iw| {
+                    let b = iw.as_bytes();
                     b.len() >= 3 && b[0] == b'm' && (b'1'..=b'3').contains(&b[1]) && b[2] == b'c'
                 });
             let want_multiply = std::env::var("T6MAT_TINTS").is_ok_and(|v| v == "multiply");
@@ -336,7 +376,7 @@ fn run(path: &Path) -> Result<(), String> {
                 continue;
             }
             let first = srf.base_index as usize;
-            let n = usize::from(srf.tri_count) * 3;
+            let n = usize::from(srf.tri_tally) * 3;
             let mut lo = [255u8; 4];
             for &idx in world.indices.get(first..first + n).unwrap_or(&[]) {
                 let at = srf.vertex_data_offset0 as usize + usize::from(idx) * 36 + 16;
@@ -362,8 +402,9 @@ fn run(path: &Path) -> Result<(), String> {
         return Ok(());
     }
     // T6MAT_NEAR=x,y,z,r: every world surface whose bounds come within r of
-    // the point: material, technique set, lightmap, triangles and its
-    // vertices' colour range (vertex record @16, R G B A bytes).
+    // the point: material, technique set, lightmap, primary light,
+    // triangles and its vertices' colour range (vertex record @16, R G B A
+    // bytes).
     if let Ok(spec) = std::env::var("T6MAT_NEAR") {
         let v: Vec<f32> = spec
             .split(',')
@@ -384,15 +425,15 @@ fn run(path: &Path) -> Result<(), String> {
                 }
                 let (mname, tname) =
                     srf.material
-                        .map_or(("(none)".to_owned(), String::new()), |k| {
+                        .map_or(("(none)".to_owned(), String::default()), |k| {
                             let m = &capture.materials[k.index];
-                            let t = m.technique_set.map_or(String::new(), |t| {
+                            let t = m.method_set.map_or(String::new(), |t| {
                                 capture.technique_sets[t.index].name.clone()
                             });
                             (m.name.clone(), t)
                         });
                 let first = srf.base_index as usize;
-                let n = usize::from(srf.tri_count) * 3;
+                let n = usize::from(srf.tri_tally) * 3;
                 let (mut clo, mut chi) = ([255u8; 4], [0u8; 4]);
                 for &idx in world.indices.get(first..first + n).unwrap_or(&[]) {
                     let at = srf.vertex_data_offset0 as usize + usize::from(idx) * 36 + 16;
@@ -405,10 +446,10 @@ fn run(path: &Path) -> Result<(), String> {
                 }
                 println!(
                     "near surf {si}: {mname} [{tname}] lightmap {} probe {} light {} tris {} colour min {clo:?} max {chi:?} bounds {:?}",
-                    srf.lightmap_index,
-                    srf.reflection_probe_index,
-                    srf.primary_light_index,
-                    srf.tri_count,
+                    srf.lightbake_index,
+                    srf.env_probe_index,
+                    srf.key_light_index,
+                    srf.tri_tally,
                     srf.bounds
                 );
             }
@@ -421,32 +462,24 @@ fn run(path: &Path) -> Result<(), String> {
         for si in spec.split(',').filter_map(|x| x.trim().parse::<usize>().ok()) {
             let Some(srf) = world.surfaces.get(si) else { continue };
             let owner = world
-                .brush_models
+                .solid_models
                 .iter()
                 .position(|&(first, count, _)| (first as usize..(first + count) as usize).contains(&si));
-            println!("tris surf {si}: {} triangles, brush model {owner:?}", srf.tri_count);
-            let base = srf.base_index as usize;
-            for t in 0..usize::from(srf.tri_count) {
-                let mut row = Vec::new();
-                for c in 0..3 {
-                    let Some(&idx) = world.indices.get(base + t * 3 + c) else { continue };
-                    let at = srf.vertex_data_offset0 as usize + usize::from(idx) * 36;
-                    let Some(v) = world.vd0.get(at..at + 36) else { continue };
-                    let f = |o: usize| f32::from_le_bytes([v[o], v[o + 1], v[o + 2], v[o + 3]]);
-                    // Position, then the vertex colour (rgba bytes at 16).
-                    row.push(format!(
-                        "({:.1} {:.1} {:.1} c{:?})",
-                        f(0),
-                        f(4),
-                        f(8),
-                        &v[16..20]
-                    ));
-                }
-                println!("  {}", row.join(" "));
+            println!("tris surf {si}: {} triangles, brush model {owner:?}", srf.tri_tally);
+            for t in 0..usize::from(srf.tri_tally) {
+                // Position, then the vertex colour (rgba bytes at 16).
+                let row: Vec<String> = (0..3)
+                    .filter_map(|c| corner_bytes(world, srf, t, c, 36))
+                    .map(|v| {
+                        let [x, y, z] = [0, 4, 8].map(|o| le_f32(v, o));
+                        format!("({x:.1} {y:.1} {z:.1} c{:?})", &v[16..20])
+                    })
+                    .collect();
+                println!("  {cells}", cells = row.join(" "));
             }
         }
     }
-    // T6MAT_COVER=x0,y0,x1,y1,step,zlo,zhi: a top-down floor map. For each
+    // T6MAT_COVER=x_start,y0,x1,y1,step,zlo,zhi: a top-down floor map. For each
     // grid point the topmost world triangle with z in [zlo, zhi]; one letter
     // per surface (legend below), '.' where nothing covers the point. Second
     // grid: only surfaces that write depth-sorted opaque (sort < 16).
@@ -455,50 +488,31 @@ fn run(path: &Path) -> Result<(), String> {
             .split(',')
             .filter_map(|x| x.trim().parse().ok())
             .collect();
-        if let [x0, y0, x1, y1, step, zlo, zhi] = v[..] {
-            let mut tris: Vec<([[f32; 3]; 3], usize)> = Vec::new();
+        if let [x_start, y0, x1, y1, step, zlo, zhi] = v[..] {
+            let mut triangle_list: Vec<([[f32; 3]; 3], usize)> = vec![];
             for (si, srf) in world.surfaces.iter().enumerate() {
                 let [lo, hi] = srf.bounds;
-                if hi[0] < x0 || lo[0] > x1 || hi[1] < y0 || lo[1] > y1 || hi[2] < zlo || lo[2] > zhi {
+                if hi[0] < x_start || lo[0] > x1 || hi[1] < y0 || lo[1] > y1 || hi[2] < zlo || lo[2] > zhi {
                     continue;
                 }
-                let base = srf.base_index as usize;
-                for t in 0..usize::from(srf.tri_count) {
-                    let mut p = [[0f32; 3]; 3];
-                    let mut ok = true;
-                    for c in 0..3 {
-                        let Some(&idx) = world.indices.get(base + t * 3 + c) else {
-                            ok = false;
-                            break;
-                        };
-                        let at = srf.vertex_data_offset0 as usize + usize::from(idx) * 36;
-                        let Some(v) = world.vd0.get(at..at + 12) else {
-                            ok = false;
-                            break;
-                        };
-                        let f = |o: usize| f32::from_le_bytes([v[o], v[o + 1], v[o + 2], v[o + 3]]);
-                        p[c] = [f(0), f(4), f(8)];
-                    }
-                    if ok {
-                        tris.push((p, si));
-                    }
-                }
+                let whole = (0..usize::from(srf.tri_tally)).filter_map(|t| tri_positions(world, srf, t));
+                triangle_list.extend(whole.map(|p| (p, si)));
             }
             let sort_of = |si: usize| {
                 world.surfaces[si]
                     .material
-                    .map_or(0, |k| capture.materials[k.index].sort_key)
+                    .map_or(0, |k| capture.materials[k.index].sort_rank)
             };
             let mut letters: Vec<usize> = Vec::new();
             let glyphs: Vec<char> = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789#$%&+=?@".chars().collect();
-            let mut grids = [String::new(), String::new()];
+            let mut grids = [String::default(), String::default()];
             let mut y = y1;
             while y >= y0 {
-                let mut x = x0;
-                let mut rows = [String::new(), String::new()];
+                let mut x = x_start;
+                let mut rows = [String::default(), String::default()];
                 while x <= x1 {
-                    let mut best: [Option<(f32, usize)>; 2] = [None, None];
-                    for (p, si) in &tris {
+                    let mut nearest: [Option<(f32, usize)>; 2] = [None, None];
+                    for (p, si) in &triangle_list {
                         let d = (p[1][1] - p[2][1]) * (p[0][0] - p[2][0]) + (p[2][0] - p[1][0]) * (p[0][1] - p[2][1]);
                         if d.abs() < 1e-6 {
                             continue;
@@ -517,8 +531,8 @@ fn run(path: &Path) -> Result<(), String> {
                             if g == 1 && sort_of(*si) >= 16 {
                                 continue;
                             }
-                            if best[g].is_none_or(|(bz, _)| z > bz) {
-                                best[g] = Some((z, *si));
+                            if nearest[g].is_none_or(|(bz, _)| z > bz) {
+                                nearest[g] = Some((z, *si));
                             }
                         }
                     }
@@ -526,10 +540,10 @@ fn run(path: &Path) -> Result<(), String> {
                     // then z and surface of both grids, -1 where none).
                     if std::env::var_os("T6MAT_COVER_TSV").is_some() {
                         let cell = |b: Option<(f32, usize)>| b.map_or("-1\t-1".to_owned(), |(z, si)| format!("{z:.1}\t{si}"));
-                        println!("cell\t{x:.0}\t{y:.0}\t{}\t{}", cell(best[0]), cell(best[1]));
+                        println!("cell\t{x:.0}\t{y:.0}\t{}\t{}", cell(nearest[0]), cell(nearest[1]));
                     }
                     for g in 0..2 {
-                        rows[g].push(match best[g] {
+                        rows[g].push(match nearest[g] {
                             None => '.',
                             Some((_, si)) => {
                                 let i = letters.iter().position(|&s| s == si).unwrap_or_else(|| {
@@ -547,12 +561,12 @@ fn run(path: &Path) -> Result<(), String> {
                 }
                 y -= step;
             }
-            println!("cover, topmost any surface (rows y high->low, columns x {x0}..{x1} step {step}):\n{}", grids[0]);
+            println!("cover, topmost any surface (rows y high->low, columns x {x_start}..{x1} step {step}):\n{}", grids[0]);
             println!("cover, topmost sort<16 surface:\n{}", grids[1]);
             for (i, &si) in letters.iter().enumerate() {
                 let srf = &world.surfaces[si];
                 let (mname, sort) = srf.material.map_or(("(none)".to_owned(), 0), |k| {
-                    (capture.materials[k.index].name.clone(), capture.materials[k.index].sort_key)
+                    (capture.materials[k.index].name.clone(), capture.materials[k.index].sort_rank)
                 });
                 println!("  {} = surf {si} {mname} sort {sort} bounds {:?}", glyphs.get(i).copied().unwrap_or('~'), srf.bounds);
                 if std::env::var_os("T6MAT_COVER_TSV").is_some() {
@@ -570,7 +584,7 @@ fn run(path: &Path) -> Result<(), String> {
             Some(k) => {
                 let e = by_material.entry(k.index).or_default();
                 e.0 += 1;
-                e.1 += usize::from(s.tri_count);
+                e.1 += usize::from(s.tri_tally);
             }
             None => no_material += 1,
         }
@@ -584,39 +598,39 @@ fn run(path: &Path) -> Result<(), String> {
     );
 
     let mut techsets: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    let mut vert_formats: BTreeMap<u8, usize> = BTreeMap::new();
-    let mut slots: BTreeMap<(String, u8), usize> = BTreeMap::new();
+    let mut vert_formats: BTreeMap<u8, usize> = BTreeMap::default();
+    let mut slots: BTreeMap<(String, u8), usize> = BTreeMap::default();
     let mut color_formats: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    let mut no_color: Vec<(String, usize)> = Vec::new();
-    for (&mi, &(_, tris)) in &by_material {
+    let mut no_color: Vec<(String, usize)> = vec![];
+    for (&mi, &(_, triangle_list)) in &by_material {
         let m = &capture.materials[mi];
-        let ts = m.technique_set.map(|k| &capture.technique_sets[k.index]);
+        let ts = m.method_set.map(|k| &capture.technique_sets[k.index]);
         let ts_name = ts.map_or("(none)".to_owned(), |t| t.name.clone());
         let prefix = ts_name.split('_').take(2).collect::<Vec<_>>().join("_");
         let e = techsets.entry(prefix).or_default();
         e.0 += 1;
-        e.1 += tris;
+        e.1 += triangle_list;
         *vert_formats
-            .entry(ts.map_or(255, |t| t.world_vert_format))
-            .or_default() += tris;
-        let mut color = None;
+            .entry(ts.map_or(255, |t| t.level_vertex_format))
+            .or_default() += triangle_list;
+        let mut tint = None;
         for t in &m.textures {
             let name = names
-                .get(&t.name_hash)
-                .map_or_else(|| format!("{:#010x}", t.name_hash), |n| (*n).to_owned());
+                .get(&t.label_digest)
+                .map_or_else(|| format!("{:#010x}", t.label_digest), |n| (*n).to_owned());
             *slots.entry((name, t.semantic)).or_default() += 1;
-            if t.name_hash == hash("colorMap") {
-                color = t.image;
+            if t.label_digest == hash("colorMap") {
+                tint = t.image;
             }
         }
-        match color {
+        match tint {
             Some(k) => {
                 let f = image_format(&packs, &capture.images[k.index]);
                 let e = color_formats.entry(f).or_default();
                 e.0 += 1;
-                e.1 += tris;
+                e.1 += triangle_list;
             }
-            None => no_color.push((m.name.clone(), tris)),
+            None => no_color.push((m.name.clone(), triangle_list)),
         }
     }
     // Materials on very large surfaces, and every material outside the lit
@@ -629,19 +643,19 @@ fn run(path: &Path) -> Result<(), String> {
             .fold(0f32, f32::max);
         let e = big.entry(k.index).or_insert((0.0, 0));
         e.0 = e.0.max(ext);
-        e.1 += usize::from(srf.tri_count);
+        e.1 += usize::from(srf.tri_tally);
     }
     let mut list: Vec<_> = big.into_iter().collect();
     list.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
     println!("materials by largest surface extent:");
-    for (mi, (ext, tris)) in list.iter().take(12) {
+    for (mi, (ext, triangle_list)) in list.iter().take(12) {
         let m = &capture.materials[*mi];
-        let ts = m.technique_set.map_or("(none)".to_owned(), |k| {
+        let ts = m.method_set.map_or("(none)".to_owned(), |k| {
             capture.technique_sets[k.index].name.clone()
         });
         println!(
-            "   {ext:>8.0} units {tris:>6} tris  {}  [{ts}] sort {}",
-            m.name, m.sort_key
+            "   {ext:>8.0} units {triangle_list:>6} tris  {}  [{ts}] sort {}",
+            m.name, m.sort_rank
         );
     }
     // Surfaces reaching high above the street: what can cover the sky.
@@ -652,19 +666,19 @@ fn run(path: &Path) -> Result<(), String> {
             continue;
         }
         let e = high.entry(k.index).or_insert((0, f32::MAX, f32::MIN));
-        e.0 += usize::from(srf.tri_count);
+        e.0 += usize::from(srf.tri_tally);
         e.1 = e.1.min(srf.bounds[0][2]);
         e.2 = e.2.max(srf.bounds[1][2]);
     }
     println!("materials on surfaces reaching above z=800:");
-    for (mi, (tris, lo, hi)) in &high {
+    for (mi, (triangle_list, lo, hi)) in &high {
         let m = &capture.materials[*mi];
-        let ts = m.technique_set.map_or("(none)".to_owned(), |k| {
+        let ts = m.method_set.map_or("(none)".to_owned(), |k| {
             capture.technique_sets[k.index].name.clone()
         });
         println!(
-            "   {tris:>6} tris z {lo:.0}..{hi:.0}  {}  [{ts}] sort {}",
-            m.name, m.sort_key
+            "   {triangle_list:>6} tris z {lo:.0}..{hi:.0}  {}  [{ts}] sort {}",
+            m.name, m.sort_rank
         );
     }
     // Rays from the east-view camera (t6_tex3): which surface is hit first.
@@ -677,32 +691,16 @@ fn run(path: &Path) -> Result<(), String> {
         (-20.0, 25.0),
     ] {
         let (cy, sy) = (yaw.to_radians().cos(), yaw.to_radians().sin());
-        let (cp, sp) = (pitch.to_radians().cos(), pitch.to_radians().sin());
-        let dir = [cy * cp, sy * cp, sp];
-        let mut best: Option<(f32, usize)> = None;
+        let (codepoint, sp) = (pitch.to_radians().cos(), pitch.to_radians().sin());
+        let dir = [cy * codepoint, sy * codepoint, sp];
+        let mut nearest: Option<(f32, usize)> = None;
         for (si, srf) in world.surfaces.iter().enumerate() {
-            let base = srf.base_index as usize;
-            for t in 0..usize::from(srf.tri_count) {
-                let mut p = [[0f32; 3]; 3];
-                let mut ok = true;
-                for c in 0..3 {
-                    let Some(&idx) = world.indices.get(base + t * 3 + c) else {
-                        ok = false;
-                        break;
-                    };
-                    let at = srf.vertex_data_offset0 as usize + usize::from(idx) * 36;
-                    let Some(v) = world.vd0.get(at..at + 12) else {
-                        ok = false;
-                        break;
-                    };
-                    let f = |o: usize| f32::from_le_bytes([v[o], v[o + 1], v[o + 2], v[o + 3]]);
-                    p[c] = [f(0), f(4), f(8)];
-                }
-                if !ok {
+            for t in 0..usize::from(srf.tri_tally) {
+                let Some(p) = tri_positions(world, srf, t) else {
                     continue;
-                }
+                };
                 // Moller-Trumbore.
-                let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+                let sub = |p: [f32; 3], q: [f32; 3]| [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
                 let cross = |a: [f32; 3], b: [f32; 3]| {
                     [
                         a[1] * b[2] - a[2] * b[1],
@@ -713,14 +711,14 @@ fn run(path: &Path) -> Result<(), String> {
                 let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
                 let e1 = sub(p[1], p[0]);
                 let e2 = sub(p[2], p[0]);
-                let h = cross(dir, e2);
-                let a = dot(e1, h);
+                let ih = cross(dir, e2);
+                let a = dot(e1, ih);
                 if a.abs() < 1e-6 {
                     continue;
                 }
                 let f = 1.0 / a;
                 let sv = sub(eye, p[0]);
-                let u = f * dot(sv, h);
+                let u = f * dot(sv, ih);
                 if !(0.0..=1.0).contains(&u) {
                     continue;
                 }
@@ -730,12 +728,12 @@ fn run(path: &Path) -> Result<(), String> {
                     continue;
                 }
                 let dist = f * dot(e2, q);
-                if dist > 1.0 && best.is_none_or(|(d, _)| dist < d) {
-                    best = Some((dist, si));
+                if dist > 1.0 && nearest.is_none_or(|(d, _)| dist < d) {
+                    nearest = Some((dist, si));
                 }
             }
         }
-        match best {
+        match nearest {
             Some((d, si)) => {
                 let srf = &world.surfaces[si];
                 let m = srf.material.map_or("(none)".to_owned(), |k| {
@@ -750,9 +748,9 @@ fn run(path: &Path) -> Result<(), String> {
         }
     }
     println!("materials outside wpc_lit / lit_sm:");
-    for (mi, (_, tris)) in &list {
+    for (mi, (_, triangle_list)) in &list {
         let m = &capture.materials[*mi];
-        let ts = m.technique_set.map_or("(none)".to_owned(), |k| {
+        let ts = m.method_set.map_or("(none)".to_owned(), |k| {
             capture.technique_sets[k.index].name.clone()
         });
         if ts.starts_with("wpc_lit") || ts.starts_with("lit_sm") {
@@ -763,8 +761,8 @@ fn run(path: &Path) -> Result<(), String> {
             .iter()
             .map(|t| {
                 let n = names
-                    .get(&t.name_hash)
-                    .map_or_else(|| format!("{:#x}", t.name_hash), |n| (*n).to_owned());
+                    .get(&t.label_digest)
+                    .map_or_else(|| format!("{:#x}", t.label_digest), |n| (*n).to_owned());
                 let img = t
                     .image
                     .map_or("-".to_owned(), |k| capture.images[k.index].name.clone());
@@ -772,17 +770,17 @@ fn run(path: &Path) -> Result<(), String> {
             })
             .collect();
         println!(
-            "   {tris:>6} tris  {}  [{ts}] sort {}  {}",
+            "   {triangle_list:>6} tris  {}  [{ts}] sort {}  {}",
             m.name,
-            m.sort_key,
+            m.sort_rank,
             tex.join(" ")
         );
     }
     println!("technique set families (materials, triangles):");
     let mut ts: Vec<_> = techsets.into_iter().collect();
     ts.sort_by(|a, b| b.1.1.cmp(&a.1.1));
-    for (name, (n, tris)) in ts.iter().take(20) {
-        println!("   {tris:>7} tris  {n:>4} materials  {name}");
+    for (name, (n, triangle_list)) in ts.iter().take(20) {
+        println!("   {triangle_list:>7} tris  {n:>4} materials  {name}");
     }
     println!("world vertex formats by triangles: {vert_formats:?}");
     println!("texture slots over the materials (slot, semantic): count");
@@ -792,16 +790,16 @@ fn run(path: &Path) -> Result<(), String> {
         println!("   {n:>5}  {name} semantic {sem}");
     }
     println!("colour map formats (materials, triangles):");
-    for (f, (n, tris)) in &color_formats {
-        println!("   {tris:>7} tris  {n:>4}  {f}");
+    for (f, (n, triangle_list)) in &color_formats {
+        println!("   {triangle_list:>7} tris  {n:>4}  {f}");
     }
     no_color.sort_by(|a, b| b.1.cmp(&a.1));
     println!("materials with no colorMap: {}", no_color.len());
-    for (name, tris) in no_color.iter().take(15) {
-        println!("   {tris:>7} tris  {name}");
+    for (name, triangle_list) in no_color.iter().take(15) {
+        println!("   {triangle_list:>7} tris  {name}");
     }
-    println!("lightmaps: {}", world.lightmaps.len());
-    for (i, pair) in world.lightmaps.iter().enumerate() {
+    println!("lightmaps: {}", world.light_atlases.len());
+    for (i, pair) in world.light_atlases.iter().enumerate() {
         let f: Vec<String> = pair
             .iter()
             .map(|k| {
@@ -824,7 +822,7 @@ fn run(path: &Path) -> Result<(), String> {
     let mut n = 0u64;
     for srf in &world.surfaces {
         let base = srf.base_index as usize;
-        for k in 0..usize::from(srf.tri_count) * 3 {
+        for k in 0..usize::from(srf.tri_tally) * 3 {
             let Some(&idx) = world.indices.get(base + k) else {
                 continue;
             };
@@ -845,19 +843,35 @@ fn run(path: &Path) -> Result<(), String> {
     println!("sun: {:?}", world.sun);
     println!("exposure volumes: {:?}", world.exposure_volumes);
     println!("init world sun exposure: {}", world.init_sun_exposure);
-    if let Some(g) = &world.light_grid {
+    if std::env::var("T6MAT_EXPOSURE").is_ok() {
+        let f: Vec<f32> = world.init_sun_raw.iter().map(|iw| f32::from_bits(*iw)).collect();
+        println!("init world sun: words {:x?}", world.init_sun_raw);
+        println!("init world sun: floats {f:?}");
+        for (i, (v, c)) in world
+            .exposure_volumes
+            .iter()
+            .zip(&world.exposure_volume_controls)
+            .enumerate()
+        {
+            println!("exposure volume {i}: control {c:#010x} {v:?}");
+        }
+        for (i, p) in world.exposure_volume_planes.iter().enumerate() {
+            println!("exposure plane {i}: {p:?}");
+        }
+    }
+    if let Some(g) = &world.probe_grid {
         println!(
             "light grid: mins {:?} maxs {:?} offset {} row axis {} col axis {} rows {} raw {} entries {} colours {} sun light {}",
-            g.mins,
-            g.maxs,
+            g.lo_corner,
+            g.hi_corner,
             g.offset,
-            g.row_axis,
-            g.col_axis,
-            g.row_data_start.len() / 2,
-            g.raw_row_data.len(),
+            g.line_direction,
+            g.column_direction,
+            g.line_bytes_origin.len() / 2,
+            g.unparsed_line_bytes.len(),
             g.entries.len() / 4,
-            g.color_count,
-            g.sun_primary_light_index
+            g.tint_key_total,
+            g.sunlight_lamp_slot
         );
         println!(
             "light grid coeff sets: {} ({} bytes)",
@@ -866,19 +880,21 @@ fn run(path: &Path) -> Result<(), String> {
         );
         for set in g.coeffs.chunks_exact(54).skip(20000).step_by(5000).take(6) {
             let v: Vec<String> = set
-                .chunks_exact(2)
-                .map(|b| format!("{:5}", u16::from_le_bytes([b[0], b[1]])))
+                .iter()
+                .step_by(2)
+                .zip(set.iter().skip(1).step_by(2))
+                .map(|(&lo, &hi)| format!("{:5}", u16::from_le_bytes([lo, hi])))
                 .collect();
             println!("   {}", v.join(" "));
         }
     }
     // The first lightmap's pixels: channel ranges, and a PNG when asked.
-    if let Some(Some(k)) = world.lightmaps.first().map(|pair| pair[1])
+    if let Some(Some(k)) = world.light_atlases.first().map(|pair| pair[1])
         && let Some(e) = capture.images[k.index].embedded.as_ref()
     {
         let img = &capture.images[k.index];
-        let (w, h) = (usize::from(img.width), usize::from(img.height));
-        let px = &e.data[..(w * h * 4).min(e.data.len())];
+        let (iw, ih) = (usize::from(img.width), usize::from(img.height));
+        let px = &e.data[..(iw * ih * 4).min(e.data.len())];
         let mut lo = [255u8; 4];
         let mut hi = [0u8; 4];
         let mut sum = [0u64; 4];
@@ -891,15 +907,15 @@ fn run(path: &Path) -> Result<(), String> {
         }
         let n = (px.len() / 4).max(1) as u64;
         println!(
-            "lightmap 0 secondary {w}x{h}, {} bytes ({} levels): channel min {lo:?} max {hi:?} mean {:?}",
+            "lightmap 0 secondary {iw}x{ih}, {} bytes ({} levels): channel min {lo:?} max {hi:?} mean {:?}",
             e.data.len(),
-            e.level_count,
+            e.tier_total,
             sum.map(|s| s / n)
         );
         if let Ok(out) = std::env::var("T6MAT_LIGHTMAP_PNG")
             && let Ok(file) = std::fs::File::create(&out)
         {
-            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), iw as u32, ih as u32);
             enc.set_color(png::ColorType::Rgb);
             enc.set_depth(png::BitDepth::Eight);
             let rgb: Vec<u8> = px
@@ -911,7 +927,7 @@ fn run(path: &Path) -> Result<(), String> {
             }
             let alpha_out = out.replace(".png", "_alpha.png");
             if let Ok(file) = std::fs::File::create(&alpha_out) {
-                let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+                let mut enc = png::Encoder::new(std::io::BufWriter::new(file), iw as u32, ih as u32);
                 enc.set_color(png::ColorType::Grayscale);
                 enc.set_depth(png::BitDepth::Eight);
                 let a: Vec<u8> = px.chunks_exact(4).map(|c| c[3]).collect();
@@ -921,11 +937,26 @@ fn run(path: &Path) -> Result<(), String> {
             }
         }
     }
-    let mut lm: BTreeMap<i8, usize> = BTreeMap::new();
+    let mut lm: BTreeMap<i8, usize> = BTreeMap::default();
     for s in &world.surfaces {
-        *lm.entry(s.lightmap_index).or_default() += 1;
+        *lm.entry(s.lightbake_index).or_default() += 1;
     }
     println!("surfaces per lightmap index: {lm:?}");
+    // The materials on surfaces with no lightmap page (index 31 or below 0).
+    let mut no_lm: BTreeMap<String, usize> = BTreeMap::default();
+    for s in world.surfaces.iter().filter(|s| !(0..31).contains(&s.lightbake_index)) {
+        let name = s.material.map_or("-".to_owned(), |k| {
+            let m = &capture.materials[k.index];
+            let ts = m.method_set.map_or("-".to_owned(), |t| {
+                capture.technique_sets[t.index].name.clone()
+            });
+            format!("{} [{ts}]", m.name)
+        });
+        *no_lm.entry(name).or_default() += 1;
+    }
+    for (name, n) in &no_lm {
+        println!("no lightmap: {n:>5} {name}");
+    }
     // Lightmap coordinates (half2 at +32 of each 36-byte vertex) per lightmap.
     let half = |bits: u16| -> f32 {
         let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
@@ -941,10 +972,10 @@ fn run(path: &Path) -> Result<(), String> {
     let mut tex_range = ([f32::MAX; 2], [f32::MIN; 2]);
     for srf in &world.surfaces {
         let e = ranges
-            .entry(srf.lightmap_index)
+            .entry(srf.lightbake_index)
             .or_insert(([f32::MAX; 2], [f32::MIN; 2], 0));
         let base = srf.base_index as usize;
-        for k in 0..usize::from(srf.tri_count) * 3 {
+        for k in 0..usize::from(srf.tri_tally) * 3 {
             let Some(&idx) = world.indices.get(base + k) else {
                 continue;
             };
@@ -972,9 +1003,9 @@ fn run(path: &Path) -> Result<(), String> {
     // Which 4-byte field is which: two halfs in 0..1, or a packed unit vector.
     for off in [20usize, 24, 28, 32] {
         let (mut unit_halfs, mut unit_vec, mut n) = (0usize, 0usize, 0usize);
-        for srf in world.surfaces.iter().filter(|s| s.lightmap_index == 0) {
+        for srf in world.surfaces.iter().filter(|s| s.lightbake_index == 0) {
             let base = srf.base_index as usize;
-            for k in 0..usize::from(srf.tri_count) * 3 {
+            for k in 0..usize::from(srf.tri_tally) * 3 {
                 let Some(&idx) = world.indices.get(base + k) else {
                     continue;
                 };
@@ -983,16 +1014,16 @@ fn run(path: &Path) -> Result<(), String> {
                     continue;
                 };
                 n += 1;
-                let h = [
+                let ih = [
                     half(u16::from_le_bytes([v[0], v[1]])),
                     half(u16::from_le_bytes([v[2], v[3]])),
                 ];
-                if h.iter().all(|x| (0.0..=1.0).contains(x)) {
+                if ih.iter().all(|x| (0.0..=1.0).contains(x)) {
                     unit_halfs += 1;
                 }
-                let w = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+                let iw = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
                 let comp = |shift: u32| {
-                    let raw = ((w >> shift) & 0x3ff) as i32;
+                    let raw = ((iw >> shift) & 0x3ff) as i32;
                     let signed = if raw >= 512 { raw - 1024 } else { raw };
                     signed as f32 / 511.0
                 };
@@ -1025,24 +1056,17 @@ fn run(path: &Path) -> Result<(), String> {
     for (label, dec) in decoders {
         let mut ratios = Vec::new();
         let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
-        for srf in world.surfaces.iter().filter(|s| s.lightmap_index == 0) {
-            let base = srf.base_index as usize;
-            for t in 0..usize::from(srf.tri_count) {
+        for srf in world.surfaces.iter().filter(|s| s.lightbake_index == 0) {
+            for t in 0..usize::from(srf.tri_tally) {
                 let mut p = [[0f32; 3]; 3];
                 let mut q = [[0f32; 2]; 3];
                 let mut ok = true;
                 for c in 0..3 {
-                    let Some(&idx) = world.indices.get(base + t * 3 + c) else {
+                    let Some(v) = corner_bytes(world, srf, t, c, 36) else {
                         ok = false;
                         break;
                     };
-                    let at = srf.vertex_data_offset0 as usize + usize::from(idx) * 36;
-                    let Some(v) = world.vd0.get(at..at + 36) else {
-                        ok = false;
-                        break;
-                    };
-                    let f = |o: usize| f32::from_le_bytes([v[o], v[o + 1], v[o + 2], v[o + 3]]);
-                    p[c] = [f(0), f(4), f(8)];
+                    p[c] = [0, 4, 8].map(|o| le_f32(v, o));
                     q[c] = [
                         dec(u16::from_le_bytes([v[32], v[33]])) * 2048.0,
                         dec(u16::from_le_bytes([v[34], v[35]])) * 3072.0,
@@ -1076,8 +1100,7 @@ fn run(path: &Path) -> Result<(), String> {
         let pct = |p: f32| {
             ratios
                 .get(((ratios.len() as f32 - 1.0) * p) as usize)
-                .copied()
-                .unwrap_or(0.0)
+                .map_or(0.0, |&v| v)
         };
         println!(
             "+32 as {label}: texels/unit p10 {:.4} p50 {:.4} p90 {:.4}; texel range u {:.0}..{:.0} v {:.0}..{:.0}",
@@ -1101,73 +1124,73 @@ fn run(path: &Path) -> Result<(), String> {
         tex_range.0[0], tex_range.1[0], tex_range.0[1], tex_range.1[1]
     );
     // Static models: placements, LOD0 geometry, vertices inside model bounds.
-    let mut used: BTreeMap<usize, usize> = BTreeMap::new();
-    for sm in &world.static_models {
+    let mut used: BTreeMap<usize, usize> = BTreeMap::default();
+    for sm in &world.prop_set {
         if let Some(k) = sm.model {
             *used.entry(k.index).or_default() += 1;
         }
     }
-    let (mut tris, mut verts, mut inside, mut multi_bone, mut bone_lists) =
+    let (mut triangle_list, mut vertex_points, mut inside, mut multi_bone, mut bone_lists) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
     for (&mi, &n) in &used {
         let m = &capture.xmodels[mi];
-        if m.num_bones > 1 {
+        if m.skeleton_joint_total > 1 {
             multi_bone += 1;
         }
         for srf in &m.lod0 {
-            tris += n * srf.indices.len() / 3;
+            triangle_list += n * srf.indices.len() / 3;
             bone_lists += srf.vert_lists.iter().filter(|l| l.0 != 0).count();
-            for v in srf.verts.chunks_exact(32) {
+            for v in srf.vertex_points.chunks_exact(32) {
                 let f = |o: usize| f32::from_le_bytes([v[o], v[o + 1], v[o + 2], v[o + 3]]);
                 let p = [f(0), f(4), f(8)];
-                verts += 1;
-                if (0..3).all(|i| p[i] >= m.mins[i] - 1.0 && p[i] <= m.maxs[i] + 1.0) {
+                vertex_points += 1;
+                if (0..3).all(|i| p[i] >= m.lo_corner[i] - 1.0 && p[i] <= m.hi_corner[i] + 1.0) {
                     inside += 1;
                 }
             }
         }
     }
     println!(
-        "static models: {} placed, {} distinct; {tris} placed LOD0 triangles; {verts} distinct-model vertices, {:.2}% inside model bounds; {multi_bone} models with >1 bone, {bone_lists} vertex lists on a non-root bone",
-        world.static_models.len(),
+        "static models: {} placed, {} distinct; {triangle_list} placed LOD0 triangles; {vertex_points} distinct-model vertices, {:.2}% inside model bounds; {multi_bone} models with >1 bone, {bone_lists} vertex lists on a non-root bone",
+        world.prop_set.len(),
         used.len(),
-        100.0 * inside as f32 / verts.max(1) as f32
+        100.0 * inside as f32 / vertex_points.max(1) as f32
     );
-    // Model vertex fields: +20 texcoord, +24 / +28 normal and tangent.
+    // Model vertex fields: +20 uv_semantic, +24 / +28 normal and tangent.
     {
         let (mut n, mut uv_unit, mut v24_1010, mut v28_1010, mut v24_u8) =
             (0usize, 0usize, 0usize, 0usize, 0usize);
-        let unit1010 = |w: u32| {
+        let unit1010 = |iw: u32| {
             let c = |sh: u32| {
-                let r = ((w >> sh) & 0x3ff) as i32;
+                let r = ((iw >> sh) & 0x3ff) as i32;
                 (if r >= 512 { r - 1024 } else { r }) as f32 / 511.0
             };
             ((c(0).powi(2) + c(10).powi(2) + c(20).powi(2)).sqrt() - 1.0).abs() < 0.02
         };
-        let unit_u8 = |w: u32| {
-            let b = w.to_le_bytes();
+        let unit_u8 = |iw: u32| {
+            let b = iw.to_le_bytes();
             let scale = (f32::from(b[3]) + 192.0) / 32_385.0;
             let v: Vec<f32> = (0..3).map(|i| (f32::from(b[i]) - 127.0) * scale).collect();
             ((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() - 1.0).abs() < 0.05
         };
         for &mi in used.keys() {
             for srf in &capture.xmodels[mi].lod0 {
-                for v in srf.verts.chunks_exact(32) {
-                    let w = |o: usize| u32::from_le_bytes([v[o], v[o + 1], v[o + 2], v[o + 3]]);
+                for v in srf.vertex_points.chunks_exact(32) {
+                    let iw = |o: usize| u32::from_le_bytes([v[o], v[o + 1], v[o + 2], v[o + 3]]);
                     n += 1;
-                    let t = w(20);
+                    let t = iw(20);
                     let lo = half(t as u16);
                     let hi = half((t >> 16) as u16);
                     if (0.0..=1.0).contains(&lo) && (0.0..=1.0).contains(&hi) {
                         uv_unit += 1;
                     }
-                    if unit1010(w(24)) {
+                    if unit1010(iw(24)) {
                         v24_1010 += 1;
                     }
-                    if unit1010(w(28)) {
+                    if unit1010(iw(28)) {
                         v28_1010 += 1;
                     }
-                    if unit_u8(w(24)) {
+                    if unit_u8(iw(24)) {
                         v24_u8 += 1;
                     }
                 }
@@ -1184,36 +1207,34 @@ fn run(path: &Path) -> Result<(), String> {
     }
     {
         let (mut with, mut matching, mut total) = (0usize, 0usize, 0usize);
-        let mut sample = None;
-        for sm in &world.static_models {
+        let mut picked = None;
+        for sm in &world.prop_set {
             total += 1;
             if sm.lmap_colors.is_empty() {
                 continue;
             }
             with += 1;
-            let verts: usize = sm.model.map_or(0, |k| {
+            let vertex_points: usize = sm.model.map_or(0, |k| {
                 capture.xmodels[k.index]
                     .lod0
                     .iter()
-                    .map(|s| usize::from(s.vert_count))
+                    .map(|s| usize::from(s.vertex_tally))
                     .sum()
             });
-            if verts == sm.lmap_colors.len() {
+            if vertex_points == sm.lmap_colors.len() {
                 matching += 1;
             }
-            if sample.is_none() {
-                sample = Some((
+            if picked.is_none() {
+                picked = Some((
                     sm.lmap_colors.iter().take(6).copied().collect::<Vec<_>>(),
                     sm.lighting_sh,
                 ));
             }
         }
         println!(
-            "static model vertex light: {with} of {total} instances have LOD0 colours, {matching} with one per LOD0 vertex; sample {sample:x?}"
+            "static model vertex light: {with} of {total} instances have LOD0 colours, {matching} with one per LOD0 vertex; sample {picked:x?}"
         );
-        let nonzero_sh = world
-            .static_models
-            .iter()
+        let nonzero_sh = placements(world)
             .filter(|m| m.lighting_sh.iter().any(|&v| v != 0))
             .count();
         println!("static models with nonzero lightingSH: {nonzero_sh}");
@@ -1222,7 +1243,7 @@ fn run(path: &Path) -> Result<(), String> {
         if let Ok(spec) = std::env::var("T6MAT_SMCOVER") {
             let v: Vec<f32> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
             if let [x, y] = v[..] {
-                for sm in &world.static_models {
+                for sm in &world.prop_set {
                     let Some(k) = sm.model else { continue };
                     let xm = &capture.xmodels[k.index];
                     let r = xm.radius * sm.scale;
@@ -1230,7 +1251,7 @@ fn run(path: &Path) -> Result<(), String> {
                     if d <= r {
                         println!(
                             "smcover {} at {:?} scale {} radius {r:.0} dist {d:.0} mins {:?} maxs {:?} cull {}",
-                            xm.name, sm.origin, sm.scale, xm.mins, xm.maxs, sm.cull_dist
+                            xm.name, sm.origin, sm.scale, xm.lo_corner, xm.hi_corner, sm.hide_dist
                         );
                     }
                 }
@@ -1238,13 +1259,13 @@ fn run(path: &Path) -> Result<(), String> {
         }
         // T6MAT_SMODEL=<name part>: those placements' baked vertex light.
         if let Ok(want) = std::env::var("T6MAT_SMODEL") {
-            for sm in &world.static_models {
+            for sm in &world.prop_set {
                 let Some(k) = sm.model else { continue };
                 let xm = &capture.xmodels[k.index];
                 if !xm.name.contains(&want) {
                     continue;
                 }
-                let verts: usize = xm.lod0.iter().map(|s| usize::from(s.vert_count)).sum();
+                let vertex_points: usize = xm.lod0.iter().map(|s| usize::from(s.vertex_tally)).sum();
                 let ch = |c: &u32, i: usize| c.to_le_bytes()[i] as f32;
                 let n = sm.lmap_colors.len().max(1) as f32;
                 let mean: Vec<f32> = (0..4)
@@ -1256,33 +1277,33 @@ fn run(path: &Path) -> Result<(), String> {
                     .filter(|c| (0..3).map(|i| ch(c, i)).sum::<f32>() < 30.0)
                     .count();
                 println!(
-                    "smodel {} at {:?} scale {} verts {verts} colours {} mean {:?} dark {dark} sh {:?} colorsIndex {} probe {} light {}",
+                    "smodel {} at {:?} scale {} verts {vertex_points} colours {} mean {:?} dark {dark} sh {:?} colorsIndex {} probe {} light {}",
                     xm.name,
                     sm.origin,
                     sm.scale,
                     sm.lmap_colors.len(),
                     mean,
                     sm.lighting_sh,
-                    sm.colors_index,
-                    sm.reflection_probe_index,
-                    sm.primary_light_index
+                    sm.vertex_color_slot,
+                    sm.env_probe_index,
+                    sm.key_light_index
                 );
                 for srf in &xm.lod0 {
                     let mat = srf.material.map(|m| &capture.materials[m.index]);
                     println!(
                         "   surf verts {} material {} techset {}",
-                        srf.vert_count,
+                        srf.vertex_tally,
                         mat.map_or("-", |m| m.name.as_str()),
-                        mat.and_then(|m| m.technique_set)
+                        mat.and_then(|m| m.method_set)
                             .map_or("-".to_owned(), |t| capture.technique_sets[t.index]
                                 .name
                                 .clone())
                     );
                 }
                 // The first colours, per surface, as RGBA bytes.
-                let mut at = 0usize;
+                let mut at: usize = 0;
                 for srf in &xm.lod0 {
-                    let n = usize::from(srf.vert_count);
+                    let n = usize::from(srf.vertex_tally);
                     let part: Vec<[u8; 4]> = sm
                         .lmap_colors
                         .iter()
@@ -1296,12 +1317,12 @@ fn run(path: &Path) -> Result<(), String> {
             }
         }
         let mut fams: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-        for sm in &world.static_models {
+        for sm in &world.prop_set {
             let Some(k) = sm.model else { continue };
             for srf in &capture.xmodels[k.index].lod0 {
                 let name = srf
                     .material
-                    .and_then(|m| capture.materials[m.index].technique_set)
+                    .and_then(|m| capture.materials[m.index].method_set)
                     .map_or("(none)".to_owned(), |t| {
                         capture.technique_sets[t.index].name.clone()
                     });
@@ -1327,7 +1348,7 @@ fn run(path: &Path) -> Result<(), String> {
         for srf in &sky.lod0 {
             let Some(mk) = srf.material else { continue };
             let m = &capture.materials[mk.index];
-            let ts = m.technique_set.map_or("(none)".to_owned(), |k| {
+            let ts = m.method_set.map_or("(none)".to_owned(), |k| {
                 capture.technique_sets[k.index].name.clone()
             });
             let tex: Vec<String> = m
@@ -1337,14 +1358,14 @@ fn run(path: &Path) -> Result<(), String> {
                     let img = t.image.map(|k| &capture.images[k.index]);
                     format!(
                         "{:#x}/sem{}={}",
-                        t.name_hash,
+                        t.label_digest,
                         t.semantic,
                         img.map_or("-".to_owned(), |i| format!(
                             "{} {}x{} map{} {}",
                             i.name,
                             i.width,
                             i.height,
-                            i.map_type,
+                            i.map_kind,
                             image_format(&packs, i)
                         ))
                     )
@@ -1352,14 +1373,14 @@ fn run(path: &Path) -> Result<(), String> {
                 .collect();
             println!(
                 "sky surface: {} verts {} tris, material {} [{ts}] sort {}: {}",
-                srf.vert_count,
+                srf.vertex_tally,
                 srf.indices.len() / 3,
                 m.name,
-                m.sort_key,
+                m.sort_rank,
                 tex.join(", ")
             );
             let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-            for v in srf.verts.chunks_exact(32) {
+            for v in srf.vertex_points.chunks_exact(32) {
                 for i in 0..3 {
                     let f =
                         f32::from_le_bytes([v[i * 4], v[i * 4 + 1], v[i * 4 + 2], v[i * 4 + 3]]);
@@ -1378,12 +1399,12 @@ fn run(path: &Path) -> Result<(), String> {
             println!(
                 "surface {si}: {} surfaceFlags {:#x} contents {:#x} gfx flags {:#x} sort {} tris {} lightmap {} constants {:?}",
                 m.name,
-                m.surface_flags,
+                m.surf_bits,
                 m.contents,
                 srf.flags,
-                m.sort_key,
-                srf.tri_count,
-                srf.lightmap_index,
+                m.sort_rank,
+                srf.tri_tally,
+                srf.lightbake_index,
                 m.constants
             );
         }
@@ -1391,7 +1412,7 @@ fn run(path: &Path) -> Result<(), String> {
     {
         let mut flags: BTreeMap<u8, (usize, String)> = BTreeMap::new();
         for srf in &world.surfaces {
-            let e = flags.entry(srf.flags).or_insert((0, String::new()));
+            let e = flags.entry(srf.flags).or_insert((0, String::default()));
             e.0 += 1;
             if e.1.is_empty() {
                 e.1 = srf
@@ -1413,7 +1434,7 @@ fn run(path: &Path) -> Result<(), String> {
     );
     if let Some(k) = world.lut_material {
         let m = &capture.materials[k.index];
-        let ts = m.technique_set.map_or("(none)".to_owned(), |t| {
+        let ts = m.method_set.map_or("(none)".to_owned(), |t| {
             capture.technique_sets[t.index].name.clone()
         });
         for t in &m.textures {
@@ -1421,7 +1442,7 @@ fn run(path: &Path) -> Result<(), String> {
             println!(
                 "lut material {} [{ts}]: slot {:#x} sem {} -> {}",
                 m.name,
-                t.name_hash,
+                t.label_digest,
                 t.semantic,
                 img.map_or("-".to_owned(), |i| format!(
                     "{} {}x{}x{} map{} {}",
@@ -1429,7 +1450,7 @@ fn run(path: &Path) -> Result<(), String> {
                     i.width,
                     i.height,
                     i.depth,
-                    i.map_type,
+                    i.map_kind,
                     image_format(&packs, i)
                 ))
             );
@@ -1439,7 +1460,7 @@ fn run(path: &Path) -> Result<(), String> {
             && let Some(img) = m
                 .textures
                 .first()
-                .and_then(|t| t.image)
+                .and_then(|first| first.image)
                 .map(|k| &capture.images[k.index])
             && let Some(ImageSource::Pack(i, entry)) = packs.locate(img)
             && let Ok(bytes) = packs.packs[i].read(entry)
@@ -1449,14 +1470,14 @@ fn run(path: &Path) -> Result<(), String> {
             println!(
                 "lut iwi {:?} {}x{} levels {} bytes {}",
                 iwi.format,
-                iwi.width,
+                iwi.texel_width,
                 iwi.height,
                 iwi.levels,
                 px.len()
             );
             if let Ok(file) = std::fs::File::create(&out) {
                 let mut enc =
-                    png::Encoder::new(std::io::BufWriter::new(file), iwi.width, iwi.height);
+                    png::Encoder::new(std::io::BufWriter::new(file), iwi.texel_width, iwi.height);
                 enc.set_color(png::ColorType::Rgba);
                 enc.set_depth(png::BitDepth::Eight);
                 if let Ok(mut wr) = enc.write_header() {
@@ -1468,7 +1489,7 @@ fn run(path: &Path) -> Result<(), String> {
                 println!("lut row0 x{x}: {:?}", &px[o..o + 4]);
             }
             for y in [0usize, 63] {
-                let o = (y * iwi.width as usize) * 4;
+                let o = (y * iwi.texel_width as usize) * 4;
                 println!("lut y{y} x0: {:?}", &px[o..o + 4]);
             }
         }
@@ -1485,20 +1506,20 @@ fn run(path: &Path) -> Result<(), String> {
                 let mat = &capture.materials[mk.index];
                 // The surface's vertex colours (rgba bytes): lowest, highest.
                 let (mut lo, mut hi) = ([255u8; 4], [0u8; 4]);
-                for v in s.verts.chunks_exact(32) {
+                for v in s.vertex_points.chunks_exact(32) {
                     for q in 0..4 {
                         lo[q] = lo[q].min(v[16 + q]);
                         hi[q] = hi[q].max(v[16 + q]);
                     }
                 }
-                println!("  {} verts, colour {lo:?}..{hi:?}", s.verts.len() / 32);
-                let ts = mat.technique_set.map_or("-".to_owned(), |t| {
+                println!("  {} verts, colour {lo:?}..{hi:?}", s.vertex_points.len() / 32);
+                let ts = mat.method_set.map_or("-".to_owned(), |t| {
                     capture.technique_sets[t.index].name.clone()
                 });
                 let c = |hash: u32| {
                     mat.constants
                         .iter()
-                        .find(|(h, _, _)| *h == hash)
+                        .find(|(ih, _, _)| *ih == hash)
                         .map(|(_, _, v)| format!("{v:?}"))
                 };
                 println!(
@@ -1513,7 +1534,7 @@ fn run(path: &Path) -> Result<(), String> {
         }
     }
     if std::env::var("T6MAT_TREES").is_ok() {
-        for sm in world.static_models.iter() {
+        for sm in world.prop_set.iter() {
             let Some(k) = sm.model else { continue };
             let m = &capture.xmodels[k.index];
             let want = std::env::var("T6MAT_TREES").unwrap_or_default();
@@ -1531,7 +1552,7 @@ fn run(path: &Path) -> Result<(), String> {
                     .filter_map(|s| s.material)
                     .map(|mk| {
                         let mat = &capture.materials[mk.index];
-                        let ts = mat.technique_set.map_or("-".to_owned(), |t| {
+                        let ts = mat.method_set.map_or("-".to_owned(), |t| {
                             capture.technique_sets[t.index].name.clone()
                         });
                         format!("{} [{ts}]", mat.name)
@@ -1543,8 +1564,8 @@ fn run(path: &Path) -> Result<(), String> {
     }
     // T6MAT_PROBES: the reflection probes: origin, cube image, format.
     if std::env::var("T6MAT_PROBES").is_ok() {
-        println!("reflection probes {}", world.reflection_probes.len());
-        for (i, p) in world.reflection_probes.iter().enumerate() {
+        println!("reflection probes {}", world.probe_list.len());
+        for (i, p) in world.probe_list.iter().enumerate() {
             let img = p.image.map(|k| &capture.images[k.index]);
             println!(
                 "probe {i}: origin {:?} sh {:?} lod bias {} image {}",
@@ -1556,14 +1577,14 @@ fn run(path: &Path) -> Result<(), String> {
                     i.name,
                     i.width,
                     i.height,
-                    i.map_type,
-                    i.level_count,
+                    i.map_kind,
+                    i.tier_total,
                     image_format(&packs, i)
                 ))
             );
         }
         if let Some(e) = world
-            .reflection_probes
+            .probe_list
             .get(1)
             .and_then(|p| p.image)
             .and_then(|k| capture.images[k.index].embedded.as_ref())
@@ -1571,19 +1592,19 @@ fn run(path: &Path) -> Result<(), String> {
             println!(
                 "probe 1 embedded: dxgi {} levels {} flags {:#x} bytes {}",
                 e.dxgi_format,
-                e.level_count,
+                e.tier_total,
                 e.flags,
                 e.data.len()
             );
         }
-        let mut per: BTreeMap<i8, usize> = BTreeMap::new();
+        let mut per: BTreeMap<i8, usize> = BTreeMap::default();
         for srf in &world.surfaces {
-            *per.entry(srf.reflection_probe_index).or_default() += 1;
+            *per.entry(srf.env_probe_index).or_default() += 1;
         }
         println!("surfaces per probe {per:?}");
     }
     if std::env::var("T6MAT_TECHSETS").is_ok() {
-        let mut fam: BTreeMap<String, usize> = BTreeMap::new();
+        let mut fam: BTreeMap<String, usize> = BTreeMap::default();
         for t in &capture.technique_sets {
             let stem = t
                 .name
@@ -1628,11 +1649,11 @@ fn run(path: &Path) -> Result<(), String> {
         for (i, srf) in world.surfaces.iter().enumerate() {
             let vf = srf
                 .material
-                .and_then(|k| capture.materials[k.index].technique_set)
-                .map_or(255, |k| capture.technique_sets[k.index].world_vert_format);
+                .and_then(|k| capture.materials[k.index].method_set)
+                .map_or(255, |k| capture.technique_sets[k.index].level_vertex_format);
             let need = {
                 let first = srf.base_index as usize;
-                let n = usize::from(srf.tri_count) * 3;
+                let n = usize::from(srf.tri_tally) * 3;
                 world.indices[first..first + n]
                     .iter()
                     .map(|&x| u32::from(x) + 1)
@@ -1646,13 +1667,13 @@ fn run(path: &Path) -> Result<(), String> {
             }
         }
         let keys: Vec<i32> = groups.keys().copied().collect();
-        let mut per: BTreeMap<u8, BTreeMap<String, usize>> = BTreeMap::new();
+        let mut per: BTreeMap<u8, BTreeMap<String, usize>> = BTreeMap::default();
         for (j, k) in keys.iter().enumerate() {
-            let (verts, vf, _) = groups[k];
+            let (vertex_points, vf, _) = groups[k];
             let next = keys.get(j + 1).copied().unwrap_or(world.vd1.len() as i32);
             let gap = next - k;
-            let bpv = if verts > 0 {
-                format!("{:.2}", f64::from(gap) / f64::from(verts))
+            let bpv = if vertex_points > 0 {
+                format!("{:.2}", f64::from(gap) / f64::from(vertex_points))
             } else {
                 "-".into()
             };
@@ -1665,18 +1686,18 @@ fn run(path: &Path) -> Result<(), String> {
         );
         // Per technique set: measured bytes per vertex against the rule
         // "each extra layer: half2 UV, plus 4 bytes when it has a normal map".
-        let mut by_set: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+        let mut by_set: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::default();
         for (j, k) in keys.iter().enumerate() {
-            let (verts, _, si) = groups[k];
-            if verts == 0 {
+            let (vertex_points, _, si) = groups[k];
+            if vertex_points == 0 {
                 continue;
             }
             let next = keys.get(j + 1).copied().unwrap_or(world.vd1.len() as i32);
-            let bpv = f64::from(next - k) / f64::from(verts);
+            let bpv = f64::from(next - k) / f64::from(vertex_points);
             let srf = &world.surfaces[si];
             let set = srf
                 .material
-                .and_then(|m| capture.materials[m.index].technique_set)
+                .and_then(|m| capture.materials[m.index].method_set)
                 .map_or("-".to_owned(), |t| {
                     capture.technique_sets[t.index].name.clone()
                 });
@@ -1700,7 +1721,7 @@ fn run(path: &Path) -> Result<(), String> {
             println!("   vd1 {set}: predicted {predicted}, measured {m:?}");
         }
         for vf in [1u8, 2, 3, 4, 5, 7] {
-            let Some((k, (verts, _, si))) = groups.iter().find(|(_, g)| g.1 == vf && g.0 > 3)
+            let Some((k, (vertex_points, _, si))) = groups.iter().find(|(_, g)| g.1 == vf && g.0 > 3)
             else {
                 continue;
             };
@@ -1708,7 +1729,7 @@ fn run(path: &Path) -> Result<(), String> {
             let name = srf
                 .material
                 .map_or("-".to_owned(), |m| capture.materials[m.index].name.clone());
-            println!("vf {vf}: group vd1 {k:#x}, {verts} verts, surface {si} {name}");
+            println!("vf {vf}: group vd1 {k:#x}, {vertex_points} verts, surface {si} {name}");
             for v in 0..3usize {
                 for stride in [8usize, 16, 24] {
                     let at = *k as usize + v * stride;
@@ -1718,12 +1739,12 @@ fn run(path: &Path) -> Result<(), String> {
                     let words: Vec<String> = r
                         .chunks_exact(4)
                         .map(|c| {
-                            let w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                            let iw = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                             format!(
                                 "[{:.3} {:.3} | {:08x}]",
-                                half_f32(w as u16),
-                                half_f32((w >> 16) as u16),
-                                w
+                                half_f32(iw as u16),
+                                half_f32((iw >> 16) as u16),
+                                iw
                             )
                         })
                         .collect();
@@ -1735,45 +1756,43 @@ fn run(path: &Path) -> Result<(), String> {
     // T6MAT_SKYGRID: the light grid's sky volumes, and how many static
     // models fall outside the grid / inside a sky volume.
     if std::env::var("T6MAT_SKYGRID").is_ok()
-        && let Some(g) = world.light_grid.as_ref()
+        && let Some(g) = world.probe_grid.as_ref()
     {
         println!("sky grid volumes: {}", g.sky_volumes.len());
         for v in g.sky_volumes.iter().take(20) {
             println!("   {:?}", v);
         }
         let inside = |p: [f32; 3], v: &asset_t6::SkyGridVolumeRef| {
-            (0..3).all(|a| p[a] >= v.mins[a] && p[a] <= v.maxs[a])
+            (0..3).all(|a| p[a] >= v.lo_corner[a] && p[a] <= v.hi_corner[a])
         };
-        let in_sky = world
-            .static_models
-            .iter()
+        let in_sky = placements(world)
             .filter(|s| g.sky_volumes.iter().any(|v| inside(s.origin, v)))
             .count();
         println!(
             "static models inside a sky volume: {in_sky} of {}",
-            world.static_models.len()
+            world.prop_set.len()
         );
     }
     // T6MAT_GRIDAT=x,y,z[;x,y,z]: what the light grid gives a model at each
     // point (the light a viewmodel or prop there is lit by).
     if let Ok(spec) = std::env::var("T6MAT_GRIDAT")
-        && let Some(g) = world.light_grid.as_ref()
+        && let Some(g) = world.probe_grid.as_ref()
         && let Some(grid) = lighting_t6::t6_light_grid(g)
     {
-        let sun = g.sun_primary_light_index;
-        println!("grid mins {:?} maxs {:?} sun primary {sun}", g.mins, g.maxs);
+        let sun = g.sunlight_lamp_slot;
+        println!("grid mins {:?} maxs {:?} sun primary {sun}", g.lo_corner, g.hi_corner);
         // The same lookup with the map's collision for the sight checks (as
         // the first-person gun is lit in game).
         let traced = lighting_t6::T6LightSampler {
             grid: Some(grid.clone()),
-            mins: g.mins,
-            maxs: g.maxs,
+            low: g.lo_corner,
+            high: g.hi_corner,
             sky: Vec::new(),
             scale: 1.0,
-            sun_primary: sun as u8,
+            sunlight_primary_flag_index: sun as u8,
             sight: capture.clip.as_ref().and_then(|c| asset_world::build_t6_clip_collision(c).ok()).map(|c| {
                 std::sync::Arc::new(move |a: [f32; 3], b: [f32; 3]| {
-                    c.box_sight_clear(a, b, lighting_t6::LIGHT_GRID_SIGHT_CONTENT_MASK)
+                    c.box_sight_clear(a, b, lighting_t6::GRID_LINE_OF_SIGHT_CONTENT_BITS)
                 }) as lighting_t6::SightCheck
             }),
             cache: Default::default(),
@@ -1791,15 +1810,15 @@ fn run(path: &Path) -> Result<(), String> {
                 lighting_t6::t6_grid_visibility(&grid, pos, sun as u8)
             );
             println!("  traced: {:?}", traced.at(pos));
-            if let Ok(s) = asset_model::sample_light_grid(&grid.view(), pos) {
+            if let Ok(s) = asset_model::probe_light_cells(&grid.view(), pos) {
                 println!(
                     "  corners: live {} path {:?} weights {:?} primaries {:?} vis {:?} picked {}",
-                    s.live_corners,
+                    s.active_corner_total,
                     s.path,
-                    s.weights,
-                    s.corner_primaries,
+                    s.mix,
+                    s.corner_dominant_lights,
                     s.corner_flags,
-                    s.picked_primary
+                    s.chosen_key_light
                 );
             }
         }
@@ -1809,16 +1828,20 @@ fn run(path: &Path) -> Result<(), String> {
         println!("init world fog: {:?}", world.init_fog);
         for (mins, maxs, control, ex, fog) in &world.fog_volumes {
             println!("fog volume {mins:?}..{maxs:?} control {control:#x} ex {ex:#x}: {fog:?}");
+            let start = (control >> 16) as usize;
+            let count = ((control >> 8) & 0xff) as usize + 1;
+            for p in world.fog_volume_planes.get(start..start + count).unwrap_or_default() {
+                println!("   plane {p:?}");
+            }
         }
     }
     // T6MAT_CULL: the static models' cull distances.
     if std::env::var("T6MAT_CULL").is_ok() {
-        let mut d: Vec<f32> = world.static_models.iter().map(|s| s.cull_dist).collect();
+        let mut d: Vec<f32> = world.prop_set.iter().map(|s| s.hide_dist).collect();
         d.sort_by(f32::total_cmp);
         let pick = |q: f32| {
             d.get(((d.len() as f32 - 1.0) * q) as usize)
-                .copied()
-                .unwrap_or(0.0)
+                .map_or(0.0, |&v| v)
         };
         println!(
             "cull dist over {} placements: zero {}, min {:.0} p10 {:.0} p50 {:.0} p90 {:.0} max {:.0}",
@@ -1839,7 +1862,7 @@ fn run(path: &Path) -> Result<(), String> {
             .iter()
             .filter_map(|s| s.material.map(|k| k.index))
             .collect();
-        for sm in &world.static_models {
+        for sm in &world.prop_set {
             if let Some(k) = sm.model {
                 for srf in &capture.xmodels[k.index].lod0 {
                     if let Some(m) = srf.material {
@@ -1848,9 +1871,9 @@ fn run(path: &Path) -> Result<(), String> {
                 }
             }
         }
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = std::collections::BTreeSet::default();
         let (mut same, mut smaller, mut other) = (0, 0, 0);
-        let mut by_size: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+        let mut by_size: BTreeMap<(u32, u32), usize> = BTreeMap::default();
         for mi in wanted {
             let m = &capture.materials[mi];
             for t in &m.textures {
@@ -1863,26 +1886,26 @@ fn run(path: &Path) -> Result<(), String> {
                     Some(ImageSource::Pack(i, e)) => packs.packs[i].read(e).ok().and_then(|b| {
                         ipak_t6::parse_iwi(&b)
                             .ok()
-                            .map(|w| (w.width, w.height, w.levels, packs.packs[i].name.clone()))
+                            .map(|iw| (iw.texel_width, iw.height, iw.levels, packs.packs[i].name.clone()))
                     }),
                     _ => None,
                 };
                 match &iwi {
-                    Some((w, h, _, _))
-                        if *w == u32::from(img.width) && *h == u32::from(img.height) =>
+                    Some((iw, ih, _, _))
+                        if *iw == u32::from(img.width) && *ih == u32::from(img.height) =>
                     {
                         same += 1
                     }
-                    Some((w, _, _, _)) if *w < u32::from(img.width) => smaller += 1,
+                    Some((iw, _, _, _)) if *iw < u32::from(img.width) => smaller += 1,
                     _ => other += 1,
                 }
-                if let Some((w, h, _, _)) = iwi {
-                    *by_size.entry((w, h)).or_default() += 1;
+                if let Some((iw, ih, _, _)) = iwi {
+                    *by_size.entry((iw, ih)).or_default() += 1;
                 }
                 if seen.len() <= 25 {
                     println!(
                         "image {} zone {}x{} levels {} parts {} -> pack {:?}",
-                        img.name, img.width, img.height, img.level_count, img.streamed_parts, iwi
+                        img.name, img.width, img.height, img.tier_total, img.streamed_parts, iwi
                     );
                 }
             }
@@ -1926,7 +1949,7 @@ fn state_words(st: &asset_t6::DrawState) -> String {
         w.push("no rgb write".to_owned());
     }
     w.push(
-        if st.depth_write {
+        if st.writes_depth {
             "zwrite"
         } else {
             "no zwrite"
@@ -1951,32 +1974,32 @@ fn states_report(capture: &ZoneCapture, world: &asset_t6::WorldRef) {
     let d = &world.dpvs;
     println!(
         "dpvs: {} static surfaces of {}; lit {:?}, lit trans {:?}, emissive opaque {:?}, emissive trans {:?}; sorted index {} entries; {} cells",
-        d.static_surface_count,
+        d.static_facet_tally,
         world.surfaces.len(),
         d.lit,
-        d.lit_trans,
+        d.lit_see_through,
         d.emissive_opaque,
         d.emissive_trans,
-        world.sorted_surf_index.len(),
+        world.sorted_facet_index.len(),
         world.cells.len()
     );
     // Where each surface sits in draw order, and whether a cell draws it.
     let mut position = vec![usize::MAX; world.surfaces.len()];
-    for (i, &s) in world.sorted_surf_index.iter().enumerate() {
+    for (i, &s) in world.sorted_facet_index.iter().enumerate() {
         if let Some(p) = position.get_mut(usize::from(s)) {
             *p = i;
         }
     }
-    let mut in_cell = vec![false; world.sorted_surf_index.len()];
-    let mut smodel_in_cell = vec![false; world.static_models.len()];
+    let mut in_cell = vec![false; world.sorted_facet_index.len()];
+    let mut smodel_in_cell = vec![false; world.prop_set.len()];
     for trees in &world.cells {
         for t in trees {
-            for i in 0..usize::from(t.surface_count) {
+            for i in 0..usize::from(t.facet_tally) {
                 if let Some(c) = in_cell.get_mut(usize::from(t.start_surf_index) + i) {
                     *c = true;
                 }
             }
-            for &m in &t.smodel_indexes {
+            for &m in &t.prop_indexes {
                 if let Some(c) = smodel_in_cell.get_mut(usize::from(m)) {
                     *c = true;
                 }
@@ -1995,7 +2018,7 @@ fn states_report(capture: &ZoneCapture, world: &asset_t6::WorldRef) {
         let inr = |r: (u32, u32)| p >= r.0 && p < r.1;
         if inr(d.lit) {
             "lit"
-        } else if inr(d.lit_trans) {
+        } else if inr(d.lit_see_through) {
             "lit trans"
         } else if inr(d.emissive_opaque) {
             "emissive opaque"
@@ -2006,7 +2029,7 @@ fn states_report(capture: &ZoneCapture, world: &asset_t6::WorldRef) {
         }
     };
     // Per material: its surfaces' lists and cell coverage.
-    let mut per_mat: BTreeMap<usize, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut per_mat: BTreeMap<usize, BTreeMap<String, usize>> = BTreeMap::default();
     for (si, srf) in world.surfaces.iter().enumerate() {
         let Some(k) = srf.material else { continue };
         let p = position[si];
@@ -2019,12 +2042,12 @@ fn states_report(capture: &ZoneCapture, world: &asset_t6::WorldRef) {
                 if in_cell[p] { "" } else { " (no cell)" }
             )
         };
-        *per_mat.entry(k.index).or_default().entry(key).or_default() += usize::from(srf.tri_count);
+        *per_mat.entry(k.index).or_default().entry(key).or_default() += usize::from(srf.tri_tally);
     }
     println!("world materials: lists (triangles) | technique slots with a state | main state");
     for (mi, lists) in &per_mat {
         let m = &capture.materials[*mi];
-        let ts = m.technique_set.map(|k| &capture.technique_sets[k.index]);
+        let ts = m.method_set.map(|k| &capture.technique_sets[k.index]);
         let slots: Vec<String> = ts
             .map(|t| {
                 t.techniques
@@ -2042,7 +2065,7 @@ fn states_report(capture: &ZoneCapture, world: &asset_t6::WorldRef) {
             "  {} [{}] sort {} lists {:?} | {} | {}",
             m.name,
             ts.map_or("-", |t| t.name.as_str()),
-            m.sort_key,
+            m.sort_rank,
             lists,
             slots.join(" "),
             main.map_or("none".to_owned(), |(t, s)| format!(
@@ -2053,12 +2076,12 @@ fn states_report(capture: &ZoneCapture, world: &asset_t6::WorldRef) {
     }
     // Static model materials: grouped by technique set and main state.
     let mut groups: BTreeMap<(String, String), (usize, Vec<String>)> = BTreeMap::new();
-    for sm in &world.static_models {
+    for sm in &world.prop_set {
         let Some(k) = sm.model else { continue };
         for srf in &capture.xmodels[k.index].lod0 {
             let Some(mk) = srf.material else { continue };
             let m = &capture.materials[mk.index];
-            let ts = m.technique_set.map_or("-".to_owned(), |t| {
+            let ts = m.method_set.map_or("-".to_owned(), |t| {
                 capture.technique_sets[t.index].name.clone()
             });
             let main = [6usize, 5, 4, 3, 2]
@@ -2078,7 +2101,7 @@ fn states_report(capture: &ZoneCapture, world: &asset_t6::WorldRef) {
         "static model surfaces by technique set and main state (placed surfaces, sample materials):"
     );
     for ((ts, main), (n, names)) in &groups {
-        println!("  {n:>5} [{ts}] {main} | {}", names.join(", "));
+        println!("  {n:>5} [{ts}] {main} | {list}", list = names.join(", "));
     }
     // Mirrored placements: an axis basis with a negative determinant.
     let det = |a: &[[f32; 3]; 3]| {
@@ -2086,32 +2109,26 @@ fn states_report(capture: &ZoneCapture, world: &asset_t6::WorldRef) {
             - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
             + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])
     };
-    let mirrored: Vec<&asset_t6::StaticModel> = world
-        .static_models
-        .iter()
+    let mirrored: Vec<&asset_t6::StaticModel> = placements(world)
         .filter(|s| det(&s.axis) < 0.0)
         .collect();
-    let mut dets: Vec<f32> = world.static_models.iter().map(|s| det(&s.axis)).collect();
+    let mut dets: Vec<f32> = world.prop_set.iter().map(|s| det(&s.axis)).collect();
     dets.sort_by(f32::total_cmp);
     println!(
         "static models: {} mirrored (axis det < 0) of {}; det min {:.3} median {:.3} max {:.3}; scale min {:.3} max {:.3}",
         mirrored.len(),
-        world.static_models.len(),
+        world.prop_set.len(),
         dets.first().copied().unwrap_or(0.0),
         dets.get(dets.len() / 2).copied().unwrap_or(0.0),
         dets.last().copied().unwrap_or(0.0),
-        world
-            .static_models
-            .iter()
+        placements(world)
             .map(|s| s.scale)
-            .fold(f32::MAX, f32::min),
-        world
-            .static_models
-            .iter()
+            .fold(FAR, f32::min),
+        placements(world)
             .map(|s| s.scale)
             .fold(f32::MIN, f32::max),
     );
-    let mut mirrored_names: BTreeMap<String, usize> = BTreeMap::new();
+    let mut mirrored_names: BTreeMap<String, usize> = BTreeMap::default();
     for s in &mirrored {
         if let Some(k) = s.model {
             *mirrored_names
@@ -2123,21 +2140,21 @@ fn states_report(capture: &ZoneCapture, world: &asset_t6::WorldRef) {
         println!("  mirrored {c:>3} {n}");
     }
     // Primary lights.
-    let mut by_type: BTreeMap<u8, usize> = BTreeMap::new();
-    for p in &capture.primary_lights {
+    let mut by_type: BTreeMap<u8, usize> = BTreeMap::default();
+    for p in &capture.key_lights {
         *by_type.entry(p.ty).or_default() += 1;
     }
     println!(
         "primary lights: {} in ComWorld (GfxWorld says {}), by type {:?}",
-        capture.primary_lights.len(),
+        capture.key_lights.len(),
         world.primary_light_count,
         by_type
     );
-    for (i, p) in capture.primary_lights.iter().enumerate() {
+    for (i, p) in capture.key_lights.iter().enumerate() {
         println!(
             "  {i:>3} type {} shadow {} origin [{:.0}, {:.0}, {:.0}] radius {:.0} colour [{:.2}, {:.2}, {:.2}] diffuse {:?} dir [{:.2}, {:.2}, {:.2}] fov cos {:.3}/{:.3} datt {:.3} falloff {:?} aAbB {:?} angle {:?}",
             p.ty,
-            p.can_use_shadow_map,
+            p.supports_depth_shade,
             p.origin[0],
             p.origin[1],
             p.origin[2],
@@ -2146,14 +2163,14 @@ fn states_report(capture: &ZoneCapture, world: &asset_t6::WorldRef) {
             p.color[1],
             p.color[2],
             p.diffuse_color,
-            p.dir[0],
-            p.dir[1],
-            p.dir[2],
+            p.heading[0],
+            p.heading[1],
+            p.heading[2],
             p.cos_half_fov_outer,
             p.cos_half_fov_inner,
             p.d_attenuation,
             p.falloff,
-            p.a_ab_b,
+            p.pair_ab_vs_b,
             p.angle
         );
     }

@@ -10,7 +10,7 @@
 //! - [`LocalPose`]: the part poses between the calc and the skeleton, with
 //!   the control bits `DObjSetControlTagAngles` sets;
 //! - [`compute_radius`] / [`bounds`]: `DObjComputeBounds` and `DObjGetBounds`;
-//! - [`ModelPoseSrc`], [`Bone`], [`Attach`] and [`HidePartBits`]: the models a
+//! - [`PoseDonorModel`], [`Bone`], [`MountedModel`] and [`HidePartBits`]: the models a
 //!   DObj is built from, its bones and its hidden parts, and the surface
 //!   tests that read them ([`surface_hidden_whole`]).
 
@@ -18,12 +18,12 @@ mod bounds;
 mod calc;
 mod dobj;
 mod hide;
-mod part_bits;
+mod part_set;
 mod pose;
 
 pub use bounds::*;
 pub use calc::*;
 pub use dobj::*;
 pub use hide::*;
-pub use part_bits::*;
+pub use part_set::*;
 pub use pose::*;

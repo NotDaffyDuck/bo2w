@@ -2,7 +2,7 @@
 //! the portal walk decides what is drawn (doorways, windows).
 //!
 //! One line per portal:
-//! `portal N cell FROM -> TO centre X Y Z verts V size W x H yaw Y`
+//! `portal N cell FROM -> TO centre X Y Z vertex_points V size W x H yaw Y`
 //! where the centre is the mean of its vertices, the size is its extent along its two hull
 //! axes and the yaw (degrees) is the direction its plane faces. Run from the workspace:
 //! `cargo run -p dpvs_t6 --example t6portals -- "...\zone\all\mp_nuketown_2020.ff"`.
@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use asset_t6::capture_zone;
 
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+fn inner(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
@@ -46,11 +46,11 @@ fn main() -> ExitCode {
                 let c: [f32; 3] =
                     core::array::from_fn(|i| p.vertices.iter().map(|q| q[i]).sum::<f32>() / v);
                 let extent = |axis: [f32; 3]| {
-                    let d = p.vertices.iter().map(|q| dot(*q, axis));
+                    let d = p.vertices.iter().map(|q| inner(*q, axis));
                     let (lo, hi) = d.fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
                     if hi >= lo { hi - lo } else { 0.0 }
                 };
-                let (w, h) = (extent(p.hull_axis[0]), extent(p.hull_axis[1]));
+                let (w, h) = (extent(p.hull_axes_dir[0]), extent(p.hull_axes_dir[1]));
                 let yaw = p.plane[1].atan2(p.plane[0]).to_degrees();
                 println!(
                     "portal {n} cell {from} -> {} centre {:.1} {:.1} {:.1} verts {} size {w:.0} x {h:.0} yaw {yaw:.0}",

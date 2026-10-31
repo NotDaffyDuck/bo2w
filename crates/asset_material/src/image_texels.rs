@@ -54,16 +54,18 @@ fn leading<'a>(data: &'a [u8], len: usize, what: &str) -> Result<&'a [u8], Strin
     data.get(..len).ok_or_else(|| format!("truncated {what}"))
 }
 
-/// Bytes a block-compressed level of this size occupies.
-fn block_bytes(width: u32, height: u32, layout: Layout) -> usize {
-    let block = if layout == Layout::Bc1 { 8 } else { 16 };
-    width.div_ceil(4) as usize * height.div_ceil(4) as usize * block
+impl Layout {
+    /// Bytes a block-compressed level of this size occupies in this layout.
+    fn level_bytes(self, width: u32, height: u32) -> usize {
+        let block = if self == Self::Bc1 { 8 } else { 16 };
+        width.div_ceil(4) as usize * height.div_ceil(4) as usize * block
+    }
 }
 
 /// Widens each `step`-byte source pixel to four bytes with `expand`.
-fn widen(source: &[u8], step: usize, expand: impl Fn(&[u8]) -> [u8; 4]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(source.len() / step * 4);
-    for pixel in source.chunks_exact(step) {
+fn widen(source: &[u8], pixel_bytes: usize, expand: impl Fn(&[u8]) -> [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(source.len() / pixel_bytes * 4);
+    for pixel in source.chunks_exact(pixel_bytes) {
         out.extend_from_slice(&expand(pixel));
     }
     out
@@ -77,7 +79,7 @@ pub(crate) fn decode(
 ) -> Result<Texels, String> {
     let stored = Stored::of(d3d_format)?;
     if let Stored::Block(layout) = stored {
-        let bytes = leading(data, block_bytes(width, height, layout), "BC image")?.to_vec();
+        let bytes = leading(data, layout.level_bytes(width, height), "BC image")?.to_vec();
         return Ok(Texels {
             width,
             height,

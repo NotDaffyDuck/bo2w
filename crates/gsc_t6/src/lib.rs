@@ -17,5 +17,5 @@ pub mod vm;
 pub use compile::compile;
 pub use object::{Import, Insn, ScriptObject, op_name};
 pub use program::{CallKind, Program};
-pub use value::{Array, ArrayRef, FuncRef, Key, ObjKind, ObjRef, Str, Strings, Value};
-pub use vm::{Hooks, Native, ThreadId, Vm, hash_name, truthy};
+pub use value::{Array, ArrayRef, FuncRef, Key, ObjKind, ObjRef, Str, Strings, ScriptValue};
+pub use vm::{Hooks, Native, ThreadId, Vm, hang_report, hash_name, truthy};

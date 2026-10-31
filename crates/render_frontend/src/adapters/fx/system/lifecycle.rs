@@ -2,15 +2,13 @@
 //! sliding player, and the hold that keeps the authority waiting while the map spawns.
 
 use bevy::prelude::*;
-use net::{AuthorityLoadHold, GameActive, LastAdoptedSnapshot};
+use net::{HostLoadingPause, GameActive, NewestTakenSnapshot};
 use render_anim::occupancy::t6_body::{T6_SLIDE_DUST_FX, T6SlideDust};
-use render_fx::{FxJournalCursor, HostFxSystem, PreparedFxCatalog, PreparedFxElemInfos};
+use render_fx::{EffectJournalCursor, JournalCount};
 
-use super::scene_access::FxSceneAccess;
-use crate::adapters::fx::present::{
-    FxScene, boot_createfx_effects, play_named_oriented_at_msec,
-};
-use crate::prepare::scene::world::WorldScene;
+use super::stage::{FxStage, Pose, StageParts};
+use render_fx::effect_play::{EffectStage, start_map_placed_effects};
+use crate::prepare::scene::world::LevelStage;
 
 /// Whether the authority should keep waiting: a map is being presented but has not spawned yet,
 /// or the bots' navigation is not ready. A headless run never presents, so only navigation holds
@@ -25,8 +23,8 @@ fn authority_should_wait(
 
 pub(super) fn latch_authority_load_hold(
     navigation: Option<Res<frame::BotNavigationReady>>,
-    scene: Option<Res<WorldScene>>,
-    hold: Option<ResMut<AuthorityLoadHold>>,
+    scene: Option<Res<LevelStage>>,
+    hold: Option<ResMut<HostLoadingPause>>,
     headless: Option<Res<frame::Headless>>,
 ) {
     let Some(mut hold) = hold else {
@@ -57,78 +55,64 @@ enum CreateFxBoot {
 
 pub(super) fn boot_createfx_oneshots(
     emitters: Option<Res<asset_audio::CreateFxOneshotEmitters>>,
-    catalog: Option<Res<PreparedFxCatalog>>,
-    mut elem_infos: ResMut<PreparedFxElemInfos>,
-    mut host: ResMut<HostFxSystem>,
-    mut cursor: ResMut<FxJournalCursor>,
-    fx_world: FxSceneAccess,
+    mut stage: FxStage,
+    mut cursor: ResMut<EffectJournalCursor>,
     game_active: Res<GameActive>,
-    adopted: Option<Res<LastAdoptedSnapshot>>,
+    adopted: Option<Res<NewestTakenSnapshot>>,
 ) {
-    if cursor.createfx_booted || !game_active.get() {
+    if cursor.createfx.done || !game_active.get() {
         return;
     }
-    let Some(catalog) = catalog else {
+    let StageParts { catalog, infos, host, scene } = stage.parts();
+    let (Some(fx_catalog), Some(emitter_set)) = (catalog, emitters.as_deref()) else {
         return;
     };
     let scripts_placed_effects = adopted
         .as_ref()
         .and_then(|adopted| adopted.next())
         .is_some_and(|snapshot| snapshot.meta.objectives.scripted_effects);
-    let is_t6_map = catalog.0.map_namespace() == asset_core::AssetNamespace::T6;
+    let is_t6_map = fx_catalog.0.level_scope() == asset_core::AssetCategoryScope::T6;
     if createfx_boot(is_t6_map, scripts_placed_effects) == CreateFxBoot::SkipForGood {
-        cursor.createfx_booted = true;
+        cursor.createfx.done = true;
         return;
     }
-    let Some(emitters) = emitters else {
-        return;
-    };
-    let msec = host.0.msec_now;
-    cursor.createfx_booted = true;
-    cursor.createfx_boot_msec = Some(msec);
-    if emitters.0.is_empty() {
+    let msec = host.0.clock_ms_now;
+    cursor.createfx.done = true;
+    cursor.createfx.ms_now = Some(msec);
+    if emitter_set.0.is_empty() {
         return;
     }
 
-    elem_infos.0.sync(&catalog.0);
-    let scene = fx_world.view();
-    let census = boot_createfx_effects(
-        &mut host.0,
-        &catalog.0,
-        &elem_infos.0,
-        &emitters.0,
-        msec,
-        scene.as_ref().map(|scene| scene as &dyn FxScene),
-    );
-    cursor.createfx_miss = cursor.createfx_miss.saturating_add(census.miss_def);
-    for failure in &census.failed {
-        diag::warn!(World, "fx: CreateFX spawn_oriented failed — {failure}");
+    let scene = scene.as_ref().map(|scene| scene as &dyn EffectStage);
+    let tally = start_map_placed_effects(&mut host.0, &fx_catalog.0, infos, &emitter_set.0, msec, scene);
+    cursor.add(JournalCount::CreateFxMissedDefs, tally.missing_definition_total);
+    for failure in &tally.refused {
+        diag::warn!(World, "fx: a map-placed effect did not start: {failure}");
     }
     diag::info!(
         World,
-        "fx: CreateFX oneshots — named={} held={} miss_def={} (Billboard/Oriented sprites; Beam/Trail/… still gaps)",
-        census.named,
-        census.held,
-        census.miss_def
+        "fx: map-placed one-shot effects named={} kept={} without a definition={} (only billboard and oriented sprites draw; beams and trails do not yet)",
+        tally.by_name,
+        tally.kept_count,
+        tally.missing_definition_total
     );
 }
 
 /// Plays the dust of a player sliding, where the body put it this frame, each time it is due.
 pub(super) fn play_t6_slide_dust(
     mut due: MessageReader<T6SlideDust>,
-    catalog: Option<Res<PreparedFxCatalog>>,
-    mut elem_infos: ResMut<PreparedFxElemInfos>,
-    mut host: ResMut<HostFxSystem>,
-    fx_world: FxSceneAccess,
+    mut stage: FxStage,
     mut warned: Local<bool>,
 ) {
-    let dust: Vec<_> = due.read().copied().collect();
-    let Some(catalog) = catalog.filter(|_| !dust.is_empty()) else {
+    let dust_fx: Vec<_> = due.read().copied().collect();
+    if dust_fx.is_empty() {
+        return;
+    }
+    let Some(mut play) = stage.playback() else {
         return;
     };
-    if catalog.0.resolve_def_for_map(T6_SLIDE_DUST_FX).is_none() {
-        if !*warned {
-            *warned = true;
+    if play.defs().resolve_def_for_map(T6_SLIDE_DUST_FX).is_none() {
+        if !std::mem::replace(&mut *warned, true) {
             diag::warn!(
                 World,
                 "bo2mp: the slide's effect {T6_SLIDE_DUST_FX} is not loaded (typed gap)"
@@ -136,22 +120,14 @@ pub(super) fn play_t6_slide_dust(
         }
         return;
     }
-    elem_infos.0.sync(&catalog.0);
-    let scene = fx_world.view();
-    let scene = scene.as_ref().map(|scene| scene as &dyn FxScene);
-    let name = catalog.0.map_fx_name(T6_SLIDE_DUST_FX);
-    let msec = host.0.msec_now;
-    for puff in dust {
-        let _ = play_named_oriented_at_msec(
-            &mut host.0,
-            &catalog.0,
-            &elem_infos.0,
-            name,
-            puff.origin,
-            puff.axis,
-            msec,
-            scene,
-        );
+    let name = play.defs().map_fx_name(T6_SLIDE_DUST_FX);
+    let msec = play.now();
+    for puff in dust_fx {
+        let at = Pose {
+            anchor: puff.origin,
+            turn: puff.axis,
+        };
+        let _ = play.oriented_at(name, at, msec);
     }
 }
 

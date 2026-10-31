@@ -3,55 +3,50 @@
 //! same bits as BO2's `DrawState::decode` in asset_t6).
 
 pub use d3d9_state::{
-    D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DRS_ZENABLE, D3DRS_ZFUNC,
-    D3DRS_ZWRITEENABLE,
+    STATE_DEPTH_WRITE_TOGGLE,
 };
+pub use d3d9_state::COMPARE_PASS_ALWAYS;
+pub use d3d9_state::COMPARE_PASS_IF_SAME;
+pub use d3d9_state::DEPTH_COMPARE_STRICT_BELOW;
+pub use d3d9_state::DEPTH_COMPARE_BELOW_OR_SAME;
+pub use d3d9_state::STATE_DEPTH_TEST;
+pub use d3d9_state::STATE_DEPTH_COMPARE;
 
-pub const GFXS1_DEPTHWRITE: u32 = 0x1;
+pub const DEPTH_WRITE_ENABLED_BIT: u32 = 0x1;
 
-pub const GFXS1_DEPTHTEST_DISABLE: u32 = 0x2;
+pub const DEPTH_COMPARE_OFF: u32 = 0x2;
 
-pub const GFXS1_DEPTHTEST_SHIFT: u32 = 2;
+pub const DEPTH_COMPARE_FIELD_SHIFT: u32 = 2;
 
-pub const GFXS1_DEPTHTEST_MASK: u32 = 0xc;
+pub const DEPTH_COMPARE_FIELD_MASK: u32 = 0xc;
 
-pub const GFXS1_DEPTHTEST_ALWAYS: u32 = 0x0;
+pub const DEPTH_COMPARE_ALWAYS_PASS: u32 = 0x0;
 
-pub const GFXS1_DEPTHTEST_LESS: u32 = 0x4;
+pub const DEPTH_COMPARE_NEARER: u32 = 0x4;
 
-pub const GFXS1_DEPTHTEST_EQUAL: u32 = 0x8;
+pub const DEPTH_COMPARE_SAME: u32 = 0x8;
 
-pub const GFXS1_DEPTHTEST_LESSEQUAL: u32 = 0xc;
+pub const DEPTH_COMPARE_NEARER_OR_SAME: u32 = 0xc;
 
-pub const S_DEPTH_TEST_TABLE: [u32; 4] =
-    [D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_EQUAL, D3DCMP_LESSEQUAL];
+pub const DEPTH_COMPARE_LOOKUP: [u32; 4] =
+    [COMPARE_PASS_ALWAYS, DEPTH_COMPARE_STRICT_BELOW, COMPARE_PASS_IF_SAME, DEPTH_COMPARE_BELOW_OR_SAME];
 
 #[inline]
-pub const fn depth_test_field(word1: u32) -> u32 {
-    (word1 & GFXS1_DEPTHTEST_MASK) >> GFXS1_DEPTHTEST_SHIFT
+pub const fn depth_test_field(dword1: u32) -> u32 {
+    (dword1 & DEPTH_COMPARE_FIELD_MASK) >> DEPTH_COMPARE_FIELD_SHIFT
 }
 
 #[inline]
-pub const fn depth_write_enable(word1: u32) -> bool {
-    (word1 & GFXS1_DEPTHWRITE) != 0
+pub const fn depth_writing_on(dword1: u32) -> bool {
+    (dword1 & DEPTH_WRITE_ENABLED_BIT) != 0
 }
 
 #[inline]
-pub const fn depth_test_enable(word1: u32) -> bool {
-    (word1 & GFXS1_DEPTHTEST_DISABLE) == 0
+pub const fn depth_testing_on(dword1: u32) -> bool {
+    (dword1 & DEPTH_COMPARE_OFF) == 0
 }
 
 #[inline]
-pub const fn d3d_zfunc_from_word1(word1: u32) -> u32 {
-    S_DEPTH_TEST_TABLE[depth_test_field(word1) as usize]
-}
-
-#[inline]
-pub const fn depth_state_from_state_bits(load_bits: [u32; 2]) -> (bool, bool, u32) {
-    let w1 = load_bits[1];
-    (
-        depth_write_enable(w1),
-        depth_test_enable(w1),
-        d3d_zfunc_from_word1(w1),
-    )
+pub const fn legacy_depth_compare_from_state_word(dword1: u32) -> u32 {
+    DEPTH_COMPARE_LOOKUP[depth_test_field(dword1) as usize]
 }

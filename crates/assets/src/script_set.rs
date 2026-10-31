@@ -42,7 +42,14 @@ pub struct T6ScriptSet {
     pub playeranim: Option<(String, String)>,
     /// Props that break apart piece by piece when shot: mannequins, cars, a
     /// clock.
-    pub destructibles: Vec<Arc<xmodel_runtime::T5DestructibleDef>>,
+    pub destructibles: Vec<Arc<xmodel_runtime::BreakableModelDef>>,
+    /// Barrier types (`ZBarrierDef`: window boards, the box), a later zone
+    /// winning a name.
+    pub zbarriers: Vec<asset_t6::ZBarrierDefRef>,
+    /// Another map's special weapons loaded onto this one (the Hell's
+    /// Retriever on Nuketown): the `level._effect` rows that map's fx
+    /// script sets for them, as (key, effect).
+    pub donor_effects: Vec<(String, String)>,
     /// How a dead body goes limp (`ragdoll.cfg`).
     pub ragdoll: Option<String>,
 }
@@ -51,11 +58,13 @@ pub struct T6ScriptSet {
 #[derive(Clone, Debug, Default)]
 pub struct T6AnimFacts {
     pub name: String,
-    pub numframes: u16,
-    pub framerate: f32,
+    pub frame_total: u16,
+    pub fps: f32,
     pub looping: bool,
     /// Root translation keys as (frame, position).
     pub delta_trans: Vec<(u16, [f32; 3])>,
+    /// Root turn keys as (frame, quaternion x y z w).
+    pub delta_quat: Vec<(u16, [f32; 4])>,
     /// Notetracks as (name, time from 0 to 1).
     pub notifies: Vec<(String, f32)>,
 }

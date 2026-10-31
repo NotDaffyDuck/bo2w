@@ -1,7 +1,7 @@
 //! bo2zm: Black Ops II movement rules that differ from the legacy code this
 //! crate started from.
 
-use playerstate_t6::game::{PlayerState, pm_flags};
+use playerstate_t6::game::{AvatarState, movement_state_bits};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bo2Feel {
@@ -27,15 +27,16 @@ pub struct Bo2Feel {
     /// bg_gravity, for the Zombies low-gravity rule.
     pub gravity: i32,
 
-    /// The fall perk's bit in perks[0] (specialty_fallheight): no fall
-    /// damage, in both modes. 0 = none.
+    /// The fall perk's number (specialty_fallheight): no fall damage, in both
+    /// modes. `PERK_UNKNOWN` = none.
     pub fall_damage_perk: u32,
 
-    /// PhD Flopper's bit in perks[0] (specialty_flakjacket): in Zombies any
-    /// fall damage becomes 1, so the scripts can set off its blast. 0 = none.
+    /// PhD Flopper's number (specialty_flakjacket): in Zombies any fall
+    /// damage becomes 1, so the scripts can set off its blast. `PERK_UNKNOWN`
+    /// = none.
     pub flak_jacket_perk: u32,
 
-    /// Quickdraw's bit in perks[0] (specialty_fastads). 0 = none.
+    /// Quickdraw's number (specialty_fastads). `PERK_UNKNOWN` = none.
     pub fast_ads_perk: u32,
 
     /// perk_weapAdsMultiplier: with Quickdraw, aiming in and out takes this
@@ -43,14 +44,14 @@ pub struct Bo2Feel {
     /// are left alone.
     pub fast_ads_multiplier: f32,
 
-    /// Stamin-Up's bit in perks[0] (specialty_longersprint). 0 = none.
+    /// Stamin-Up's number (specialty_longersprint). `PERK_UNKNOWN` = none.
     pub longer_sprint_perk: u32,
 
     /// perk_sprintMultiplier: Stamin-Up multiplies the sprint time by this
     /// (BO2 default 2, still capped at 16383 ms).
     pub sprint_multiplier: f32,
 
-    /// Move-faster's bit in perks[0] (specialty_movefaster). 0 = none.
+    /// Move-faster's number (specialty_movefaster). `PERK_UNKNOWN` = none.
     pub move_faster_perk: u32,
 
     /// perk_speedMultiplier: move-faster multiplies the walk speed by this
@@ -83,7 +84,7 @@ pub struct Bo2Feel {
     pub mantle_weapon_anim_height: f32,
 
     /// jump_height (39 in both modes; the mod menu's Super Jump raises it).
-    pub jump_height: f32,
+    pub leap_height: f32,
 }
 
 impl Bo2Feel {
@@ -111,7 +112,7 @@ impl Bo2Feel {
         omni: false,
         mantle_weapon_height: 39.0,
         mantle_weapon_anim_height: 32.0,
-        jump_height: 39.0,
+        leap_height: 39.0_f32,
     };
 }
 
@@ -129,37 +130,27 @@ pub fn shellshock_walk_scale(movement: bool, movement_scale: f32) -> f32 {
     }
 }
 
-/// Fall perk (specialty_fallheight).
-pub const PERK_FALLHEIGHT: u32 = 1 << 29;
-
-/// Flak Jacket, Zombies' PhD Flopper (specialty_flakjacket).
-pub const PERK_FLAKJACKET: u32 = 1 << 31;
-
-/// Quickdraw (specialty_fastads).
-pub const PERK_FASTADS: u32 = 1 << 30;
-
-/// Stamin-Up, multiplayer's Extreme Conditioning (specialty_longersprint).
-pub const PERK_LONGERSPRINT: u32 = 1 << 26;
-
-/// Stalker (specialty_stalker): aiming does not slow the walk.
-pub const PERK_STALKER: u32 = 1 << 11;
+// The perks these rules test, by BO2's perksEnum number (Stalker: aiming does
+// not slow the walk; move-faster: multiplayer's Lightweight speed and the
+// Turned zombies' perk; flak jacket: Zombies' PhD Flopper; longer sprint:
+// Stamin-Up).
+pub use playerstate_t6::perks::{
+    PERK_FALLHEIGHT, PERK_FASTADS, PERK_FLAKJACKET, PERK_LONGERSPRINT, PERK_MOVEFASTER, PERK_STALKER,
+    PERK_UNKNOWN,
+};
 
 /// BO2 feel M10b: the crouch-to-prone stage of the eye-height change takes
 /// 600 ms (MW2 400), and the stance speed blends over the same time. The
 /// curves themselves are the same.
 pub const PRONE_LERP_MS: i32 = 600;
 
-/// Move-faster (specialty_movefaster): multiplayer's Lightweight speed and
-/// the Turned zombies' perk.
-pub const PERK_MOVEFASTER: u32 = 1 << 9;
-
 /// BO2 feel M8b: every frame the walk speed starts again from g_speed; with
 /// move-faster it is multiplied by perk_speedMultiplier and cut to a whole
 /// number (190 x 1.07 = 203).
 #[must_use]
-pub fn player_speed(ps: &PlayerState, feel: Bo2Feel) -> i32 {
+pub fn player_speed(avatar: &AvatarState, feel: Bo2Feel) -> i32 {
     let mut speed = feel.g_speed;
-    if feel.move_faster_perk != 0 && ps.perks[0] & feel.move_faster_perk != 0 {
+    if avatar.has_perk_bit(feel.move_faster_perk) {
         speed *= feel.speed_multiplier;
     }
     speed as i32
@@ -169,8 +160,8 @@ pub fn player_speed(ps: &PlayerState, feel: Bo2Feel) -> i32 {
 /// sprinting (BO2's own number).
 pub const STAMIN_UP_SPRINT_MOVE_SPEED_SCALE: f32 = 1.1;
 
-fn stamin_up(ps: &PlayerState, feel: Bo2Feel) -> bool {
-    feel.longer_sprint_perk != 0 && (ps.perks[0] & feel.longer_sprint_perk) != 0
+fn stamin_up(avatar: &AvatarState, feel: Bo2Feel) -> bool {
+    avatar.has_perk_bit(feel.longer_sprint_perk)
 }
 
 /// BO2 feel M13: in Zombies, Stamin-Up sprints with the gun's move speed at
@@ -178,18 +169,18 @@ fn stamin_up(ps: &PlayerState, feel: Bo2Feel) -> bool {
 /// its own keeps its aiming speed.
 #[must_use]
 pub fn stamin_up_cmd_scale(
-    ps: &PlayerState,
-    scale: crate::bridge::CmdScaleWalkContext,
+    avatar: &AvatarState,
+    scale: crate::bridge::StrideScaleArgs,
     feel: Bo2Feel,
-) -> crate::bridge::CmdScaleWalkContext {
+) -> crate::bridge::StrideScaleArgs {
     if feel.zombies
-        && stamin_up(ps, feel)
-        && ps.pm_flags & pm_flags::SPRINTING != 0
-        && scale.weapon_move_speed_scale > 0.0
+        && stamin_up(avatar, feel)
+        && avatar.movement_state_bits & movement_state_bits::SPRINTING != 0
+        && scale.gun_stride_ratio > 0.0
     {
-        crate::bridge::CmdScaleWalkContext {
-            weapon_move_speed_scale: scale
-                .weapon_move_speed_scale
+        crate::bridge::StrideScaleArgs {
+            gun_stride_ratio: scale
+                .gun_stride_ratio
                 .max(STAMIN_UP_SPRINT_MOVE_SPEED_SCALE),
             ..scale
         }
@@ -202,22 +193,21 @@ pub fn stamin_up_cmd_scale(
 /// rifles. Returns the aim-in and aim-out rates (per ms).
 #[must_use]
 pub fn quickdraw_ads_rates(
-    ps: &PlayerState,
-    ads_in_rate: f32,
-    ads_out_rate: f32,
+    avatar: &AvatarState,
+    scope_raise_speed: f32,
+    scope_lower_speed: f32,
     sniper: bool,
     feel: Bo2Feel,
 ) -> (f32, f32) {
     if sniper
-        || feel.fast_ads_perk == 0
-        || (ps.perks[0] & feel.fast_ads_perk) == 0
+        || !avatar.has_perk_bit(feel.fast_ads_perk)
         || feel.fast_ads_multiplier <= 0.0
     {
-        return (ads_in_rate, ads_out_rate);
+        return (scope_raise_speed, scope_lower_speed);
     }
     (
-        ads_in_rate / feel.fast_ads_multiplier,
-        ads_out_rate / feel.fast_ads_multiplier,
+        scope_raise_speed / feel.fast_ads_multiplier,
+        scope_lower_speed / feel.fast_ads_multiplier,
     )
 }
 
@@ -229,7 +219,7 @@ impl Default for Bo2Feel {
 
 /// Head bob and footstep rhythm per stance: stand, prone, crouch, then the
 /// same three running backwards. Columns: running, walking.
-const BOB_FACTOR_TABLE: [[f32; 2]; 6] = [
+const SWAY_WEIGHTS: [[f32; 2]; 6] = [
     [0.335, 0.28],
     [0.25, 0.24],
     [0.34, 0.29],
@@ -248,65 +238,64 @@ const PLAYER_RUNBK_THRESHHOLD: f32 = 60.0;
 const PLAYER_SPRINT_THRESHHOLD: f32 = 185.0;
 
 /// player_sprintCameraBob.
-const PLAYER_SPRINT_CAMERA_BOB: f32 = 0.5;
-
+const DASH_VIEW_SWAY: f32 = 0.5;
 
 /// Moves the head bob and footstep rhythm one frame on the ground. The caller
 /// has already ruled out standing still, no input, the air and turrets.
-pub(crate) fn bob_cycle(
-    ps: &mut PlayerState,
+pub(crate) fn sway_phase(
+    avatar: &mut AvatarState,
     msec: i32,
-    forwardmove: i8,
-    rightmove: i8,
-    xyspeed: f32,
-    server_time: i32,
-    scales: crate::bridge::CmdScaleWalkContext,
+    thrust_ahead: i8,
+    thrust_lateral: i8,
+    ground_velocity: f32,
+    authority_clock_ms: i32,
+    scales: crate::bridge::StrideScaleArgs,
     feel: Bo2Feel,
 ) {
-    let scales = stamin_up_cmd_scale(ps, scales, feel);
+    let scales = stamin_up_cmd_scale(avatar, scales, feel);
     // Downed (22) uses the prone row.
-    let stance = match ps.view_height_target {
+    let stance = match avatar.eye_height_goal {
         22 | 11 => 1,
         40 => 2,
         _ => 0,
     };
-    let backward = (ps.pm_flags & pm_flags::BACKWARDS_RUN) != 0;
+    let backward = (avatar.movement_state_bits & movement_state_bits::BACKWARDS_RUN) != 0;
     let row = stance + 3 * usize::from(backward);
-    let mut walking = (ps.pm_flags & pm_flags::WALKING) != 0 || ps.leanf != 0.0;
-    let mut sprinting = (ps.pm_flags & pm_flags::SPRINTING) != 0;
+    let mut walking = (avatar.movement_state_bits & movement_state_bits::WALKING) != 0 || avatar.tilt_sideways != 0.0;
+    let mut sprinting = (avatar.movement_state_bits & movement_state_bits::SPRINTING) != 0;
     if stance == 0 {
-        walking |= xyspeed <= PLAYER_RUNBK_THRESHHOLD;
-        sprinting &= xyspeed >= PLAYER_SPRINT_THRESHHOLD;
+        walking |= ground_velocity <= PLAYER_RUNBK_THRESHHOLD;
+        sprinting &= ground_velocity >= PLAYER_SPRINT_THRESHHOLD;
     }
-    let max_speed = crate::bridge::get_bob_max_speed(
-        ps,
-        forwardmove,
-        rightmove,
+    let top_velocity = crate::bridge::get_bob_max_speed(
+        avatar,
+        thrust_ahead,
+        thrust_lateral,
         walking,
         sprinting,
-        server_time,
+        authority_clock_ms,
         scales,
-    ) * ps.move_speed_scale_multiplier;
-    if max_speed <= 0.0 {
+    ) * avatar.run_speed_modifier;
+    if top_velocity <= 0.0 {
         return;
     }
     let factor = if row == 0 && sprinting {
-        PLAYER_SPRINT_CAMERA_BOB
+        DASH_VIEW_SWAY
     } else {
-        BOB_FACTOR_TABLE[row][usize::from(walking)]
+        SWAY_WEIGHTS[row][usize::from(walking)]
     };
-    let bobmove = xyspeed / max_speed * factor;
+    let bobmove = ground_velocity / top_velocity * factor;
     // The gun in hand speeds up or slows the rhythm while the sprint flag
     // is on (crouched: its own scale), whatever the speed.
-    let sprint_flag = (ps.pm_flags & pm_flags::SPRINTING) != 0;
-    let scale = if sprint_flag && ps.view_height_target == 40 {
+    let sprint_flag = (avatar.movement_state_bits & movement_state_bits::SPRINTING) != 0;
+    let scale = if sprint_flag && avatar.eye_height_goal == 40 {
         feel.ducked_sprint_cycle_scale
     } else if sprint_flag {
         feel.sprint_cycle_scale
     } else {
         1.0
     };
-    ps.bob_cycle = step_cycle(ps.bob_cycle, msec, bobmove, scale);
+    avatar.sway_phase = step_cycle(avatar.sway_phase, msec, bobmove, scale);
 }
 
 /// Rhythm speed through a dive (dtpBobMove).
@@ -315,24 +304,25 @@ const DTP_BOB_MOVE: f32 = 0.24;
 /// Through a whole dive, air and slide, the rhythm runs at its own pace
 /// (times the gun's dive scale) and the normal step rhythm is skipped.
 /// Returns true while diving.
-pub(crate) fn dive_bob_cycle(ps: &mut PlayerState, msec: i32, feel: Bo2Feel) -> bool {
-    if !crate::bridge::dive::active(ps) {
+pub(crate) fn dive_bob_cycle(avatar: &mut AvatarState, msec: i32, feel: Bo2Feel) -> bool {
+    if !crate::bridge::dive::active(avatar) {
         return false;
     }
-    ps.bob_cycle = step_cycle(ps.bob_cycle, msec, DTP_BOB_MOVE, feel.dtp_cycle_scale);
+    avatar.sway_phase = step_cycle(avatar.sway_phase, msec, DTP_BOB_MOVE, feel.dtp_cycle_scale);
     true
 }
 
 /// The rhythm counter steps by whole units, rounding down.
-fn step_cycle(old: i32, msec: i32, bobmove: f32, scale: f32) -> i32 {
+fn step_cycle(old: i32, msec: i32, bobmove: f32, factor: f32) -> i32 {
     let old = old as u8;
-    i32::from((f32::from(old) + msec as f32 * bobmove * scale) as i32 as u8)
+    i32::from((f32::from(old) + msec as f32 * bobmove * factor) as i32 as u8)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use playerstate_t6::game::UserCmd;
+    use crate::bridge::eye_level::{LYING_FLAT, UPRIGHT};
+    use playerstate_t6::game::InputCommand;
 
     const BO2: Bo2Feel = Bo2Feel {
         sprint_strafe_speed_scale: 0.667,
@@ -345,28 +335,28 @@ mod tests {
     /// with the jump slowdown off. Ending a jump keeps last stand.
     #[test]
     fn bo2_jump_soon_after_landing_goes_lower() {
-        let mut ps = PlayerState::ZERO;
-        ps.pm_time = 1750;
-        assert_eq!(crate::bridge::jump::bo2_land_factor(&ps, true), 2.5);
-        assert_eq!(crate::bridge::jump::bo2_land_factor(&ps, false), 1.0);
-        ps.pm_time = 850;
-        assert!((crate::bridge::jump::bo2_land_factor(&ps, true) - 1.75).abs() < 1e-4);
-        ps.pm_time = 0;
-        assert_eq!(crate::bridge::jump::bo2_land_factor(&ps, true), 1.0);
+        let mut avatar = AvatarState::ZERO;
+        avatar.move_timer = 1750;
+        assert_eq!(crate::bridge::leap::bo2_land_factor(&avatar, true), 2.5);
+        assert_eq!(crate::bridge::leap::bo2_land_factor(&avatar, false), 1.0);
+        avatar.move_timer = 850;
+        assert!((crate::bridge::leap::bo2_land_factor(&avatar, true) - 1.75).abs() < 1e-4);
+        avatar.move_timer = 0;
+        assert_eq!(crate::bridge::leap::bo2_land_factor(&avatar, true), 1.0);
 
-        ps.pm_flags = pm_flags::JUMPING | pm_flags::PRONE;
-        crate::bridge::jump::clear_state(&mut ps);
-        assert_eq!(ps.pm_flags, pm_flags::PRONE);
+        avatar.movement_state_bits = movement_state_bits::JUMPING | movement_state_bits::LYING_FLAT;
+        crate::bridge::leap::clear_state(&mut avatar);
+        assert_eq!(avatar.movement_state_bits, movement_state_bits::LYING_FLAT);
     }
 
-    fn scales() -> crate::bridge::CmdScaleWalkContext {
-        crate::bridge::CmdScaleWalkContext {
-            player_back_speed_scale: 0.7,
-            player_strafe_speed_scale: 0.8,
-            player_sprint_speed_scale: 1.5,
-            player_last_stand_crawl_speed_scale: 0.15,
-            weapon_move_speed_scale: 1.0,
-            weapon_ads_move_speed_scale: 1.0,
+    fn scales() -> crate::bridge::StrideScaleArgs {
+        crate::bridge::StrideScaleArgs {
+            retreat_pace_ratio: 0.7,
+            sidestep_pace_ratio: 0.8,
+            dash_pace_ratio: 1.5,
+            downed_crawl_pace_ratio: 0.15,
+            gun_stride_ratio: 1.0,
+            scoped_carry_pace: 1.0,
             shellshock_movement_scale: 1.0,
             prone_lerp_ms: 0,
         }
@@ -377,49 +367,49 @@ mod tests {
     /// once the eye heads below standing height.
     #[test]
     fn bo2_walk_scale_keeps_prone_aim_slow() {
-        let mut ps = PlayerState::ZERO;
-        ps.speed = 190;
-        ps.move_speed_scale_multiplier = 1.0;
-        ps.weapon = 1;
-        ps.view_height_target = crate::bridge::stance::view_height::PRONE;
-        let cmd = UserCmd {
-            forwardmove: 127,
-            ..UserCmd::default()
+        let mut avatar = AvatarState::ZERO;
+        avatar.speed = 190;
+        avatar.run_speed_modifier = 1.0;
+        avatar.weapon = 1;
+        avatar.eye_height_goal = LYING_FLAT;
+        let ucmd = InputCommand {
+            thrust_ahead: 127,
+            ..InputCommand::default()
         };
-        let bo2 = crate::bridge::CmdScaleWalkContext {
-            weapon_ads_move_speed_scale: 0.5,
+        let bo2 = crate::bridge::StrideScaleArgs {
+            scoped_carry_pace: 0.5,
             ..scales()
         };
 
-        ps.pm_flags = pm_flags::PRONE;
-        ps.f_weapon_pos_frac = 0.0;
-        let crawl = crate::bridge::cmd_scale_walk(&ps, &cmd, bo2);
-        ps.f_weapon_pos_frac = 1.0;
-        let aimed = crate::bridge::cmd_scale_walk(&ps, &cmd, bo2);
+        avatar.movement_state_bits = movement_state_bits::LYING_FLAT;
+        avatar.weapon_raise_fraction = 0.0;
+        let crawl = crate::bridge::cmd_scale_walk(&avatar, &ucmd, bo2);
+        avatar.weapon_raise_fraction = 1.0;
+        let aimed = crate::bridge::cmd_scale_walk(&avatar, &ucmd, bo2);
         assert!((aimed / crawl - 0.4 * 0.5).abs() < 1e-5, "{aimed} {crawl}");
 
-        ps.pm_flags = pm_flags::SPRINTING;
-        ps.f_weapon_pos_frac = 0.0;
-        let no_sprint = crate::bridge::CmdScaleWalkContext { player_sprint_speed_scale: 1.0, ..bo2 };
-        let low_sprint = crate::bridge::cmd_scale_walk(&ps, &cmd, bo2);
-        assert_eq!(low_sprint, crate::bridge::cmd_scale_walk(&ps, &cmd, no_sprint), "no sprint speed low down");
-        ps.view_height_target = crate::bridge::stance::view_height::STAND;
-        let standing = crate::bridge::cmd_scale_walk(&ps, &cmd, bo2);
-        let standing_walk = crate::bridge::cmd_scale_walk(&ps, &cmd, no_sprint);
+        avatar.movement_state_bits = movement_state_bits::SPRINTING;
+        avatar.weapon_raise_fraction = 0.0;
+        let no_sprint = crate::bridge::StrideScaleArgs { dash_pace_ratio: 1.0, ..bo2 };
+        let low_sprint = crate::bridge::cmd_scale_walk(&avatar, &ucmd, bo2);
+        assert_eq!(low_sprint, crate::bridge::cmd_scale_walk(&avatar, &ucmd, no_sprint), "no sprint speed low down");
+        avatar.eye_height_goal = UPRIGHT;
+        let standing = crate::bridge::cmd_scale_walk(&avatar, &ucmd, bo2);
+        let standing_walk = crate::bridge::cmd_scale_walk(&avatar, &ucmd, no_sprint);
         assert!((standing / standing_walk - 1.5).abs() < 1e-5, "{standing} {standing_walk}");
     }
 
     /// One 50 ms step of the head bob rhythm from 0, standing on the ground.
-    fn bob_step(feel: Bo2Feel, speed: f32, forward: i8, flags: u32) -> i32 {
-        let mut ps = PlayerState::ZERO;
-        ps.speed = 190;
-        ps.move_speed_scale_multiplier = 1.0;
-        ps.view_height_target = 60;
-        ps.ground_entity_num = 1022;
-        ps.pm_flags = flags;
-        ps.velocity = [speed, 0.0, 0.0];
-        crate::bridge::footsteps_bob_cycle(&mut ps, 50, forward, 0, true, 1000, scales(), feel);
-        ps.bob_cycle
+    fn bob_step(feel: Bo2Feel, speed: f32, fwd: i8, flags: u32) -> i32 {
+        let mut avatar = AvatarState::ZERO;
+        avatar.speed = 190;
+        avatar.run_speed_modifier = 1.0;
+        avatar.eye_height_goal = 60;
+        avatar.standing_on = 1022;
+        avatar.movement_state_bits = flags;
+        avatar.velocity = [speed, 0.0, 0.0];
+        crate::bridge::footsteps_bob_cycle(&mut avatar, 50, fwd, 0, true, 1000, scales(), feel);
+        avatar.sway_phase
     }
 
     #[test]
@@ -438,21 +428,21 @@ mod tests {
     #[test]
     fn running_backwards_uses_its_own_row_in_bo2() {
         // 133 / (190 x 0.7) * 0.36 * 50 = 18.
-        let back = pm_flags::BACKWARDS_RUN;
+        let back = movement_state_bits::BACKWARDS_RUN;
         assert_eq!(bob_step(BO2, 133.0, -127, back), 18);
     }
 
     #[test]
     fn script_move_speed_counts_in_bo2() {
-        let mut ps = PlayerState::ZERO;
-        ps.speed = 190;
-        ps.move_speed_scale_multiplier = 0.5;
-        ps.view_height_target = 60;
-        ps.ground_entity_num = 1022;
-        ps.velocity = [95.0, 0.0, 0.0];
-        crate::bridge::footsteps_bob_cycle(&mut ps, 50, 127, 0, true, 1000, scales(), BO2);
+        let mut avatar = AvatarState::ZERO;
+        avatar.speed = 190;
+        avatar.run_speed_modifier = 0.5;
+        avatar.eye_height_goal = 60;
+        avatar.standing_on = 1022;
+        avatar.velocity = [95.0, 0.0, 0.0];
+        crate::bridge::footsteps_bob_cycle(&mut avatar, 50, 127, 0, true, 1000, scales(), BO2);
         // 95 / (190 x 0.5) * 0.335 * 50 = 16.75.
-        assert_eq!(ps.bob_cycle, 16);
+        assert_eq!(avatar.sway_phase, 16);
     }
 
     #[test]
@@ -462,26 +452,26 @@ mod tests {
             fast_ads_multiplier: 0.5,
             ..BO2
         };
-        let mut ps = PlayerState::ZERO;
+        let mut avatar = AvatarState::ZERO;
         let rates = (1.0 / 250.0, 1.0 / 200.0);
         assert_eq!(
-            quickdraw_ads_rates(&ps, rates.0, rates.1, false, feel),
+            quickdraw_ads_rates(&avatar, rates.0, rates.1, false, feel),
             rates
         );
-        ps.perks[0] |= PERK_FASTADS;
+        avatar.set_perk(PERK_FASTADS, true);
         assert_eq!(
-            quickdraw_ads_rates(&ps, rates.0, rates.1, false, feel),
+            quickdraw_ads_rates(&avatar, rates.0, rates.1, false, feel),
             (1.0 / 125.0, 1.0 / 100.0)
         );
         assert_eq!(
-            quickdraw_ads_rates(&ps, rates.0, rates.1, true, feel),
+            quickdraw_ads_rates(&avatar, rates.0, rates.1, true, feel),
             rates
         );
     }
 
     #[test]
     fn sprint_rhythm_follows_the_gun_in_bo2() {
-        let sprint = pm_flags::SPRINTING;
+        let sprint = movement_state_bits::SPRINTING;
         let galil = Bo2Feel {
             sprint_cycle_scale: 0.85,
             ..BO2
@@ -495,16 +485,16 @@ mod tests {
 
     #[test]
     fn diving_runs_its_own_rhythm_in_the_air_in_bo2() {
-        let mut ps = PlayerState::ZERO;
-        ps.speed = 190;
-        ps.move_speed_scale_multiplier = 1.0;
-        ps.view_height_target = 40;
-        ps.ground_entity_num = playerstate_t6::game::ENTITYNUM_NONE;
-        ps.pm_flags = crate::bridge::dive::PMF_DIVE;
-        ps.velocity = [300.0, 0.0, 50.0];
-        crate::bridge::footsteps_bob_cycle(&mut ps, 50, 127, 0, true, 1000, scales(), BO2);
+        let mut avatar = AvatarState::ZERO;
+        avatar.speed = 190;
+        avatar.run_speed_modifier = 1.0;
+        avatar.eye_height_goal = 40;
+        avatar.standing_on = playerstate_t6::game::NO_ENTITY_SLOT;
+        avatar.movement_state_bits = crate::bridge::dive::PMF_DIVE;
+        avatar.velocity = [300.0, 0.0, 50.0];
+        crate::bridge::footsteps_bob_cycle(&mut avatar, 50, 127, 0, true, 1000, scales(), BO2);
         // 0.24 x 50 = 12.
-        assert_eq!(ps.bob_cycle, 12);
+        assert_eq!(avatar.sway_phase, 12);
     }
 
     #[test]
@@ -514,10 +504,15 @@ mod tests {
             speed_multiplier: 1.07,
             ..BO2
         };
-        let mut ps = PlayerState::ZERO;
-        ps.speed = 150;
-        assert_eq!(player_speed(&ps, feel), 190);
-        ps.perks[0] |= PERK_MOVEFASTER;
-        assert_eq!(player_speed(&ps, feel), 203);
+        let mut avatar = AvatarState::ZERO;
+        avatar.speed = 150;
+        assert_eq!(player_speed(&avatar, feel), 190);
+        avatar.set_perk(PERK_MOVEFASTER, true);
+        assert_eq!(player_speed(&avatar, feel), 203);
+        // Move-faster lives in word 1: the old single-word test never saw it.
+        assert_eq!(avatar.perks[0], 0);
+        // A feel with no move-faster perk never speeds up.
+        let none = Bo2Feel { move_faster_perk: PERK_UNKNOWN, ..feel };
+        assert_eq!(player_speed(&avatar, none), 190);
     }
 }

@@ -1,53 +1,59 @@
-//! The console panel on screen: the scrollback, the prompt line, and the
-//! completions drawn above it.
+//! On-screen console panel: the log area, the input line, and the
+//! suggestion strip that floats over the log's final row.
 
-use bevy::{
-    prelude::*,
-    text::{EditableText, TextCursorStyle},
-};
-use ui::UiLayer;
+use bevy::prelude::*;
+use ui::OverlayTier;
 
-use super::{
-    prompt::offered,
-    state::{ConsoleFont, ConsoleSettings, ConsoleState},
-};
-use crate::{
-    ConsoleRegistry,
-    suggest::{SuggestSpan, SuggestTone, suggestion_spans},
-};
+use super::prompt::offered;
+use super::state::PromptTypeface;
+use super::state::PromptPanelOptions;
+use super::state::PromptPanelStatus;
+use crate::OrderCatalog;
+use crate::completion::HintRange;
+use crate::completion::HintShade;
+use crate::completion::suggestion_spans;
+use bevy::ecs::system::Commands;
+use bevy::text::Font;
+use bevy::text::EditableText;
+use bevy::text::TextCursorStyle;
 
 const FONT_BYTES: &[u8] = include_bytes!("../../assets/FreeMono.otf");
 
-/// What is printed before the line being typed.
-pub(super) const PROMPT: &str = "> ";
+/// Text drawn ahead of whatever the user is typing.
+pub(super) const INPUT_LEAD_GLYPH: &str = "> ";
 
-const FONT_SIZE: f32 = 15.0;
-const MARGIN: f32 = 12.0;
-/// The scrollback stops this far above the bottom edge, clear of the prompt.
-const SCROLLBACK_BOTTOM: f32 = 36.0;
+/// Palette used by the panel; every tint lives here.
+mod palette {
+    use bevy::color::Color;
 
-const COLOR_BODY: Color = Color::srgb(0.82, 0.92, 0.82);
-const COLOR_MATCHED: Color = Color::srgb(0.40, 0.48, 0.42);
-const COLOR_REST_SELECTED: Color = Color::srgb(0.95, 0.78, 0.35);
-const COLOR_REST_MUTED: Color = Color::srgb(0.48, 0.58, 0.50);
-const COLOR_PANEL: Color = Color::srgba(0.02, 0.03, 0.04, 0.96);
-const COLOR_SUGGEST_BG: Color = Color::srgb(0.02, 0.03, 0.04);
-const COLOR_SELECTION: Color = Color::srgba(0.35, 0.55, 0.85, 0.45);
-const COLOR_SELECTION_UNFOCUSED: Color = Color::srgba(0.35, 0.55, 0.85, 0.2);
+    pub(super) const TEXT: Color = Color::srgb(0.82, 0.92, 0.82);
+    pub(super) const HIT: Color = Color::srgb(0.40, 0.48, 0.42);
+    pub(super) const TAIL_PICKED: Color = Color::srgb(0.95, 0.78, 0.35);
+    pub(super) const TAIL_DIM: Color = Color::srgb(0.48, 0.58, 0.50);
+    pub(super) const BACKDROP: Color = Color::srgba(0.02, 0.03, 0.04, 0.96);
+    pub(super) const STRIP: Color = Color::srgb(0.02, 0.03, 0.04);
+    pub(super) const HIGHLIGHT: Color = Color::srgba(0.35, 0.55, 0.85, 0.45);
+    pub(super) const HIGHLIGHT_IDLE: Color = Color::srgba(0.35, 0.55, 0.85, 0.2);
+}
 
-/// The whole panel, shown while the console is open.
+const GLYPH_PX: f32 = 15.0;
+const PANEL_MARGIN: f32 = 12.0;
+/// Gap kept between the log's lower edge and the panel bottom, for the input row.
+const LOG_FLOOR: f32 = 36.0;
+
+/// Root of the panel; visible only while the console is open.
 #[derive(Component)]
-pub(super) struct ConsolePanel;
+pub(super) struct PromptPanelRoot;
 
-/// The printed lines.
+/// Marks the printed log text.
 #[derive(Component)]
 pub(super) struct ScrollbackText;
 
-/// The line being typed.
+/// Marks the editable input line.
 #[derive(Component)]
 pub(super) struct PromptText;
 
-/// The list of completions, drawn over the scrollback's last line.
+/// Marks the suggestion strip, which overlaps the last log row.
 #[derive(Component)]
 pub(super) struct CompletionText;
 
@@ -57,298 +63,268 @@ pub(super) struct PromptEntity(pub Entity);
 #[derive(Resource, Clone, Copy)]
 pub(super) struct ScrollbackEntity(pub Entity);
 
-fn text_font(font: &Handle<Font>) -> TextFont {
-    TextFont {
-        font: font.clone().into(),
-        font_size: FontSize::Px(FONT_SIZE),
-        ..default()
-    }
+/// The console's monospace face at its one size.
+fn mono(handle: &Handle<Font>) -> TextFont {
+    let mut face = TextFont::default();
+    face.font = handle.clone().into();
+    face.font_size = FontSize::Px(GLYPH_PX);
+    face
 }
 
-/// Builds the panel, hidden, and the font it is set in.
+/// Cursor/selection look shared by both text areas; only the insert_column and the
+/// unfocused highlight differ.
+fn cursor_look(insert_column: Color, unfocused: Color) -> TextCursorStyle {
+    let mut look = TextCursorStyle::default();
+    look.color = insert_column;
+    look.selection_color = palette::HIGHLIGHT;
+    look.unfocused_selection_color = unfocused;
+    look.selected_text_color = None;
+    look
+}
+
+/// An absolutely placed node, offset from whichever panel edges are given.
+fn pinned(left: Option<f32>, right: Option<f32>, top: Option<f32>, bottom: Option<f32>) -> Node {
+    let edge = |offset: Option<f32>| offset.map_or(Val::Auto, px);
+    let mut node = Node::default();
+    node.position_type = PositionType::Absolute;
+    node.left = edge(left);
+    node.right = edge(right);
+    node.top = edge(top);
+    node.bottom = edge(bottom);
+    node
+}
+
+/// The log text inside a clipping frame that keeps the newest line at its foot.
+fn spawn_log(commands: &mut Commands, face: &TextFont) -> (Entity, Entity) {
+    let text_bits = (TextColor(palette::TEXT), cursor_look(Color::NONE, palette::HIGHLIGHT));
+    let text = commands.spawn((ScrollbackText, Text(String::new()), face.clone(), text_bits)).id();
+    let mut frame = pinned(Some(PANEL_MARGIN), Some(PANEL_MARGIN), Some(PANEL_MARGIN), Some(LOG_FLOOR));
+    frame.flex_direction = FlexDirection::Column;
+    frame.justify_content = JustifyContent::End;
+    frame.overflow = Overflow::clip();
+    let frame = commands.spawn(frame).add_child(text).id();
+    (frame, text)
+}
+
+/// The suggestion strip, hidden until there is something to offer.
+fn spawn_strip(commands: &mut Commands, face: &TextFont) -> Entity {
+    let mut place = pinned(Some(PANEL_MARGIN), None, None, Some(LOG_FLOOR));
+    place.padding = UiRect::vertical(px(2.0));
+    let look = (TextColor(palette::TAIL_DIM), BackgroundColor(palette::STRIP));
+    let hidden = Visibility::Hidden;
+    commands.spawn((CompletionText, Text(String::new()), face.clone(), look, hidden, place)).id()
+}
+
+/// The `> ` label and the editable line beside it.
+fn spawn_input(commands: &mut Commands, face: &TextFont) -> (Entity, Entity) {
+    let label = commands.spawn((Text::new(INPUT_LEAD_GLYPH), face.clone(), TextColor(palette::TEXT))).id();
+    let mut editing = EditableText::default();
+    editing.visible_lines = Some(1.0);
+    editing.allow_newlines = false;
+    let mut field = Node::default();
+    field.min_width = px(8.0);
+    field.height = px(20.0);
+    field.flex_grow = 1.0;
+    field.overflow = Overflow::clip();
+    let look = (TextColor(palette::TEXT), cursor_look(palette::TEXT, palette::HIGHLIGHT_IDLE));
+    let one_row = TextLayout::no_wrap();
+    let line = commands
+        .spawn((PromptText, editing, one_row, face.clone(), look, field))
+        .id();
+    let mut row = pinned(Some(PANEL_MARGIN), Some(PANEL_MARGIN), None, Some(PANEL_MARGIN));
+    row.flex_direction = FlexDirection::Row;
+    row.align_items = AlignItems::Center;
+    row.column_gap = px(4.0);
+    row.overflow = Overflow::clip();
+    let row = commands.spawn(row).add_children(&[label, line]).id();
+    (row, line)
+}
+
+/// Spawns the panel (initially hidden) and loads its font.
 pub(super) fn build_panel(
     mut commands: Commands,
-    mut fonts: ResMut<Assets<Font>>,
-    settings: Res<ConsoleSettings>,
+    mut font_store: ResMut<Assets<Font>>,
+    settings: Res<PromptPanelOptions>,
 ) {
-    let font = fonts.add(Font::from_bytes(FONT_BYTES.to_vec()));
-    commands.insert_resource(ConsoleFont(font.clone()));
+    let handle = font_store.add(Font::from_bytes(FONT_BYTES.to_vec()));
+    let face = mono(&handle);
+    let (log_frame, log_text) = spawn_log(&mut commands, &face);
+    let strip = spawn_strip(&mut commands, &face);
+    let (input_row, input) = spawn_input(&mut commands, &face);
 
-    let scrollback = commands
-        .spawn((
-            ScrollbackText,
-            Text::new(""),
-            text_font(&font),
-            TextColor(COLOR_BODY),
-            TextCursorStyle {
-                color: Color::NONE,
-                selection_color: COLOR_SELECTION,
-                unfocused_selection_color: COLOR_SELECTION,
-                selected_text_color: None,
-            },
-        ))
-        .id();
-    let scrollback_clip = commands
-        .spawn(Node {
-            position_type: PositionType::Absolute,
-            left: px(MARGIN),
-            right: px(MARGIN),
-            top: px(MARGIN),
-            bottom: px(SCROLLBACK_BOTTOM),
-            flex_direction: FlexDirection::Column,
-            justify_content: JustifyContent::End,
-            overflow: Overflow::clip(),
-            ..default()
-        })
-        .add_child(scrollback)
-        .id();
-
-    let completions = commands
-        .spawn((
-            CompletionText,
-            Node {
-                position_type: PositionType::Absolute,
-                left: px(MARGIN),
-                bottom: px(SCROLLBACK_BOTTOM),
-                padding: UiRect::axes(px(0.0), px(2.0)),
-                ..default()
-            },
-            BackgroundColor(COLOR_SUGGEST_BG),
-            Visibility::Hidden,
-            Text::new(""),
-            text_font(&font),
-            TextColor(COLOR_REST_MUTED),
-        ))
-        .id();
-
-    let label = commands
-        .spawn((Text::new(PROMPT), text_font(&font), TextColor(COLOR_BODY)))
-        .id();
-    let prompt = commands
-        .spawn((
-            PromptText,
-            EditableText {
-                allow_newlines: false,
-                visible_lines: Some(1.0),
-                ..default()
-            },
-            TextLayout::no_wrap(),
-            text_font(&font),
-            TextColor(COLOR_BODY),
-            TextCursorStyle {
-                color: COLOR_BODY,
-                selection_color: COLOR_SELECTION,
-                unfocused_selection_color: COLOR_SELECTION_UNFOCUSED,
-                selected_text_color: None,
-            },
-            Node {
-                flex_grow: 1.0,
-                min_width: px(8.0),
-                height: px(20.0),
-                overflow: Overflow::clip(),
-                ..default()
-            },
-        ))
-        .id();
-    let prompt_row = commands
-        .spawn(Node {
-            position_type: PositionType::Absolute,
-            left: px(MARGIN),
-            right: px(MARGIN),
-            bottom: px(MARGIN),
-            flex_direction: FlexDirection::Row,
-            align_items: AlignItems::Center,
-            column_gap: px(4.0),
-            overflow: Overflow::clip(),
-            ..default()
-        })
-        .add_children(&[label, prompt])
-        .id();
-
+    let mut body = pinned(Some(PANEL_MARGIN), None, None, Some(PANEL_MARGIN));
+    body.padding = UiRect::all(px(PANEL_MARGIN));
+    body.width = px(settings.panel_width);
+    body.height = px(settings.panel_height);
+    // Drawn above every other overlay.
+    let stacking = (GlobalZIndex(20_000), ZIndex(100));
+    let backdrop = BackgroundColor(palette::BACKDROP);
+    let hidden = Visibility::Hidden;
     commands
-        .spawn((
-            ConsolePanel,
-            UiLayer::Overlay,
-            Visibility::Hidden,
-            Node {
-                position_type: PositionType::Absolute,
-                left: px(MARGIN),
-                bottom: px(MARGIN),
-                width: px(settings.width),
-                height: px(settings.height),
-                padding: UiRect::all(px(MARGIN)),
-                ..default()
-            },
-            BackgroundColor(COLOR_PANEL),
-            GlobalZIndex(20_000),
-            ZIndex(100),
-        ))
-        .add_children(&[scrollback_clip, completions, prompt_row]);
+        .spawn((PromptPanelRoot, OverlayTier::Overlay, hidden, backdrop, stacking, body))
+        .add_children(&[log_frame, strip, input_row]);
 
-    commands.insert_resource(PromptEntity(prompt));
-    commands.insert_resource(ScrollbackEntity(scrollback));
-    crate::showpos::spawn_hud(&mut commands, font);
+    commands.insert_resource(PromptTypeface(handle.clone()));
+    commands.insert_resource(ScrollbackEntity(log_text));
+    commands.insert_resource(PromptEntity(input));
+    crate::showpos::spawn_hud(&mut commands, handle);
 }
 
-fn tone_color(tone: SuggestTone) -> Color {
-    match tone {
-        SuggestTone::Indent | SuggestTone::Ellipsis | SuggestTone::RestMuted => COLOR_REST_MUTED,
-        SuggestTone::Matched => COLOR_MATCHED,
-        SuggestTone::RestSelected => COLOR_REST_SELECTED,
-    }
-}
-
-fn completion_span(span: &SuggestSpan, font: &Handle<Font>) -> impl Bundle {
-    (
-        TextSpan::new(span.text.clone()),
-        text_font(font),
-        TextColor(tone_color(span.tone)),
-        TextBackgroundColor(COLOR_SUGGEST_BG),
-    )
-}
-
-fn visibility_for(shown: bool) -> Visibility {
-    if shown {
-        Visibility::Visible
+fn tint_of(tone: HintShade) -> Color {
+    if tone == HintShade::Matched {
+        palette::HIT
+    } else if tone == HintShade::RemainderPicked {
+        palette::TAIL_PICKED
     } else {
-        Visibility::Hidden
+        palette::TAIL_DIM
     }
 }
 
-/// Shows or hides the panel, and keeps the scrollback and the completions
-/// matching the console's state.
+fn shown_if(flag: bool) -> Visibility {
+    [Visibility::Hidden, Visibility::Visible][usize::from(flag)]
+}
+
+type StripQuery<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, &'static mut Visibility, &'static mut Text, Option<&'static Children>),
+    (With<CompletionText>, Without<PromptPanelRoot>, Without<ScrollbackText>),
+>;
+
+/// Empties and hides every strip (the console just closed).
+fn wipe_strips(commands: &mut Commands, strips: &mut StripQuery) {
+    for (strip, mut shown, mut body, pieces) in strips.iter_mut() {
+        shown.set_if_neq(Visibility::Hidden);
+        if !body.is_empty() {
+            body.clear();
+        }
+        if pieces.is_some_and(|list| !list.is_empty()) {
+            commands.entity(strip).despawn_related::<Children>();
+        }
+    }
+}
+
+/// Swaps every strip's pieces for `spans`, shown only when there are any.
+fn redraw_strips(commands: &mut Commands, strips: &mut StripQuery, spans: &[HintRange], handle: &Handle<Font>) {
+    let face = mono(handle);
+    for (strip, mut shown, mut body, _) in strips.iter_mut() {
+        body.clear();
+        shown.set_if_neq(shown_if(!spans.is_empty()));
+        let mut node = commands.entity(strip);
+        node.despawn_related::<Children>();
+        node.with_children(|strip_children| {
+            for span in spans {
+                let colours = (TextColor(tint_of(span.tone)), TextBackgroundColor(palette::STRIP));
+                strip_children.spawn((TextSpan::new(span.fill.clone()), face.clone(), colours));
+            }
+        });
+    }
+}
+
+/// Per-frame sync: panel visibility, the log text, and the suggestion strip.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_console_ui(
     mut commands: Commands,
-    state: Res<ConsoleState>,
-    registry: Res<ConsoleRegistry>,
-    font: Res<ConsoleFont>,
-    mut drawn: Local<Vec<SuggestSpan>>,
-    mut panels: Query<&mut Visibility, (With<ConsolePanel>, Without<CompletionText>)>,
-    mut completions: Query<
-        (Entity, &mut Visibility, &mut Text, Option<&Children>),
-        (
-            With<CompletionText>,
-            Without<ConsolePanel>,
-            Without<ScrollbackText>,
-        ),
-    >,
-    mut scrollback: Query<&mut Text, (With<ScrollbackText>, Without<CompletionText>)>,
+    state: Res<PromptPanelStatus>,
+    book: Res<OrderCatalog>,
+    font: Res<PromptTypeface>,
+    mut drawn: Local<Vec<HintRange>>,
+    mut panels: Query<&mut Visibility, (With<PromptPanelRoot>, Without<CompletionText>)>,
+    mut strips: StripQuery,
+    mut logs: Query<&mut Text, (With<ScrollbackText>, Without<CompletionText>)>,
 ) {
-    let want = visibility_for(state.open);
-    for mut visibility in &mut panels {
-        visibility.set_if_neq(want);
+    for mut shown in &mut panels {
+        shown.set_if_neq(shown_if(state.shown));
     }
-
-    if !state.open {
+    if !state.shown {
         drawn.clear();
-        for (entity, mut visibility, mut text, children) in &mut completions {
-            visibility.set_if_neq(Visibility::Hidden);
-            if !text.is_empty() {
-                text.clear();
-            }
-            if children.is_some_and(|children| !children.is_empty()) {
-                commands.entity(entity).despawn_related::<Children>();
-            }
-        }
+        wipe_strips(&mut commands, &mut strips);
         return;
     }
 
-    let log = state.log.join("\n");
-    for mut text in &mut scrollback {
-        if **text != log {
-            **text = log.clone();
-        }
+    let whole_log = state.lines.join("\n");
+    for mut text in logs.iter_mut().filter(|text| text.as_str() != whole_log) {
+        text.0.clone_from(&whole_log);
     }
 
-    let (token_start, _, token) = state.editor.token_at_caret();
-    let indent_cols = PROMPT.chars().count() + token_start;
-    let spans = suggestion_spans(
-        &offered(&state, &registry),
-        state.editor.selected,
-        &token,
-        indent_cols,
-    );
-    if *drawn == spans {
-        return;
+    // The strip lines up under the word being typed, after the prompt.
+    let (word_start, _, word) = state.editor.word_at_caret();
+    let column = word_start + INPUT_LEAD_GLYPH.chars().count();
+    let choices = offered(&state, &book);
+    let spans = suggestion_spans(&choices, state.editor.highlight, &word, column);
+    if spans != *drawn {
+        redraw_strips(&mut commands, &mut strips, &spans, &font.0);
+        *drawn = spans;
     }
-    for (entity, mut visibility, mut text, _) in &mut completions {
-        text.clear();
-        commands.entity(entity).despawn_related::<Children>();
-        visibility.set_if_neq(visibility_for(!spans.is_empty()));
-        commands.entity(entity).with_children(|list| {
-            for span in &spans {
-                list.spawn(completion_span(span, &font.0));
-            }
-        });
-    }
-    *drawn = spans;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::CommandSpec;
+    use crate::app::panel::*;
+    use crate::OrderBlueprint;
+    use bevy::app::Update;
 
     fn console_app() -> App {
-        let mut app = App::new();
-        app.init_resource::<Assets<Font>>()
-            .init_resource::<ConsoleSettings>()
-            .init_resource::<ConsoleState>()
-            .init_resource::<ConsoleRegistry>()
-            .add_systems(Startup, build_panel)
-            .add_systems(Update, update_console_ui);
-        app.world_mut()
-            .resource_mut::<ConsoleRegistry>()
-            .register(CommandSpec::new("map").usage("map <name>"));
+        let mut app = App::default();
+        app.init_resource::<Assets<Font>>();
+        app.init_resource::<PromptPanelOptions>();
+        app.init_resource::<PromptPanelStatus>();
+        let mut book = OrderCatalog::default();
+        book.enlist(OrderBlueprint::new("map").help_line("map <name>"));
+        app.insert_resource(book);
+        app.add_systems(Startup, build_panel);
+        app.add_systems(Update, update_console_ui);
         app.update();
         app
     }
 
     fn visibility_of<M: Component>(app: &mut App) -> Visibility {
         let world = app.world_mut();
-        let mut query = world.query_filtered::<&Visibility, With<M>>();
-        *query.single(world).expect("one such entity")
+        let found = world.query_filtered::<&Visibility, With<M>>().single(world).copied();
+        found.expect("one such entity")
     }
 
     fn text_of<M: Component>(app: &mut App) -> String {
         let world = app.world_mut();
-        let mut query = world.query_filtered::<&Text, With<M>>();
-        (**query.single(world).expect("one such entity")).clone()
+        let found = world.query_filtered::<&Text, With<M>>().single(world).map(|text| text.0.clone());
+        found.expect("one such entity")
     }
 
     fn completion_children(app: &mut App) -> usize {
         let world = app.world_mut();
-        let mut query = world.query_filtered::<&Children, With<CompletionText>>();
-        query.iter(world).map(|children| children.len()).sum()
+        let mut lists = world.query_filtered::<&Children, With<CompletionText>>();
+        lists.iter(world).fold(0, |total, list| total + list.len())
     }
 
-    fn type_line(app: &mut App, line: &str) {
-        let mut state = app.world_mut().resource_mut::<ConsoleState>();
-        state.open = true;
-        state.editor.line = line.to_owned();
-        state.editor.caret = line.chars().count();
+    fn type_line(app: &mut App, typed: &str) {
+        let mut state = app.world_mut().resource_mut::<PromptPanelStatus>();
+        state.shown = true;
+        state.editor.insert_column = typed.chars().count();
+        state.editor.line = typed.to_owned();
+    }
+
+    fn set_open(app: &mut App, open: bool) {
+        app.world_mut().resource_mut::<PromptPanelStatus>().shown = open;
     }
 
     #[test]
     fn the_panel_starts_hidden_and_follows_open() {
         let mut app = console_app();
-        assert_eq!(visibility_of::<ConsolePanel>(&mut app), Visibility::Hidden);
+        assert_eq!(visibility_of::<PromptPanelRoot>(&mut app), Visibility::Hidden);
         type_line(&mut app, "");
         app.update();
-        assert_eq!(visibility_of::<ConsolePanel>(&mut app), Visibility::Visible);
-        app.world_mut().resource_mut::<ConsoleState>().open = false;
+        assert_eq!(visibility_of::<PromptPanelRoot>(&mut app), Visibility::Visible);
+        set_open(&mut app, false);
         app.update();
-        assert_eq!(visibility_of::<ConsolePanel>(&mut app), Visibility::Hidden);
+        assert_eq!(visibility_of::<PromptPanelRoot>(&mut app), Visibility::Hidden);
     }
 
     #[test]
     fn the_scrollback_shows_the_log_one_line_each() {
         let mut app = console_app();
         type_line(&mut app, "");
-        let mut state = app.world_mut().resource_mut::<ConsoleState>();
-        state.log = vec!["first".to_owned(), "second".to_owned()];
+        app.world_mut().resource_mut::<PromptPanelStatus>().lines = ["first", "second"].map(String::from).to_vec();
         app.update();
         assert_eq!(text_of::<ScrollbackText>(&mut app), "first\nsecond");
     }
@@ -358,17 +334,11 @@ mod tests {
         let mut app = console_app();
         type_line(&mut app, "ma");
         app.update();
-        assert_eq!(
-            visibility_of::<CompletionText>(&mut app),
-            Visibility::Visible
-        );
-        assert!(completion_children(&mut app) > 0);
+        assert_eq!(visibility_of::<CompletionText>(&mut app), Visibility::Visible);
+        assert_ne!(completion_children(&mut app), 0);
         type_line(&mut app, "zzzz");
         app.update();
-        assert_eq!(
-            visibility_of::<CompletionText>(&mut app),
-            Visibility::Hidden
-        );
+        assert_eq!(visibility_of::<CompletionText>(&mut app), Visibility::Hidden);
         assert_eq!(completion_children(&mut app), 0);
     }
 
@@ -377,44 +347,33 @@ mod tests {
         let mut app = console_app();
         type_line(&mut app, "ma");
         app.update();
-        app.world_mut().resource_mut::<ConsoleState>().open = false;
+        set_open(&mut app, false);
         app.update();
-        assert_eq!(
-            visibility_of::<CompletionText>(&mut app),
-            Visibility::Hidden
-        );
+        assert_eq!(visibility_of::<CompletionText>(&mut app), Visibility::Hidden);
         assert_eq!(completion_children(&mut app), 0);
         type_line(&mut app, "ma");
         app.update();
-        assert!(
-            completion_children(&mut app) > 0,
-            "reopening draws them again"
-        );
+        assert_ne!(completion_children(&mut app), 0, "reopening draws them again");
     }
 
     #[test]
     fn the_prompt_and_scrollback_are_found_through_their_resources() {
         let app = console_app();
-        let prompt = app.world().resource::<PromptEntity>().0;
-        let scrollback = app.world().resource::<ScrollbackEntity>().0;
-        assert!(app.world().get::<PromptText>(prompt).is_some());
-        assert!(app.world().get::<EditableText>(prompt).is_some());
-        assert!(app.world().get::<ScrollbackText>(scrollback).is_some());
+        let world = app.world();
+        let PromptEntity(input) = *world.resource::<PromptEntity>();
+        let ScrollbackEntity(log) = *world.resource::<ScrollbackEntity>();
+        assert!(world.entity(input).contains::<PromptText>());
+        assert!(world.entity(input).contains::<EditableText>());
+        assert!(world.entity(log).contains::<ScrollbackText>());
     }
 
     #[test]
     fn completion_tones_have_their_own_colours() {
-        assert_eq!(
-            tone_color(SuggestTone::Indent),
-            tone_color(SuggestTone::RestMuted)
-        );
-        assert_ne!(
-            tone_color(SuggestTone::RestSelected),
-            tone_color(SuggestTone::RestMuted)
-        );
-        assert_ne!(
-            tone_color(SuggestTone::Matched),
-            tone_color(SuggestTone::RestSelected)
-        );
+        let [lead_spaces, muted, picked, matched] =
+            [HintShade::Indent, HintShade::RestMuted, HintShade::RemainderPicked, HintShade::Matched]
+                .map(tint_of);
+        assert_eq!(lead_spaces, muted);
+        assert_ne!(picked, muted);
+        assert_ne!(matched, picked);
     }
 }

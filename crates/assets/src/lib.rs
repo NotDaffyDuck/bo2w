@@ -1,7 +1,7 @@
 //! Loading what a match needs from the game's files, and handing the prepared
 //! products to the rest of the engine.
 
-mod lane;
+mod zone_io;
 mod load_overlay;
 mod load_process;
 mod match_load_admit;
@@ -13,37 +13,39 @@ mod script_bundle;
 mod script_names;
 mod script_set;
 mod t6_hud_assets;
-mod teardown;
+mod session_teardown;
 
-pub mod image_handles;
-pub mod plugin;
-pub mod session_load;
+pub mod surf_images;
+pub mod load_wiring;
+pub mod load_stages;
 
 pub use asset_core::{
-    AssetEdge, FpvMeshIndex, MaterialIndex, MaterialSpace, TracerSpace, WorldWeaponIndex,
+    AssetDependencyLink, FpvMeshSlot, SurfaceMaterialId, SurfaceShaderSpace, TracerRange, WorldWeaponSlot,
 };
 pub use asset_transport::{
-    NamespaceSoundIwd, NamespaceTrees, cache_get, cache_put, fnv1a64, fnv1a64_more,
+    CategorySoundArchive, CategoryTreeSet, memo_fetch, memo_store, hash_text_64, fnv1a64_extend,
 };
-pub use lane::t6_frontend::{T6Frontend, load_t6_frontend, plain_rgba8};
-pub use lighting_t6::MODEL_LIGHTING_TILE_BYTES;
-pub use load_overlay::{LoadingPreviewSource, LoadingScreen};
+pub use zone_io::t6_frontend::{T6Frontend, load_t6_frontend, plain_rgba8};
+pub use lighting_t6::ILLUM_TILE_LEN;
+pub use load_overlay::{LoadBackdropOrigin, LoadBackdrop};
 pub use load_process::MapLoadProcess;
 pub use match_load_state::{
-    MapLoadApproval, MatchLoadAbort, MatchLoadAccepted, MatchLoadBusy, MatchLoadDispatch,
-    MatchLoadRequest, PreparedMatchReady, PreparedMatchSound,
+    MapLoadApproval, SessionLoadCancel, SessionLoadApproved, SessionLoadOccupied, MatchLoadDispatch,
+    SessionLoadOrder, ReadiedSessionSignal, PreparedMatchSound,
 };
-pub use plugin::AssetPlugin;
-pub use prepared_map::{MapFacts, MatchMaterials, PreparedMap};
+pub use load_wiring::ZoneAssetPlugin;
+pub use prepared_map::{MapFacts, MatchMaterials, ReadiedMapData};
 pub use prepared_resources::{
-    DestructibleDeathRow, MatchType10SoundHints, PreparedBodies, PreparedDestructibleDeath,
-    PreparedFpvMeshes, PreparedLocalizedStrings, PreparedProjectileMeshes, PreparedWeapons,
-    PreparedWorldWeapons, PreparedXAnims, PreparedXModelWalkCensus,
+    BreakableDemiseRecord, RoundTenthKindAudioClues, ReadiedCharacterBodies, ReadiedBreakableDeath,
+    ReadiedFpvMeshes, ReadiedLocalText, ReadiedProjectileMeshes, StagedWeapons,
+    ReadiedWorldWeapons, StagedXAnims, ReadiedXModelWalkCensus,
 };
 pub use script_bundle::ScriptSources;
 pub use script_set::{T6AnimFacts, T6ScriptSet};
-pub use session_load::{
-    MatchLoadOutcome, PreparedMatch, PreparedWorld, load_pool, load_prepared_match, load_workers,
-    note_gpu_resident, publish_process_cpus, release_resident_cpu_images,
+pub use load_stages::{
+    MatchLoadOutcome, ReadiedSession, StagedLevel, loader_pool, read_staged_round, spawn_reader_threads,
+    note_gpu_resident, announce_worker_cores, release_resident_cpu_images,
 };
-pub use t6_hud_assets::{T6HudFont, T6HudFonts, T6HudIcons, T6Ui};
+pub use t6_hud_assets::{
+    T6HudFont, T6HudFonts, T6HudIcons, T6ScreenFilter, T6ScreenFilters, T6Ui,
+};

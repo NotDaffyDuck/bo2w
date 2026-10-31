@@ -2,30 +2,34 @@
 
 // Public modules.
 pub mod classes;
-pub mod frontend;
+pub mod menu_flow;
 pub mod lui_omni_row; // bo2zm: Controls > Move "Omni Movement" (10-10)
 
 // Shell, loading and status pages.
-mod gap_hud;
-mod launch_report;
-mod layers;
+mod cheat_menu; // bo2zm: the solo cheat menu (Num 1)
+mod frame_rate; // bo2zm: Draw FPS, Max FPS
+mod status_page;
+mod boot_digest;
+mod tiers;
 mod load_table;
-mod loading;
+mod load_splash;
 mod menu;
-mod menu_load;
-mod options;
-mod plugin;
-mod screen;
+mod map_entry;
+mod window_prefs;
+mod ui_root;
+mod screen_tiers;
+mod screen_box;
 
 // In-game widgets and the LUI front end.
 mod bo2_font;
+mod bo2_globe;
 mod bo2mp_damage; // bo2mp lane C
 mod bo2mp_grenade; // bo2mp: the grenade warning
 mod lui_additive; // bo2mp scope: true additive HUD pictures
 mod lui_frontend; // bo2mp lane C
 mod lui_hud; // bo2zm M4
 mod lui_scene; // bo2mp menus: the front end's 3D backdrop
-mod overhead_names; // bo2mp: names over heads in BO2's font
+mod name_tags; // bo2mp: names over heads in BO2's font
 mod rcxd_hint; // bo2mp RC-XD
 mod rcxd_screen; // bo2mp RC-XD
 mod scope_hint; // bo2mp scope lane
@@ -33,33 +37,41 @@ mod target_highlights; // bo2mp Dragonfire
 mod zm_hud;
 
 pub use classes::equip_txn::{
-    EquipTxnWatch, apply_pending_class_equip, resolve_class_equip_transaction,
-    sync_class_change_allowed,
+    LoadoutArmTracker, enact_queued_loadout_arm, settle_loadout_arm_deal,
+    refresh_loadout_swap_permit,
 };
 pub use classes::icons::{
-    ClassSelectIconCache, UiAssetRoot, cac_attachment_image, cac_material_iwd_stem,
-    cac_weapon_image, pretty_weapon_name,
+    LoadoutPickerThumbs, MenuMediaAnchor, loadout_addon_thumb, loadout_surface_pack_stem,
+    loadout_gun_thumb, display_gun_title,
 };
+// What the console's class commands drive.
 pub use classes::select::{
-    ClassChangeAllowed, ClassChangeBlockReason, ClassEquipRefusal, ClassEquipRequest,
-    ClassSelectHighlight, ClassSelectOverlayOpen, ClassSelectPhase, ClassSelectStatus,
-    PendingClassEquip, accept_class_equip, class_index_by_name, commit_class_equip,
-    reject_class_equip,
+    LoadoutSwapPermit, LoadoutSwapDenial, LoadoutArmRejection, LoadoutPickerFocus, LoadoutPickerStage,
+    LoadoutPickerReport, QueuedLoadoutArm, loadout_slot_named, finalize_loadout_arm,
 };
-pub use classes::setup::{ClassEditRow, ClassLoadoutCatalog, ClassPickerFolder, ClassSlotState};
-pub use classes::store::SessionClassStore;
-pub use frame::{AppScreen, ClassPreset, LaunchIdentity, LaunchReport, showcase_classes};
-pub use gap_hud::GapHud;
-pub use launch_report::publish_gap_hud;
-pub use layers::{
-    ApplyUiLayers, GameUiFont, UiCamera, UiDraw, UiLayer, UiLayerVisibility, UiLayers,
-    game_text_font,
+pub use classes::setup::{LoadoutEditorLine, LoadoutRoster, ClassPickerFolder, LoadoutSlotStatus};
+pub use classes::store::MatchLoadoutVault;
+pub use frame::{ShellScreen, KitTemplate, StartupPersona, StartupReport, showcase_classes};
+pub use status_page::InterimOverlay;
+pub use boot_digest::share_interim_overlay;
+pub use name_tags::{OverheadNameRow, OverheadNameRows};
+pub use tiers::{
+    OverlayTierPass, MenuTypeface, UiCamera, MenuPaintPass, OverlayTier, OverlayStackShown, OverlayTierSet,
+    match_typeface,
 };
-pub use loading::{LoadProgress, LoadingPreviewSource, LoadingScreen};
+pub use load_splash::{LoadCompletion, LoadBackdropOrigin, LoadBackdrop};
 pub use lui_additive::AdditiveUi;
 pub use lui_frontend::{Bo2mpFrontend, Bo2mpFrontendAssets};
-pub use menu::MenuMapList;
-pub use options::{BindingView, PresentModeOverride};
-pub use overhead_names::{OverheadNameRow, OverheadNameRows};
-pub use plugin::UiPlugin;
-pub use screen::{layers_for_screen, sync_ui_layers};
+pub use menu::ScreenArenaRoster;
+pub use window_prefs::{KeymapSnapshot, SwapChainPacingChoice};
+pub use ui_root::MenuHudPlugin;
+pub use screen_tiers::{refresh_overlay_tiers, tiers_for_screen};
+pub(crate) use screen_box::{
+    ActiveView, CompositedWorldCameras, MainWindow, MainWindowMut, SceneCameras, ScreenBox, absolute_node, covering_node,
+    every_ui_frame, pinned_node,
+};
+
+/// The HUD picture filed under this material name, once the packs are in.
+pub(crate) fn hud_picture<'a>(icons: &'a assets::T6HudIcons, name: &str) -> Option<&'a std::sync::Arc<bevy::image::Image>> {
+    icons.0.iter().find_map(|(material, image)| (material == name).then_some(image))
+}

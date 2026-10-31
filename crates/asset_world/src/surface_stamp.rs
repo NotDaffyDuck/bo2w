@@ -3,98 +3,84 @@
 
 use std::fmt;
 
-use dpvs_t6::{GfxDrawSurf, fill_surface_materials};
+use dpvs_t6::{SortedDraw, populate_surface_material_table};
 
-use crate::SurfaceCastsSunShadow;
+use crate::FaceBlocksSunlight;
 
 /// A world's surfaces as the renderer sorts them: one packed draw key for
 /// each, and which of them cast the sun's shadow. The two always have the
 /// same length.
 #[derive(Clone, Debug, Default)]
-pub struct WorldCapture {
+pub struct LevelSnapshot {
     /// Material and light bits are filled in by
-    /// [`stamp_packed_surface_materials`] once the materials are known.
-    pub packed_draw_surfs: Vec<GfxDrawSurf>,
-    pub casters: SurfaceCastsSunShadow,
+    /// [`stamp_compact_facet_materials`] once the materials are known.
+    pub compact_facet_draws: Vec<SortedDraw>,
+    pub casters: FaceBlocksSunlight,
 }
 
-impl WorldCapture {
-    pub fn surface_count(&self) -> usize {
-        self.packed_draw_surfs.len()
+impl LevelSnapshot {
+    pub fn facet_tally(&self) -> usize {
+        self.compact_facet_draws.len()
     }
 }
 
 /// Why materials could not be stamped into a capture's draw keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SurfaceMaterialStampError {
+pub enum FacetMaterialStampError {
     /// The capture's draw keys and shadow casters cover different numbers of
     /// surfaces.
-    CaptureLengthMismatch { packed: usize, casters: usize },
+    KeyCasterCountDiffers { keys: usize, shadow_casters: usize },
     /// A per-surface input list is not as long as the capture.
-    InputLengthMismatch {
-        authored: usize,
-        material_slots: usize,
-        primary_lights: usize,
+    WrongPayloadSize {
+        surfaces: usize,
+        slots_wanted: usize,
+        key_lights: usize,
     },
 }
 
-impl fmt::Display for SurfaceMaterialStampError {
+impl fmt::Display for FacetMaterialStampError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::CaptureLengthMismatch { packed, casters } => {
-                write!(f, "capture covers {packed} draw keys but {casters} casters")
+        match self {
+            Self::KeyCasterCountDiffers { keys, shadow_casters: casters } => {
+                write!(f, "capture covers {keys} draw keys but {casters} casters")
             }
-            Self::InputLengthMismatch {
-                authored,
-                material_slots,
-                primary_lights,
-            } => write!(
-                f,
-                "capture has {authored} surfaces but {material_slots} material slots \
-                 and {primary_lights} primary lights"
-            ),
+            Self::WrongPayloadSize { surfaces, slots_wanted, key_lights } => {
+                let head = format!("capture has {surfaces} surfaces but {slots_wanted} material slots");
+                write!(f, "{head} and {key_lights} primary lights")
+            }
         }
     }
 }
 
-impl std::error::Error for SurfaceMaterialStampError {}
+impl std::error::Error for FacetMaterialStampError {}
 
 /// A capture whose draw keys are all blank, for the given shadow casters.
-pub fn world_capture_from_casters(casters: SurfaceCastsSunShadow) -> WorldCapture {
-    WorldCapture {
-        packed_draw_surfs: vec![GfxDrawSurf::from_packed(0); casters.len()],
-        casters,
-    }
+pub fn snapshot_from_sun_blockers(casters: FaceBlocksSunlight) -> LevelSnapshot {
+    let blank = SortedDraw::unpack_from_bits(0);
+    let compact_facet_draws = vec![blank; casters.len()];
+    LevelSnapshot { casters, compact_facet_draws }
 }
 
+/// Stamping a capture's draw keys, or why it was refused.
+type Stamped = Result<(), FacetMaterialStampError>;
+
 /// Writes each surface's material and primary light into its draw key.
-/// `baked_by_material_slot` gives the key bits a material contributes.
-pub fn stamp_packed_surface_materials(
-    surface_material_slots: &[Option<usize>],
-    surface_primary_lights: &[u8],
-    baked_by_material_slot: &[Option<GfxDrawSurf>],
-    capture: &mut WorldCapture,
-) -> Result<(), SurfaceMaterialStampError> {
-    let surfaces = capture.surface_count();
-    if capture.casters.len() != surfaces {
-        return Err(SurfaceMaterialStampError::CaptureLengthMismatch {
-            packed: surfaces,
-            casters: capture.casters.len(),
-        });
+/// `baked` gives the key bits a material contributes.
+pub fn stamp_compact_facet_materials(
+    slots: &[Option<usize>],
+    lights: &[u8],
+    baked: &[Option<SortedDraw>],
+    target: &mut LevelSnapshot,
+) -> Stamped {
+    let (keys, caster_total) = (target.compact_facet_draws.len(), target.casters.len());
+    if keys != caster_total {
+        return Err(FacetMaterialStampError::KeyCasterCountDiffers { keys, shadow_casters: caster_total });
     }
-    if surface_material_slots.len() != surfaces || surface_primary_lights.len() != surfaces {
-        return Err(SurfaceMaterialStampError::InputLengthMismatch {
-            authored: surfaces,
-            material_slots: surface_material_slots.len(),
-            primary_lights: surface_primary_lights.len(),
-        });
+    let (slots_wanted, key_lights) = (slots.len(), lights.len());
+    if [slots_wanted, key_lights].iter().any(|&n| n != keys) {
+        return Err(FacetMaterialStampError::WrongPayloadSize { surfaces: keys, slots_wanted, key_lights });
     }
-    fill_surface_materials(
-        surface_material_slots,
-        surface_primary_lights,
-        baked_by_material_slot,
-        &mut capture.packed_draw_surfs,
-    );
+    populate_surface_material_table(slots, lights, baked, &mut target.compact_facet_draws);
     Ok(())
 }
 
@@ -104,45 +90,36 @@ mod tests {
 
     #[test]
     fn a_new_capture_has_a_blank_key_for_every_caster() {
-        let capture = world_capture_from_casters(SurfaceCastsSunShadow::with_len(4));
-        assert_eq!(capture.surface_count(), 4);
-        assert_eq!(capture.casters.len(), 4);
+        let made = snapshot_from_sun_blockers(FaceBlocksSunlight::with_len(4));
+        assert_eq!(made.casters.len(), 4);
+        assert_eq!(made.facet_tally(), 4);
     }
 
     #[test]
     fn stamping_refuses_inputs_of_the_wrong_length() {
-        let mut capture = world_capture_from_casters(SurfaceCastsSunShadow::with_len(2));
-        let err = stamp_packed_surface_materials(&[None], &[0, 0], &[], &mut capture);
-        assert_eq!(
-            err,
-            Err(SurfaceMaterialStampError::InputLengthMismatch {
-                authored: 2,
-                material_slots: 1,
-                primary_lights: 2,
-            })
-        );
+        let mut held = snapshot_from_sun_blockers(FaceBlocksSunlight::with_len(2));
+        let outcome = stamp_compact_facet_materials(&[None], &[0, 0], &[], &mut held);
+        let expected = FacetMaterialStampError::WrongPayloadSize {
+            surfaces: 2,
+            slots_wanted: 1,
+            key_lights: 2,
+        };
+        assert_eq!(outcome, Err(expected));
     }
 
     #[test]
     fn stamping_refuses_a_capture_whose_halves_disagree() {
-        let mut capture = world_capture_from_casters(SurfaceCastsSunShadow::with_len(2));
-        capture.casters = SurfaceCastsSunShadow::with_len(3);
-        let err = stamp_packed_surface_materials(&[None; 2], &[0; 2], &[], &mut capture);
-        assert_eq!(
-            err,
-            Err(SurfaceMaterialStampError::CaptureLengthMismatch {
-                packed: 2,
-                casters: 3,
-            })
-        );
+        let mut held = snapshot_from_sun_blockers(FaceBlocksSunlight::with_len(2));
+        held.casters = FaceBlocksSunlight::with_len(3);
+        let outcome = stamp_compact_facet_materials(&[None; 2], &[0; 2], &[], &mut held);
+        let expected = FacetMaterialStampError::KeyCasterCountDiffers { keys: 2, shadow_casters: 3 };
+        assert_eq!(outcome, Err(expected));
     }
 
     #[test]
     fn stamping_matching_inputs_succeeds() {
-        let mut capture = world_capture_from_casters(SurfaceCastsSunShadow::with_len(2));
-        assert_eq!(
-            stamp_packed_surface_materials(&[None; 2], &[0; 2], &[], &mut capture),
-            Ok(())
-        );
+        let mut held = snapshot_from_sun_blockers(FaceBlocksSunlight::with_len(2));
+        let outcome = stamp_compact_facet_materials(&[None; 2], &[0; 2], &[], &mut held);
+        assert_eq!(outcome, Ok(()));
     }
 }

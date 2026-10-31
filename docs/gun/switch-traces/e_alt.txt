@@ -1,0 +1,19 @@
+# E. Alt switch to the AN-94's grenade launcher: no drop, the launcher's own raise (700) from the press tick.
+# Spawn as BO2 does: empty hands, class guns given, the primary comes up with its first raise (AN-94 1600 ms),
+# which marks every held gun as raised before. 50 ms ticks: 1 press tick + 32.
+msec 50
+give an94_mp
+give gl_an94_mp
+select an94_mp
+run 33
+expect state READY
+expect anim IDLE
+select gl_an94_mp
+run 1
+expect state RAISING_ALTSWITCH
+expect anim ALTSWITCHTO
+expect weapon gl_an94_mp
+run 13
+expect state RAISING_ALTSWITCH
+run 1                 # 700 ms
+expect state READY

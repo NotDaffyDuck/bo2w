@@ -2,20 +2,21 @@
 
 mod hash;
 mod ids;
-mod material;
+mod mat_entry;
 mod table;
 mod technique;
 
-pub(crate) use hash::{fnv1a64, fnv1a64_more};
+pub(crate) use hash::hash_text_64;
+pub(crate) use hash::fnv_extend;
 pub use ids::{
-    CAMERA_REGION_DEPTH_HACK, CAMERA_REGION_EMISSIVE, CAMERA_REGION_LIT_OPAQUE,
-    CAMERA_REGION_LIT_TRANS, CAMERA_REGION_NONE, MaterialAssetId, MaterialGenerationId, PortId,
-    RuntimeImageId, RuntimeProgramIdentity, RuntimeShaderPair, RuntimeShaderProgram,
-    RuntimeShaderProgramId, RuntimeTechniqueSetId, RuntimeTextureBinding, SortedMaterialOrdinal,
-    TECHNIQUE_SLOT_COUNT, sort_band,
+    CAMERA_REGION_NEAR_DEPTH_TRICK, VIEW_STAGE_SELF_LIT, VIEW_STAGE_SOLID_LIT,
+    VIEW_STAGE_BLENDED_LIT, VIEW_STAGE_ABSENT, MaterialAssetKey, MaterialEpochId, ShaderPortKey,
+    LiveImageId, LiveShaderIdentity, LiveShaderPair, ActiveShaderCombo,
+    LiveShaderProgramId, LiveTechniqueBundleKey, LiveTextureBinding, SortedMaterialRank,
+    RENDER_RECIPE_SLOT_TOTAL, sort_band,
 };
-pub use material::RuntimeMaterial;
-pub use table::{CatalogBuildError, RuntimeMaterialCatalog, RuntimeSortedMaterialTable};
+pub use mat_entry::LiveMaterial;
+pub use table::{LedgerBuildError, LiveMaterialLedger, LiveSortedMaterialTable};
 pub use technique::{
-    RemapResolution, RuntimePass, RuntimeTechnique, RuntimeTechniqueSet, sort_pass_args,
+    MaterialRemapOutcome, LivePassRecord, LiveShadingTechnique, LiveTechniqueBundle, sort_pass_args,
 };

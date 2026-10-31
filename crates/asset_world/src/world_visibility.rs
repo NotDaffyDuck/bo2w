@@ -1,26 +1,26 @@
 //! The visibility side of a loaded world: its cells, portals, plane tree and
 //! the bounds each cell draws from.
 
-use dpvs_t6::{AabbTree, Bounds, CPlane};
+use dpvs_t6::{AabbTree, Bounds, PlaneEquation};
 
-use crate::mesh_report::{BoundsTable, WorldMeshError};
+use crate::mesh_report::{BoxSource, LevelMeshFault};
 
 /// A doorway between two cells.
 #[derive(Clone, Debug)]
-pub struct OwnedPortal {
-    pub plane: [f32; 4],
+pub struct SelfContainedVisibilityPortal {
+    pub split: [f32; 4],
     /// The cell on the far side.
-    pub neighbor: u16,
-    /// Where this portal's corners sit in `DpvsWorldData::portal_verts`.
-    pub vert_start: usize,
-    pub vert_count: usize,
+    pub adjacent_cell: u16,
+    /// Where this portal's corners sit in `VisibilityLevelData::portal_vertices`.
+    pub vertex_first: usize,
+    pub vertex_tally: usize,
     /// Two axes of the portal's hull, when it has one.
-    pub hull_axis: Option<[[f32; 3]; 2]>,
+    pub hull_axes_dir: Option<[[f32; 3]; 2]>,
 }
 
 /// Which kind of surface a camera range holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CameraRangeKind {
+pub enum CameraSpanKind {
     LitOpaque,
     LitTrans,
     Decal,
@@ -29,96 +29,97 @@ pub enum CameraRangeKind {
 
 /// A run of sorted surfaces `[begin, end)` of one kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CameraSurfRange {
-    pub kind: CameraRangeKind,
-    pub begin: u32,
-    pub end: u32,
+pub struct ViewSurfaceSpan {
+    pub kind: CameraSpanKind,
+    pub from: u32,
+    pub until: u32,
 }
 
 /// The camera's surface runs. There is always at least one, so the first is
 /// kept apart from the rest.
 #[derive(Clone, Debug)]
-pub struct CameraSurfRanges {
-    first: CameraSurfRange,
-    rest: Vec<CameraSurfRange>,
+pub struct ViewSurfaceSpans {
+    lead: ViewSurfaceSpan,
+    others: Vec<ViewSurfaceSpan>,
 }
 
-impl CameraSurfRanges {
-    pub fn new(first: CameraSurfRange, rest: Vec<CameraSurfRange>) -> Self {
-        Self { first, rest }
+impl ViewSurfaceSpans {
+    pub fn new(lead: ViewSurfaceSpan, others: Vec<ViewSurfaceSpan>) -> Self {
+        Self { others, lead }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = CameraSurfRange> + '_ {
-        std::iter::once(self.first).chain(self.rest.iter().copied())
+    pub fn iter(&self) -> impl Iterator<Item = ViewSurfaceSpan> + '_ {
+        let tail = self.others.iter().copied();
+        std::iter::once(self.lead).chain(tail)
     }
 }
 
 /// Everything the culler reads from a world.
 #[derive(Clone, Debug)]
-pub struct DpvsWorldData {
-    pub planes: Vec<CPlane>,
-    pub nodes: Vec<u16>,
-    pub cell_count: usize,
+pub struct VisibilityLevelData {
+    pub planes: Vec<PlaneEquation>,
+    pub tree_nodes: Vec<u16>,
+    pub cell_total: usize,
     /// Per cell, its bounding-box tree.
     pub aabb_trees: Vec<Vec<AabbTree>>,
     /// Per cell, the static models its tree points at.
-    pub aabb_smodel_indices: Vec<Vec<u16>>,
-    pub sorted_surf_index: Vec<u16>,
-    pub static_surface_count: usize,
-    pub static_surface_count_no_decal: usize,
-    pub surface_bounds: Vec<Bounds>,
-    pub smodel_bounds: Vec<Bounds>,
-    pub portal_verts: Vec<[f32; 3]>,
-    pub portals_per_cell: Vec<Vec<OwnedPortal>>,
-    pub cell_reflection_probes: Vec<Vec<u8>>,
-    pub lit_opaque_begin: u32,
-    pub lit_opaque_end: u32,
-    pub camera_ranges: CameraSurfRanges,
-    pub emissive_surfs_begin: u32,
-    pub emissive_surfs_end: u32,
-    /// How many boxes arrived already cleared (set by `checked`).
-    pub cleared_boxes: usize,
+    pub aabb_prop_indices: Vec<Vec<u16>>,
+    pub sorted_facet_index: Vec<u16>,
+    pub static_facet_tally: usize,
+    pub static_facet_tally_no_stain: usize,
+    pub facet_bounds: Vec<Bounds>,
+    pub static_prop_boxes: Vec<Bounds>,
+    pub portal_vertices: Vec<[f32; 3]>,
+    pub portals_per_room: Vec<Vec<SelfContainedVisibilityPortal>>,
+    pub room_env_probes: Vec<Vec<u8>>,
+    pub lit_solid_begin: u32,
+    pub lit_solid_end: u32,
+    pub camera_spans: ViewSurfaceSpans,
+    pub emissive_facets_begin: u32,
+    pub emissive_facets_end: u32,
+    /// How many boxes arrived already cleared (set by `vetted`).
+    pub emptied_volumes: usize,
 }
 
-impl DpvsWorldData {
+impl VisibilityLevelData {
     /// An empty world around its camera ranges.
-    pub fn new(camera_ranges: CameraSurfRanges) -> Self {
+    pub fn new(ranges: ViewSurfaceSpans) -> Self {
         Self {
-            planes: vec![],
-            nodes: vec![],
-            cell_count: 0,
-            aabb_trees: vec![],
-            aabb_smodel_indices: vec![],
-            sorted_surf_index: vec![],
-            static_surface_count: 0,
-            static_surface_count_no_decal: 0,
-            surface_bounds: vec![],
-            smodel_bounds: vec![],
-            portal_verts: vec![],
-            portals_per_cell: vec![],
-            cell_reflection_probes: vec![],
-            lit_opaque_begin: 0,
-            lit_opaque_end: 0,
-            camera_ranges,
-            emissive_surfs_begin: 0,
-            emissive_surfs_end: 0,
-            cleared_boxes: 0,
+            emptied_volumes: Default::default(),
+            emissive_facets_end: Default::default(),
+            emissive_facets_begin: Default::default(),
+            camera_spans: ranges,
+            lit_solid_end: Default::default(),
+            lit_solid_begin: Default::default(),
+            room_env_probes: Default::default(),
+            portals_per_room: Default::default(),
+            portal_vertices: Default::default(),
+            static_prop_boxes: Default::default(),
+            facet_bounds: Default::default(),
+            static_facet_tally_no_stain: Default::default(),
+            static_facet_tally: Default::default(),
+            sorted_facet_index: Default::default(),
+            aabb_prop_indices: Default::default(),
+            aabb_trees: Default::default(),
+            cell_total: Default::default(),
+            tree_nodes: Default::default(),
+            planes: Default::default(),
         }
     }
 
     /// Looks over every bounds table. A box with a negative half-extent is an
     /// error; a box that was deliberately cleared is counted and let through.
-    pub(crate) fn checked(mut self) -> Result<Self, WorldMeshError> {
-        let mut cleared = 0;
-        for (cell, trees) in self.aabb_trees.iter().enumerate() {
-            let boxes = trees.iter().map(AabbTree::bounds);
-            cleared += count_cleared(BoundsTable::AabbNode { cell }, boxes)?;
+    pub(crate) fn vetted(mut self) -> Result<Self, LevelMeshFault> {
+        let mut running = 0usize;
+        for (cell, per_cell) in self.aabb_trees.iter().enumerate() {
+            running += count_cleared(
+                BoxSource::TreeNode { cell },
+                per_cell.iter().map(AabbTree::bounds),
+            )?;
         }
-        let surfaces = self.surface_bounds.iter().copied();
-        cleared += count_cleared(BoundsTable::Surface, surfaces)?;
-        let models = self.smodel_bounds.iter().copied();
-        cleared += count_cleared(BoundsTable::SmodelInst, models)?;
-        self.cleared_boxes = cleared;
+        running += count_cleared(BoxSource::Surface, self.facet_bounds.iter().copied())?;
+        running += count_cleared(BoxSource::PropInstance, self.static_prop_boxes.iter().copied())?;
+        self.emptied_volumes = running;
         Ok(self)
     }
 }
@@ -126,48 +127,45 @@ impl DpvsWorldData {
 /// How many of `boxes` are cleared; the first with a negative half-extent is
 /// an error naming its table, index and axis.
 fn count_cleared(
-    table: BoundsTable,
-    boxes: impl Iterator<Item = Bounds>,
-) -> Result<usize, WorldMeshError> {
-    let mut cleared = 0;
-    for (index, bounds) in boxes.enumerate() {
-        if bounds.is_cleared() {
-            cleared += 1;
-        } else if let Some(axis) = bounds.negative_half_axis() {
-            let half = bounds.half()[axis];
-            return Err(WorldMeshError::NegativeBoundsHalf {
-                table,
-                index,
-                axis,
-                half,
-            });
+    which: BoxSource,
+    candidates: impl Iterator<Item = Bounds>,
+) -> Result<usize, LevelMeshFault> {
+    let mut tally = 0usize;
+    for (index, found) in candidates.enumerate() {
+        if found.has_been_reset() {
+            tally += 1;
+            continue;
         }
+        let Some(axis) = found.minus_axis_direction() else {
+            continue;
+        };
+        let half = found.half()[axis];
+        return Err(LevelMeshFault::InsideOutBox { half, axis, index, table: which });
     }
-    Ok(cleared)
+    Ok(tally)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ranges() -> CameraSurfRanges {
-        let run = |kind, begin, end| CameraSurfRange { kind, begin, end };
-        CameraSurfRanges::new(
-            run(CameraRangeKind::LitOpaque, 0, 4),
-            vec![run(CameraRangeKind::Decal, 4, 6)],
-        )
+    fn ranges() -> ViewSurfaceSpans {
+        let span = |kind, begin, end| ViewSurfaceSpan { kind, from: begin, until: end };
+        let lead = span(CameraSpanKind::LitOpaque, 0, 4);
+        let tail = vec![span(CameraSpanKind::Decal, 4, 6)];
+        ViewSurfaceSpans::new(lead, tail)
     }
 
     #[test]
     fn the_first_range_leads_the_rest() {
         let kinds: Vec<_> = ranges().iter().map(|r| r.kind).collect();
-        assert_eq!(kinds, [CameraRangeKind::LitOpaque, CameraRangeKind::Decal]);
+        assert_eq!(kinds, [CameraSpanKind::LitOpaque, CameraSpanKind::Decal]);
     }
 
     #[test]
     fn an_empty_world_checks_clean() {
-        let world = DpvsWorldData::new(ranges()).checked().unwrap();
-        assert_eq!(world.cleared_boxes, 0);
-        assert_eq!(world.cell_count, 0);
+        let world = VisibilityLevelData::new(ranges()).vetted().unwrap();
+        assert_eq!(world.emptied_volumes, 0);
+        assert_eq!(world.cell_total, 0);
     }
 }

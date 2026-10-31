@@ -6,92 +6,113 @@ use std::time::{Duration, Instant};
 
 use bevy::prelude::Resource;
 
-use asset_transport::progress::LoadProgress;
+use asset_transport::progress::LoadCompletion;
 
 /// How the load under the overlay stands.
 #[derive(Clone, Debug)]
-enum Phase {
+enum LoadPhase {
     Loading,
     Finished,
-    Failed(String),
+    LoadFailed(String),
 }
 
 /// The overlay drawn over a map load. It only tracks its own life; what the
 /// load itself does on completion is [`crate::MapLoadProcess`]'s job, which
 /// carries on whether an overlay exists or not.
 #[derive(Resource)]
-pub struct LoadingScreen {
-    pub progress: LoadProgress,
-    title: String,
-    mode_label: String,
-    phase: Phase,
+pub struct LoadBackdrop {
+    pub progress: LoadCompletion,
+    title_text: String,
+    mode_caption: String,
+    phase: LoadPhase,
     shown_since: Instant,
     /// The overlay's age as of the last [`Self::tick_elapsed`], so everything
     /// drawn in one frame reads the same number.
     age: Duration,
-    preview_ready: bool,
+    backdrop_available: bool,
+    /// The screen stays up at least this long after it appeared (BO2's own
+    /// loading screen fades its picture in over a few seconds).
+    min_hold: Duration,
 }
 
-impl LoadingScreen {
+impl LoadBackdrop {
     pub fn new(
-        progress: LoadProgress,
-        title: impl Into<String>,
-        mode_label: impl Into<String>,
+        progress: LoadCompletion,
+        heading: impl Into<String>,
+        mode_caption: impl Into<String>,
     ) -> Self {
         Self {
             progress,
-            title: title.into(),
-            mode_label: mode_label.into(),
-            phase: Phase::Loading,
+            title_text: heading.into(),
+            mode_caption: mode_caption.into(),
+            phase: LoadPhase::Loading,
             shown_since: Instant::now(),
             age: Duration::ZERO,
-            preview_ready: false,
+            backdrop_available: false,
+            min_hold: Duration::ZERO,
         }
     }
 
     pub fn title(&self) -> &str {
-        &self.title
+        &self.title_text
     }
 
-    pub fn mode_label(&self) -> &str {
-        &self.mode_label
+    pub fn mode_caption(&self) -> &str {
+        &self.mode_caption
     }
 
     /// Marks the load done. A load that already ended, either way, stays as it
     /// ended.
     pub fn finish(&mut self) {
-        if matches!(self.phase, Phase::Loading) {
-            self.phase = Phase::Finished;
+        if matches!(self.phase, LoadPhase::Loading) {
+            self.phase = LoadPhase::Finished;
         }
     }
 
     /// Marks the load failed, whatever state it was in.
-    pub fn fail(&mut self, reason: impl Into<String>) {
-        self.phase = Phase::Failed(reason.into());
+    pub fn fail(&mut self, why: impl Into<String>) {
+        self.phase = LoadPhase::LoadFailed(why.into());
     }
 
     pub fn failure(&self) -> Option<&str> {
         match &self.phase {
-            Phase::Failed(reason) => Some(reason),
+            LoadPhase::LoadFailed(reason) => Some(reason),
             _ => None,
         }
     }
 
-    pub fn is_complete(&self) -> bool {
-        matches!(self.phase, Phase::Finished)
+    pub fn is_done(&self) -> bool {
+        matches!(self.phase, LoadPhase::Finished)
     }
 
-    pub fn mark_preview_ready(&mut self) {
-        self.preview_ready = true;
+    /// Keeps the screen up for `d` more from now.
+    pub fn hold_for(&mut self, d: Duration) {
+        self.min_hold = self.shown_since.elapsed() + d;
     }
 
-    pub fn preview_ready(&self) -> bool {
-        self.preview_ready
+    /// [`Self::hold_for`], the first time only.
+    pub fn hold_once(&mut self, d: Duration) {
+        if self.min_hold.is_zero() {
+            self.hold_for(d);
+            diag::info!(Ui, "loading: held until {} ms", self.min_hold.as_millis());
+        }
+    }
+
+    pub fn held(&self) -> bool {
+        self.shown_since.elapsed() < self.min_hold
+    }
+
+    pub fn flag_showcase_done(&mut self) {
+        self.backdrop_available = true;
+    }
+
+    pub fn backdrop_available(&self) -> bool {
+        self.backdrop_available
     }
 
     /// Reads the clock once for this frame. The caller's frame delta is not
     /// needed: the age is measured from when the overlay appeared.
-    pub fn tick_elapsed(&mut self, _frame_delta: Duration) {
+    pub fn advance_clock(&mut self, _frame_delta: Duration) {
         self.age = self.shown_since.elapsed();
     }
 
@@ -102,35 +123,35 @@ impl LoadingScreen {
 
 /// The map file shown as a still behind the overlay while the real load runs.
 #[derive(Resource, Clone, Debug)]
-pub struct LoadingPreviewSource {
+pub struct LoadBackdropOrigin {
     pub path: PathBuf,
-    pub map_name: String,
-    pub request_id: u64,
+    pub level_name: String,
+    pub ticket: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn screen() -> LoadingScreen {
-        LoadingScreen::new(LoadProgress::default(), "Nuketown", "Team Deathmatch")
+    fn screen() -> LoadBackdrop {
+        LoadBackdrop::new(LoadCompletion::default(), "Nuketown", "Team Deathmatch")
     }
 
     #[test]
     fn a_fresh_overlay_is_loading_and_carries_its_labels() {
         let s = screen();
-        assert!(!s.is_complete());
+        assert!(!s.is_done());
         assert_eq!(s.failure(), None);
-        assert_eq!((s.title(), s.mode_label()), ("Nuketown", "Team Deathmatch"));
+        assert_eq!((s.title(), s.mode_caption()), ("Nuketown", "Team Deathmatch"));
     }
 
     #[test]
     fn finishing_completes_it_once() {
         let mut s = screen();
         s.finish();
-        assert!(s.is_complete());
+        assert!(s.is_done());
         s.finish();
-        assert!(s.is_complete());
+        assert!(s.is_done());
     }
 
     #[test]
@@ -138,13 +159,13 @@ mod tests {
         let mut s = screen();
         s.fail("refused");
         s.finish();
-        assert!(!s.is_complete());
+        assert!(!s.is_done());
         assert_eq!(s.failure(), Some("refused"));
 
         let mut done = screen();
         done.finish();
         done.fail("late");
-        assert!(!done.is_complete());
+        assert!(!done.is_done());
         assert_eq!(done.failure(), Some("late"));
     }
 
@@ -154,15 +175,15 @@ mod tests {
         assert_eq!(s.elapsed(), Duration::ZERO);
         std::thread::sleep(Duration::from_millis(2));
         assert_eq!(s.elapsed(), Duration::ZERO);
-        s.tick_elapsed(Duration::ZERO);
+        s.advance_clock(Duration::ZERO);
         assert!(s.elapsed() >= Duration::from_millis(2));
     }
 
     #[test]
     fn the_preview_flag_latches() {
         let mut s = screen();
-        assert!(!s.preview_ready());
-        s.mark_preview_ready();
-        assert!(s.preview_ready());
+        assert!(!s.backdrop_available());
+        s.flag_showcase_done();
+        assert!(s.backdrop_available());
     }
 }

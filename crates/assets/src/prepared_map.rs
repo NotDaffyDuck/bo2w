@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use asset_material::MaterialDefinitions;
 
-use crate::t6_hud_assets::{T6HudFonts, T6HudIcons, T6Ui};
+use crate::t6_hud_assets::{T6HudFonts, T6HudIcons, T6ScreenFilters, T6Ui};
 
 /// The one pool of materials a prepared match owns. Geometry never holds a
 /// pool of its own: it holds indices into the map zone's list, and
@@ -19,18 +19,20 @@ pub struct MatchMaterials {
 }
 
 /// What the map says about the match it hosts. The lane collects these once
-/// and hands them on to their single owner, [`PreparedMap`].
+/// and hands them on to their single owner, [`ReadiedMapData`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MapFacts {
-    pub north_yaw: Option<f32>,
+    pub compass_heading: Option<f32>,
     pub airstrike_height: Option<f32>,
-    pub script_sound: asset_audio::MapScriptSoundFacts,
+    pub script_sound: asset_audio::LevelScriptAudioSummary,
     pub team_settings: asset_game::MapTeamSettings,
     /// The Zombies HUD's pictures: perk icons, timed power-ups.
     pub t6_hud_icons: T6HudIcons,
     pub t6_hud_fonts: T6HudFonts,
     /// Black Ops II's own UI scripts and what they read.
     pub t6_ui: T6Ui,
+    /// The full-screen filters the map's scripts turn on.
+    pub t6_screen_filters: T6ScreenFilters,
     /// The third-person player animation script and its anim types. Every
     /// client poses the other players with it.
     pub t6_playeranim: Option<(String, String)>,
@@ -47,9 +49,9 @@ pub struct MapFacts {
 
 /// The map a match was prepared for.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct PreparedMap {
+pub struct ReadiedMapData {
     pub zone: String,
-    pub namespace: Option<asset_core::AssetNamespace>,
-    pub spawns: Vec<asset_world::SpawnPoint>,
+    pub namespace: Option<asset_core::AssetCategoryScope>,
+    pub spawns: Vec<asset_world::RespawnMarker>,
     pub facts: MapFacts,
 }

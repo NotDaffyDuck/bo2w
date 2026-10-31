@@ -6,7 +6,7 @@ use crate::env::perk;
 use crate::facts::{fire_type, offhand_slot};
 use crate::player::Hand;
 use crate::pm::{Pm, fire};
-use crate::{anim, state};
+use {crate::anim, crate::state};
 
 /// BO2 nudges the scaled time up by 2^-30 before rounding.
 const ROUND_NUDGE: f64 = 9.313226e-10;
@@ -17,10 +17,10 @@ fn scaled(msec: i32, mult: f32) -> i32 {
 
 /// The ms this tick takes off the hand's timers (BO2's `local_8`).
 fn step_ms(pm: &Pm, h: &Hand) -> i32 {
-    let msec = pm.cmd.msec;
+    let msec = pm.cmd.frame_ms;
     let env = &*pm.env;
     let d = &env.dvars;
-    let st = h.state;
+    let st = h.phase;
     let hand = pm.hand_facts().core;
     let off = pm.facts.get(pm.ps.off_hand_weapon).core;
     // A zero reload/rate multiplier means "finish now": take the whole remaining time.
@@ -36,7 +36,7 @@ fn step_ms(pm: &Pm, h: &Hand) -> i32 {
     if (state::RELOADING..=state::RELOAD_QUICK_EMPTY).contains(&st)
         && has_perk(perk::FASTRELOAD)
     {
-        or_all(d.perk_weap_reload_multiplier)
+        or_all(d.quick_hands_factor)
     } else if matches!(
         st,
         state::FIRING | state::RECHAMBER_START | state::RECHAMBERING | state::CONT_FIRE_LOOP
@@ -78,9 +78,9 @@ pub fn time_adjust(pm: &mut Pm) -> i32 {
 
 fn time_adjust_inner(pm: &mut Pm) -> i32 {
     let left = pm.left();
-    let msec = pm.cmd.msec;
-    if pm.ps.weapon_restrict_kick_time > 0 {
-        pm.ps.weapon_restrict_kick_time = (pm.ps.weapon_restrict_kick_time - msec).max(0);
+    let msec = pm.cmd.frame_ms;
+    if pm.ps.gun_lockout_kick_stamp > 0 {
+        pm.ps.gun_lockout_kick_stamp = (pm.ps.gun_lockout_kick_stamp - msec).max(0);
     }
     let mut h = pm.hand();
     let r = step_ms(pm, &h);
@@ -97,7 +97,7 @@ fn time_adjust_inner(pm: &mut Pm) -> i32 {
         if ends {
             let hw = pm.hand_weapon();
             let hand = pm.hand_facts().core;
-            if matches!(h.state, state::FIRING | state::CONT_FIRE_LOOP)
+            if matches!(h.phase, state::FIRING | state::CONT_FIRE_LOOP)
                 && hw != 0
                 && fire_type::uses_burst(hand.fire_type)
                 && !fire::burst_fire_pending(pm, left)
@@ -108,18 +108,18 @@ fn time_adjust_inner(pm: &mut Pm) -> i32 {
                 } else {
                     hand.burst_delay_time
                 };
-                h.state = state::READY;
+                h.phase = state::READY;
                 pm.set_hand(h);
-                base::continue_anim(pm, anim::IDLE);
+                base::continue_anim(pm, anim::REST);
                 return 0;
             }
             if fire::burst_waiting_for_trigger_release(pm) {
                 h.time = 1;
-                match h.state {
+                match h.phase {
                     s if state::is_reload_family(s) => {
                         pm.server_print("end weapon (timeout)");
                         h.time = 0;
-                        h.shot_count = 0;
+                        h.rounds_fired = 0;
                     }
                     state::RECHAMBERING => {
                         pm.set_hand(h);
@@ -132,9 +132,9 @@ fn time_adjust_inner(pm: &mut Pm) -> i32 {
                     | state::MELEE_INIT
                     | state::MELEE_FIRE
                     | state::MELEE_END => {
-                        h.state = state::READY;
+                        h.phase = state::READY;
                         pm.set_hand(h);
-                        base::continue_anim(pm, anim::IDLE);
+                        base::continue_anim(pm, anim::REST);
                     }
                     _ => {}
                 }
@@ -144,7 +144,7 @@ fn time_adjust_inner(pm: &mut Pm) -> i32 {
                 if (!held || fire::trigger_pull_pending(pm, left))
                     && !fire::burst_fire_pending(pm, left)
                 {
-                    h.shot_count = 0;
+                    h.rounds_fired = 0;
                 }
                 h.time = 0;
             }
@@ -153,7 +153,7 @@ fn time_adjust_inner(pm: &mut Pm) -> i32 {
     pm.set_hand(h);
 
     // Crawling: both hands' shot counts reset once their triggers are let go.
-    if (state::CRAWL_FORWARD..=state::CRAWL_LEFT).contains(&pm.ps.weaponstate) {
+    if (state::CRAWL_FORWARD..=state::CRAWL_LEFT).contains(&pm.ps.gun_phase) {
         for hand_left in [false, true] {
             let held = pm.cmd.held(fire::fire_button(pm, hand_left));
             if (!held || fire::trigger_pull_pending(pm, hand_left))
@@ -183,7 +183,7 @@ fn time_adjust_inner(pm: &mut Pm) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{scaled, step_ms};
+    use self::super::{scaled, step_ms};
     use crate::cmd::T6Cmd;
     use crate::env::{T6Env, perk};
     use crate::facts::{FactsTable, T6WeaponFacts};
@@ -207,7 +207,7 @@ mod tests {
 
     fn step(ps: &mut T6WeaponPs, env: &mut T6Env, facts: &FactsTable) -> i32 {
         let cmd = T6Cmd {
-            msec: 50,
+            frame_ms: 50,
             ..T6Cmd::default()
         };
         let mut out = FrameOut::default();
@@ -225,23 +225,23 @@ mod tests {
 
     #[test]
     fn the_hand_guns_own_perks_speed_its_timers() {
-        // PM_Weapon_WeaponTimeAdjust: BG_GetPerks ORs the hand weapon's perks into the player's.
+        // PM_Weapon_WeaponTimeAdjust: BG_GetPerks ORs the hand slot's perks into the player's.
         let facts = table();
         let mut env = T6Env::default();
         env.dvars.perk_weap_rate_multiplier = 0.75;
-        for (weapon, want) in [(1, 50), (2, 67)] {
+        for (slot, want) in [(1, 50), (2, 67)] {
             let mut ps = T6WeaponPs {
-                weapon,
-                weaponstate: state::FIRING,
+                weapon: slot,
+                gun_phase: state::FIRING,
                 ..T6WeaponPs::default()
             };
-            assert_eq!(step(&mut ps, &mut env, &facts), want, "weapon {weapon}");
+            assert_eq!(step(&mut ps, &mut env, &facts), want, "weapon {slot}");
         }
         // The player's own perk still counts on a plain gun.
         env.perks = 1 << perk::RATEOFFIRE;
         let mut ps = T6WeaponPs {
             weapon: 1,
-            weaponstate: state::FIRING,
+            gun_phase: state::FIRING,
             ..T6WeaponPs::default()
         };
         assert_eq!(step(&mut ps, &mut env, &facts), 67);
@@ -257,7 +257,7 @@ mod tests {
             ..T6WeaponPs::default()
         };
         let firing = Hand {
-            state: state::FIRING,
+            phase: state::FIRING,
             ..Hand::default()
         };
         ps.set_hand(false, firing);
@@ -286,8 +286,8 @@ mod tests {
             (state::MELEE_FIRE, false, 8),
             (state::MELEE_END, false, 1),
         ] {
-            ps.weaponstate = st;
-            ps.weap_flags = if offhand_flag { wf::USING_OFFHAND } else { 0 };
+            ps.gun_phase = st;
+            ps.weapon_state_bits = if offhand_flag { wf::USING_OFFHAND } else { 0 };
             assert_eq!(viewmodel_weapon(&ps, &facts), want, "state {st} flag {offhand_flag}");
         }
         // A gun that is its own melee weapon (a bayonet) keeps the gun in the swing.
@@ -295,8 +295,8 @@ mod tests {
         let mut bayonet = T6WeaponFacts::default();
         bayonet.melee.use_as_melee = true;
         facts.set(1, "gun_mp", bayonet);
-        ps.weaponstate = state::MELEE_FIRE;
-        ps.weap_flags = 0;
+        ps.gun_phase = state::MELEE_FIRE;
+        ps.weapon_state_bits = 0;
         assert_eq!(viewmodel_weapon(&ps, &facts), 1);
     }
 

@@ -1,122 +1,47 @@
-IW4L
+bo2mp: notices for third-party material
 
-Copyright 2026 vladtrc
+================================================================================
+Fonts built into the binary
+================================================================================
 
-IW4L was originally developed by vladtrc.
-https://github.com/vladtrc/iw4L
+The two fonts listed here are embedded with `include_bytes!`, so every bo2mp
+build carries them, and any archive containing a bo2mp binary must carry their
+licence texts too.
 
-IW4L is licensed under the Apache License, Version 2.0; see LICENSE.
+1. Oxanium, file crates/ui/assets/Oxanium-Regular.ttf, source https://github.com/sevmeyer/oxanium
+   Oxanium notice: Copyright 2019 The Oxanium Project Authors
+   Licence: SIL Open Font License 1.1 (whole text: crates/ui/assets/OFL-Oxanium.txt)
 
---------------------------------------------------------------------------------
-Third-party material bundled with this repository
---------------------------------------------------------------------------------
+2. GNU FreeFont, file crates/console/assets/FreeMono.otf, source https://www.gnu.org/software/freefont/
+   FreeFont notice: Copyright (C) 2002-2012 Free Software Foundation, Inc.
+   Licence: GNU GPL version 3 or later plus the GNU font exception (whole text:
+   crates/console/assets/COPYING-FreeFont.txt). Thanks to that exception, a
+   program or document that only uses the font is not itself put under the GPL,
+   which is what allows embedding it in a bo2mp binary. The font file is
+   unchanged and stays under the GPL.
 
-Both fonts below are compiled into the IW4L binary with `include_bytes!`, so
-they are redistributed with every build. Any archive that ships an IW4L binary
-ships these two licence texts with it.
+================================================================================
+Copied third-party code and data
+================================================================================
 
-Oxanium (crates/ui/assets/Oxanium-Regular.ttf)
-  Copyright 2019 The Oxanium Project Authors
-  https://github.com/sevmeyer/oxanium
-  SIL Open Font License 1.1 — full text in crates/ui/assets/OFL-Oxanium.txt
+1. Portal Gun model and texture, in crates/asset_source/src/portalgun.rs
+   Taken from MeowMC's Portal Gun mod (repository https://github.com/iPortalTeam/PortalGun),
+   converted from portalgun.geo.json and portalgun.png into cube and pixel tables.
+   Portal Gun notice: Copyright (c) 2021 MeowMC
+   Licence: MIT (whole text: crates/asset_source/src/LICENSE-portalgun-MIT.txt)
 
-GNU FreeFont (crates/console/assets/FreeMono.otf)
-  Copyright (C) 2002-2012 Free Software Foundation, Inc.
-  https://www.gnu.org/software/freefont/
-  GNU General Public License v3 or later, with the GNU font exception — full
-  text in crates/console/assets/COPYING-FreeFont.txt. The exception is what
-  makes embedding the font in an Apache-2.0 binary possible: a document or
-  program that merely uses the font is not thereby covered by the GPL. The
-  font itself is unmodified and remains under the GPL.
+2. wgpu-hal 29.0.4, in third_party/wgpu-hal, from https://github.com/gfx-rs/wgpu
+   wgpu-hal notice: Copyright (c) 2025 The gfx-rs developers
+   Licence: MIT OR Apache-2.0 (whole texts: third_party/wgpu-hal/LICENSE.MIT, third_party/wgpu-hal/LICENSE.APACHE)
+   Local change: src/vulkan/swapchain/native.rs (look for "bo2mp patch") waits
+   again for a swap-chain image that is slow, rather than losing the device.
 
---------------------------------------------------------------------------------
-Third-party source code
---------------------------------------------------------------------------------
+The crates that bo2mp depends on are the ones Cargo.toml declares, each under its
+own licence.
 
-Two pieces of third-party work are copied into this repository:
-
-Portal Gun model and texture (crates/asset_source/src/portalgun.rs)
-  From the Portal Gun mod by MeowMC, via https://github.com/iPortalTeam/PortalGun
-  (portalgun.geo.json and portalgun.png, as cube and pixel tables)
-  Copyright (c) 2021 MeowMC
-  MIT License; full text in crates/asset_source/src/LICENSE-portalgun-MIT.txt
-
-wgpu-hal 29.0.4 (third_party/wgpu-hal)
-  From the wgpu project, https://github.com/gfx-rs/wgpu
-  Copyright (c) 2025 The gfx-rs developers
-  MIT OR Apache-2.0; full texts in third_party/wgpu-hal/LICENSE.MIT and
-  third_party/wgpu-hal/LICENSE.APACHE. Patched here (marked "bo2mp patch" in
-  src/vulkan/swapchain/native.rs) so a slow swap-chain image is waited for
-  again instead of ending the device.
-
-The build links no third-party project named below. IW4L's own dependencies are
-the crates declared in Cargo.toml, under their own licences.
-
---------------------------------------------------------------------------------
-References consulted during development
---------------------------------------------------------------------------------
-
-These projects were read while working out how the original games behave. They
-are named here because the reading happened, not because anything of theirs is
-distributed: none of them is vendored, linked, bundled or otherwise shipped.
-
-OpenAssetTools — https://github.com/Laupetin/OpenAssetTools
-  Open-source modding tools for older Call of Duty games. Its asset-structure
-  headers document the on-disk layouts IW4L reads. Licensed under GPLv3.
-
-oat (iw4x-x64 fork of OpenAssetTools) — https://github.com/iw4x-x64/oat
-  The x64 fork, at revision 3a7442dee5ce040cfdb8da23fdb9fb525b5f743e, is the
-  tree whose IW4MS headers were read for the 64-bit FastFile layouts.
-  Licensed under GPLv3, like its upstream. No file in this repository is
-  compiled against, generated from or distributed with those headers.
-
-IW4x — https://github.com/iw4x/iw4x-client
-  A custom client for Call of Duty: Modern Warfare 2 (2009), with dedicated
-  servers, security fixes and modding support. Read as a cross-reference for
-  asset and protocol behaviour. Licensed under GPLv3.
-
-KisakCOD — https://github.com/SwagSoftware/KisakCOD
-  A Call of Duty 4 open-source reimplementation. Read as a cross-reference for
-  engine structure. IW4L targets IW4, so this is a neighbouring generation of
-  the same engine family, not the same codebase.
-
-Ghidra — https://github.com/NationalSecurityAgency/ghidra
-  The software reverse engineering framework the original game binaries were
-  read with. A development tool: none of it, and none of its output, is
-  committed here or distributed with IW4L. Licensed under Apache 2.0.
-
---------------------------------------------------------------------------------
-bo2zm fork
---------------------------------------------------------------------------------
-
-This tree is bo2zm, a local fork of IW4L taken at upstream commit
-11514ea37d1e80d75bf2c1ba332bbd68fac5db4e (2026-09-30) and extended to read
-Call of Duty: Black Ops II (T6) PC files. Where the fork changes an upstream
-file the change is marked "bo2zm"; the crates fastfile_t6 and bo2zm_tools and
-the file crates/assets/src/lane/t6.rs are new. The fork stays under the Apache
-License, Version 2.0.
-
-OpenAssetTools (above) was also read for the Black Ops II zone layout: the
-TAff0100 envelope and auth header, the XChunk streams, the public Salsa20 key
-and its IV chain, the XFile blocks and the T6 asset list. It was read for
-facts only; none of its code is copied here. Salsa20 is written from
-D. J. Bernstein's specification and SHA-1 from FIPS 180-4.
-
-The T6 zone walk and structure layouts (crates/fastfile_t6/src/walk_gen.rs and
-layout_gen.rs) are generated by
-crates/fastfile_t6/gen/t6gen.py, a development tool that reads layout and
-load-rule facts from an OpenAssetTools checkout on the developer's machine
-(the T6 structure declarations and the T6 zone-load rules) and writes Rust of
-its own form. The checkout is not part of this repository, nothing from it is
-vendored or linked, and the computed layouts were verified against the 32-bit
-MSVC compiler.
-
---------------------------------------------------------------------------------
-Game content
---------------------------------------------------------------------------------
-
-No Call of Duty game data is contained in this repository or in any IW4L
-release archive. IW4L reads game data from a copy of the game the user already
-owns and has installed. Call of Duty, Modern Warfare, Black Ops, related
-trademarks and all original game assets belong to their respective owners.
-IW4L is not affiliated with, endorsed by or supported by them.
+=========================================================================
+Neither this repository nor any bo2mp release contains Call of Duty game data.
+bo2mp loads the data from a copy of the game that the user already owns and has
+installed. Every Call of Duty title (Modern Warfare and Black Ops among them), its trademarks and every
+original game asset belong to their owners, and bo2mp is not affiliated with,
+endorsed or supported by any of them.

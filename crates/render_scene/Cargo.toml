@@ -1,25 +1,25 @@
 [package]
 name = "render_scene"
 version = "0.1.0"
+description = "The pieces each frame is built from: who stands in the scene, where the eye sits and what it sees, which models still need light, and the module that wires them up. Tessellation, animation, effects and GPU work live elsewhere."
 edition.workspace = true
-license.workspace = true
-description = "What the renderer's frame is made of: the scene occupancy tables, view parameters, lighting requests and the plugin that registers them. No tess, anim, FX or GPU work."
-
-[dependencies]
-asset_game.workspace = true
-asset_material.workspace = true
-asset_model.workspace = true
-asset_world.workspace = true
-assets.workspace = true
-bevy.workspace = true
-dpvs_t6.workspace = true
-fx_t6.workspace = true
-game_math.workspace = true
-hud_t6.workspace = true
-lighting_t6.workspace = true
-render_material.workspace = true
-sim.workspace = true
-xmodel_runtime.workspace = true
+publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+bevy.workspace = true
+asset_game = { path = "../asset_game" }
+asset_material = { path = "../asset_material" }
+asset_model = { path = "../asset_model" }
+asset_world = { path = "../asset_world" }
+assets = { path = "../assets", version = "0.1" }
+dpvs_t6 = { path = "../dpvs_t6" }
+fx_t6 = { path = "../fx_t6" }
+game_math = { path = "../game_math" }
+hud_t6 = { path = "../hud_t6" }
+lighting_t6 = { path = "../lighting_t6" }
+render_material = { path = "../render_material" }
+sim = { path = "../sim", version = "0.1" }
+xmodel_runtime = { path = "../xmodel_runtime" }

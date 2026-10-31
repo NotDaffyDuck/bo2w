@@ -3,13 +3,11 @@
 //! decides WHEN a pane cracks or shatters; the client decides how it looks.
 //!
 //! A pane starts pristine. A hit of at least 5 (times the damage
-//! multiplier) takes that much health; grenades, projectiles, melee,
+//! multiplier) takes that much health; grenades, launched rounds, melee,
 //! bayonets, impacts and fire take all of it. A pane left with health is
 //! cracked, and a cracked pane bleeds 1-10 health a second until it breaks
 //! by itself. Out of health it shatters, keeping the hit's position and
 //! direction for the client's falling pieces.
-
-type V3 = [f32; 3];
 
 /// `glassDamageMultiplier` default.
 pub const DAMAGE_MULTIPLIER: f32 = 1.0;
@@ -65,16 +63,16 @@ pub const MEANS_NAMES: [&str; 21] = [
 /// the health it leaves. Under `MIN_DAMAGE` times the multiplier a hit
 /// does nothing.
 #[must_use]
-pub fn health_after_hit(health: f32, damage: i32, mult: f32) -> f32 {
-    if (damage as f32) < MIN_DAMAGE * mult {
+pub fn health_after_hit(health: f32, dmg_pts: i32, mult: f32) -> f32 {
+    if (dmg_pts as f32) < MIN_DAMAGE * mult {
         health
     } else {
-        health - ((damage as f32) * mult) as i32 as f32
+        health - ((dmg_pts as f32) * mult) as i32 as f32
     }
 }
 
 /// These kinds take a pane's whole health in one hit, whatever the damage
-/// (grenade, projectile, melee, bayonet, impact, burned).
+/// (grenade, launched round, melee, bayonet, impact, burned).
 pub fn means_shatters(means: u8) -> bool {
     matches!(
         means,
@@ -119,11 +117,11 @@ impl PaneState {
 /// (`Glass::absmin`, `absmax`) and its GlassDef's `maxHealth`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PaneDef {
-    pub origin: V3,
+    pub origin: [f32; 3],
     /// What an explosion's area search tests.
-    pub absmin: V3,
-    pub absmax: V3,
-    pub max_health: f32,
+    pub absmin: [f32; 3],
+    pub absmax: [f32; 3],
+    pub hit_point_ceiling: f32,
 }
 
 /// One pane as the server keeps it (`GlassServer`).
@@ -138,8 +136,8 @@ pub struct ServerPane {
     pub changed_ms: i32,
     /// The shattering hit; both zero for a pane that bled out, which the
     /// client takes as "fall any which way".
-    pub hit_pos: V3,
-    pub hit_dir: V3,
+    pub impact_point: [f32; 3],
+    pub hit_dir: [f32; 3],
 }
 
 /// What a shatter tells the scripts (`Scr_GlassSmash` ->
@@ -147,8 +145,8 @@ pub struct ServerPane {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Smash {
     pub pane: u32,
-    pub origin: V3,
-    pub dir: V3,
+    pub origin: [f32; 3],
+    pub facing: [f32; 3],
 }
 
 /// What caused a change, for logs and the client's sounds only; BO2 keeps
@@ -187,7 +185,7 @@ impl GlassesServer {
         Self {
             panes: defs
                 .into_iter()
-                .map(|def| ServerPane { def, health: def.max_health, ..Default::default() })
+                .map(|def| ServerPane { def, health: def.hit_point_ceiling, ..ServerPane::default() })
                 .collect(),
             damage_multiplier: DAMAGE_MULTIPLIER,
             cracked_rate_range: CRACKED_RATE_RANGE,
@@ -214,7 +212,7 @@ impl GlassesServer {
     /// Every pane back to pristine and full health (a new round).
     pub fn reset(&mut self) {
         for p in &mut self.panes {
-            *p = ServerPane { def: p.def, health: p.def.max_health, ..Default::default() };
+            *p = ServerPane { def: p.def, health: p.def.hit_point_ceiling, ..ServerPane::default() };
         }
         self.last_update_ms = None;
         self.smashes.clear();
@@ -227,11 +225,11 @@ impl GlassesServer {
     pub fn damage(
         &mut self,
         pane: u32,
-        damage: i32,
+        hit_pts: i32,
         means: u8,
-        hit_pos: V3,
-        hit_dir: V3,
-        now_ms: i32,
+        impact_point: [f32; 3],
+        hit_dir: [f32; 3],
+        clock_millis: i32,
         cause: Cause,
         rand01: &mut impl FnMut() -> f32,
     ) -> PaneState {
@@ -245,25 +243,25 @@ impl GlassesServer {
         }
         if means_shatters(means) {
             p.health = 0.0;
-        } else if (damage as f32) < MIN_DAMAGE * mult {
+        } else if (hit_pts as f32) < MIN_DAMAGE * mult {
             return p.state;
         } else {
-            p.health = health_after_hit(p.health, damage, mult);
+            p.health = health_after_hit(p.health, hit_pts, mult);
         }
         if p.health <= 0.0 {
             if p.state != PaneState::Shattered {
-                p.changed_ms = now_ms;
-                p.hit_pos = hit_pos;
+                p.changed_ms = clock_millis;
+                p.impact_point = impact_point;
                 p.hit_dir = hit_dir;
                 p.state = PaneState::Shattered;
-                self.smashes.push(Smash { pane, origin: p.def.origin, dir: hit_dir });
-                self.changes.push(PaneChange { pane, state: p.state, cause, at_ms: now_ms });
+                self.smashes.push(Smash { pane, origin: p.def.origin, facing: hit_dir });
+                self.changes.push(PaneChange { pane, state: p.state, cause, at_ms: clock_millis });
             }
         } else if p.state != PaneState::Cracked {
-            p.changed_ms = now_ms;
+            p.changed_ms = clock_millis;
             p.cracked_rate = lo + (hi - lo) * rand01();
             p.state = PaneState::Cracked;
-            self.changes.push(PaneChange { pane, state: p.state, cause, at_ms: now_ms });
+            self.changes.push(PaneChange { pane, state: p.state, cause, at_ms: clock_millis });
         }
         p.state
     }
@@ -277,41 +275,42 @@ impl GlassesServer {
     #[allow(clippy::too_many_arguments)]
     pub fn radius_damage(
         &mut self,
-        origin: V3,
-        radius: f32,
-        cone: Option<(V3, f32)>,
+        blast_at: [f32; 3],
+        blast_r: f32,
+        cone: Option<([f32; 3], f32)>,
         max_damage: f32,
         min_damage: f32,
         means: u8,
-        now_ms: i32,
+        clock_millis: i32,
         rand01: &mut impl FnMut() -> f32,
     ) {
-        let reach = radius * std::f32::consts::SQRT_2;
-        let mins = [origin[0] - reach, origin[1] - reach, origin[2] - reach];
-        let maxs = [origin[0] + reach, origin[1] + reach, origin[2] + reach];
+        let reach = blast_r * std::f32::consts::SQRT_2;
+        let mins = [blast_at[0] - reach, blast_at[1] - reach, blast_at[2] - reach];
+        let maxs = [blast_at[0] + reach, blast_at[1] + reach, blast_at[2] + reach];
         for pane in self.area_panes(mins, maxs, RADIUS_DAMAGE_MAX_PANES) {
             let def = self.panes[pane].def;
-            let delta = sub(def.origin, origin);
+            let delta = sub(def.origin, blast_at);
             let d2 = dot(delta, delta);
-            if !(d2 < radius * radius) {
+            if !(d2 < blast_r * blast_r) {
                 continue;
             }
             let d = d2.sqrt();
-            let unit = if d < 0.01 { [0.0, 0.0, 1.0] } else { scale(delta, 1.0 / d) };
+            const STRAIGHT_UP: [f32; 3] = [0.0, 0.0, 1.0];
+            let unit = if d < 0.01 { STRAIGHT_UP } else { scale(delta, 1.0 / d) };
             if let Some((cone_dir, cone_cos)) = cone {
                 if d > 0.01 && !(cone_cos <= dot(unit, cone_dir)) {
                     continue;
                 }
             }
-            let dmg = (1.0 - d / radius) * (max_damage - min_damage) + min_damage;
-            let push = dmg / def.max_health + 1.0;
+            let dmg = (1.0 - d / blast_r) * (max_damage - min_damage) + min_damage;
+            let push = dmg / def.hit_point_ceiling + 1.0;
             self.damage(
                 pane as u32,
                 dmg as i32,
                 means,
-                origin,
+                blast_at,
                 scale(unit, push),
-                now_ms,
+                clock_millis,
                 Cause::Blast,
                 rand01,
             );
@@ -320,13 +319,13 @@ impl GlassesServer {
 
     /// `GlassSv_AreaGlasses`: up to `max` standing panes whose box touches
     /// `mins`..`maxs`, in pane order.
-    pub fn area_panes(&self, mins: V3, maxs: V3, max: usize) -> Vec<usize> {
+    pub fn area_panes(&self, lo_corner: [f32; 3], hi_corner: [f32; 3], max: usize) -> Vec<usize> {
         self.panes
             .iter()
             .enumerate()
             .filter(|(_, p)| {
                 p.state != PaneState::Shattered
-                    && (0..3).all(|i| p.def.absmin[i] <= maxs[i] && mins[i] <= p.def.absmax[i])
+                    && (0..3).all(|i| p.def.absmin[i] <= hi_corner[i] && lo_corner[i] <= p.def.absmax[i])
             })
             .map(|(i, _)| i)
             .take(max)
@@ -336,9 +335,9 @@ impl GlassesServer {
     /// `GlassesServer::Update`: each cracked pane loses its bleed rate
     /// times the frame's time, and breaks by itself once below zero (no
     /// hit, so its pieces fall any which way).
-    pub fn update(&mut self, now_ms: i32) {
-        let frame_ms = self.last_update_ms.map_or(0, |last| now_ms.saturating_sub(last)).max(0);
-        self.last_update_ms = Some(now_ms);
+    pub fn update(&mut self, clock_millis: i32) {
+        let frame_ms = self.last_update_ms.map_or(0, |last| clock_millis.saturating_sub(last)).max(0);
+        self.last_update_ms = Some(clock_millis);
         if frame_ms == 0 {
             return;
         }
@@ -349,17 +348,17 @@ impl GlassesServer {
             }
             p.health -= p.cracked_rate * mult * frame_ms as f32 * 0.001;
             if p.health < 0.0 {
-                p.changed_ms = now_ms;
-                p.hit_pos = [0.0; 3];
+                p.changed_ms = clock_millis;
+                p.impact_point = [0.0; 3];
                 p.hit_dir = [0.0; 3];
                 p.state = PaneState::Shattered;
                 let pane = i as u32;
-                self.smashes.push(Smash { pane, origin: p.def.origin, dir: [0.0; 3] });
+                self.smashes.push(Smash { pane, origin: p.def.origin, facing: [0.0; 3] });
                 self.changes.push(PaneChange {
                     pane,
                     state: p.state,
                     cause: Cause::BledOut,
-                    at_ms: now_ms,
+                    at_ms: clock_millis,
                 });
             }
         }
@@ -376,39 +375,39 @@ impl GlassesServer {
     }
 }
 
-fn sub(a: V3, b: V3) -> V3 {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+fn sub(lhs: [f32; 3], rhs: [f32; 3]) -> [f32; 3] {
+    [lhs[0] - rhs[0], lhs[1] - rhs[1], lhs[2] - rhs[2]]
 }
 
-fn dot(a: V3, b: V3) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+fn dot(u: [f32; 3], v: [f32; 3]) -> f32 {
+    u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
 }
 
-fn scale(a: V3, s: f32) -> V3 {
-    [a[0] * s, a[1] * s, a[2] * s]
+fn scale(vec: [f32; 3], k: f32) -> [f32; 3] {
+    [vec[0] * k, vec[1] * k, vec[2] * k]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn pane_at(origin: V3, max_health: f32) -> PaneDef {
+    fn pane_at(origin: [f32; 3], hit_point_ceiling: f32) -> PaneDef {
         let box_at = |d: f32| [origin[0] + d, origin[1] + d, origin[2] + d];
-        PaneDef { origin, absmin: box_at(-8.0), absmax: box_at(8.0), max_health }
+        PaneDef { origin, absmin: box_at(-8.0), absmax: box_at(8.0), hit_point_ceiling }
     }
 
     fn one_pane(health: f32) -> GlassesServer {
         GlassesServer::new([pane_at([0.0; 3], health)])
     }
 
-    fn hit(g: &mut GlassesServer, damage: i32, means: u8) -> PaneState {
-        g.damage(0, damage, means, [1.0, 2.0, 3.0], [0.0, 1.0, 0.0], 500, Cause::Hit, &mut || 0.5)
+    fn hit(g: &mut GlassesServer, dmg: i32, means: u8) -> PaneState {
+        g.damage(0, dmg, means, [1.0, 2.0, 3.0], [0.0, 1.0, 0.0], 500, Cause::Hit, &mut || 0.5)
     }
 
     /// One blast on a lone 120-health pane at `at`; its push, if it was hit.
-    fn blast(at: V3, radius: f32, cone: Option<(V3, f32)>, max_damage: f32, min_damage: f32) -> Option<V3> {
+    fn blast(at: [f32; 3], burst_span: f32, cone: Option<([f32; 3], f32)>, max_damage: f32, min_damage: f32) -> Option<[f32; 3]> {
         let mut g = GlassesServer::new([pane_at(at, 120.0)]);
-        g.radius_damage([0.0; 3], radius, cone, max_damage, min_damage, MOD_GRENADE_SPLASH, 0, &mut || 0.5);
+        g.radius_damage([0.0; 3], burst_span, cone, max_damage, min_damage, MOD_GRENADE_SPLASH, 0, &mut || 0.5);
         (g.state(0) != PaneState::Pristine).then_some(g.panes[0].hit_dir)
     }
 
@@ -438,8 +437,8 @@ mod tests {
             let mut g = one_pane(1000.0);
             let s = g.damage(0, 1, means, [1.0; 3], [0.0, 1.0, 0.0], 7, Cause::Hit, &mut || 0.0);
             assert_eq!(s, PaneState::Shattered, "{}", means_name(means));
-            assert_eq!(g.take_smashes(), vec![Smash { pane: 0, origin: [0.0; 3], dir: [0.0, 1.0, 0.0] }]);
-            assert_eq!(g.panes[0].hit_pos, [1.0; 3]);
+            assert_eq!(g.take_smashes(), vec![Smash { pane: 0, origin: [0.0; 3], facing: [0.0, 1.0, 0.0] }]);
+            assert_eq!(g.panes[0].impact_point, [1.0; 3]);
         }
     }
 
@@ -489,7 +488,7 @@ mod tests {
         for means in [MOD_GRENADE, MOD_PROJECTILE, MOD_MELEE, MOD_BAYONET, MOD_IMPACT, MOD_BURNED] {
             let mut g = one_pane(120.0);
             assert_eq!(hit(&mut g, 1, means), PaneState::Shattered, "{}", means_name(means));
-            assert_eq!((g.panes[0].hit_pos, g.panes[0].hit_dir), ([1.0, 2.0, 3.0], [0.0, 1.0, 0.0]));
+            assert_eq!((g.panes[0].impact_point, g.panes[0].hit_dir), ([1.0, 2.0, 3.0], [0.0, 1.0, 0.0]));
             assert_eq!(g.take_smashes().len(), 1);
             hit(&mut g, 1000, means);
             assert!(g.take_smashes().is_empty() && g.take_changes().len() == 1);

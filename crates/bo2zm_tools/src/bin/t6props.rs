@@ -8,106 +8,139 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use asset_t6::ZoneCapture;
 
-const DEFAULT_ZONE: &str =
-    r"C:\Program Files (x86)\Steam\steamapps\common\Call of Duty Black Ops II\zone\all\zm_nuked.ff";
+fn default_zone() -> PathBuf {
+    bo2zm_tools::zone_file("zm_nuked.ff")
+}
 
-fn main() -> ExitCode {
+/// A run that already said why on its own.
+struct Failed;
+
+/// `1,2,x,3` -> the entries that are numbers.
+fn parse_indices(list: &str) -> Vec<usize> {
+    list.split(',').filter_map(|v| v.trim().parse().ok()).collect()
+}
+
+/// `x,y,z,r`: a point and a radius, or nothing when it is not exactly four numbers.
+fn parse_near(spec: &str) -> Option<[f32; 4]> {
+    let n: Vec<f32> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    <[f32; 4]>::try_from(n).ok()
+}
+
+/// `T6PROPS_MODEL=<substring>`: every model of the zone whose name contains
+/// it: bounds, contents, collision LOD and collision surfaces.
+fn list_models(capture: &ZoneCapture, want: &str) {
+    for m in capture.xmodels.iter().filter(|m| m.name.contains(want)) {
+        println!(
+            "model {}: bounds {:?}..{:?} radius {} contents {:#x} coll lod {} surfs {}",
+            m.name,
+            m.lo_corner,
+            m.hi_corner,
+            m.radius,
+            m.contents,
+            m.collision_detail_tier,
+            m.collision_faces.len()
+        );
+        println!("  lighting origin offset {:?} range {}", m.lighting_origin_offset, m.lighting_origin_range);
+        for k in m.materials.iter().flatten() {
+            let mat = &capture.materials[k.index];
+            let ts = mat.method_set.map_or("-".to_owned(), |t| capture.technique_sets[t.index].name.clone());
+            println!("  material {} techset {ts} sort {}", mat.name, mat.sort_rank);
+        }
+        for c in &m.collision_faces {
+            println!(
+                "  coll surf: {} tris, {:?}..{:?}, contents {:#x}, surf flags {:#x}",
+                c.triangle_list.len(),
+                c.lo_corner,
+                c.hi_corner,
+                c.contents,
+                c.face_property_bits
+            );
+        }
+        // Its collision maps' brushes (what `spawncollision` pieces are
+        // solid with, and to what: their contents).
+        for b in &m.collmap_brushes {
+            println!(
+                "  collmap brush: {:?}..{:?}, contents {:#x}, {} extra sides",
+                b.lo_corner,
+                b.hi_corner,
+                b.contents,
+                b.sides.len()
+            );
+        }
+    }
+}
+
+/// `T6PROPS_MATFLAGS=<substring>`: every material of the zone whose name
+/// contains it (decals too), with its game flags and surface type bits.
+fn list_material_flags(capture: &ZoneCapture, want: &str) {
+    for m in capture.materials.iter().filter(|m| m.name.contains(want)) {
+        println!(
+            "material {}: game flags {:#x} type bits {:#x} surface flags {:#x} sort {}",
+            m.name, m.game_flags, m.facet_type_bits, m.surf_bits, m.sort_rank
+        );
+    }
+}
+
+/// `T6PROPS_PRESET=<substring>`: the zone's physics presets whose name contains it.
+fn list_presets(capture: &ZoneCapture, want: &str) {
+    for p in capture.phys_presets.iter().filter(|p| p.name.contains(want)) {
+        println!("{p:?}");
+    }
+}
+
+/// The modes that need only the capture, in the order they are tried.
+const CAPTURE_QUERIES: [(&str, fn(&ZoneCapture, &str)); 3] = [
+    ("T6PROPS_MODEL", list_models),
+    ("T6PROPS_MATFLAGS", list_material_flags),
+    ("T6PROPS_PRESET", list_presets),
+];
+
+fn main() {
+    std::process::exit(match drive() {
+        Ok(()) => 0,
+        Err(Failed) => 1,
+    });
+}
+
+fn drive() -> Result<(), Failed> {
     let path = std::env::args()
         .nth(1)
-        .map_or_else(|| PathBuf::from(DEFAULT_ZONE), PathBuf::from);
+        .map_or_else(default_zone, PathBuf::from);
     let capture = match asset_t6::capture_zone(&path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("t6props: {e}");
-            return ExitCode::FAILURE;
+            return Err(Failed);
         }
     };
-    // T6PROPS_MODEL=<substring>: every model of the zone whose name contains
-    // it: bounds, contents, collision LOD and collision surfaces.
-    if let Ok(want) = std::env::var("T6PROPS_MODEL") {
-        for m in capture
-            .xmodels
-            .iter()
-            .filter(|m| m.name.contains(want.as_str()))
-        {
-            println!(
-                "model {}: bounds {:?}..{:?} radius {} contents {:#x} coll lod {} surfs {}",
-                m.name,
-                m.mins,
-                m.maxs,
-                m.radius,
-                m.contents,
-                m.coll_lod,
-                m.coll_surfs.len()
-            );
-            for c in &m.coll_surfs {
-                println!(
-                    "  coll surf: {} tris, {:?}..{:?}, contents {:#x}, surf flags {:#x}",
-                    c.tris.len(),
-                    c.mins,
-                    c.maxs,
-                    c.contents,
-                    c.surf_flags
-                );
-            }
-            // Its collision maps' brushes (what `spawncollision` pieces are
-            // solid with, and to what: their contents).
-            for b in &m.collmap_brushes {
-                println!(
-                    "  collmap brush: {:?}..{:?}, contents {:#x}, {} extra sides",
-                    b.mins,
-                    b.maxs,
-                    b.contents,
-                    b.sides.len()
-                );
-            }
-        }
-        return ExitCode::SUCCESS;
-    }
-    // T6PROPS_MATFLAGS=<substring>: every material of the zone whose name
-    // contains it (decals too), with its game flags and surface type bits.
-    if let Ok(want) = std::env::var("T6PROPS_MATFLAGS") {
-        for m in capture
-            .materials
-            .iter()
-            .filter(|m| m.name.contains(want.as_str()))
-        {
-            println!(
-                "material {}: game flags {:#x} type bits {:#x} surface flags {:#x} sort {}",
-                m.name, m.game_flags, m.surface_type_bits, m.surface_flags, m.sort_key
-            );
-        }
-        return ExitCode::SUCCESS;
-    }
-    // T6PROPS_PRESET=<substring>: the zone's physics presets whose name
-    // contains it.
-    if let Ok(want) = std::env::var("T6PROPS_PRESET") {
-        for p in capture.phys_presets.iter().filter(|p| p.name.contains(want.as_str())) {
-            println!("{p:?}");
-        }
-        return ExitCode::SUCCESS;
+    if let Some((query, want)) = CAPTURE_QUERIES
+        .iter()
+        .find_map(|(var, query)| Some((query, std::env::var(var).ok()?)))
+    {
+        query(&capture, &want);
+        return Ok(());
     }
     let Some(clip) = capture.clip.as_ref() else {
         eprintln!("t6props: no clipMap");
-        return ExitCode::FAILURE;
+        return Err(Failed);
     };
     // T6PROPS_DYN=<substring>: the loose props (clipmap dynents) whose model
     // contains it: kind, health, physics preset (and its numbers), contents.
     if let Ok(want) = std::env::var("T6PROPS_DYN") {
         for (i, d) in clip
-            .dyn_ents
+            .debris_pieces
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.model.contains(want.as_str()))
+            .filter(|(_key, d)| d.model.contains(want.as_str()))
         {
-            let preset = capture.phys_presets.iter().find(|p| p.name == d.phys_preset);
+            let preset = capture.phys_presets.iter().find(|p| p.name == d.physics_template);
             let model_preset = capture
                 .xmodels
                 .iter()
                 .find(|m| m.name.trim_start_matches(',') == d.model.trim_start_matches(','))
-                .and_then(|m| m.phys_preset)
+                .and_then(|m| m.physics_template)
                 .and_then(|k| capture.phys_presets.get(k.index));
             println!(
                 "dyn {i} kind {} model {} at {:?} health {} flags {:#x} contents {:#x} brush {} phys brush {} preset {:?} {:?} model preset {:?}",
@@ -117,49 +150,43 @@ fn main() -> ExitCode {
                 d.health,
                 d.flags,
                 d.contents,
-                d.brush_model,
-                d.physics_brush_model,
-                d.phys_preset,
+                d.solid_model,
+                d.physics_solid_mesh,
+                d.physics_template,
                 preset,
                 model_preset
             );
         }
-        return ExitCode::SUCCESS;
+        return Ok(());
     }
     // T6PROPS_CMODEL=<n>[,<n>...]: those submodels' bounds and brush count.
     if let Ok(list) = std::env::var("T6PROPS_CMODEL") {
-        for n in list
-            .split(',')
-            .filter_map(|v| v.trim().parse::<usize>().ok())
-        {
-            if let Some(m) = clip.cmodels.get(n) {
+        for n in parse_indices(&list) {
+            if let Some(m) = clip.sub_models.get(n) {
                 println!(
                     "cmodel {n}: mins {:?} maxs {:?} radius {} leaf brush node {} shares map info {}",
-                    m.mins, m.maxs, m.radius, m.leaf.leaf_brush_node, m.shares_map_info
+                    m.lo_corner, m.hi_corner, m.radius, m.leaf.brush_leaf_link, m.shares_map_info
                 );
             }
         }
-        println!("cmodels: {}", clip.cmodels.len());
+        println!("cmodels: {}", clip.sub_models.len());
         if let Some(world) = capture.world.as_ref() {
             let statics: std::collections::HashSet<u16> =
-                world.sorted_surf_index.iter().copied().collect();
+                world.sorted_facet_index.iter().copied().collect();
             println!(
                 "gfx brush models: {}, static surfaces {} of {}",
-                world.brush_models.len(),
-                world.sorted_surf_index.len(),
+                world.solid_models.len(),
+                world.sorted_facet_index.len(),
                 world.surfaces.len()
             );
-            for n in list
-                .split(',')
-                .filter_map(|v| v.trim().parse::<usize>().ok())
-            {
-                if let Some((start, count, bounds)) = world.brush_models.get(n) {
-                    let in_static = (*start..start + count)
+            for n in parse_indices(&list) {
+                if let Some((head, count, bounds)) = world.solid_models.get(n) {
+                    let in_static = (*head..head + count)
                         .filter(|i| statics.contains(&(*i as u16)))
                         .count();
                     println!(
-                        "gfx brush model {n}: surfaces {start}..{} ({count}), {in_static} in the static list, bounds {bounds:?}",
-                        start + count
+                        "gfx brush model {n}: surfaces {head}..{} ({count}), {in_static} in the static list, bounds {bounds:?}",
+                        head + count
                     );
                 }
             }
@@ -167,19 +194,16 @@ fn main() -> ExitCode {
     }
     println!(
         "clip static models: {} (header count {}), world static models: {}",
-        clip.static_models.len(),
+        clip.prop_set.len(),
         clip.static_model_count,
-        capture.world.as_ref().map_or(0, |w| w.static_models.len())
+        capture.world.as_ref().map_or(0, |w| w.prop_set.len())
     );
-    let near: Option<[f32; 4]> = std::env::var("T6PROPS_NEAR").ok().and_then(|v| {
-        let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        (n.len() == 4).then(|| [n[0], n[1], n[2], n[3]])
-    });
+    let near = std::env::var("T6PROPS_NEAR").ok().and_then(|v| parse_near(&v));
     // name -> (placed, instance contents set, model)
-    let mut by_name: BTreeMap<String, (usize, Vec<u32>, Option<&asset_t6::XModelRef>)> =
+    let mut per_model: BTreeMap<String, (usize, Vec<u32>, Option<&asset_t6::XModelRef>)> =
         BTreeMap::new();
     let mut unresolved = 0;
-    for sm in &clip.static_models {
+    for sm in &clip.prop_set {
         let model = sm.model.map(|k| &capture.xmodels[k.index]);
         if model.is_none() {
             unresolved += 1;
@@ -204,7 +228,7 @@ fn main() -> ExitCode {
                     let mut lo = [f32::MAX; 3];
                     let mut hi = [f32::MIN; 3];
                     for s in model.map(|m| m.lod0.as_slice()).unwrap_or_default() {
-                        for v in s.verts.chunks_exact(32) {
+                        for v in s.vertex_points.chunks_exact(32) {
                             for (i, c) in v[..12].chunks_exact(4).enumerate() {
                                 let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                                 lo[i] = lo[i].min(f);
@@ -214,13 +238,13 @@ fn main() -> ExitCode {
                     }
                     println!(
                         "      origin {:?} inv axis {:?} mesh {lo:?}..{hi:?}",
-                        sm.origin, sm.inv_scaled_axis
+                        sm.origin, sm.reverse_scaled_basis
                     );
                     // The faces in the middle (|x| < 20, |z| < 6): each
                     // vertex's y there, rounded to a tenth, with counts.
-                    let mut ys: BTreeMap<i32, usize> = BTreeMap::new();
+                    let mut ys: BTreeMap<i32, usize> = BTreeMap::default();
                     for s in model.map(|m| m.lod0.as_slice()).unwrap_or_default() {
-                        for v in s.verts.chunks_exact(32) {
+                        for v in s.vertex_points.chunks_exact(32) {
                             let f =
                                 |o: usize| f32::from_le_bytes([v[o], v[o + 1], v[o + 2], v[o + 3]]);
                             if f(0).abs() < 20.0 && f(8).abs() < 6.0 {
@@ -235,14 +259,14 @@ fn main() -> ExitCode {
                                 .iter()
                                 .map(|k| {
                                     k.map_or("-".to_owned(), |k| {
-                                        let mat = &capture.materials[k.index];
-                                        let state = mat
-                                            .state_bits
+                                        let mt = &capture.materials[k.index];
+                                        let state = mt
+                                            .state_words
                                             .first()
                                             .map(|b| asset_t6::DrawState::decode(*b));
                                         format!(
                                             "{} sort {} state0 {state:?}",
-                                            mat.name, mat.sort_key
+                                            mt.name, mt.sort_rank
                                         )
                                     })
                                 })
@@ -252,7 +276,7 @@ fn main() -> ExitCode {
                     println!("      materials {mats:?}");
                     println!(
                         "      lods {:?}",
-                        model.map(|m| m.lods.clone()).unwrap_or_default()
+                        model.map(|m| m.detail_tiers.clone()).unwrap_or_default()
                     );
                     // T6PROPS_TRIS=1: every LOD 0 triangle (model space).
                     if std::env::var_os("T6PROPS_TRIS").is_some() {
@@ -265,7 +289,7 @@ fn main() -> ExitCode {
                             let p = |i: u16| -> [f32; 3] {
                                 let o = usize::from(i) * 32;
                                 std::array::from_fn(|k| {
-                                    let b = &s.verts[o + k * 4..o + k * 4 + 4];
+                                    let b = &s.vertex_points[o + k * 4..o + k * 4 + 4];
                                     (f32::from_le_bytes([b[0], b[1], b[2], b[3]]) * 10.0).round()
                                         / 10.0
                                 })
@@ -283,7 +307,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        let e = by_name.entry(name).or_insert((0, Vec::new(), model));
+        let e = per_model.entry(name).or_insert((0, vec![], model));
         e.0 += 1;
         if !e.1.contains(&sm.contents) {
             e.1.push(sm.contents);
@@ -293,46 +317,46 @@ fn main() -> ExitCode {
     let mut with_coll = 0;
     let mut placed_with_coll = 0;
     let mut placed = 0;
-    for (name, (count, contents, model)) in &by_name {
+    for (name, (count, contents, model)) in &per_model {
         placed += count;
         let Some(m) = model else {
             println!("{name}: x{count} contents {contents:x?} NO MODEL");
             continue;
         };
-        let tris: usize = m.coll_surfs.iter().map(|s| s.tris.len()).sum();
-        if tris > 0 && m.coll_lod >= 0 {
+        let triangle_list: usize = m.collision_faces.iter().map(|s| s.triangle_list.len()).sum();
+        if triangle_list > 0 && m.collision_detail_tier >= 0 {
             with_coll += 1;
             placed_with_coll += count;
         }
         let surfs: Vec<String> = m
-            .coll_surfs
+            .collision_faces
             .iter()
             .take(4)
             .map(|s| {
                 format!(
                     "[{} tris c={:#x} sf={:#x} (type {}) bone {} {:?}..{:?}]",
-                    s.tris.len(),
+                    s.triangle_list.len(),
                     s.contents,
-                    s.surf_flags,
-                    (s.surf_flags >> 20) & 0x1f,
-                    s.bone_idx,
-                    s.mins.map(|v| (v * 10.0).round() / 10.0),
-                    s.maxs.map(|v| (v * 10.0).round() / 10.0)
+                    s.face_property_bits,
+                    (s.face_property_bits >> 20) & 0x1f,
+                    s.joint_position,
+                    s.lo_corner.map(|v| (v * 10.0).round() / 10.0),
+                    s.hi_corner.map(|v| (v * 10.0).round() / 10.0)
                 )
             })
             .collect();
         println!(
-            "{name}: x{count} inst contents {contents:x?} model contents {:#x} collLod {} collSurfs {} tris {tris} radius {:.0} {}",
+            "{name}: x{count} inst contents {contents:x?} model contents {:#x} collLod {} collSurfs {} tris {triangle_list} radius {:.0} {}",
             m.contents,
-            m.coll_lod,
-            m.coll_surfs.len(),
+            m.collision_detail_tier,
+            m.collision_faces.len(),
             m.radius,
             surfs.join(" ")
         );
     }
     println!(
         "models: {} placed kinds, {with_coll} with collision; placements {placed}, {placed_with_coll} with collision",
-        by_name.len()
+        per_model.len()
     );
     // T6PROPS_MAT=<substring>: world surfaces drawn with matching materials
     // (bounds, surface type) and the clip materials of that name.
@@ -350,17 +374,17 @@ fn main() -> ExitCode {
             println!(
                 "world material {name}: {} surfaces, surface flags {:#x} (type {}) game flags {:#x} type bits {:#x}",
                 list.len(),
-                m.map_or(0, |m| m.surface_flags),
-                m.map_or(0, |m| (m.surface_flags >> 20) & 0x1f),
+                m.map_or(0, |m| m.surf_bits),
+                m.map_or(0, |m| (m.surf_bits >> 20) & 0x1f),
                 m.map_or(0, |m| m.game_flags),
-                m.map_or(0, |m| m.surface_type_bits)
+                m.map_or(0, |m| m.facet_type_bits)
             );
             for srf in list.iter().take(12) {
                 println!(
                     "   bounds {:?}..{:?} tris {}",
                     srf.bounds[0].map(|v| v.round()),
                     srf.bounds[1].map(|v| v.round()),
-                    srf.tri_count
+                    srf.tri_tally
                 );
             }
         }
@@ -375,7 +399,7 @@ fn main() -> ExitCode {
                     m.name,
                     m.surface_flags,
                     (m.surface_flags >> 20) & 0x1f,
-                    m.content_flags
+                    m.pack_presence_bits
                 );
             }
         }
@@ -404,14 +428,34 @@ fn main() -> ExitCode {
                     "surface at {:?}..{:?} tris {} material {} type {} game flags {:#x} type bits {:#x}",
                     lo.map(|v| v.round()),
                     hi.map(|v| v.round()),
-                    srf.tri_count,
+                    srf.tri_tally,
                     m.name,
-                    (m.surface_flags >> 20) & 0x1f,
+                    (m.surf_bits >> 20) & 0x1f,
                     m.game_flags,
-                    m.surface_type_bits
+                    m.facet_type_bits
                 );
             }
         }
     }
-    ExitCode::SUCCESS
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indices_skip_what_is_not_a_number() {
+        assert_eq!(parse_indices("1, 2,x,,30"), [1, 2, 30]);
+        assert!(parse_indices("").is_empty());
+        assert!(parse_indices("-1").is_empty());
+    }
+
+    #[test]
+    fn near_needs_exactly_four_numbers() {
+        assert_eq!(parse_near("1,2.5, -3,100"), Some([1.0, 2.5, -3.0, 100.0]));
+        assert_eq!(parse_near("1,2,3"), None);
+        assert_eq!(parse_near("1,2,3,4,5"), None);
+        assert_eq!(parse_near("1,2,three,4"), None);
+    }
 }

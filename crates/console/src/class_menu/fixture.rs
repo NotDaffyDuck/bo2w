@@ -2,28 +2,37 @@
 //! tests. The catalog knows no weapon registry entries, so a pick that has to
 //! resolve a weapon is refused and a class never resolves.
 
-use std::sync::Arc;
 
-use asset_game::{CacStatBar, CacWeaponPreview, LocalizeCatalog, WeaponRegistry};
-use bevy::prelude::*;
-use frame::{CacWeaponOffer, UiMenuDvars};
+use asset_game::{LoadoutStatMeter, LoadoutGunShowcase, TranslationStringIndex, WeaponLedger};
+use bevy::app::App;
+use frame::CustomClassGunChoice;
+use frame::UiMenuDvars;
 use ui::classes::setup::CatalogResolver;
-use ui::{ClassLoadoutCatalog, ClassSlotState, SessionClassStore};
+use ui::{LoadoutRoster, LoadoutSlotStatus, MatchLoadoutVault};
 
-use crate::feature_dispatch::testing::console_app;
+use crate::tool_cmds::testing::console_app;
+use std::sync::Arc;
 
 pub(crate) const AK47: &str = "t6:weapon/ak47_mp";
 pub(crate) const MP7: &str = "t6:weapon/mp7_mp";
 pub(crate) const M16: &str = "t5:weapon/m16_mp";
 pub(crate) const FIVESEVEN: &str = "t6:weapon/fiveseven_mp";
-pub(crate) const FRAG: &str = "t6:weapon/frag_grenade_mp";
+pub(crate) const SAMPLE_FRAG_ASSET: &str = "t6:weapon/frag_grenade_mp";
 pub(crate) const SEMTEX: &str = "t6:weapon/sticky_grenade_mp";
 pub(crate) const FLASH: &str = "t6:weapon/flash_grenade_mp";
 
-fn gun(key: &str, group: &str, attachments: &[&str]) -> CacWeaponOffer {
-    CacWeaponOffer {
-        key: key.into(),
-        item_group: Some(group.into()),
+/// Loot groups the sample guns sit in.
+const ASSAULT: &str = "weapon_assault";
+const SMG: &str = "weapon_smg";
+const PISTOL: &str = "weapon_pistol";
+
+/// What the sample ak47 can carry.
+const AK_KIT: &[&str] = &["reflex", "grip"];
+
+fn gun(asset: &str, bundle: &str, attachments: &[&str]) -> CustomClassGunChoice {
+    CustomClassGunChoice {
+        key: asset.to_owned(),
+        loot_bundle: Some(bundle.into()),
         attachments: attachments.iter().map(|name| (*name).to_owned()).collect(),
     }
 }
@@ -32,32 +41,44 @@ fn preview(
     reference: &str,
     name: &str,
     image: &str,
-    bars: &[(CacStatBar, i32)],
-) -> CacWeaponPreview {
-    CacWeaponPreview {
+    bars: &[(LoadoutStatMeter, i32)],
+) -> LoadoutGunShowcase {
+    LoadoutGunShowcase {
         reference: reference.into(),
-        name_key: format!("@{name}"),
+        title_token: "@".to_owned() + name,
         image: image.into(),
-        desc_key: format!("@{name}_DESC"),
+        description_lookup: format!("@{name}_DESC"),
         bars: bars.to_vec(),
     }
 }
 
+/// The perks the stats table would offer in each slot; the stock class
+/// holds the last of each.
+const PERK1: [&str; 2] = ["specialty_fastreload", "specialty_marathon"];
+const PERK2: [&str; 2] = ["specialty_flakjacket", "specialty_bulletdamage"];
+const PERK3: [&str; 2] = ["specialty_longersprint", "specialty_extendedmelee"];
+
 /// Primary: ak47 (assault, takes reflex and grip), mp7 (smg, reflex), and
 /// the older game's m16 (assault, none). Secondary: a fiveseven. Two
-/// lethals, one tactical. Perks are the stock roster.
-pub(crate) fn catalog() -> ClassLoadoutCatalog {
-    let mut catalog = ClassLoadoutCatalog {
+/// lethals, one tactical. Perks are two per slot after none.
+pub(crate) fn catalog() -> LoadoutRoster {
+    let mut catalog = LoadoutRoster {
         primary: vec![
-            gun(AK47, "weapon_assault", &["reflex", "grip"]),
-            gun(MP7, "weapon_smg", &["reflex"]),
-            gun(M16, "weapon_assault", &[]),
+            gun(AK47, ASSAULT, AK_KIT),
+            gun(MP7, SMG, &["reflex"]),
+            gun(M16, ASSAULT, &[]),
         ],
-        secondary: vec![gun(FIVESEVEN, "weapon_pistol", &["extclip"])],
-        lethal: vec![FRAG.into(), SEMTEX.into()],
+        secondary: vec![gun(FIVESEVEN, PISTOL, &["extclip"])],
+        lethal: vec![SAMPLE_FRAG_ASSET.into(), SEMTEX.into()],
         tactical: vec![FLASH.into()],
-        resolver: CatalogResolver(Some(Arc::new(WeaponRegistry::default()))),
-        ..ClassLoadoutCatalog::default()
+        resolver: CatalogResolver(Some(Arc::new(WeaponLedger::default()))),
+        perks: [PERK1, PERK2, PERK3].map(|column| {
+            std::iter::once(ui::classes::setup::NO_PERK)
+                .chain(column)
+                .map(String::from)
+                .collect::<Vec<String>>()
+        }),
+        ..LoadoutRoster::default()
     };
     catalog.previews.extend([
         (
@@ -67,9 +88,9 @@ pub(crate) fn catalog() -> ClassLoadoutCatalog {
                 "WEAPON_AK47",
                 "ui_ak47",
                 &[
-                    (CacStatBar::Accuracy, 40),
-                    (CacStatBar::Damage, 120),
-                    (CacStatBar::Mobility, -5),
+                    (LoadoutStatMeter::Accuracy, 40),
+                    (LoadoutStatMeter::Damage, 120),
+                    (LoadoutStatMeter::Mobility, -5),
                 ],
             ),
         ),
@@ -85,8 +106,8 @@ pub(crate) fn catalog() -> ClassLoadoutCatalog {
     catalog
 }
 
-pub(crate) fn words() -> LocalizeCatalog {
-    LocalizeCatalog::from_rows([
+pub(crate) fn words() -> TranslationStringIndex {
+    TranslationStringIndex::from_rows([
         ("WEAPON_AK47", "AK-47"),
         ("WEAPON_AK47_DESC", "Reliable and strong."),
         ("WEAPON_MP7", "MP7"),
@@ -100,29 +121,27 @@ pub(crate) fn words() -> LocalizeCatalog {
 
 /// A usable class: the ak47 and no attachments, a fiveseven, a frag, a flash
 /// and a perk in each place.
-pub(crate) fn slot(name: &str) -> ClassSlotState {
-    ClassSlotState {
-        name: name.into(),
+pub(crate) fn slot(called: &str) -> LoadoutSlotStatus {
+    LoadoutSlotStatus {
+        name: called.into(),
         primary: AK47.into(),
         primary_attachments: Vec::new(),
         secondary: FIVESEVEN.into(),
         secondary_attachments: Vec::new(),
-        lethal: FRAG.into(),
+        lethal: SAMPLE_FRAG_ASSET.into(),
         tactical: FLASH.into(),
-        perk1: "specialty_marathon".into(),
-        perk2: "specialty_bulletdamage".into(),
-        perk3: "specialty_extendedmelee".into(),
-        deathstreak: "specialty_null".into(),
-        lock_reason: None,
+        first_specialty: "specialty_marathon".into(),
+        second_specialty: "specialty_bulletdamage".into(),
+        third_specialty: "specialty_extendedmelee".into(),
+        frozen_because: None,
     }
 }
 
 /// Ten classes named "Class 1" to "Class 10", the first one selected.
-pub(crate) fn store() -> SessionClassStore {
-    SessionClassStore {
+pub(crate) fn store() -> MatchLoadoutVault {
+    MatchLoadoutVault {
         slots: (1..=10).map(|n| slot(&format!("Class {n}"))).collect(),
-        equipped: None,
-        selected: 0,
+        ..Default::default()
     }
 }
 
@@ -134,6 +153,6 @@ pub(crate) fn menu_app() -> App {
         .insert_resource(words())
         .insert_resource(store())
         .init_resource::<UiMenuDvars>()
-        .add_systems(Update, super::route);
+        .add_systems(bevy::app::Update, super::route_class_menu);
     app
 }

@@ -14,7 +14,7 @@ pub const COMPASS_CLAMP_ICONS_DEFAULT: bool = true;
 pub const COMPASS_SHOW_ENEMIES_DEFAULT: bool = true;
 pub const COMPASS_FORCE_PLAYER_ICON_DEFAULT: bool = false;
 
-pub const COMPASS_SOUND_PING_FADE_TIME_DEFAULT: f32 = 2.0;
+pub const RADAR_NOISE_BLIP_LINGER_MS: f32 = 2.0;
 pub const COMPASS_SOUND_PING_FADE_TIME_RANGE: (f32, f32) = (0.0, 10.0);
 pub const COMPASS_RADAR_PING_FADE_TIME_DEFAULT: f32 = 4.0;
 pub const COMPASS_RADAR_PING_FADE_TIME_RANGE: (f32, f32) = (0.01, 60.0);
@@ -104,36 +104,32 @@ pub enum CompassType {
 /// The minimap's place in the world: cg_t's compassMapUpperLeft, compassMapWorldSize and
 /// compassNorth.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CompassMapBounds {
-    pub upper_left: [f32; 2],
-    pub world_size: [f32; 2],
-    pub north: [f32; 2],
+pub struct RadarAreaLimits {
+    pub top_corner: [f32; 2],
+    pub map_span: [f32; 2],
+    pub north_deg: [f32; 2],
 }
 
 /// compassNorth: (cos, sin) of the north yaw in degrees.
 #[must_use]
 pub fn compass_north(north_yaw_deg: f32) -> [f32; 2] {
     let rad = north_yaw_deg.to_radians();
-    [libm::cosf(rad), libm::sinf(rad)]
+    [libm::cosf, libm::sinf].map(|wave| wave(rad))
 }
 
 /// CG_MiniMapChanged: the bounds from the config string's corners and the north yaw. No corner
 /// reordering and no aspect widening; a zero size becomes 1000.
 #[must_use]
 pub fn mini_map_changed(
-    upper_left: [f32; 2],
-    lower_right: [f32; 2],
+    top_corner: [f32; 2],
+    bottom_corner: [f32; 2],
     north_yaw_deg: f32,
-) -> CompassMapBounds {
+) -> RadarAreaLimits {
     let north = compass_north(north_yaw_deg);
-    let (dx, dy) = (lower_right[0] - upper_left[0], lower_right[1] - upper_left[1]);
-    let mut world_size = [dx * north[1] - dy * north[0], -(dx * north[0] + dy * north[1])];
-    for size in &mut world_size {
-        if *size == 0.0 {
-            *size = MINIMAP_ZERO_SIZE_FALLBACK;
-        }
-    }
-    CompassMapBounds { upper_left, world_size, north }
+    let (step_along_x, dy) = (bottom_corner[0] - top_corner[0], bottom_corner[1] - top_corner[1]);
+    let span: [f32; 2] = [step_along_x * north[1] - dy * north[0], -(step_along_x * north[0] + dy * north[1])]
+        .map(|side| if side == 0.0 { MINIMAP_ZERO_SIZE_FALLBACK } else { side });
+    RadarAreaLimits { top_corner, map_span: span, north_deg: north }
 }
 
 /// The parts of the minimap config string: material name, upper-left, lower-right.
@@ -142,9 +138,9 @@ pub fn parse_minimap_config(config: &str) -> Option<(&str, [f32; 2], [f32; 2])> 
     let mut tokens = config.split_ascii_whitespace();
     let material = tokens.next()?;
     let mut number = || tokens.next().and_then(|t| t.parse::<f32>().ok());
-    let upper_left = [number()?, number()?];
-    let lower_right = [number()?, number()?];
-    Some((material, upper_left, lower_right))
+    let top_corner = [number()?, number()?];
+    let bottom_corner = [number()?, number()?];
+    Some((material, top_corner, bottom_corner))
 }
 
 /// CompassCalcDimensions, PARTIAL: the ownerdraw size times compassSize, and on split screen
@@ -152,10 +148,10 @@ pub fn parse_minimap_config(config: &str) -> Option<(&str, [f32; 2], [f32; 2])> 
 #[must_use]
 pub fn compass_partial_size(
     rect_size: [f32; 2],
-    compass_size: f32,
+    radar_extent: f32,
     splitscreen_scale: Option<f32>,
 ) -> Option<[f32; 2]> {
-    let k = compass_size * splitscreen_scale.unwrap_or(1.0);
+    let k = radar_extent * splitscreen_scale.unwrap_or(1.0);
     let size = [rect_size[0] * k, rect_size[1] * k];
     (size[0] > 0.0 && size[1] > 0.0).then_some(size)
 }
@@ -191,31 +187,29 @@ pub struct CompassPoint {
 /// Scale `offset` down along its ray until it fits +-w/2, +-h/2; true when it had to.
 #[must_use]
 pub fn compass_clamp(offset: [f32; 2], size: [f32; 2]) -> ([f32; 2], bool) {
-    let mut scale = 1.0_f32;
-    for axis in 0..2 {
-        let half = size[axis] * 0.5;
-        if offset[axis].abs() > half {
-            scale = scale.min(half / offset[axis].abs());
-        }
-    }
-    ([offset[0] * scale, offset[1] * scale], scale < 1.0)
+    let shrink = (0..2).fold(1.0_f32, |shrink, lane| {
+        let half = size[lane] * 0.5;
+        let reach = offset[lane].abs();
+        if reach > half { shrink.min(half / reach) } else { shrink }
+    });
+    ([offset[0] * shrink, offset[1] * shrink], shrink < 1.0)
 }
 
-/// CG_WorldPosToCompass, PARTIAL: `view_dir` is (cos, sin) of the player's yaw; the map's height
+/// CG_WorldPosToCompass, PARTIAL: `facing` is (cos, sin) of the player's yaw; the map's height
 /// covers compassMaxRange.
 #[must_use]
 pub fn world_pos_to_compass_partial(
-    view_dir: [f32; 2],
-    view_origin: [f32; 2],
-    world: [f32; 2],
+    heading: [f32; 2],
+    eye_origin: [f32; 2],
+    spot: [f32; 2],
     size: [f32; 2],
-    compass_max_range: f32,
+    reach: f32,
 ) -> CompassPoint {
-    let scale = size[1] / compass_max_range;
-    let (dx, dy) = (world[0] - view_origin[0], world[1] - view_origin[1]);
+    let scale = size[1] / reach;
+    let (step_along_x, dy) = (spot[0] - eye_origin[0], spot[1] - eye_origin[1]);
     let unclamped = [
-        (view_dir[1] * dx - view_dir[0] * dy) * scale,
-        (-(view_dir[1] * dy) - view_dir[0] * dx) * scale,
+        (heading[1] * step_along_x - heading[0] * dy) * scale,
+        (-(heading[1] * dy) - heading[0] * step_along_x) * scale,
     ];
     let (offset, clamped) = compass_clamp(unclamped, size);
     CompassPoint { offset, unclamped, clamped }
@@ -224,12 +218,12 @@ pub fn world_pos_to_compass_partial(
 /// CG_WorldPosToCompass, FULL: the point as a fraction of the map's world size from its upper-left,
 /// moved to the rect's centre. The facts name no clamp on this branch.
 #[must_use]
-pub fn world_pos_to_compass_full(bounds: &CompassMapBounds, world: [f32; 2], size: [f32; 2]) -> [f32; 2] {
-    let n = bounds.north;
-    let (dx, dy) = (world[0] - bounds.upper_left[0], world[1] - bounds.upper_left[1]);
+pub fn world_pos_to_compass_full(bounds: &RadarAreaLimits, spot: [f32; 2], size: [f32; 2]) -> [f32; 2] {
+    let n = bounds.north_deg;
+    let (step_along_x, dy) = (spot[0] - bounds.top_corner[0], spot[1] - bounds.top_corner[1]);
     [
-        size[0] * ((n[1] * dx - n[0] * dy) / bounds.world_size[0] - 0.5),
-        size[1] * ((-(n[1] * dy) - n[0] * dx) / bounds.world_size[1] - 0.5),
+        size[0] * ((n[1] * step_along_x - n[0] * dy) / bounds.map_span[0] - 0.5),
+        size[1] * ((-(n[1] * dy) - n[0] * step_along_x) / bounds.map_span[1] - 0.5),
     ]
 }
 
@@ -256,33 +250,33 @@ pub fn tickertape_half_span_deg(stretch: f32) -> f32 {
 
 /// CalcCompassPointerSize: the tickertape objective icon size.
 #[must_use]
-pub fn compass_pointer_size(compass_size: f32, objective_size: [f32; 2]) -> [f32; 2] {
-    [compass_size * objective_size[0], compass_size * objective_size[1]]
+pub fn compass_pointer_size(radar_extent: f32, objective_size: [f32; 2]) -> [f32; 2] {
+    [radar_extent * objective_size[0], radar_extent * objective_size[1]]
 }
 
 /// North coordinate text value: the view position along north, over compassCoords.z, plus
 /// compassCoords.y.
 #[must_use]
-pub fn compass_coord_north(north: [f32; 2], view_xy: [f32; 2], coords: [f32; 3]) -> f32 {
-    (north[1] * view_xy[1] + north[0] * view_xy[0]) / coords[2] + coords[1]
+pub fn compass_coord_north(north: [f32; 2], at: [f32; 2], coords: [f32; 3]) -> f32 {
+    (north[1] * at[1] + north[0] * at[0]) / coords[2] + coords[1]
 }
 
 /// East coordinate text value: the same along the perpendicular of north.
 /// TODO(fact): the east offset is read as compassCoords.x (the facts name only "the perpendicular").
 #[must_use]
-pub fn compass_coord_east(north: [f32; 2], view_xy: [f32; 2], coords: [f32; 3]) -> f32 {
-    (north[1] * view_xy[0] - north[0] * view_xy[1]) / coords[2] + coords[0]
+pub fn compass_coord_east(north: [f32; 2], at: [f32; 2], coords: [f32; 3]) -> f32 {
+    (north[1] * at[0] - north[0] * at[1]) / coords[2] + coords[0]
 }
 
 /// GetRadarLineMargin: how near the sweep line a moving enemy counts as crossing it.
 #[must_use]
 pub fn radar_line_margin(
     compass_type: CompassType,
-    compass_max_range: f32,
+    reach: f32,
     radar_line_thickness: f32,
     hud_map_radar_line_thickness: f32,
 ) -> f32 {
-    compass_max_range
+    reach
         * match compass_type {
             CompassType::Partial => radar_line_thickness,
             CompassType::Full => hud_map_radar_line_thickness,
@@ -295,12 +289,12 @@ pub fn radar_line_margin(
 #[must_use]
 pub fn radar_ping_enemy_player(
     actor_last_update_ms: i32,
-    time_ms: i32,
+    clock_stamp_ms: i32,
     perk: u32,
     actor_has_perk: bool,
     actor_gps_jammer_active: bool,
 ) -> bool {
-    time_ms - actor_last_update_ms <= RADAR_PING_FRESH_MS
+    clock_stamp_ms - actor_last_update_ms <= RADAR_PING_FRESH_MS
         && (!actor_has_perk || (perk == RADAR_PERK_GPS_JAMMER && !actor_gps_jammer_active))
 }
 
@@ -334,13 +328,13 @@ mod tests {
     #[test]
     fn bounds_keep_corners_and_replace_zero_size() {
         let b = mini_map_changed([-1000.0, 2000.0], [3000.0, -2000.0], 90.0);
-        assert!(near(b.north[0], 0.0) && near(b.north[1], 1.0));
-        assert!(near(b.world_size[0], 4000.0) && near(b.world_size[1], 4000.0));
+        assert!(near(b.north_deg[0], 0.0) && near(b.north_deg[1], 1.0));
+        assert!(near(b.map_span[0], 4000.0) && near(b.map_span[1], 4000.0));
         let flat = mini_map_changed([0.0, 0.0], [0.0, 0.0], 90.0);
-        assert_eq!(flat.world_size, [MINIMAP_ZERO_SIZE_FALLBACK; 2]);
+        assert_eq!(flat.map_span, [MINIMAP_ZERO_SIZE_FALLBACK; 2]);
         // No reorder: swapped corners give negative sizes, as BO2.
         let swapped = mini_map_changed([3000.0, -2000.0], [-1000.0, 2000.0], 90.0);
-        assert!(swapped.world_size[0] < 0.0);
+        assert!(swapped.map_span[0] < 0.0);
     }
 
     #[test]

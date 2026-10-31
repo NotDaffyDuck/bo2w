@@ -7,20 +7,20 @@ mod key;
 mod space;
 mod t6_draw;
 mod t6_wind;
-mod zone;
+mod zone_tag;
 
-pub use asset_ref::{AssetRef, AssetRefCensus};
-pub use edge::{bound_zone_names, AssetEdge, AssetEdgeReason, BoundTarget};
-pub use key::{AssetKey, AssetKind, AssetNamespace, KeyError, MaterialKey};
+pub use asset_ref::{AssetPointer, AssetPointerTally};
+pub use edge::{linked_zone_names, AssetDependencyLink, DependencyCause, AttachedDestination};
+pub use key::{AssetIdentity, AssetVariety, AssetCategoryScope, KeyError, MaterialKey};
 pub use space::{
-    CatalogIndex, FpvMeshIndex, FpvMeshSpace, FxIndex, FxModelIndex, FxModelSpace, FxSpace,
-    IndexSpace, LoadedSoundIndex, LoadedSoundSpace, MapXModelIndex, MapXModelSpace, MaterialIndex,
-    MaterialSpace, ProjectileModelIndex, ProjectileModelSpace, SoundAliasIndex, SoundAliasSpace,
-    TracerIndex, TracerSpace, WalkLocalMaterialIndex,
-    WorldWeaponIndex, WorldWeaponSpace, XAnimIndex, XAnimSpace,
+    CatalogSlot, FpvMeshSlot, FpvMeshRange, FxSlot, FxModelSlot, FxModelRange, FxRange,
+    KeyDomain, LoadedSoundSlot, LoadedSoundRange, MapXModelSlot, MapXModelRange, SurfaceMaterialId,
+    SurfaceShaderSpace, ProjectileModelSlot, ProjectileModelRange, SoundAliasSlot, SoundAliasRange,
+    TracerSlot, TracerRange, TraversalMaterialSlot,
+    WorldWeaponSlot, WorldWeaponRange, XAnimSlot, XAnimRange,
 };
 pub use t6_draw::{
-    t6_fast, t6_set_fast, t6_water_kind, T6Blend, T6Cull, T6Draw, T6Layers, T6StateBits,
+    t6_aniso, t6_fast, t6_set_aniso, t6_set_fast, t6_water_kind, T6Blend, T6Cull, T6Draw, T6Layers, T6StateBits,
 };
 pub use t6_wind::{t6_map_wind, t6_wind_table};
-pub use zone::{ZoneGame, ZoneOwner};
+pub use zone_tag::{ZoneTitleKind, ZoneCustodian};

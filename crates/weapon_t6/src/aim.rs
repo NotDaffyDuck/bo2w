@@ -18,8 +18,8 @@ pub const SLOWDOWN_REGION: [f32; 2] = [90.0, 90.0];
 pub const OVERLAY_MIN_ZOOM: f32 = 0.01;
 
 #[inline]
-fn lerp(pair: [f32; 2], frac: f32) -> f32 {
-    pair[0] + (pair[1] - pair[0]) * frac
+fn lerp(pair: [f32; 2], amount: f32) -> f32 {
+    pair[0] + (pair[1] - pair[0]) * amount
 }
 
 /// AimAssist_GetAimAssistRange: the hip range blended into the ADS range by posFrac.

@@ -4,29 +4,29 @@ pub const HULL_POINTS_MAX: usize = 64;
 /// A queued portal's hull points, in the portal's hullAxis coordinates.
 #[derive(Clone, Copy, Debug)]
 pub struct HullPoints {
-    pub points: [[f32; 2]; HULL_POINTS_MAX],
+    pub point_count: [[f32; 2]; HULL_POINTS_MAX],
     pub count: usize,
 }
 
 impl HullPoints {
-    pub const EMPTY: Self = Self {
-        points: [[0.0; 2]; HULL_POINTS_MAX],
+    pub const BLANK: Self = Self {
+        point_count: [[0.0; 2]; HULL_POINTS_MAX],
         count: 0,
     };
 
     /// R_AddVertToPortalHullPoints: a full buffer is first shrunk to its convex hull; when
     /// the hull itself fills it the point is dropped.
-    pub fn add(&mut self, uv: [f32; 2]) -> bool {
+    pub fn push_point(&mut self, pt2: [f32; 2]) -> bool {
         if self.count == HULL_POINTS_MAX {
-            let mut out = [[0.0f32; 2]; HULL_POINTS_MAX];
-            let n = convex_hull(&self.points, &mut out);
+            let mut dst = [[0.0f32; 2]; HULL_POINTS_MAX];
+            let n = convex_hull(&self.point_count, &mut dst);
             if n == HULL_POINTS_MAX {
                 return false;
             }
-            self.points[..n].copy_from_slice(&out[..n]);
+            self.point_count[..n].copy_from_slice(&dst[..n]);
             self.count = n;
         }
-        self.points[self.count] = uv;
+        self.point_count[self.count] = pt2;
         self.count += 1;
         true
     }
@@ -35,10 +35,10 @@ impl HullPoints {
 /// A point's coordinates along the portal's two hull axes.
 #[inline]
 #[must_use]
-pub fn hull_uv(v: [f32; 3], axis: [[f32; 3]; 2]) -> [f32; 2] {
+pub fn hull_uv(pos: [f32; 3], ax: [[f32; 3]; 2]) -> [f32; 2] {
     [
-        v[0] * axis[0][0] + v[1] * axis[0][1] + v[2] * axis[0][2],
-        v[0] * axis[1][0] + v[1] * axis[1][1] + v[2] * axis[1][2],
+        pos[0] * ax[0][0] + pos[1] * ax[0][1] + pos[2] * ax[0][2],
+        pos[0] * ax[1][0] + pos[1] * ax[1][1] + pos[2] * ax[1][2],
     ]
 }
 
@@ -46,8 +46,8 @@ pub fn hull_uv(v: [f32; 3], axis: [[f32; 3]; 2]) -> [f32; 2] {
 /// origin plus the two axes.
 #[inline]
 #[must_use]
-pub fn hull_point(plane: [f32; 4], axis: [[f32; 3]; 2], uv: [f32; 2]) -> [f32; 3] {
-    core::array::from_fn(|i| -plane[3] * plane[i] + uv[0] * axis[0][i] + uv[1] * axis[1][i])
+pub fn hull_point(plane: [f32; 4], ax_pair: [[f32; 3]; 2], uv_pt: [f32; 2]) -> [f32; 3] {
+    core::array::from_fn(|i| -plane[3] * plane[i] + uv_pt[0] * ax_pair[0][i] + uv_pt[1] * ax_pair[1][i])
 }
 
 fn cross(o: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
@@ -56,18 +56,18 @@ fn cross(o: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
 
 /// Com_ConvexHull: the convex hull of up to 64 points, counter-clockwise, without collinear
 /// points. Fewer than 3 points, or all on one line, give 0.
-pub fn convex_hull(points: &[[f32; 2]], out: &mut [[f32; 2]]) -> usize {
-    let n = points.len();
-    if !(3..=HULL_POINTS_MAX).contains(&n) || out.len() < n.min(HULL_POINTS_MAX) {
+pub fn convex_hull(points: &[[f32; 2]], dst_buf: &mut [[f32; 2]]) -> usize {
+    let nrm = points.len();
+    if !(3..=HULL_POINTS_MAX).contains(&nrm) || dst_buf.len() < nrm.min(HULL_POINTS_MAX) {
         return 0;
     }
     let mut sorted = [[0.0f32; 2]; HULL_POINTS_MAX];
-    sorted[..n].copy_from_slice(points);
-    sorted[..n].sort_unstable_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    sorted[..nrm].copy_from_slice(points);
+    sorted[..nrm].sort_unstable_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
 
     let mut hull = [[0.0f32; 2]; HULL_POINTS_MAX * 2];
     let mut k = 0usize;
-    for &p in &sorted[..n] {
+    for &p in &sorted[..nrm] {
         while k >= 2 && cross(hull[k - 2], hull[k - 1], p) <= 0.0 {
             k -= 1;
         }
@@ -75,7 +75,7 @@ pub fn convex_hull(points: &[[f32; 2]], out: &mut [[f32; 2]]) -> usize {
         k += 1;
     }
     let lower = k + 1;
-    for &p in sorted[..n - 1].iter().rev() {
+    for &p in sorted[..nrm - 1].iter().rev() {
         while k >= lower && cross(hull[k - 2], hull[k - 1], p) <= 0.0 {
             k -= 1;
         }
@@ -86,7 +86,7 @@ pub fn convex_hull(points: &[[f32; 2]], out: &mut [[f32; 2]]) -> usize {
     if count < 3 {
         return 0;
     }
-    out[..count].copy_from_slice(&hull[..count]);
+    dst_buf[..count].copy_from_slice(&hull[..count]);
     count
 }
 
@@ -117,14 +117,14 @@ mod tests {
 
     #[test]
     fn full_buffer_shrinks_to_its_hull() {
-        let mut h = HullPoints::EMPTY;
+        let mut h = HullPoints::BLANK;
         for i in 0..HULL_POINTS_MAX {
             let corner = i % 4;
             let x = if corner == 1 || corner == 2 { 1.0 } else { 0.0 };
             let y = if corner >= 2 { 1.0 } else { 0.0 };
-            assert!(h.add([x, y]));
+            assert!(h.push_point([x, y]));
         }
-        assert!(h.add([0.5, 0.5]));
+        assert!(h.push_point([0.5, 0.5]));
         assert_eq!(h.count, 5);
     }
 

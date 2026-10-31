@@ -381,11 +381,11 @@ class Parser:
         if not words:
             raise ParseError('no type near %r' % self.context())
         if len(words) > 1 or words[0] in PRIMS:
-            name = ' '.join(words)
-            name = {'signed': 'int', 'unsigned long int': 'unsigned long', 'signed char': 'signed char'}.get(name, name)
-            if name not in PRIMS:
-                raise ParseError('unknown primitive %r' % name)
-            return name, is_const
+            prim = ' '.join(words)
+            prim = {'signed': 'int', 'unsigned long int': 'unsigned long', 'signed char': 'signed char'}.get(prim, prim)
+            if prim not in PRIMS:
+                raise ParseError('unknown primitive %r' % prim)
+            return prim, is_const
         return words[0], is_const
 
     def declarator(self):
@@ -396,19 +396,19 @@ class Parser:
         inner = []
         if self.peek() == '(':
             self.next()
-            name, inner = self.declarator()
+            ident, inner = self.declarator()
             self.expect(')')
         else:
-            name = self.next()
-            if not re.match(r'[A-Za-z_]', name):
-                raise ParseError('bad declarator %r near %r' % (name, self.context()))
+            ident = self.next()
+            if not re.match(r'[A-Za-z_]', ident):
+                raise ParseError('bad declarator %r near %r' % (ident, self.context()))
         suffix = []
         while self.peek() == '[':
             self.next()
             n = self.const_expr((']',))
             self.expect(']')
             suffix.append(('arr', n))
-        return name, inner + suffix + [('ptr',)] * nptr
+        return ident, inner + suffix + [('ptr',)] * nptr
 
 
 def eval_const(toks, constants):
@@ -425,18 +425,18 @@ class Layout:
         self.h = header
         self.busy = set()
 
-    def resolve(self, name):
+    def resolve(self, tname):
         """Follow typedef names to the final base name; returns (base, mods
         prefix from typedefs, align override seen first)."""
         mods = []
         override = None
-        while name in self.h.typedefs:
-            td = self.h.typedefs[name]
+        while tname in self.h.typedefs:
+            td = self.h.typedefs[tname]
             if override is None and td.align_override:
                 override = td.align_override
             mods = mods + td.decl.mods
-            name = td.decl.base
-        return name, mods, override
+            tname = td.decl.base
+        return tname, mods, override
 
     def base_size_align(self, name):
         """(size, msvc align, oat align) of a base type name."""

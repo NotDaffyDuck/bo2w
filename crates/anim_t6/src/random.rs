@@ -3,20 +3,20 @@
 //! over a 32-bit state the caller holds ("holdrand").
 
 /// `BG_rand`: steps the state and returns its top 15 bits (0..=32767).
-pub fn bg_rand(holdrand: &mut u32) -> u32 {
-    *holdrand = holdrand.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
-    *holdrand >> 17
+pub fn bg_rand(seed_state: &mut u32) -> u32 {
+    *seed_state = seed_state.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+    *seed_state >> 17
 }
 
 /// `BG_irand`: `min + ((r * (max - min)) >> 15)`, so `min..max`.
-pub fn bg_irand(holdrand: &mut u32, min: i32, max: i32) -> i32 {
-    let r = bg_rand(holdrand) as i32;
+pub fn bg_irand(seed_state: &mut u32, min: i32, max: i32) -> i32 {
+    let r = bg_rand(seed_state) as i32;
     min + ((r * (max - min)) >> 15)
 }
 
 /// `BG_random`: `r / 32768`, so `0.0..1.0`.
-pub fn bg_random(holdrand: &mut u32) -> f32 {
-    bg_rand(holdrand) as f32 * 3.0517578e-05
+pub fn bg_random(seed_state: &mut u32) -> f32 {
+    bg_rand(seed_state) as f32 * 3.0517578e-05
 }
 
 #[cfg(test)]

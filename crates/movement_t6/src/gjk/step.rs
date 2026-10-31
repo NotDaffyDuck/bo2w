@@ -5,30 +5,30 @@
 //! footstep. Its traces are the GJK body's (player trace up, ground trace
 //! down).
 
-use crate::bridge::{CollisionBackend, PRONE_CHECK_HEIGHT, PRONE_FEET_DIST, Pml, ProneRules, jump};
-use playerstate_t6::game::{ENTITYNUM_NONE, PM_TYPE_LAST_STAND, PlayerState, pm_flags};
+use crate::bridge::{SolidProbe, BELLY_CLEARANCE_PROBE, BELLY_FOOT_REACH, TickLocals, ProneRules, leap};
+use playerstate_t6::game::{NO_ENTITY_SLOT, MOVE_MODE_DOWNED, AvatarState, movement_state_bits};
 
 use super::Bo2Collision;
 use super::slide::slide_move;
-use super::trace::{ground_trace, player_trace};
-use crate::check_prone::check_prone;
-use crate::footstep::{footstep_event, should_make_footsteps};
+use super::trace::{floor_probe, player_trace};
+use crate::prone_room::check_prone;
+use crate::gait_cycle::{footstep_event, should_make_footsteps};
 use crate::project::project_velocity;
 
-const STEP_SIZE: f32 = 18.0;
-const PRONE_STEP_SIZE: f32 = 10.0;
+const STAIR_RISE_MAX: f32 = 18.0;
+const BELLY_STAIR_RISE: f32 = 10.0;
 /// The step up looks one unit past the step.
-const STEP_UP_EXTRA: f32 = 1.0;
+const STAIR_LIFT_MARGIN: f32 = 1.0;
 /// Ground facing up less than this is sloped: the move tries a step on it
 /// even when the slide met nothing.
-const STEP_GROUND_NORMAL_Z: f32 = 0.9;
+const STAIR_FLOOR_UPRIGHTNESS: f32 = 0.9;
 /// Walking, the step down looks this much farther down.
-const WALKING_STEP_DOWN_EXTRA: f32 = 9.0;
+const FOOTED_DROP_MARGIN: f32 = 9.0;
 /// The step must gain at least this much along the move.
-const STEP_PROGRESS_EPSILON: f32 = 0.001;
+const STAIR_ADVANCE_TOLERANCE: f32 = 0.001;
 /// Entity numbers below this are players: the step never lands on one.
-const MAX_CLIENTS: u16 = playerstate_t6::game::PLAYER_CORPSE_ENTITY_BASE as u16;
-/// pm_type below this (Black Ops II MP's own test): the stair step counts.
+const MAX_CLIENTS: u16 = playerstate_t6::game::BODY_ENTITY_FIRST_SLOT as u16;
+/// movement_mode below this (Black Ops II MP's own test): the stair step counts.
 const STAIR_PM_TYPE_LIMIT: i32 = 10;
 /// The room a prone player needs after the move.
 const PRONE_VERIFY_SIZE: f32 = 15.0;
@@ -51,145 +51,145 @@ const STEP_BOB_BASE: f32 = 7.0;
 /// camera eases over it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_slide_move<C: Bo2Collision>(
-    ps: &mut PlayerState,
-    pml: &Pml,
-    collision: &C,
-    mins: [f32; 3],
-    maxs: [f32; 3],
+    avatar: &mut AvatarState,
+    tick_vars: &TickLocals,
+    solids: &C,
+    box_lo: [f32; 3],
+    box_hi: [f32; 3],
     mask: u32,
     gravity: bool,
     zombies: bool,
 ) -> f32 {
-    let had_ground = if ps.pm_flags & pm_flags::LADDER != 0 {
-        jump::clear_state(ps);
+    let was_footed = if avatar.movement_state_bits & movement_state_bits::LADDER != 0 {
+        leap::clear_state(avatar);
         false
-    } else if pml.ground_plane != 0 {
+    } else if tick_vars.standing_on_floor != 0 {
         true
     } else {
-        if ps.pm_flags & pm_flags::JUMPING != 0 && ps.pm_time != 0 {
-            jump::clear_state(ps);
+        if avatar.movement_state_bits & movement_state_bits::JUMPING != 0 && avatar.move_timer != 0 {
+            leap::clear_state(avatar);
         }
         false
     };
-    let start_origin = ps.origin;
-    let start_velocity = ps.velocity;
+    let from_origin = avatar.origin;
+    let initial_speed_vec = avatar.velocity;
 
-    let bumped = slide_move(ps, pml, collision, mins, maxs, mask, gravity);
-    if !bumped && ps.pm_type == PM_TYPE_LAST_STAND && ps.pm_flags & crate::ground::PMF_SLIDING != 0 {
+    let bumped = slide_move(avatar, tick_vars, solids, box_lo, box_hi, mask, gravity);
+    if !bumped && avatar.movement_mode == MOVE_MODE_DOWNED && avatar.movement_state_bits & crate::ground::PMF_SLIDING != 0 {
         return 0.0;
     }
-    let mut step_size = if ps.pm_flags & pm_flags::PRONE != 0 { PRONE_STEP_SIZE } else { STEP_SIZE };
+    let mut step_size = if avatar.movement_state_bits & movement_state_bits::LYING_FLAT != 0 { BELLY_STAIR_RISE } else { STAIR_RISE_MAX };
     let mut jump_step = false;
-    if ps.ground_entity_num == ENTITYNUM_NONE {
-        if ps.pm_flags & pm_flags::JUMPING != 0 && ps.pm_time != 0 {
-            jump::clear_state(ps);
+    if avatar.standing_on == NO_ENTITY_SLOT {
+        if avatar.movement_state_bits & movement_state_bits::JUMPING != 0 && avatar.move_timer != 0 {
+            leap::clear_state(avatar);
         }
-        let ladder_up = ps.pm_flags & pm_flags::LADDER != 0 && ps.velocity[2] > 0.0;
-        if bumped && ps.pm_flags & pm_flags::JUMPING != 0 {
-            match jump::get_step_height(ps, start_origin) {
+        let rung_ascent_dir = avatar.movement_state_bits & movement_state_bits::LADDER != 0 && avatar.velocity[2] > 0.0;
+        if bumped && avatar.movement_state_bits & movement_state_bits::JUMPING != 0 {
+            match leap::step_room(avatar, from_origin[2]) {
                 Some(height) if height < 1.0 => return 0.0,
                 Some(height) => {
                     step_size = height;
                     jump_step = true;
                 }
-                None if !ladder_up => return 0.0,
+                None if !rung_ascent_dir => return 0.0,
                 None => {}
             }
-        } else if !ladder_up {
+        } else if !rung_ascent_dir {
             return 0.0;
         }
     }
-    let down_origin = ps.origin;
-    let down_velocity = ps.velocity;
+    let lowered_spot = avatar.origin;
+    let descent_speed_vec = avatar.velocity;
 
-    let sloped = pml.ground_plane != 0 && f32::from_bits(pml.ground_trace[3]) < STEP_GROUND_NORMAL_Z;
-    let mut step_height = 0.0;
+    let sloped = tick_vars.standing_on_floor != 0 && f32::from_bits(tick_vars.floor_probe[3]) < STAIR_FLOOR_UPRIGHTNESS;
+    let mut stair_rise = 0.0;
     if bumped || sloped {
-        let top = [start_origin[0], start_origin[1], start_origin[2] + step_size + STEP_UP_EXTRA];
-        let up = player_trace(collision, start_origin, top, mins, maxs, mask);
-        let rise = (step_size + STEP_UP_EXTRA) * up.fraction - STEP_UP_EXTRA;
+        let top = [from_origin[0], from_origin[1], from_origin[2] + step_size + STAIR_LIFT_MARGIN];
+        let up = player_trace(solids, from_origin, top, box_lo, box_hi, mask);
+        let rise = (step_size + STAIR_LIFT_MARGIN) * up.fraction - STAIR_LIFT_MARGIN;
         if rise >= 1.0 {
-            step_height = rise;
-            ps.origin = [start_origin[0], start_origin[1], start_origin[2] + rise];
-            ps.velocity = start_velocity;
-            slide_move(ps, pml, collision, mins, maxs, mask, gravity);
+            stair_rise = rise;
+            avatar.origin = [from_origin[0], from_origin[1], from_origin[2] + rise];
+            avatar.velocity = initial_speed_vec;
+            slide_move(avatar, tick_vars, solids, box_lo, box_hi, mask, gravity);
         }
     }
 
-    if had_ground || step_height != 0.0 {
-        let mut drop = step_height;
-        if had_ground {
-            drop += WALKING_STEP_DOWN_EXTRA;
+    if was_footed || stair_rise != 0.0 {
+        let mut drop = stair_rise;
+        if was_footed {
+            drop += FOOTED_DROP_MARGIN;
         }
-        let end = [ps.origin[0], ps.origin[1], ps.origin[2] - drop];
-        let down = ground_trace(collision, ps.origin, end, mins, maxs, mask);
-        if trace_t6::trace_get_entity_hit_id(&down) < MAX_CLIENTS {
+        let end = [avatar.origin[0], avatar.origin[1], avatar.origin[2] - drop];
+        let drop_hit = floor_probe(solids, avatar.origin, end, box_lo, box_hi, mask);
+        if trace_t6::trace_get_entity_hit_id(&drop_hit) < MAX_CLIENTS {
             // Never onto another player: the step is taken back.
-            ps.origin = down_origin;
-            ps.velocity = down_velocity;
+            avatar.origin = lowered_spot;
+            avatar.velocity = descent_speed_vec;
             return 0.0;
         }
-        if down.fraction >= 1.0 {
-            if step_height != 0.0 {
-                ps.origin[2] -= step_height;
+        if 1.0 <= drop_hit.fraction {
+            if stair_rise != 0.0 {
+                avatar.origin[2] -= stair_rise;
             }
-        } else if down.walkable {
-            ps.origin = down.end_pos(ps.origin, end);
-            project_velocity(&mut ps.velocity, &down.normal);
+        } else if drop_hit.walkable {
+            avatar.origin = drop_hit.finish_location(avatar.origin, end);
+            project_velocity(&mut avatar.velocity, &drop_hit.normal);
         } else {
-            ps.origin = down_origin;
-            ps.velocity = down_velocity;
+            avatar.origin = lowered_spot;
+            avatar.velocity = descent_speed_vec;
             return 0.0;
         }
     }
 
     let gained =
-        start_velocity[0] * (ps.origin[0] - start_origin[0]) + start_velocity[1] * (ps.origin[1] - start_origin[1]);
-    let flat = start_velocity[0] * (down_origin[0] - start_origin[0])
-        + start_velocity[1] * (down_origin[1] - start_origin[1]);
-    if gained <= flat + STEP_PROGRESS_EPSILON || (jump_step && above_max(ps)) {
+        initial_speed_vec[0] * (avatar.origin[0] - from_origin[0]) + initial_speed_vec[1] * (avatar.origin[1] - from_origin[1]);
+    let flat = initial_speed_vec[0] * (lowered_spot[0] - from_origin[0])
+        + initial_speed_vec[1] * (lowered_spot[1] - from_origin[1]);
+    if gained <= flat + STAIR_ADVANCE_TOLERANCE || (jump_step && above_max(avatar)) {
         // The step got no farther (or a jump's step ends past the top of
         // the jump): the plain slide stands, kept on the ground.
-        ps.origin = down_origin;
-        ps.velocity = down_velocity;
-        if had_ground {
-            let end = [ps.origin[0], ps.origin[1], ps.origin[2] - WALKING_STEP_DOWN_EXTRA];
-            let down = player_trace(collision, ps.origin, end, mins, maxs, mask);
-            if down.fraction < 1.0 {
-                ps.origin = down.end_pos(ps.origin, end);
-                project_velocity(&mut ps.velocity, &down.normal);
+        avatar.origin = lowered_spot;
+        avatar.velocity = descent_speed_vec;
+        if was_footed {
+            let end = [avatar.origin[0], avatar.origin[1], avatar.origin[2] - FOOTED_DROP_MARGIN];
+            let drop_hit = player_trace(solids, avatar.origin, end, box_lo, box_hi, mask);
+            if 1.0 > drop_hit.fraction {
+                avatar.origin = drop_hit.finish_location(avatar.origin, end);
+                project_velocity(&mut avatar.velocity, &drop_hit.normal);
             }
         }
     }
     if jump_step {
-        clamp_velocity(ps, down_origin);
+        clamp_velocity(avatar, lowered_spot);
     }
-    if had_ground
-        && ps.pm_type < STAIR_PM_TYPE_LIMIT
-        && verify_prone_position(ps, collision, start_origin, start_velocity, zombies)
+    if was_footed
+        && avatar.movement_mode < STAIR_PM_TYPE_LIMIT
+        && verify_prone_position(avatar, solids, from_origin, initial_speed_vec, zombies)
     {
-        return stair_step(ps, pml, start_origin, down_origin, step_size);
+        return stair_step(avatar, tick_vars, from_origin, lowered_spot, step_size);
     }
     0.0
 }
 
 /// BO2's Jump_IsPlayerAboveMax: at or past the top of the jump.
-fn above_max(ps: &PlayerState) -> bool {
-    ps.jump_origin_z + JUMP_HEIGHT <= ps.origin[2]
+fn above_max(avatar: &AvatarState) -> bool {
+    avatar.takeoff_height + JUMP_HEIGHT <= avatar.origin[2]
 }
 
 /// BO2's Jump_ClampVelocity: a jump that rose from `before` climbs no
 /// faster than takes it to the top of the jump.
-fn clamp_velocity(ps: &mut PlayerState, before: [f32; 3]) {
-    if ps.origin[2] - before[2] > 0.0 {
-        let room = ps.jump_origin_z + JUMP_HEIGHT - ps.origin[2];
+fn clamp_velocity(avatar: &mut AvatarState, before: [f32; 3]) {
+    if avatar.origin[2] - before[2] > 0.0 {
+        let room = avatar.takeoff_height + JUMP_HEIGHT - avatar.origin[2];
         if room < 0.1 {
-            ps.velocity[2] = 0.0;
+            avatar.velocity[2] = 0.0;
             return;
         }
-        let top = libm::sqrtf(ps.gravity as f32 * room * 2.0);
-        if top < ps.velocity[2] {
-            ps.velocity[2] = top;
+        let top = libm::sqrtf(avatar.gravity as f32 * room * 2.0);
+        if top < avatar.velocity[2] {
+            avatar.velocity[2] = top;
         }
     }
 }
@@ -198,45 +198,45 @@ fn clamp_velocity(ps: &mut PlayerState, before: [f32; 3]) {
 /// lie where they ended up. If not, they go back to where they started; if
 /// that spot is no better, the move stands. False when the move was taken
 /// back.
-fn verify_prone_position<C: CollisionBackend>(
-    ps: &mut PlayerState,
-    collision: &C,
+fn verify_prone_position<C: SolidProbe>(
+    avatar: &mut AvatarState,
+    solids: &C,
     old_origin: [f32; 3],
     old_velocity: [f32; 3],
     zombies: bool,
 ) -> bool {
-    if ps.pm_flags & pm_flags::PRONE == 0 || prone_fits(ps, collision, zombies) {
+    if avatar.movement_state_bits & movement_state_bits::LYING_FLAT == 0 || prone_fits(avatar, solids, zombies) {
         return true;
     }
-    let (new_origin, new_velocity) = (ps.origin, ps.velocity);
-    ps.origin = old_origin;
-    ps.velocity = old_velocity;
-    if prone_fits(ps, collision, zombies) {
+    let (new_origin, new_velocity) = (avatar.origin, avatar.velocity);
+    avatar.origin = old_origin;
+    avatar.velocity = old_velocity;
+    if prone_fits(avatar, solids, zombies) {
         return false;
     }
-    ps.origin = new_origin;
-    ps.velocity = new_velocity;
+    avatar.origin = new_origin;
+    avatar.velocity = new_velocity;
     true
 }
 
-fn prone_fits<C: CollisionBackend>(ps: &mut PlayerState, collision: &C, zombies: bool) -> bool {
-    let (mut torso, mut waist) = (ps.f_torso_pitch, ps.f_waist_pitch);
+fn prone_fits<C: SolidProbe>(avatar: &mut AvatarState, solids: &C, zombies: bool) -> bool {
+    let (mut torso, mut waist) = (avatar.f_torso_pitch, avatar.f_waist_pitch);
     let fits = check_prone(
-        collision,
-        ps.origin,
+        solids,
+        avatar.origin,
         PRONE_VERIFY_SIZE,
-        PRONE_CHECK_HEIGHT,
-        ps.prone_direction,
+        BELLY_CLEARANCE_PROBE,
+        avatar.prone_direction,
         true,
         true,
         true,
-        ProneRules::for_player(ps, zombies),
-        PRONE_FEET_DIST,
+        ProneRules::for_player(avatar, zombies),
+        BELLY_FOOT_REACH,
         Some(&mut torso),
         Some(&mut waist),
     );
-    ps.f_torso_pitch = torso;
-    ps.f_waist_pitch = waist;
+    avatar.f_torso_pitch = torso;
+    avatar.f_waist_pitch = waist;
     fits
 }
 
@@ -244,8 +244,8 @@ fn prone_fits<C: CollisionBackend>(ps: &mut PlayerState, collision: &C, zombies:
 /// height, and one of more than 3 units moves the walk rhythm on, which can
 /// sound a footstep. Returns the step's height for the camera (0 when it
 /// does not count).
-fn stair_step(ps: &mut PlayerState, pml: &Pml, start_origin: [f32; 3], down_origin: [f32; 3], step_size: f32) -> f32 {
-    let rise = ps.origin[2] - down_origin[2];
+fn stair_step(avatar: &mut AvatarState, tick_vars: &TickLocals, start_origin: [f32; 3], lowered_spot: [f32; 3], step_size: f32) -> f32 {
+    let rise = avatar.origin[2] - lowered_spot[2];
     if libm::fabsf(rise) <= STEP_SLOW_MIN_RISE {
         return 0.0;
     }
@@ -253,19 +253,19 @@ fn stair_step(ps: &mut PlayerState, pml: &Pml, start_origin: [f32; 3], down_orig
     if delta == 0 {
         return 0.0;
     }
-    let scale = (1.0 - libm::fabsf(ps.origin[2] - start_origin[2]) / step_size) * STEP_SLOW_RANGE + STEP_SLOW_FLOOR;
-    for v in &mut ps.velocity {
+    let scale = (1.0 - libm::fabsf(avatar.origin[2] - start_origin[2]) / step_size) * STEP_SLOW_RANGE + STEP_SLOW_FLOOR;
+    for v in &mut avatar.velocity {
         *v *= scale;
     }
     // The step's footstep goes by the speed the stair left.
-    let xyspeed = libm::sqrtf(ps.velocity[0] * ps.velocity[0] + ps.velocity[1] * ps.velocity[1]);
+    let ground_velocity = libm::sqrtf(avatar.velocity[0] * avatar.velocity[0] + avatar.velocity[1] * avatar.velocity[1]);
     let delta = delta.abs();
-    if delta > 3 && ps.ground_entity_num != ENTITYNUM_NONE {
+    if delta > 3 && avatar.standing_on != NO_ENTITY_SLOT {
         let beats = (delta / 2).min(4);
-        let old = ps.bob_cycle;
-        ps.bob_cycle = ((beats as f32 * STEP_BOB_PER_UNIT + STEP_BOB_BASE + old as f32) as i32) & 0xff;
-        let footsteps = should_make_footsteps(ps, xyspeed);
-        footstep_event(ps, pml.ground_trace[4], old, ps.bob_cycle, footsteps, xyspeed);
+        let old = avatar.sway_phase;
+        avatar.sway_phase = ((beats as f32 * STEP_BOB_PER_UNIT + STEP_BOB_BASE + old as f32) as i32) & 0xff;
+        let footsteps = should_make_footsteps(avatar, ground_velocity);
+        footstep_event(avatar, tick_vars.floor_probe[4], old, avatar.sway_phase, footsteps, ground_velocity);
     }
     rise
 }
@@ -276,19 +276,19 @@ mod tests {
     use super::super::testkit::{MASK, MAXS, MINS, World, block, floor, other_player};
     use super::super::{Shape, add};
     use super::*;
-    use crate::testing::pml;
+    use crate::testing::tick_vars;
     use trace_t6::ENTITYNUM_WORLD;
 
     const REST_Z: f32 = 0.125;
     const REACH: f32 = 14.625 / 0.965_925_8 + 0.5;
 
-    fn standing(x: f32, vx: f32) -> PlayerState {
-        PlayerState {
+    fn standing(x: f32, vx: f32) -> AvatarState {
+        AvatarState {
             origin: [x, 0.0, REST_Z],
             velocity: [vx, 0.0, 0.0],
             gravity: 800,
-            ground_entity_num: i32::from(ENTITYNUM_WORLD),
-            ..PlayerState::ZERO
+            standing_on: i32::from(ENTITYNUM_WORLD),
+            ..AvatarState::ZERO
         }
     }
 
@@ -301,26 +301,26 @@ mod tests {
     #[test]
     fn up_a_stair() {
         let world = World::new(alloc::vec![floor(), block([0.0, -256.0, -16.0], [256.0, 256.0, 12.0])]);
-        let mut ps = standing(-20.0, 600.0);
-        let rise = step_slide_move(&mut ps, &pml(true), &world, MINS, MAXS, MASK, false, false);
-        assert!(near(ps.origin[2], 12.0 + REST_Z, 0.01), "{:?}", ps.origin);
-        assert!(near(ps.origin[0], 10.0, 0.01), "{:?}", ps.origin);
+        let mut avatar = standing(-20.0, 600.0);
+        let rise = step_slide_move(&mut avatar, &tick_vars(true), &world, MINS, MAXS, MASK, false, false);
+        assert!(near(avatar.origin[2], 12.0 + REST_Z, 0.01), "{:?}", avatar.origin);
+        assert!(near(avatar.origin[0], 10.0, 0.01), "{:?}", avatar.origin);
         assert!(near(rise, 12.0, 0.01), "{rise}");
         let scale = (1.0 - 12.0 / 18.0) * 0.8 + f32::from_bits(0x3e4c_cccc);
-        assert!(near(ps.velocity[0], 600.0 * scale, 0.1), "{:?}", ps.velocity);
+        assert!(near(avatar.velocity[0], 600.0 * scale, 0.1), "{:?}", avatar.velocity);
         // 12 units moves the walk rhythm on four beats.
-        assert_eq!(ps.bob_cycle, 12);
+        assert_eq!(avatar.sway_phase, 12);
     }
 
     /// 24 units is more than a step: stopped at its face, nothing climbed.
     #[test]
     fn a_step_too_high() {
         let world = World::new(alloc::vec![floor(), block([0.0, -256.0, -16.0], [256.0, 256.0, 24.0])]);
-        let mut ps = standing(-20.0, 600.0);
-        let rise = step_slide_move(&mut ps, &pml(true), &world, MINS, MAXS, MASK, false, false);
+        let mut avatar = standing(-20.0, 600.0);
+        let rise = step_slide_move(&mut avatar, &tick_vars(true), &world, MINS, MAXS, MASK, false, false);
         assert_eq!(rise, 0.0);
-        assert!(near(ps.origin[0], -REACH, 0.05), "{:?}", ps.origin);
-        assert!(near(ps.origin[2], REST_Z, 0.01), "{:?}", ps.origin);
+        assert!(near(avatar.origin[0], -REACH, 0.05), "{:?}", avatar.origin);
+        assert!(near(avatar.origin[2], REST_Z, 0.01), "{:?}", avatar.origin);
     }
 
     /// Off a 6-unit ledge: down onto the lower floor, which costs speed
@@ -331,12 +331,12 @@ mod tests {
             block([-256.0, -256.0, -16.0], [0.0, 256.0, 0.0]),
             block([0.0, -256.0, -22.0], [256.0, 256.0, -6.0]),
         ]);
-        let mut ps = standing(-20.0, 1000.0);
-        let rise = step_slide_move(&mut ps, &pml(true), &world, MINS, MAXS, MASK, false, false);
-        assert!(near(ps.origin[2], REST_Z - 6.0, 0.01), "{:?}", ps.origin);
+        let mut avatar = standing(-20.0, 1000.0);
+        let rise = step_slide_move(&mut avatar, &tick_vars(true), &world, MINS, MAXS, MASK, false, false);
+        assert!(near(avatar.origin[2], REST_Z - 6.0, 0.01), "{:?}", avatar.origin);
         assert!(near(rise, -6.0, 0.01), "{rise}");
         let scale = (1.0 - 6.0 / 18.0) * 0.8 + f32::from_bits(0x3e4c_cccc);
-        assert!(near(ps.velocity[0], 1000.0 * scale, 0.1), "{:?}", ps.velocity);
+        assert!(near(avatar.velocity[0], 1000.0 * scale, 0.1), "{:?}", avatar.velocity);
     }
 
     /// Off a ledge with a player lying on the floor below, inside the
@@ -349,8 +349,8 @@ mod tests {
         let hull = player_hull(MINS, [15.0, 15.0, 2.0], 0.0);
         let (lo, hi) = hull.calc_aabb();
         lying.shape = Shape::Player { hull };
-        lying.mins = add(lower, lo);
-        lying.maxs = add(lower, hi);
+        lying.lo_corner = add(lower, lo);
+        lying.hi_corner = add(lower, hi);
         let ledge = || {
             alloc::vec![
                 block([-256.0, -256.0, -16.0], [0.0, 256.0, 0.0]),
@@ -360,30 +360,30 @@ mod tests {
         let mut shapes = ledge();
         shapes.push(lying);
         let world = World::new(shapes);
-        let mut ps = standing(-20.0, 1000.0);
-        let rise = step_slide_move(&mut ps, &pml(true), &world, MINS, MAXS, MASK, false, false);
+        let mut avatar = standing(-20.0, 1000.0);
+        let rise = step_slide_move(&mut avatar, &tick_vars(true), &world, MINS, MAXS, MASK, false, false);
         assert_eq!(rise, 0.0);
-        assert!(near(ps.origin[0], 30.0, 0.01), "{:?}", ps.origin);
-        assert!(near(ps.origin[2], REST_Z, 0.01), "{:?}", ps.origin);
-        assert_eq!(ps.velocity, [1000.0, 0.0, 0.0]);
+        assert!(near(avatar.origin[0], 30.0, 0.01), "{:?}", avatar.origin);
+        assert!(near(avatar.origin[2], REST_Z, 0.01), "{:?}", avatar.origin);
+        assert_eq!(avatar.velocity, [1000.0, 0.0, 0.0]);
 
         // The same ledge with nobody there: down onto the lower floor.
         let world = World::new(ledge());
-        let mut ps = standing(-20.0, 1000.0);
-        step_slide_move(&mut ps, &pml(true), &world, MINS, MAXS, MASK, false, false);
-        assert!(near(ps.origin[2], REST_Z - 6.0, 0.01), "{:?}", ps.origin);
+        let mut avatar = standing(-20.0, 1000.0);
+        step_slide_move(&mut avatar, &tick_vars(true), &world, MINS, MAXS, MASK, false, false);
+        assert!(near(avatar.origin[2], REST_Z - 6.0, 0.01), "{:?}", avatar.origin);
     }
 
     /// In the air, meeting nothing: just the fall, no step.
     #[test]
     fn falling_never_steps() {
         let world = World::new(alloc::vec![floor()]);
-        let mut ps = standing(0.0, 100.0);
-        ps.origin[2] = 100.0;
-        ps.ground_entity_num = ENTITYNUM_NONE;
-        let rise = step_slide_move(&mut ps, &pml(false), &world, MINS, MAXS, MASK, true, false);
+        let mut avatar = standing(0.0, 100.0);
+        avatar.origin[2] = 100.0;
+        avatar.standing_on = NO_ENTITY_SLOT;
+        let rise = step_slide_move(&mut avatar, &tick_vars(false), &world, MINS, MAXS, MASK, true, false);
         assert_eq!(rise, 0.0);
-        assert!(near(ps.origin[2], 99.0, 1e-3), "{:?}", ps.origin);
-        assert!(near(ps.velocity[2], -40.0, 1e-3), "{:?}", ps.velocity);
+        assert!(near(avatar.origin[2], 99.0, 1e-3), "{:?}", avatar.origin);
+        assert!(near(avatar.velocity[2], -40.0, 1e-3), "{:?}", avatar.velocity);
     }
 }

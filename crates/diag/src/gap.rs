@@ -5,93 +5,94 @@
 //! was raised, and writes the live set as a one-line signature, so a report
 //! can tell when the set changed.
 
-use core::fmt::{self, Write as _};
+use core::fmt;
 
 /// One kind of gap. `ALL` names every kind once, and a ledger keeps one slot
 /// per entry.
 pub trait Gap: Copy + PartialEq + 'static {
-    const ALL: &'static [Self];
+    const ALL_KINDS: &'static [Self];
 
     /// The gap's name in the log.
     fn name(self) -> &'static str;
 
     /// Missing for good: live from the start, and never cleared.
-    fn is_standing(self) -> bool;
+    fn still_open(self) -> bool;
 
     /// The gap's slot: its place in `ALL`.
     fn index(self) -> usize {
-        Self::ALL
-            .iter()
-            .position(|gap| *gap == self)
-            .expect("every gap is listed in Gap::ALL")
+        let listed = Self::ALL_KINDS.iter().position(|gap| *gap == self);
+        listed.expect("every gap is listed in Gap::ALL")
     }
 }
 
 /// Why a gap was raised; written after the gap's name.
-pub trait GapCause: fmt::Display {
+pub trait ShortfallOrigin: fmt::Display {
     type Gap: Gap;
 
     fn gap(&self) -> Self::Gap;
 }
 
-/// The live gaps, each one's last cause, and how often each was raised.
-/// `N` must be `Gap::ALL.len()`.
-pub struct GapLedger<C: GapCause, const N: usize> {
-    causes: [Option<C>; N],
-    hits: [u64; N],
+/// One gap's slot in a ledger: its last cause while live, and its raise count.
+struct Slot<Origin> {
+    cause: Option<Origin>,
+    raised: u64,
 }
 
-impl<C: GapCause, const N: usize> Default for GapLedger<C, N> {
+/// The live gaps, each one's last cause, and how often each was raised.
+/// `KINDS` must be `Gap::ALL.len()`.
+pub struct LackLedger<Origin: ShortfallOrigin, const KINDS: usize> {
+    slots: [Slot<Origin>; KINDS],
+}
+
+impl<Origin: ShortfallOrigin, const KINDS: usize> Default for LackLedger<Origin, KINDS> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<C: GapCause, const N: usize> GapLedger<C, N> {
+impl<Origin: ShortfallOrigin, const KINDS: usize> LackLedger<Origin, KINDS> {
     pub fn new() -> Self {
-        const {
-            assert!(
-                N == C::Gap::ALL.len(),
-                "a ledger has one slot per Gap::ALL entry"
-            )
-        };
-        Self {
-            causes: core::array::from_fn(|_| None),
-            hits: [0; N],
-        }
+        const { assert!(KINDS == Origin::Gap::ALL_KINDS.len(), "a ledger has one slot per Gap::ALL entry") };
+        let slots = core::array::from_fn(|_| Slot { cause: None, raised: 0 });
+        Self { slots }
+    }
+
+    fn slot_for(&self, kind: Origin::Gap) -> &Slot<Origin> {
+        &self.slots[kind.index()]
     }
 
     /// Makes the cause's gap live with it, and counts the raise.
-    pub fn raise(&mut self, cause: C) {
-        let slot = cause.gap().index();
-        self.hits[slot] = self.hits[slot].saturating_add(1);
-        self.causes[slot] = Some(cause);
+    pub fn raise(&mut self, why: Origin) {
+        let entry = &mut self.slots[why.gap().index()];
+        entry.raised = entry.raised.saturating_add(1);
+        entry.cause = Some(why);
     }
 
     /// Ends a raised gap. A standing gap stays live, with its last cause.
-    pub fn clear(&mut self, gap: C::Gap) {
-        if !gap.is_standing() {
-            self.causes[gap.index()] = None;
+    pub fn clear(&mut self, hole: Origin::Gap) {
+        if hole.still_open() {
+            return;
         }
+        self.slots[hole.index()].cause = None;
     }
 
-    pub fn is_live(&self, gap: C::Gap) -> bool {
-        gap.is_standing() || self.causes[gap.index()].is_some()
+    pub fn is_live(&self, kind: Origin::Gap) -> bool {
+        kind.still_open() || self.slot_for(kind).cause.is_some()
     }
 
     /// The cause the gap was last raised with, while it is live.
-    pub fn cause(&self, gap: C::Gap) -> Option<&C> {
-        self.causes[gap.index()].as_ref()
+    pub fn cause(&self, hole: Origin::Gap) -> Option<&Origin> {
+        self.slot_for(hole).cause.as_ref()
     }
 
     /// How many times the gap was raised.
-    pub fn hits(&self, gap: C::Gap) -> u64 {
-        self.hits[gap.index()]
+    pub fn hits(&self, hole: Origin::Gap) -> u64 {
+        self.slot_for(hole).raised
     }
 
     /// The live gaps, in `ALL` order.
-    pub fn live(&self) -> impl Iterator<Item = C::Gap> + '_ {
-        C::Gap::ALL.iter().copied().filter(|gap| self.is_live(*gap))
+    pub fn live(&self) -> impl Iterator<Item = Origin::Gap> + '_ {
+        Origin::Gap::ALL_KINDS.iter().copied().filter(|gap| self.is_live(*gap))
     }
 
     pub fn count(&self) -> usize {
@@ -99,26 +100,21 @@ impl<C: GapCause, const N: usize> GapLedger<C, N> {
     }
 
     /// Each live gap as `name ` or `name=cause `, in `ALL` order.
-    pub fn write_signature(&self, out: &mut impl fmt::Write) -> fmt::Result {
-        for gap in self.live() {
-            out.write_str(gap.name())?;
-            if let Some(cause) = self.cause(gap) {
-                write!(out, "={cause}")?;
-            }
-            out.write_char(' ')?;
-        }
-        Ok(())
+    pub fn print_fingerprint(&self, sink: &mut impl fmt::Write) -> fmt::Result {
+        self.live().try_for_each(|gap| match self.cause(gap) {
+            Some(cause) => write!(sink, "{}={cause} ", gap.name()),
+            None => write!(sink, "{} ", gap.name()),
+        })
     }
 }
 
-impl<C: GapCause, const N: usize> fmt::Debug for GapLedger<C, N> {
+impl<Origin: ShortfallOrigin, const KINDS: usize> fmt::Debug for LackLedger<Origin, KINDS> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("GapLedger[")?;
-        self.write_signature(f)?;
-        f.write_char(']')
+        let mut live_names = String::new();
+        self.print_fingerprint(&mut live_names)?;
+        write!(f, "GapLedger[{live_names}]")
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,44 +127,43 @@ mod tests {
     }
 
     impl Gap for Missing {
-        const ALL: &'static [Self] = &[Self::Glass, Self::Ropes, Self::Water];
+        const ALL_KINDS: &'static [Self] = &[Self::Glass, Self::Ropes, Self::Water];
 
         fn name(self) -> &'static str {
-            match self {
-                Self::Glass => "glass",
-                Self::Ropes => "ropes",
-                Self::Water => "water",
-            }
+            ["glass", "ropes", "water"][self as usize]
         }
 
-        fn is_standing(self) -> bool {
+        fn still_open(self) -> bool {
             self == Self::Water
         }
     }
 
-    struct Because(Missing, &'static str);
+    struct Because {
+        missing: Missing,
+        note: &'static str,
+    }
 
     impl fmt::Display for Because {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(self.1)
+            f.write_str(self.note)
         }
     }
 
-    impl GapCause for Because {
+    impl ShortfallOrigin for Because {
         type Gap = Missing;
 
         fn gap(&self) -> Missing {
-            self.0
+            self.missing
         }
     }
 
     #[test]
     fn standing_gaps_start_live_and_raised_ones_come_and_go() {
-        let mut ledger = GapLedger::<Because, 3>::new();
+        let mut ledger = LackLedger::<Because, 3>::new();
         assert_eq!(ledger.live().collect::<Vec<_>>(), [Missing::Water]);
-        ledger.raise(Because(Missing::Glass, "pane"));
-        ledger.raise(Because(Missing::Glass, "shard"));
-        ledger.raise(Because(Missing::Water, "pool"));
+        ledger.raise(Because { missing: Missing::Glass, note: "pane" });
+        ledger.raise(Because { missing: Missing::Glass, note: "shard" });
+        ledger.raise(Because { missing: Missing::Water, note: "pool" });
         assert_eq!(ledger.count(), 2);
         assert_eq!(ledger.hits(Missing::Glass), 2);
         assert_eq!(format!("{ledger:?}"), "GapLedger[glass=shard water=pool ]");
@@ -177,7 +172,7 @@ mod tests {
         assert!(!ledger.is_live(Missing::Glass));
         assert!(ledger.cause(Missing::Glass).is_none());
         assert_eq!(
-            ledger.cause(Missing::Water).map(|cause| cause.1),
+            ledger.cause(Missing::Water).map(|cause| cause.note),
             Some("pool")
         );
         assert_eq!(ledger.hits(Missing::Glass), 2);

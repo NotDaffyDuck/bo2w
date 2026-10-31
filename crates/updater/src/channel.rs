@@ -12,20 +12,20 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn parse(url: &str) -> Result<Self, String> {
-        let rest = url
-            .strip_prefix("https://")
-            .ok_or_else(|| format!("update URL must use https: `{url}`"))?;
-        let (authority, path) = match rest.split_once('/') {
-            Some((authority, path)) => (authority, format!("/{path}")),
+        let Some(rest) = url.strip_prefix("https://") else {
+            return Err(format!("update URL must use https, not `{url}`"));
+        };
+        let (host_port, path) = match rest.split_once('/') {
+            Some((host_port, path)) => (host_port, format!("/{path}")),
             None => (rest, "/".to_owned()),
         };
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) => (host, port.parse::<u16>().ok()),
-            None => (authority, Some(443)),
+        let (domain, port) = match host_port.rsplit_once(':') {
+            Some((domain, port)) => (domain, port.parse::<u16>().ok()),
+            None => (host_port, Some(443)),
         };
         match port {
-            Some(port) if port != 0 && !host.is_empty() => Ok(Self {
-                host: host.to_owned(),
+            Some(port) if port != 0 && !domain.is_empty() => Ok(Self {
+                host: domain.to_owned(),
                 port,
                 path,
             }),
@@ -39,34 +39,34 @@ impl Endpoint {
 pub fn base_from(setting: Option<&str>) -> Result<String, String> {
     let Some(setting) = setting else {
         return Err(
-            "BO2MP_UPDATE_URL is unset; set it in the portable .env before the first HTTP request"
+            "BO2MP_UPDATE_URL is unset; put it in the portable .env before the first HTTP request"
                 .to_owned(),
         );
     };
-    let base = setting.trim();
-    if base.is_empty() {
+    let stripped = setting.trim();
+    if stripped.is_empty() {
         return Err("BO2MP_UPDATE_URL is empty".to_owned());
     }
-    if base.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if stripped.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("BO2MP_UPDATE_URL contains invalid characters".to_owned());
     }
     // A plain-http or hostless channel is refused here, before anyone is asked.
-    Endpoint::parse(base)?;
-    Ok(base.trim_end_matches('/').to_owned())
+    Endpoint::parse(stripped)?;
+    Ok(stripped.trim_end_matches('/').to_owned())
 }
 
 /// The address of `name` on the channel at `base`.
-pub fn address_of(base: &str, name: &str) -> String {
-    format!("{base}/{name}")
+pub fn address_of(base: &str, file: &str) -> String {
+    format!("{base}/{file}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn endpoint(host: &str, port: u16, path: &str) -> Endpoint {
+    fn endpoint(domain: &str, port: u16, path: &str) -> Endpoint {
         Endpoint {
-            host: host.to_owned(),
+            host: domain.to_owned(),
             port,
             path: path.to_owned(),
         }

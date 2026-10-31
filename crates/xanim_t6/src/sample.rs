@@ -91,12 +91,12 @@ pub fn snap_jumpcut(f: f32, jumpcut_frames: &[i32]) -> f32 {
 
 /// The sample between two keys: a per-component lerp (no flip, no
 /// normalise).
-pub fn lerp4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
-    core::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
+pub fn lerp4(q_from: [f32; 4], q_to: [f32; 4], blend_k: f32) -> [f32; 4] {
+    core::array::from_fn(|i| q_from[i] + (q_to[i] - q_from[i]) * blend_k)
 }
 
-pub fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    core::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
+pub fn blend_triple(p0: [f32; 3], p1: [f32; 3], mix: f32) -> [f32; 3] {
+    core::array::from_fn(|i| p0[i] + (p1[i] - p0[i]) * mix)
 }
 
 #[cfg(test)]

@@ -3,24 +3,14 @@
 
 #![forbid(unsafe_code)]
 
-mod args;
-mod lobby;
-mod pem;
-mod probe;
-mod service;
-mod unit;
-mod wire;
-
 use std::io::Write;
 
-use args::Invocation;
-
-type Error = Box<dyn std::error::Error + Send + Sync>;
+use bo2mp_master::{args, args::Invocation, probe, service, unit, Error};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     match args::read(std::env::args().skip(1))? {
-        Invocation::Serve { bind, cert, key } => service::serve(bind, &cert, &key).await,
+        Invocation::Serve { address, cert_file, key_file } => service::serve(address, &cert_file, &key_file).await,
         Invocation::Status(target) => probe::status(&target).await,
         Invocation::List(target) => probe::list(&target).await,
         Invocation::PrintUnit(settings) => {

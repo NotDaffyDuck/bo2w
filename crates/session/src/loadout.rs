@@ -1,301 +1,324 @@
 //! Turning a class as the player built it (names from the menu) into the
 //! class the match runs (ids), and saying why a class can't be used.
 
-use asset_game::{FamilyKey, LoadoutRules, WeaponRegistry, WeaponSelection};
-use sim::match_state::{
-    CLASS_CATALOG_DEATHSTREAKS, CLASS_CATALOG_PERKS, perk_slot_from_class_catalog,
+use asset_game::{
+    LoadoutPerkEntry, FamilyKey, LoadoutRules, WeaponLedger, WeaponSelection, default_class_perks,
 };
-use weapon_t6::combat_facts::WeaponCombatFacts;
+use weapon_t6::combat_facts::GunBattleProfile;
 
 /// A class as the menu holds it: weapon names, the attachments on the first
-/// two, three perks and a deathstreak.
+/// two and three perks (each a perk's reference, or empty for none).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClassRow {
     /// Primary, secondary, lethal, tactical.
     pub weapons: [String; 4],
     /// Attachments on the primary and the secondary.
-    pub attachments: [Vec<String>; 2],
-    pub perks: [String; 3],
-    pub deathstreak: String,
+    pub mods: [Vec<String>; 2],
+    pub specialties: [String; 3],
 }
 
-impl From<&frame::HostClassSlot> for ClassRow {
-    fn from(slot: &frame::HostClassSlot) -> Self {
+impl From<&frame::ServerKitSlot> for ClassRow {
+    fn from(source: &frame::ServerKitSlot) -> Self {
+        let weapons = [
+            source.primary.clone(),
+            source.secondary.clone(),
+            source.lethal.clone(),
+            source.tactical.clone(),
+        ];
+        let mods = [
+            source.main_gun_parts.clone(),
+            source.side_gun_parts.clone(),
+        ];
         Self {
-            weapons: [
-                slot.primary.clone(),
-                slot.secondary.clone(),
-                slot.lethal.clone(),
-                slot.tactical.clone(),
-            ],
-            attachments: [
-                slot.primary_attachments.clone(),
-                slot.secondary_attachments.clone(),
-            ],
-            perks: slot.perks.clone(),
-            deathstreak: slot.deathstreak.clone(),
+            weapons,
+            mods,
+            specialties: source.perks.clone(),
         }
     }
 }
 
 /// The class the match will run, and the reasons (if any) it is locked.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthoritativeClassProjection {
-    pub def: sim::ClassDef,
-    pub lock_reason: Option<String>,
+pub struct HostLoadoutMirror {
+    pub def: sim::LoadoutClassSpec,
+    pub frozen_because: Option<String>,
 }
 
 /// "item:code", the form every refusal in this module takes.
-fn refusal(item: &str, code: &str) -> String {
-    format!("{item}:{code}")
+fn refusal(subject: &str, reason: &str) -> String {
+    [subject, reason].join(":")
 }
 
 /// The weapon id for a named weapon with the attachments the class puts on
 /// it. An empty name is an empty slot (id 0).
 pub fn resolve_class_weapon(
-    weapons: &WeaponRegistry,
-    name: &str,
-    attachments: &[String],
+    registry: &WeaponLedger,
+    gun: &str,
+    extras: &[String],
     rules: LoadoutRules,
 ) -> Result<u32, String> {
-    if name.is_empty() {
-        return match attachments.is_empty() {
-            true => Ok(0),
-            false => Err("weapon.unknown_family".to_owned()),
-        };
-    }
-    let configure = |selection: WeaponSelection| {
-        weapons
-            .resolve_configuration(&selection, rules)
-            .map(|resolved| resolved.id)
-            .map_err(|why| refusal(name, why.code()))
-    };
-    if let Some(family) = FamilyKey::parse(name)
-        && weapons.weapon_families().family(&family).is_some()
-    {
-        return configure(WeaponSelection::with(family, attachments));
-    }
-    let Ok(Some(id)) = weapons.resolve_index(name) else {
-        return Err(refusal(name, "catalog.unknown"));
-    };
-    match weapons.describe_configuration(id) {
-        Some(described) if described.family.is_some() => {
-            let mut selection = described.clone();
-            for extra in attachments {
-                if !selection.attachments.contains(extra) {
-                    selection.attachments.push(extra.clone());
-                }
-            }
-            configure(selection)
+    if gun.is_empty() {
+        if extras.is_empty() {
+            return Ok(0u32);
         }
-        _ if attachments.is_empty() => weapons
-            .configuration_admission(id)
-            .map(|()| id)
-            .map_err(|why| refusal(name, why.code())),
-        _ => Err(refusal(name, "weapon.unknown_family")),
+        return Err(String::from("weapon.unknown_family"));
+    }
+    let configure = |wanted: WeaponSelection| {
+        let resolved = registry.resolve_configuration(&wanted, rules);
+        resolved
+            .map(|found| found.id)
+            .map_err(|cause| refusal(gun, cause.code()))
+    };
+    if let Some(family) = FamilyKey::parse(gun)
+        && registry.weapon_families().family(&family).is_some()
+    {
+        return configure(WeaponSelection::with(family, extras));
+    }
+    let Ok(Some(index)) = registry.follow_slot_link(gun) else {
+        return Err(refusal(gun, "catalog.unknown"));
+    };
+    let base = registry.describe_configuration(index);
+    if let Some(base) = base.filter(|described| described.family.is_some()) {
+        let mut wanted = base.clone();
+        for attachment in extras {
+            if !wanted.attachments.contains(attachment) {
+                wanted.attachments.push(attachment.clone());
+            }
+        }
+        return configure(wanted);
+    }
+    if extras.len() > 0 {
+        return Err(refusal(gun, "weapon.unknown_family"));
+    }
+    match registry.configuration_admission(index) {
+        Ok(()) => Ok(index),
+        Err(cause) => Err(refusal(gun, cause.code())),
     }
 }
 
 /// Whether an equipment slot (0 lethal, 1 tactical) holds the right kind of
 /// offhand item.
-fn offhand_fits(slot: usize, offhand_class: i32) -> bool {
-    match slot {
-        0 => matches!(offhand_class, 1 | 4 | 5),
-        1 => matches!(offhand_class, 2 | 3),
-        _ => false,
-    }
+fn offhand_fits(position: usize, kind: i32) -> bool {
+    let accepted: &[i32] = match position {
+        0 => &[1, 4, 5],
+        1 => &[2, 3],
+        _ => &[],
+    };
+    accepted.contains(&kind)
 }
 
 /// Why a class's weapons can't be used: a gun with no validated combat
 /// profile, or an offhand item of the wrong kind or without runtime facts.
 /// Several reasons are joined with "; ".
-pub fn authoritative_class_lock_reason(
-    names: [&str; 4],
+pub fn host_loadout_lock_cause(
+    labels: [&str; 4],
     ids: [u32; 4],
-    combat: &[WeaponCombatFacts],
-    equipment: &[sim::EquipmentRuntimeFacts],
+    combat: &[GunBattleProfile],
+    gear: &[sim::GadgetLiveStats],
 ) -> Option<String> {
-    let mut reasons = Vec::new();
-    for slot in 0..2 {
-        let has_profile = combat
-            .get(ids[slot] as usize)
+    let mut problems: Vec<String> = Vec::new();
+    for gun in 0..2 {
+        let usable = combat
+            .get(ids[gun] as usize)
             .copied()
-            .is_some_and(WeaponCombatFacts::is_usable);
-        if ids[slot] != 0 && !has_profile {
-            reasons.push(refusal(names[slot], "validated.missing_profile"));
+            .is_some_and(GunBattleProfile::ready_for_use);
+        if ids[gun] != 0 && !usable {
+            problems.push(refusal(labels[gun], "validated.missing_profile"));
         }
     }
-    for slot in 0..2 {
-        let id = ids[2 + slot];
-        let fits = equipment
-            .get(id as usize)
+    for offhand in 0..2 {
+        let gun_catalog_no = ids[offhand + 2];
+        let fits = gear
+            .get(gun_catalog_no as usize)
             .copied()
-            .is_some_and(|facts| facts.is_offhand() && offhand_fits(slot, facts.offhand_class));
-        if id != 0 && !fits {
-            reasons.push(refusal(names[2 + slot], "offhand.missing_runtime_facts"));
+            .is_some_and(|known| {
+                known.is_secondary_gear() && offhand_fits(offhand, known.secondary_hand_category)
+            });
+        if gun_catalog_no != 0 && !fits {
+            problems.push(refusal(labels[offhand + 2], "offhand.missing_runtime_facts"));
         }
     }
-    (!reasons.is_empty()).then(|| reasons.join("; "))
-}
-
-/// The catalog number of a perk (1-based), by its reference name.
-pub fn perk_catalog_id(reference: &str) -> Option<u32> {
-    let index = CLASS_CATALOG_PERKS
-        .iter()
-        .position(|perk| perk.eq_ignore_ascii_case(reference))?;
-    u32::try_from(index + 1).ok()
+    if problems.is_empty() {
+        None
+    } else {
+        Some(problems.join("; "))
+    }
 }
 
 /// A slot that names nothing.
-fn is_unset(name: &str) -> bool {
-    name.is_empty() || name == "specialty_null"
+fn is_unset(perk: &str) -> bool {
+    matches!(perk, "" | "specialty_null")
 }
 
-fn resolve_perk(slot: usize, name: &str) -> Result<u32, String> {
-    let id = perk_catalog_id(name).ok_or_else(|| refusal(name, "perk.unknown_catalog_entry"))?;
-    match perk_slot_from_class_catalog(id) == Some(slot) {
-        true => Ok(id),
-        false => Err(refusal(name, "perk.invalid_slot")),
-    }
-}
-
-fn resolve_deathstreak(name: &str) -> Result<u8, String> {
-    CLASS_CATALOG_DEATHSTREAKS
+/// The perk a stats table lists under `reference`, ignoring case.
+fn find_perk<'a>(registry: &'a WeaponLedger, reference: &str) -> Option<&'a LoadoutPerkEntry> {
+    let table = registry.weapon_families().perks();
+    table
         .iter()
-        .position(|candidate| *candidate == name)
-        .and_then(|index| u8::try_from(index + 1).ok())
-        .ok_or_else(|| refusal(name, "deathstreak.unknown_catalog_entry"))
+        .find(|entry| entry.reference.eq_ignore_ascii_case(reference))
+}
+
+/// The catalog number of a perk: its stats table item number.
+pub fn perk_item_number(registry: &WeaponLedger, reference: &str) -> Option<u32> {
+    let row = find_perk(registry, reference)?;
+    Some(row.index)
+}
+
+fn resolve_perk(registry: &WeaponLedger, position: usize, reference: &str) -> Result<u32, String> {
+    let Some(row) = find_perk(registry, reference) else {
+        return Err(refusal(reference, "perk.unknown_catalog_entry"));
+    };
+    if row.bay.position() != position {
+        return Err(refusal(reference, "perk.invalid_slot"));
+    }
+    Ok(row.index)
+}
+
+/// Which class slot (0, 1, 2) each perk of the stats table sits in, by its
+/// item number: what the match checks a class's perks against.
+pub fn class_perk_slots(registry: &WeaponLedger) -> Vec<(u32, u8)> {
+    let mut pairs: Vec<(u32, u8)> = Vec::new();
+    for row in registry.weapon_families().perks() {
+        pairs.push((row.index, row.bay.position() as u8));
+    }
+    pairs
+}
+
+/// Gives a stock class the perks the stats table lists for it under its
+/// name (`class_smg`...), when it names none of its own.
+pub fn fill_default_perks(slot: &mut frame::ServerKitSlot, registry: &WeaponLedger) {
+    if slot.perks.iter().any(|chosen| !is_unset(chosen)) {
+        return;
+    }
+    let defaults = default_class_perks(registry.weapon_families().perks(), &slot.name);
+    for (current, stock) in slot.perks.iter_mut().zip(defaults) {
+        let Some(stock) = stock else {
+            continue;
+        };
+        *current = stock.reference.clone();
+    }
 }
 
 /// The ids behind a class's names, or the first thing that won't resolve.
 pub fn resolve_personal_class(
     row: &ClassRow,
-    registry: &WeaponRegistry,
+    registry: &WeaponLedger,
 ) -> Result<sim::PersonalClass, String> {
-    let mut class = sim::PersonalClass::default();
-    let rules = LoadoutRules::for_class(&row.perks[0]);
-    for (slot, id) in class.weapons.iter_mut().enumerate() {
-        let attachments = row.attachments.get(slot).map_or(&[][..], Vec::as_slice);
-        *id = resolve_class_weapon(registry, &row.weapons[slot], attachments, rules)?;
+    let mut resolved = sim::PersonalClass::default();
+    let rules = LoadoutRules::default();
+    for (position, target) in resolved.weapons.iter_mut().enumerate() {
+        let mods = row.mods.get(position).map_or(&[][..], |list| list.as_slice());
+        *target = resolve_class_weapon(registry, &row.weapons[position], mods, rules)?;
     }
-    for (slot, name) in row.perks.iter().enumerate() {
-        if !is_unset(name) {
-            class.perks[slot] = resolve_perk(slot, name)?;
+    for (position, reference) in row.specialties.iter().enumerate() {
+        if is_unset(reference) {
+            continue;
         }
+        resolved.perks[position] = resolve_perk(registry, position, reference)?;
     }
-    if !is_unset(&row.deathstreak) {
-        class.deathstreak = resolve_deathstreak(&row.deathstreak)?;
-    }
-    Ok(class)
+    Ok(resolved)
 }
 
 /// The class `class_id` as the match will run it. A class that doesn't
 /// resolve becomes an empty class with the reason it is locked.
-pub fn project_class(
-    class_id: u32,
+pub fn project_loadout(
+    class_number: u32,
     row: &ClassRow,
-    weapons: &WeaponRegistry,
-    combat: &[WeaponCombatFacts],
-    equipment: &[sim::EquipmentRuntimeFacts],
-) -> AuthoritativeClassProjection {
-    let id = sim::ClassId(class_id);
-    let (mut def, mut reasons) = match resolve_personal_class(row, weapons).and_then(|class| {
-        class
+    weapons: &WeaponLedger,
+    combat: &[GunBattleProfile],
+    gear: &[sim::GadgetLiveStats],
+) -> HostLoadoutMirror {
+    let id = sim::ClassId(class_number);
+    let built = resolve_personal_class(row, weapons).and_then(|personal| {
+        personal
             .definition(id, 1)
-            .ok_or_else(|| "class.invalid_definition".to_owned())
-    }) {
+            .ok_or_else(|| String::from("class.invalid_definition"))
+    });
+    let (mut def, mut reasons) = match built {
         Ok(def) => (def, Vec::new()),
-        Err(reason) => (sim::ClassDef::primary_secondary(id, 1, 0, 0), vec![reason]),
+        Err(reason) => (sim::LoadoutClassSpec::primary_secondary(id, 1, 0, 0), vec![reason]),
     };
-    let names = row.weapons.each_ref().map(String::as_str);
-    reasons.extend(authoritative_class_lock_reason(
-        names,
-        def.weapon_slot_ids(),
-        combat,
-        equipment,
-    ));
+    let weapon_names = row.weapons.each_ref().map(String::as_str);
+    let weapon_ids = def.gun_slot_ids();
+    let weapon_reasons = host_loadout_lock_cause(weapon_names, weapon_ids, combat, gear);
+    reasons.extend(weapon_reasons);
     def.locked = !reasons.is_empty();
-    AuthoritativeClassProjection {
-        def,
-        lock_reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
-    }
+    let frozen_because = if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join("; "))
+    };
+    HostLoadoutMirror { def, frozen_because }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn names<'a>(a: &'a str, b: &'a str, c: &'a str, d: &'a str) -> [&'a str; 4] {
-        [a, b, c, d]
+    fn names<'a>(first: &'a str, second: &'a str, third: &'a str, fourth: &'a str) -> [&'a str; 4] {
+        [first, second, third, fourth]
     }
 
     #[test]
-    fn perks_are_numbered_from_one_ignoring_case() {
-        let first = CLASS_CATALOG_PERKS[0];
-        assert_eq!(perk_catalog_id(first), Some(1));
-        assert_eq!(perk_catalog_id(&first.to_ascii_uppercase()), Some(1));
-        assert_eq!(perk_catalog_id("no_such_perk"), None);
+    fn a_registry_without_a_stats_table_knows_no_perks() {
+        let registry = WeaponLedger::default();
+        let known = perk_item_number(&registry, "specialty_movefaster");
+        assert_eq!(known, None);
+        let nonsense = resolve_perk(&registry, 0, "nonsense");
+        assert_eq!(nonsense, Err("nonsense:perk.unknown_catalog_entry".to_owned()));
+        assert!(class_perk_slots(&registry).is_empty());
     }
 
     #[test]
-    fn deathstreaks_are_numbered_from_one() {
-        assert_eq!(resolve_deathstreak(CLASS_CATALOG_DEATHSTREAKS[0]), Ok(1));
-        assert_eq!(
-            resolve_deathstreak("nope"),
-            Err("nope:deathstreak.unknown_catalog_entry".to_owned())
-        );
+    fn nothing_and_the_null_perk_are_unset() {
+        assert!(is_unset("") && is_unset("specialty_null"));
+        assert!(!is_unset("specialty_movefaster"));
     }
 
     #[test]
-    fn a_perk_must_sit_in_its_own_slot() {
-        let id = perk_catalog_id(CLASS_CATALOG_PERKS[0]).unwrap();
-        let home = perk_slot_from_class_catalog(id).unwrap();
-        let elsewhere = (home + 1) % 3;
-        assert_eq!(resolve_perk(home, CLASS_CATALOG_PERKS[0]), Ok(id));
-        assert_eq!(
-            resolve_perk(elsewhere, CLASS_CATALOG_PERKS[0]),
-            Err(format!("{}:perk.invalid_slot", CLASS_CATALOG_PERKS[0]))
-        );
-    }
-
-    #[test]
-    fn an_unknown_perk_is_refused_by_name() {
-        assert_eq!(
-            resolve_perk(0, "nonsense"),
-            Err("nonsense:perk.unknown_catalog_entry".to_owned())
-        );
+    fn a_stock_class_with_no_stats_table_keeps_its_empty_perks() {
+        let mut slot = frame::ServerKitSlot::from(&frame::KitTemplate {
+            name: "class_smg",
+            primary: "",
+            main_gun_parts: &[],
+            secondary: "",
+            side_gun_parts: &[],
+            lethal: "",
+            tactical: "",
+            perks: ["", "", ""],
+        });
+        fill_default_perks(&mut slot, &WeaponLedger::default());
+        assert!(slot.perks.iter().all(String::is_empty));
     }
 
     #[test]
     fn an_empty_weapon_slot_is_id_zero_but_not_with_attachments() {
-        let registry = WeaponRegistry::default();
-        let rules = LoadoutRules::for_class("");
-        assert_eq!(resolve_class_weapon(&registry, "", &[], rules), Ok(0));
-        assert_eq!(
-            resolve_class_weapon(&registry, "", &["reflex".to_owned()], rules),
-            Err("weapon.unknown_family".to_owned())
-        );
+        let registry = WeaponLedger::default();
+        let rules = LoadoutRules::default();
+        let bare = resolve_class_weapon(&registry, "", &[], rules);
+        assert_eq!(bare, Ok(0));
+        let optic = ["reflex".to_owned()];
+        let with_optic = resolve_class_weapon(&registry, "", &optic, rules);
+        assert_eq!(with_optic, Err("weapon.unknown_family".to_owned()));
     }
 
     #[test]
     fn a_weapon_the_catalog_lacks_is_refused() {
-        let registry = WeaponRegistry::default();
-        let rules = LoadoutRules::for_class("");
-        assert_eq!(
-            resolve_class_weapon(&registry, "ghost_mp", &[], rules),
-            Err("ghost_mp:catalog.unknown".to_owned())
-        );
+        let registry = WeaponLedger::default();
+        let rules = LoadoutRules::default();
+        let ghost = resolve_class_weapon(&registry, "ghost_mp", &[], rules);
+        assert_eq!(ghost, Err("ghost_mp:catalog.unknown".to_owned()));
     }
 
     #[test]
     fn offhand_slots_take_only_their_own_kind() {
-        for class in [1, 4, 5] {
-            assert!(offhand_fits(0, class));
-            assert!(!offhand_fits(1, class));
+        for lethal in [1, 4, 5] {
+            assert!(offhand_fits(0, lethal));
+            assert!(!offhand_fits(1, lethal));
         }
-        for class in [2, 3] {
-            assert!(offhand_fits(1, class));
-            assert!(!offhand_fits(0, class));
+        for tactical in [2, 3] {
+            assert!(offhand_fits(1, tactical));
+            assert!(!offhand_fits(0, tactical));
         }
         assert!(!offhand_fits(0, 0));
         assert!(!offhand_fits(2, 1));
@@ -303,38 +326,31 @@ mod tests {
 
     #[test]
     fn empty_slots_are_never_a_lock_reason() {
-        assert_eq!(
-            authoritative_class_lock_reason(names("", "", "", ""), [0; 4], &[], &[]),
-            None
-        );
+        let reason = host_loadout_lock_cause(names("", "", "", ""), [0; 4], &[], &[]);
+        assert_eq!(reason, None);
     }
 
     #[test]
     fn a_gun_without_a_profile_locks_the_class() {
-        assert_eq!(
-            authoritative_class_lock_reason(names("gun_a", "", "", ""), [5, 0, 0, 0], &[], &[]),
-            Some("gun_a:validated.missing_profile".to_owned())
-        );
+        let reason =
+            host_loadout_lock_cause(names("gun_a", "", "", ""), [5, 0, 0, 0], &[], &[]);
+        assert_eq!(reason, Some("gun_a:validated.missing_profile".to_owned()));
     }
 
     #[test]
     fn an_offhand_without_facts_locks_the_class() {
-        assert_eq!(
-            authoritative_class_lock_reason(names("", "", "nade", ""), [0, 0, 7, 0], &[], &[]),
-            Some("nade:offhand.missing_runtime_facts".to_owned())
-        );
+        let reason =
+            host_loadout_lock_cause(names("", "", "nade", ""), [0, 0, 7, 0], &[], &[]);
+        assert_eq!(reason, Some("nade:offhand.missing_runtime_facts".to_owned()));
     }
 
     #[test]
     fn several_reasons_join_in_slot_order() {
-        assert_eq!(
-            authoritative_class_lock_reason(names("a", "b", "c", "d"), [1, 2, 3, 4], &[], &[]),
-            Some(
-                "a:validated.missing_profile; b:validated.missing_profile; \
-                 c:offhand.missing_runtime_facts; d:offhand.missing_runtime_facts"
-                    .to_owned()
-            )
-        );
+        let joined =
+            host_loadout_lock_cause(names("a", "b", "c", "d"), [1, 2, 3, 4], &[], &[]);
+        let expected = "a:validated.missing_profile; b:validated.missing_profile; \
+                        c:offhand.missing_runtime_facts; d:offhand.missing_runtime_facts";
+        assert_eq!(joined.as_deref(), Some(expected));
     }
 
     #[test]
@@ -348,19 +364,19 @@ mod tests {
             ],
             ..ClassRow::default()
         };
-        let projection = project_class(3, &row, &WeaponRegistry::default(), &[], &[]);
+        let projection = project_loadout(3, &row, &WeaponLedger::default(), &[], &[]);
         assert!(projection.def.locked);
         assert_eq!(
-            projection.lock_reason.as_deref(),
+            projection.frozen_because.as_deref(),
             Some("ghost_mp:catalog.unknown")
         );
     }
 
     #[test]
     fn an_empty_class_resolves_to_empty_ids() {
-        let class =
-            resolve_personal_class(&ClassRow::default(), &WeaponRegistry::default()).unwrap();
-        assert_eq!(class.weapons, sim::PersonalClass::default().weapons);
-        assert_eq!(class.deathstreak, 0);
+        let empty = ClassRow::default();
+        let resolved = resolve_personal_class(&empty, &WeaponLedger::default()).unwrap();
+        assert_eq!(resolved.weapons, sim::PersonalClass::default().weapons);
+        assert_eq!(resolved.perks, [0; 3]);
     }
 }

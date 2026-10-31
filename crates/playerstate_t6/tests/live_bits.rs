@@ -3,18 +3,10 @@
 //! inputs, the climb progress and the gun the view model shows. All of it folds into one FNV-1a hash, and the
 //! exhaustive destructures below stop the build if a field is added, dropped or renamed.
 
-use playerstate_t6::game::{
-    AnimPair, CG_CAMERA_PULLBACK_BOX_HALF, CG_CAMERA_PULLBACK_CLIPMASK, CG_THIRD_PERSON_RANGE_DEFAULT, ENTITYNUM_NONE,
-    GENTITY_SPAWN_BASE, HITSCAN_KILL_CAM_ENTITY, KillCamMode, LINK_FLAGS_FORCE_THIRD_PERSON, MAX_CLIENT_CORPSES,
-    OffsetThirdPersonViewInputs, PERK_COLDBLOODED, PERK_HEARTBREAKER, PERK_PISTOLDEATH, PERK_QUIETER, PERK_SCAVENGER,
-    PLAYER_CORPSE_ENTITY_BASE, PM_TYPE_DEAD, PM_TYPE_DEAD_LINKED, PM_TYPE_INTERMISSION, PM_TYPE_LAST_STAND,
-    PM_TYPE_NORMAL_LINKED, PM_TYPE_SPECTATOR, PlayerState, SeatFocus, ThirdPersonViewInputs, UserCmd, apply_killcam_seat,
-    buttons, eflags, get_viewmodel_weapon_index, is_third_person_view, killcam_lerp_deadline_ms, last_input,
-    look_at_killer_yaw, mantle_flags, offset_third_person_view, other_flags, pm_flags, rebase_archived_timers,
-    viewweapon_frame_runs, weap_flags,
-};
+use playerstate_t6::game::{self, *};
+use playerstate_t6::game::buttons as button_bit;
 
-const EXPECTED: u64 = 0x385a_bc2c_fcaa_6b4d;
+const EXPECTED: u64 = 0x557c_100a_f5c1_e8a4;
 
 struct Fold(u64);
 
@@ -24,17 +16,17 @@ impl Fold {
             self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
-    fn eat_i(&mut self, value: i32) {
-        self.eat(value as u32);
+    fn eat_i(&mut self, n: i32) {
+        self.eat(n as u32);
     }
-    fn eat_f(&mut self, value: f32) {
-        self.eat(value.to_bits());
+    fn eat_f(&mut self, x: f32) {
+        self.eat(x.to_bits());
     }
     fn eat_v(&mut self, v: [f32; 3]) {
         v.into_iter().for_each(|x| self.eat_f(x));
     }
-    fn eat_text(&mut self, text: &str) {
-        text.bytes().for_each(|b| self.eat(b.into()));
+    fn eat_text(&mut self, words: &str) {
+        words.bytes().for_each(|b| self.eat(b.into()));
     }
     /// A field: its name, its exact type and how it prints.
     fn eat_field<T: std::fmt::Debug>(&mut self, name: &str, value: &T) {
@@ -78,107 +70,104 @@ impl Dice {
     }
 }
 
-const KILLCAM_MODES: [KillCamMode; 9] = [
-    KillCamMode::Mode0,
-    KillCamMode::Mode1Heli,
-    KillCamMode::Mode2Airstrike,
-    KillCamMode::Mode3Missile,
-    KillCamMode::Mode4MissileAlt,
-    KillCamMode::Mode5Rocket,
-    KillCamMode::Mode6Turret,
-    KillCamMode::Mode7Javelin,
-    KillCamMode::Mode8Remote,
+const KILLCAM_MODES: [DeathReplayStyle; 9] = [
+    DeathReplayStyle::Mode0,
+    DeathReplayStyle::HelicopterView,
+    DeathReplayStyle::AirstrikeView,
+    DeathReplayStyle::GuidedMissileView,
+    DeathReplayStyle::AltMissileView,
+    DeathReplayStyle::RocketView,
+    DeathReplayStyle::TurretView,
+    DeathReplayStyle::AntiTankView,
+    DeathReplayStyle::RemoteDeviceView,
 ];
 
 fn numbers(out: &mut Fold) {
     let words = [
-        pm_flags::PRONE,
-        pm_flags::CROUCH,
-        pm_flags::MANTLE,
-        pm_flags::LADDER,
-        pm_flags::ADS_INTENT,
-        pm_flags::BACKWARDS_RUN,
-        pm_flags::WALKING,
-        pm_flags::TIME_HARDLANDING,
-        pm_flags::PRONEMOVE_OVERRIDDEN,
-        pm_flags::LADDER_FALL,
-        pm_flags::JUMPING,
-        pm_flags::SPRINTING,
-        pm_flags::SHELLSHOCKED,
-        pm_flags::MELEE_CHARGE,
-        pm_flags::SPRINT_BLOCKED,
-        eflags::TELEPORT,
-        eflags::DUCK,
-        eflags::PRONE,
-        eflags::HIDDEN,
-        eflags::KILLCAM_PRESERVED,
-        eflags::DEAD,
-        eflags::RADAR_JAM,
-        other_flags::DEAD_KILLCAM_TPV,
-        other_flags::PLAYER,
-        other_flags::EMP_JAMMED,
-        other_flags::INFRARED,
-        weap_flags::NIGHT_VISION,
-        weap_flags::OFFHAND_VIEW,
-        weap_flags::NO_ADS,
-        weap_flags::DOUBLEBARREL_RECOIL,
-        weap_flags::RECOIL_SCALE,
-        PERK_PISTOLDEATH,
-        PERK_QUIETER,
-        PERK_SCAVENGER,
-        PERK_COLDBLOODED,
-        PERK_HEARTBREAKER,
-        CG_CAMERA_PULLBACK_CLIPMASK,
-        LINK_FLAGS_FORCE_THIRD_PERSON,
-        buttons::ATTACK,
-        buttons::SPRINT,
-        buttons::MELEE_CHARGE,
-        buttons::USE,
-        buttons::RELOAD,
-        buttons::USE_RELOAD,
-        buttons::PRONE,
-        buttons::CROUCH,
-        buttons::JUMP,
-        buttons::ADS,
-        buttons::STANCE_HELD,
-        buttons::BREATH,
-        buttons::FRAG,
-        buttons::SMOKE,
-        buttons::LOCATION_SELECT,
-        buttons::LOCATION_CANCEL,
-        buttons::THROW,
-        buttons::REMOTE_CONTROL,
-        buttons::OFFHAND_HOLD_CANCEL,
-        buttons::CHANGE_SEAT,
-        buttons::INVENTORY,
-        buttons::JAM,
-        buttons::DOUBLE_TAP,
-    ];
-    words.into_iter().for_each(|w| out.eat(w));
+        movement_state_bits::LYING_FLAT,
+        movement_state_bits::DUCK_BUTTON_BIT,
+        movement_state_bits::MANTLE,
+        movement_state_bits::LADDER,
+        movement_state_bits::ADS_INTENT,
+        movement_state_bits::BACKWARDS_RUN,
+        movement_state_bits::WALKING,
+        movement_state_bits::TIME_HARDLANDING,
+        movement_state_bits::PRONEMOVE_OVERRIDDEN,
+        movement_state_bits::LADDER_FALL,
+        movement_state_bits::JUMPING,
+        movement_state_bits::SPRINTING,
+        movement_state_bits::SHELLSHOCKED,
+        movement_state_bits::MELEE_CHARGE,
+        movement_state_bits::SPRINT_BLOCKED,
+        entity_flag_bits::TELEPORT,
+        entity_flag_bits::CROUCH_BIT,
+        entity_flag_bits::LYING_FLAT,
+        entity_flag_bits::HIDDEN,
+        entity_flag_bits::KILLCAM_PRESERVED,
+        entity_flag_bits::DEAD,
+        entity_flag_bits::RADAR_JAM,
+        secondary_state_bits::DEAD_KILLCAM_TPV,
+        secondary_state_bits::PLAYER,
+        secondary_state_bits::EMP_JAMMED,
+        secondary_state_bits::INFRARED,
+        weapon_state_bits::NIGHT_VISION,
+        weapon_state_bits::OFFHAND_VIEW,
+        weapon_state_bits::AIM_DISABLED_BIT,
+        weapon_state_bits::DOUBLEBARREL_RECOIL,
+        weapon_state_bits::RECOIL_SCALE,
+    ]
+    .into_iter()
+    .chain([CHASE_CAM_RETREAT_MASK, LINK_FLAGS_FORCE_THIRD_PERSON])
+    .chain([
+        button_bit::ATTACK,
+        button_bit::SPRINT,
+        button_bit::MELEE_CHARGE,
+        button_bit::INTERACT_KEY,
+        button_bit::RELOAD,
+        button_bit::INTERACT_RELOAD_KEY,
+        button_bit::LYING_FLAT,
+        button_bit::DUCK_BUTTON_BIT,
+        button_bit::LEAP,
+        button_bit::ADS,
+        button_bit::STANCE_LOCK_BIT,
+        button_bit::STEADY_AIM_HOLD_BIT,
+        button_bit::SAMPLE_FRAG_ASSET,
+        button_bit::OBSCURANT,
+        button_bit::MAP_TARGET_PICK,
+        button_bit::LOCATION_CANCEL,
+        button_bit::THROW,
+        button_bit::REMOTE_CONTROL,
+        button_bit::OFFHAND_HOLD_CANCEL,
+        button_bit::CHANGE_SEAT,
+        button_bit::INVENTORY,
+        button_bit::JAM,
+        button_bit::DOUBLE_TAP,
+    ]);
+    words.for_each(|w| out.eat(w));
     let ints = [
-        mantle_flags::OVER,
-        mantle_flags::ACTIVE,
-        mantle_flags::QUICK,
-        mantle_flags::FAST_MANTLE,
-        mantle_flags::BO2,
-        mantle_flags::BO2_WEAPON_UP,
-        mantle_flags::BO2_WEAPON_ANIM,
-        mantle_flags::BO2_DURATION_SHIFT,
-        ENTITYNUM_NONE,
-        HITSCAN_KILL_CAM_ENTITY,
-        PM_TYPE_SPECTATOR,
-        PM_TYPE_INTERMISSION,
-        PM_TYPE_LAST_STAND,
-        PM_TYPE_DEAD,
-        PM_TYPE_DEAD_LINKED,
-        PM_TYPE_NORMAL_LINKED,
-        MAX_CLIENT_CORPSES,
-        PLAYER_CORPSE_ENTITY_BASE,
-        GENTITY_SPAWN_BASE,
+        ledge_climb_bits::OVER,
+        ledge_climb_bits::ACTIVE,
+        ledge_climb_bits::QUICK,
+        ledge_climb_bits::FAST_MANTLE,
+        ledge_climb_bits::BO2,
+        ledge_climb_bits::BO2_WEAPON_UP,
+        ledge_climb_bits::BO2_WEAPON_ANIM,
+        ledge_climb_bits::BO2_DURATION_SHIFT,
+        game::NO_ENTITY_SLOT,
+        game::HITSCAN_KILL_CAM_ENTITY,
+        game::MOVE_MODE_OBSERVER,
+        game::MOVE_MODE_INTERLUDE,
+        game::MOVE_MODE_DOWNED,
+        game::MOVE_KIND_DEAD,
+        game::MOVE_KIND_DEAD_TETHERED,
+        game::MOVE_MODE_WALK_ATTACHED,
+        game::CORPSE_ENTITY_COUNT,
+        game::BODY_ENTITY_FIRST_SLOT,
+        game::GENTITY_SPAWN_BASE,
     ];
     ints.into_iter().for_each(|i| out.eat_i(i));
-    out.eat_f(CG_THIRD_PERSON_RANGE_DEFAULT);
-    out.eat_f(CG_CAMERA_PULLBACK_BOX_HALF);
+    out.eat_f(CHASE_CAM_DISTANCE_FALLBACK);
+    out.eat_f(CHASE_CAM_PROBE_HALF_EXTENT);
     out.eat(last_input::GAMEPAD.into());
     out.eat(last_input::MOUSECLICK.into());
     for mode in KILLCAM_MODES {
@@ -188,200 +177,69 @@ fn numbers(out: &mut Fold) {
 }
 
 fn blank_state(out: &mut Fold) {
-    let PlayerState {
-        command_time,
-        pm_type,
-        pm_time,
-        pm_flags,
-        other_flags,
-        link_flags,
-        bob_cycle,
-        origin,
-        velocity,
-        grenade_time_left,
-        throw_back_grenade_owner,
-        gravity,
-        leanf,
-        speed,
-        delta_angles,
-        ground_entity_num,
-        v_ladder_vec,
-        jump_time,
-        jump_origin_z,
-        dive_end_time,
-        foliage_sound_time,
-        slide_time,
-        mover_entity_num,
-        mover_timestamp,
-        weapon_state_t6,
-        weapon_state_left_t6,
-        weap_anim_t6,
-        weap_anim_left_t6,
-        waterlevel,
-        prone_direction,
-        prone_direction_pitch,
-        prone_torso_pitch,
-        f_torso_pitch,
-        f_waist_pitch,
-        legs_timer,
-        legs_anim,
-        torso_timer,
-        torso_anim,
-        damage_timer,
-        damage_duration,
-        flinch_yaw_anim,
-        corpse_index,
-        movement_dir,
-        e_flags,
-        predictable_event_sequence,
-        predictable_event_sequence_old,
-        predictable_events,
-        predictable_event_parms,
-        viewangles,
-        view_height_target,
-        view_height_current,
-        view_height_lerp_time,
-        view_height_lerp_target,
-        view_height_lerp_down,
-        damage_event,
-        damage_yaw,
-        damage_pitch,
-        damage_count,
-        health,
-        max_health,
-        link_weapon_angles,
-        cursor_hint,
-        cursor_hint_string,
-        cursor_hint_ent_index,
-        cursor_hint_dual_wield,
-        sprint_state,
-        move_speed_scale_multiplier,
-        mantle_state,
-        weap_anim,
-        weapon_time,
-        weapon_delay,
-        weapon_restrict_kick_time,
-        weaponstate_primary,
-        weap_hand_flags,
-        weapon_shot_count,
-        weap_anim_secondary,
-        weapon_time_secondary,
-        weapon_delay_secondary,
-        weapon_restrict_kick_time_secondary,
-        weaponstate_secondary,
-        weap_hand_flags_secondary,
-        weapon_shot_count_secondary,
-        weapons,
-        weapon_data,
-        off_hand_index,
-        offhand_primary,
-        offhand_secondary,
-        weapon,
-        weapon_primary,
-        weap_flags,
-        f_weapon_pos_frac,
-        aim_spread_scale,
-        ads_delay_time,
-        spread_override,
-        spread_override_state,
-        last_weapon_hand,
-        ammo,
-        ammoclip,
-        melee_charge_yaw,
-        melee_charge_dist,
-        melee_charge_time,
-        perks,
-        perk_slots,
-        action_slot_type,
-        action_slot_param,
-        inventory_weapon,
-        shellshock_index,
-        shellshock_time,
-        shellshock_duration,
-        objectives,
-        delta_time,
-        kill_cam_entity,
-        kill_cam_look_at_entity,
-        kill_cam_client_num,
-        recoil_scale,
-    } = PlayerState::ZERO;
-    macro_rules! eat_all {
-        ($($field:ident)*) => { $( out.eat_field(stringify!($field), &$field); )* };
+    macro_rules! eat_every_field {
+        ($sample:expr => $ty:ident: $($field:ident)*) => {
+            let $ty { $($field),* } = $sample;
+            $( out.eat_field(stringify!($field), &$field); )*
+        };
     }
-    eat_all!(
-        command_time pm_type pm_time pm_flags other_flags link_flags bob_cycle origin velocity grenade_time_left
-        throw_back_grenade_owner gravity leanf speed delta_angles ground_entity_num v_ladder_vec jump_time jump_origin_z
+    eat_every_field!(AvatarState::ZERO => AvatarState:
+        last_cmd_ms movement_mode move_timer movement_state_bits secondary_state_bits attach_bits sway_phase origin velocity cook_remaining
+        returned_grenade_owner gravity tilt_sideways speed view_offset_angles standing_on ladder_normal_dir hop_start_ms takeoff_height
         dive_end_time foliage_sound_time slide_time mover_entity_num mover_timestamp weapon_state_t6 weapon_state_left_t6
         weap_anim_t6 weap_anim_left_t6 waterlevel prone_direction prone_direction_pitch prone_torso_pitch f_torso_pitch
-        f_waist_pitch legs_timer legs_anim torso_timer torso_anim damage_timer damage_duration flinch_yaw_anim
-        corpse_index movement_dir e_flags predictable_event_sequence predictable_event_sequence_old predictable_events
-        predictable_event_parms viewangles view_height_target view_height_current view_height_lerp_time
-        view_height_lerp_target view_height_lerp_down damage_event damage_yaw damage_pitch damage_count health
-        max_health link_weapon_angles cursor_hint cursor_hint_string cursor_hint_ent_index cursor_hint_dual_wield
-        sprint_state move_speed_scale_multiplier mantle_state weap_anim weapon_time weapon_delay
-        weapon_restrict_kick_time weaponstate_primary weap_hand_flags weapon_shot_count weap_anim_secondary
+        f_waist_pitch lower_body_clock legs_anim upper_body_clock torso_anim hurt_clock hurt_length flinch_yaw_anim
+        body_index move_heading e_flags predictable_event_sequence predictable_event_sequence_old predictable_events
+        predictable_event_parms look_angles eye_height_goal eye_height_now eye_blend_clock
+        eye_blend_goal eye_lower_blend damage_event damage_yaw damage_pitch hurt_amount health
+        hit_point_ceiling link_weapon_angles hint_kind hint_text hint_entity cursor_hint_dual_wield
+        sprint_state run_speed_modifier mantle_state weapon_anim_id weapon_timer weapon_ready_wait
+        gun_lockout_kick_stamp weaponstate_primary weap_hand_flags shots_fired weap_anim_secondary
         weapon_time_secondary weapon_delay_secondary weapon_restrict_kick_time_secondary weaponstate_secondary
-        weap_hand_flags_secondary weapon_shot_count_secondary weapons weapon_data off_hand_index offhand_primary
-        offhand_secondary weapon weapon_primary weap_flags f_weapon_pos_frac aim_spread_scale ads_delay_time
-        spread_override spread_override_state last_weapon_hand ammo ammoclip melee_charge_yaw melee_charge_dist
-        melee_charge_time perks perk_slots action_slot_type action_slot_param inventory_weapon shellshock_index
-        shellshock_time shellshock_duration objectives delta_time kill_cam_entity kill_cam_look_at_entity
-        kill_cam_client_num recoil_scale
+        weap_hand_flags_secondary weapon_shot_count_secondary weapons weapon_data secondary_hand_slot secondary_gear_main
+        secondary_gear_alt weapon weapon_primary weapon_state_bits weapon_raise_fraction sight_spread_factor scope_in_wait
+        spread_forced_value spread_forced_phase previous_gun_hand ammo magazine_rows lunge_heading lunge_reach
+        lunge_clock perks loadout_perks dpad_kind action_slot_param inventory_weapon stun_effect_id
+        stun_start stun_length objectives time_slice death_replay_target death_replay_focus
+        death_replay_player recoil_scale
     );
-    let UserCmd {
-        server_time,
-        buttons,
-        angles,
-        weapon,
-        weapon_mapped,
-        off_hand_index,
-        forwardmove,
-        rightmove,
-        melee_charge_yaw,
-        melee_charge_dist,
-        melee_charge_ent,
-        selected_location,
-        remote_control,
-        last_input,
-    } = UserCmd::default();
-    eat_all!(
-        server_time buttons angles weapon weapon_mapped off_hand_index forwardmove rightmove melee_charge_yaw
-        melee_charge_dist melee_charge_ent selected_location remote_control last_input
+    eat_every_field!(InputCommand::default() => InputCommand:
+        authority_clock_ms buttons angles weapon weapon_slot_code secondary_hand_slot thrust_ahead thrust_lateral lunge_heading
+        lunge_reach melee_charge_ent chosen_map_spot remote_operated last_input
     );
-    let AnimPair { legs_anim, torso_anim } = AnimPair::default();
-    eat_all!(legs_anim torso_anim);
-    let pair = PlayerState { legs_anim: 41, torso_anim: -7, ..PlayerState::ZERO }.anim();
-    out.eat_i(pair.legs_anim);
-    out.eat_i(pair.torso_anim);
-    for delta_time in [0, 1, -1, 50] {
-        out.eat(PlayerState { delta_time, ..PlayerState::ZERO }.is_live_frame().into());
+    eat_every_field!(BodyAnims::default() => BodyAnims: legs torso);
+    let pair = AvatarState { legs_anim: 41, torso_anim: -7, ..AvatarState::ZERO }.anim();
+    out.eat_i(pair.legs);
+    out.eat_i(pair.torso);
+    for time_slice in [0, 1, -1, 50] {
+        out.eat(AvatarState { time_slice, ..AvatarState::ZERO }.is_live_frame().into());
     }
 }
 
-fn random_state(dice: &mut Dice) -> PlayerState {
-    let mut ps = PlayerState::ZERO;
-    ps.command_time = dice.int(-5, 900_000);
-    ps.pm_time = if dice.chance(3) { 0 } else { dice.int(-40, 4_000) };
-    ps.jump_time = if dice.chance(3) { 0 } else { dice.word() as i32 };
-    ps.view_height_lerp_time = if dice.chance(2) { 0 } else { dice.int(1, 900_000) };
-    ps.shellshock_time = if dice.chance(2) { 0 } else { dice.int(-1, 900_000) };
-    ps.delta_time = if dice.chance(4) { 0 } else { dice.word() as i32 };
-    ps.e_flags = dice.flags(&[eflags::TELEPORT, eflags::DUCK, eflags::PRONE, eflags::KILLCAM_PRESERVED, eflags::DEAD]);
-    ps.other_flags = dice.flags(&[other_flags::PLAYER, other_flags::DEAD_KILLCAM_TPV, other_flags::EMP_JAMMED, 2]);
-    ps.pm_flags = dice.flags(&[pm_flags::MANTLE, pm_flags::PRONE, pm_flags::SPRINTING]);
-    ps.weap_flags = dice.flags(&[weap_flags::OFFHAND_VIEW, weap_flags::NO_ADS]);
-    ps.off_hand_index = dice.int(-3, 90);
+fn random_state(dice: &mut Dice) -> AvatarState {
+    let mut ps = AvatarState::ZERO;
+    ps.last_cmd_ms = dice.int(-5, 900_000);
+    ps.move_timer = if dice.chance(3) { 0 } else { dice.int(-40, 4_000) };
+    ps.hop_start_ms = if dice.chance(3) { 0 } else { dice.word() as i32 };
+    ps.eye_blend_clock = if dice.chance(2) { 0 } else { dice.int(1, 900_000) };
+    ps.stun_start = if dice.chance(2) { 0 } else { dice.int(-1, 900_000) };
+    ps.time_slice = if dice.chance(4) { 0 } else { dice.word() as i32 };
+    ps.e_flags = dice.flags(&[entity_flag_bits::TELEPORT, entity_flag_bits::CROUCH_BIT, entity_flag_bits::LYING_FLAT, entity_flag_bits::KILLCAM_PRESERVED, entity_flag_bits::DEAD]);
+    ps.secondary_state_bits = dice.flags(&[secondary_state_bits::PLAYER, secondary_state_bits::DEAD_KILLCAM_TPV, secondary_state_bits::EMP_JAMMED, 2]);
+    ps.movement_state_bits = dice.flags(&[movement_state_bits::MANTLE, movement_state_bits::LYING_FLAT, movement_state_bits::SPRINTING]);
+    ps.weapon_state_bits = dice.flags(&[weapon_state_bits::OFFHAND_VIEW, weapon_state_bits::AIM_DISABLED_BIT]);
+    ps.secondary_hand_slot = dice.int(-3, 90);
     ps.weapon = dice.word() % 300;
-    ps.kill_cam_entity = dice.int(-1, 2_047);
-    ps.kill_cam_look_at_entity = dice.int(-1, 2_047);
-    ps.kill_cam_client_num = dice.int(-1, 17);
+    ps.death_replay_target = dice.int(-1, 2_047);
+    ps.death_replay_focus = dice.int(-1, 2_047);
+    ps.death_replay_player = dice.int(-1, 17);
     ps.origin = dice.point(4_000.0);
     ps.health = dice.int(0, 100);
     ps.mantle_state.flags = if dice.chance(5) {
         dice.word() as i32
     } else {
-        let bits = dice.flags(&[mantle_flags::BO2 as u32, mantle_flags::BO2_WEAPON_UP as u32]) as i32 & 0xffff;
-        bits | (dice.int(-2, 1_400) << mantle_flags::BO2_DURATION_SHIFT)
+        let bits = dice.flags(&[ledge_climb_bits::BO2 as u32, ledge_climb_bits::BO2_WEAPON_UP as u32]) as i32 & 0xffff;
+        bits | (dice.int(-2, 1_400) << ledge_climb_bits::BO2_DURATION_SHIFT)
     };
     ps.mantle_state.timer = dice.int(-50, 1_600);
     ps
@@ -393,66 +251,66 @@ fn seats(out: &mut Fold, dice: &mut Dice) {
         let before = ps;
         let delta = if dice.chance(6) { dice.word() as i32 } else { dice.int(-60_000, 60_000) };
         rebase_archived_timers(&mut ps, delta);
-        for t in [ps.command_time, ps.pm_time, ps.jump_time, ps.view_height_lerp_time, ps.shellshock_time] {
+        for t in [ps.last_cmd_ms, ps.move_timer, ps.hop_start_ms, ps.eye_blend_clock, ps.stun_start] {
             out.eat_i(t);
         }
-        out.eat_i(ps.delta_time);
-        out.eat(PlayerState { command_time: before.command_time, ..ps }.health as u32);
+        out.eat_i(ps.time_slice);
+        out.eat(AvatarState { last_cmd_ms: before.last_cmd_ms, ..ps }.health as u32);
 
         let viewer = random_state(dice);
         let archived = random_state(dice);
         let focus = if dice.chance(2) {
-            SeatFocus::hitscan(dice.int(-1, 17))
+            SpectatorTarget::hitscan(dice.int(-1, 17))
         } else {
-            SeatFocus {
-                kill_cam_entity: dice.int(-1, 2_047),
-                kill_cam_look_at_entity: dice.int(-1, 2_047),
-                kill_cam_client_num: dice.int(-1, 17),
+            SpectatorTarget {
+                death_replay_target: dice.int(-1, 2_047),
+                death_replay_focus: dice.int(-1, 2_047),
+                death_replay_player: dice.int(-1, 17),
             }
         };
         out.eat_text(&format!("{focus:?}"));
         let seat = apply_killcam_seat(&viewer, &archived, focus);
         out.eat(seat.e_flags);
-        out.eat(seat.other_flags);
-        out.eat_i(seat.kill_cam_entity);
-        out.eat_i(seat.kill_cam_look_at_entity);
-        out.eat_i(seat.kill_cam_client_num);
+        out.eat(seat.secondary_state_bits);
+        out.eat_i(seat.death_replay_target);
+        out.eat_i(seat.death_replay_focus);
+        out.eat_i(seat.death_replay_player);
         let rest_kept = seat
-            == PlayerState {
+            == AvatarState {
                 e_flags: seat.e_flags,
-                other_flags: seat.other_flags,
-                kill_cam_entity: seat.kill_cam_entity,
-                kill_cam_look_at_entity: seat.kill_cam_look_at_entity,
-                kill_cam_client_num: seat.kill_cam_client_num,
+                secondary_state_bits: seat.secondary_state_bits,
+                death_replay_target: seat.death_replay_target,
+                death_replay_focus: seat.death_replay_focus,
+                death_replay_player: seat.death_replay_player,
                 ..archived
             };
         out.eat(rest_kept.into());
 
         out.eat(get_viewmodel_weapon_index(&viewer));
-        out.eat_i(mantle_flags::bo2_duration_ms(viewer.mantle_state.flags));
-        out.eat_f(mantle_flags::bo2_progress(&viewer).unwrap_or(-9.0));
-        out.eat(mantle_flags::bo2_weapon_up(&viewer).into());
+        out.eat_i(ledge_climb_bits::bo2_duration_ms(viewer.mantle_state.flags));
+        out.eat_f(ledge_climb_bits::bo2_progress(&viewer).unwrap_or(-9.0));
+        out.eat(ledge_climb_bits::bo2_weapon_up(&viewer).into());
     }
-    for now_ms in [0, 1, 7_000, i32::MAX - 100, i32::MAX, -5] {
+    for clock_millis in [0, 1, 7_000, i32::MAX - 100, i32::MAX, -5] {
         for mode in KILLCAM_MODES {
             for (entering, changed) in [(false, false), (false, true), (true, false), (true, true)] {
-                out.eat_i(killcam_lerp_deadline_ms(entering, changed, mode, now_ms));
+                out.eat_i(killcam_blend_until_ms(entering, changed, mode, clock_millis));
             }
         }
     }
 }
 
 fn chase_camera(out: &mut Fold, dice: &mut Dice) {
-    for pm_type in -2..=14 {
-        out.eat(viewweapon_frame_runs(pm_type).into());
+    for movement_mode in -2..=14 {
+        out.eat(viewweapon_frame_runs(movement_mode).into());
     }
     for _ in 0..6_000 {
         let view = ThirdPersonViewInputs {
-            pm_type: dice.int(-1, 12),
-            other_flags: dice.flags(&[2, other_flags::DEAD_KILLCAM_TPV, other_flags::PLAYER]),
-            link_flags: dice.flags(&[LINK_FLAGS_FORCE_THIRD_PERSON, 1]),
-            cg_third_person: dice.chance(2),
-            in_killcam: dice.chance(2),
+            movement_mode: dice.int(-1, 12),
+            secondary_state_bits: dice.flags(&[2, secondary_state_bits::DEAD_KILLCAM_TPV, secondary_state_bits::PLAYER]),
+            attach_bits: dice.flags(&[LINK_FLAGS_FORCE_THIRD_PERSON, 1]),
+            chase_cam_enabled: dice.chance(2),
+            replaying_final_death: dice.chance(2),
             killcam_mode: KILLCAM_MODES[dice.int(0, 8) as usize],
         };
         out.eat(is_third_person_view(view).into());
@@ -462,26 +320,26 @@ fn chase_camera(out: &mut Fold, dice: &mut Dice) {
         out.eat_i(look_at_killer_yaw(killer, me, dice.real(-400.0, 400.0)));
     }
     for _ in 0..6_000 {
-        let other_flags = dice.flags(&[other_flags::DEAD_KILLCAM_TPV, other_flags::PLAYER]);
-        let delta_time = if other_flags & other_flags::DEAD_KILLCAM_TPV != 0 { dice.int(1, 9_000) } else { 0 };
-        let inputs = OffsetThirdPersonViewInputs {
+        let secondary_state_bits = dice.flags(&[secondary_state_bits::DEAD_KILLCAM_TPV, secondary_state_bits::PLAYER]);
+        let time_slice = if secondary_state_bits & secondary_state_bits::DEAD_KILLCAM_TPV != 0 { dice.int(1, 9_000) } else { 0 };
+        let inputs = ChaseCamPlacementInputs {
             origin: dice.point(3_000.0),
-            view_height_current: dice.real(10.0, 70.0),
-            viewangles: [dice.real(-89.0, 89.0), dice.real(-180.0, 360.0), dice.real(-5.0, 5.0)],
-            pm_type: dice.int(0, 12),
-            look_at_killer_yaw: dice.real(-180.0, 180.0),
-            corpse_j_mainroot: dice.chance(2).then(|| dice.point(3_000.0)),
-            other_flags,
-            delta_time,
-            cg_third_person_angle: if dice.chance(3) { 0.0 } else { dice.real(-90.0, 90.0) },
-            cg_third_person_range: if dice.chance(3) { CG_THIRD_PERSON_RANGE_DEFAULT } else { dice.real(0.0, 300.0) },
+            eye_height_now: dice.real(10.0, 70.0),
+            look_angles: [dice.real(-89.0, 89.0), dice.real(-180.0, 360.0), dice.real(-5.0, 5.0)],
+            move_mode: dice.int(0, 12),
+            killer_facing_yaw: dice.real(-180.0, 180.0),
+            body_root_joint_pos: dice.chance(2).then(|| dice.point(3_000.0)),
+            secondary_state_bits,
+            time_slice,
+            chase_cam_yaw_offset: if dice.chance(3) { 0.0 } else { dice.real(-90.0, 90.0) },
+            chase_cam_back_distance: if dice.chance(3) { CHASE_CAM_DISTANCE_FALLBACK } else { dice.real(0.0, 300.0) },
         };
         let wall = dice.int(0, 3);
         let first_hit = dice.real(0.0, 1.0);
         let second_hit = dice.real(0.0, 1.0);
         let mut traces = 0;
         let mut calls = Vec::new();
-        let seen = offset_third_person_view(inputs, |from, to| {
+        let seen = place_chase_camera(inputs, |from, to| {
             calls.push((from, to));
             traces += 1;
             match (wall, traces) {
@@ -517,17 +375,19 @@ fn live_state_answers_match_the_recorded_bits() {
 #[test]
 #[should_panic]
 fn a_death_cam_seat_on_a_live_frame_is_refused() {
-    let inputs = OffsetThirdPersonViewInputs {
-        origin: [0.0; 3],
-        view_height_current: 60.0,
-        viewangles: [0.0; 3],
-        pm_type: PM_TYPE_DEAD,
-        look_at_killer_yaw: 0.0,
-        corpse_j_mainroot: None,
-        other_flags: other_flags::DEAD_KILLCAM_TPV,
-        delta_time: 0,
-        cg_third_person_angle: 0.0,
-        cg_third_person_range: CG_THIRD_PERSON_RANGE_DEFAULT,
+    let default_range = CHASE_CAM_DISTANCE_FALLBACK;
+    let still = [0.0; 3];
+    let inputs = ChaseCamPlacementInputs {
+        origin: still,
+        move_mode: MOVE_KIND_DEAD,
+        secondary_state_bits: secondary_state_bits::DEAD_KILLCAM_TPV,
+        chase_cam_yaw_offset: 0.0,
+        eye_height_now: 60.0,
+        killer_facing_yaw: 0.0,
+        look_angles: still,
+        time_slice: i32::default(),
+        body_root_joint_pos: Option::default(),
+        chase_cam_back_distance: default_range,
     };
-    offset_third_person_view(inputs, |_, _| 1.0);
+    place_chase_camera(inputs, |_, _| 1.0);
 }

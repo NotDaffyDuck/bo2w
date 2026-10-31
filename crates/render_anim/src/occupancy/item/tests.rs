@@ -1,10 +1,11 @@
+#![cfg(test)]
 use super::*;
 
 #[test]
 fn light_sample_sits_above_the_item() {
     assert_eq!(
-        item_lighting_origin([1.0, 2.0, 3.0]),
-        [1.0, 2.0, 3.0 + ITEM_LIGHTING_Z_OFS]
+        item_light_probe_point([1.0, 2.0, 3.0]),
+        [1.0, 2.0, 3.0 + ITEM_LIGHT_LIFT]
     );
 }
 
@@ -47,11 +48,11 @@ fn log_throttle_fires_once_per_second() {
 
 #[test]
 fn restart_keeps_counters_and_bumps_on_request() {
-    let mut plan = ItemDrawPlan::default();
-    plan.revision = 5;
+    let mut plan = PickupPaintPlan::default();
+    plan.plan_rev = 5;
     plan.generation = 9;
     restart_plan(&mut plan, false);
-    assert_eq!((plan.revision, plan.generation), (5, 9));
+    assert_eq!((plan.plan_rev, plan.generation), (5, 9));
     restart_plan(&mut plan, true);
-    assert_eq!((plan.revision, plan.generation), (6, 10));
+    assert_eq!((plan.plan_rev, plan.generation), (6, 10));
 }

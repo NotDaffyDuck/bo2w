@@ -1,10 +1,10 @@
-# Build dependencies
+# Build prerequisites
 
-Rust stable via rustup (`rust-toolchain.toml` pins it), plus a C toolchain
-and the Bevy system libs. IW4L enables both `x11` and `wayland`
-(`Cargo.toml`), so the Wayland headers stay required. Gamepad input and
-rumble (`bevy_gilrs`) link libudev, so the udev headers (`systemd-devel` /
-`libudev-dev`) are required too.
+You need Rust stable through rustup (`rust-toolchain.toml` fixes the version), a
+C toolchain, and the system libraries Bevy links. bo2mp turns on both the `x11`
+and `wayland` features (see `Cargo.toml`), so the Wayland headers are required.
+Gamepad input and rumble (`bevy_gilrs`) link libudev, which means the udev
+headers (`systemd-devel` or `libudev-dev`) are required as well.
 
 ```bash
 # Fedora
@@ -17,27 +17,34 @@ sudo apt install g++ pkg-config libx11-dev libasound2-dev libudev-dev libwayland
 sudo pacman -S gcc pkgconf libx11 alsa-lib systemd wayland libxkbcommon libxcursor libxrandr libxi
 ```
 
-Upstream list (other distros, GPU Vulkan drivers): Bevy
+For other distributions and GPU Vulkan drivers, see Bevy's
 [`linux_dependencies.md`](https://github.com/bevyengine/bevy/blob/main/docs/linux_dependencies.md).
 
-What is **not** needed for a native Linux build: `clang` / `llvm` / `lld` /
-`glibc-static` — plain `gcc-c++` links it. `llvm` (the `llvm-lib` tool) is
-only required for the Windows cross build:
+## What a native Linux build does not need
+
+`clang`, `llvm`, `lld` and `glibc-static` are unnecessary; plain `gcc-c++` links
+the game. Only the Windows cross build wants `llvm` (for the `llvm-lib` tool):
 
 ```bash
 sudo dnf install llvm        # Fedora: provides llvm-lib
-make setup-windows           # rustup target + cargo-xwin, once
 ```
 
-macOS needs only the Xcode command line tools (`xcode-select --install`)
-and rustup: winit, wgpu (Metal), CoreAudio and gilrs link system frameworks,
-and the `x11` / `wayland` features compile to nothing. Menu and
-`make map mp_boneyard` run on Apple silicon (M2 Max, Metal). Pipelined
-rendering is off by default there (`bootstrap/src/plugins.rs` says why).
-Game data: the Windows depot of a Steam copy, `steamcmd
-+@sSteamCmdForcePlatformType windows +force_install_dir ~/Games/MW2 +login
-<user> +app_update 10190 +quit`, then `BO2MP_GAMES=~/Games`.
+Then, once, `make setup-windows` adds the Windows Rust target and cargo-xwin.
 
-Then follow `README.md` (Build and run): copy `.env.example`, set
-`BO2MP_GAMES`, `make map mp_boneyard`. Portable Windows is
-[`WINDOWS.md`](WINDOWS.md).
+## macOS
+
+Install the Xcode command line tools (`xcode-select --install`) and rustup, and
+that is all: winit, wgpu (Metal), CoreAudio and gilrs use system frameworks, and
+the `x11` / `wayland` features compile to nothing. The menu and
+`make map mp_raid` have been run on Apple silicon (M2 Max, Metal). Pipelined
+rendering defaults to off there; `bootstrap/src/app_stack.rs` explains why
+(`BO2MP_PIPELINED_RENDERING` overrides it).
+
+## The game files
+
+The game reads a Black Ops II install: point `BO2MP_GAMES` at the folder that
+holds it (the Windows depot of a Steam copy works on any platform).
+
+Then follow "Install" and "Run / Play" in `README.md`: copy `.env.example`, set
+`BO2MP_GAMES`, and run `make map mp_raid`. The portable Windows folder is
+described in [`WINDOWS.md`](WINDOWS.md).

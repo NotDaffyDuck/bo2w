@@ -3,51 +3,51 @@
 mod definitions;
 mod name;
 mod t6;
-mod visual;
+mod elem_look;
 
 use std::collections::HashMap;
 
-pub use definitions::{FxCatalog, FxDefinitions, OwnedFxEffectDef};
+pub use definitions::{EffectRoster, FxDefinitions, SelfContainedEffectDef};
 pub use name::FxName;
 pub use t6::{T6_FIRST_PERSON_FLASH_SCALE, t6_elem_type, t6_first_person_flash_name};
-pub use visual::{FxBankSound, MaterialSlot, OwnedFxElemDef, OwnedFxTrailDef, OwnedFxVisual};
+pub use elem_look::{FxBankSound, MaterialSlot, SelfContainedEffectElement, SelfContainedTrailDef, SelfContainedEffectLook};
 
-use crate::AssetRef;
+use crate::AssetPointer;
 
 /// The kinds of effect element, by the number the zones store.
-pub mod elem_type {
-    pub const BILLBOARD: u8 = 0;
-    pub const ORIENTED: u8 = 1;
-    pub const TAIL: u8 = 2;
-    pub const TRAIL: u8 = 3;
-    pub const CLOUD: u8 = 4;
-    pub const MODEL: u8 = 7;
-    pub const OMNI_LIGHT: u8 = 8;
-    pub const SPOT_LIGHT: u8 = 9;
-    pub const SOUND: u8 = 10;
-    pub const DECAL: u8 = 11;
-    pub const RUNNER: u8 = 12;
+pub mod look_kind {
+    pub const ALWAYS_FACING: u8 = 0;
+    pub const ROTATED_BOX: u8 = 1;
+    pub const STREAK_END: u8 = 2;
+    pub const STREAK_BODY: u8 = 3;
+    pub const PUFF: u8 = 4;
+    pub const MESH_KIND: u8 = 7;
+    pub const POINT_EMITTER: u8 = 8;
+    pub const CONE_EMITTER: u8 = 9;
+    pub const AUDIO_KIND: u8 = 10;
+    pub const SURFACE_STICKER: u8 = 11;
+    pub const SPRINTER: u8 = 12;
 }
 
 /// A material name as the colour-map table keys it: without a reference mark.
 #[inline]
 pub fn material_bind_name(name: &str) -> &str {
-    AssetRef::bare_name(name)
+    AssetPointer::bare_name(name)
 }
 
 /// Files an effect material's colour image under its bind name; the first
 /// image for a name stays.
-pub fn insert_fx_color_image<V>(map: &mut HashMap<String, V>, authored_name: &str, image: V) {
-    let bind = material_bind_name(authored_name);
-    if !bind.is_empty() {
-        map.entry(bind.to_owned()).or_insert(image);
+pub fn add_tint_picture<V>(by_bind: &mut HashMap<String, V>, designer_label: &str, image: V) {
+    let bind = material_bind_name(designer_label);
+    if !bind.is_empty() && !by_bind.contains_key(bind) {
+        by_bind.insert(String::from(bind), image);
     }
 }
 
 /// Gives every image filed under a marked name a copy under the bare name too,
 /// unless the bare name has an image of its own. Returns how many were added.
-pub fn alias_fx_color_map_stubs<V: Clone>(map: &mut HashMap<String, V>) -> usize {
-    let aliases: Vec<(String, V)> = map
+pub fn effect_tint_map_placeholders<T: Clone>(map: &mut HashMap<String, T>) -> usize {
+    let aliases: Vec<(String, T)> = map
         .iter()
         .filter_map(|(name, image)| {
             let bare = material_bind_name(name);
@@ -59,8 +59,8 @@ pub fn alias_fx_color_map_stubs<V: Clone>(map: &mut HashMap<String, V>) -> usize
     added
 }
 
-pub fn lookup_fx_color_image<'a, V>(map: &'a HashMap<String, V>, authored_name: &str) -> Option<&'a V> {
-    map.get(material_bind_name(authored_name))
+pub fn find_tint_picture<'m, V>(map: &'m HashMap<String, V>, designer_label: &str) -> Option<&'m V> {
+    map.get(material_bind_name(designer_label))
 }
 
 #[cfg(test)]
@@ -69,12 +69,13 @@ mod tests {
 
     #[test]
     fn a_marked_name_is_filed_under_its_bare_name() {
-        let mut map = HashMap::new();
-        insert_fx_color_image(&mut map, ",wisp", 1);
-        insert_fx_color_image(&mut map, "wisp", 2);
-        insert_fx_color_image(&mut map, "", 3);
-        assert_eq!(map.len(), 1);
-        assert_eq!(lookup_fx_color_image(&map, ",wisp"), Some(&1));
+        let mut filed = HashMap::new();
+        let map = &mut filed;
+        add_tint_picture(map, ",wisp", 1);
+        add_tint_picture(map, "wisp", 2);
+        add_tint_picture(map, "", 3);
+        assert_eq!(filed.len(), 1);
+        assert_eq!(find_tint_picture(&filed, ",wisp"), Some(&1));
     }
 
     #[test]
@@ -84,7 +85,7 @@ mod tests {
             (",fire".to_owned(), 2),
             ("fire".to_owned(), 3),
         ]);
-        assert_eq!(alias_fx_color_map_stubs(&mut map), 1);
+        assert_eq!(effect_tint_map_placeholders(&mut map), 1);
         assert_eq!(map["smoke"], 1);
         assert_eq!(map["fire"], 3);
     }

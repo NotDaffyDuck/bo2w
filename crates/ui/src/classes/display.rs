@@ -1,21 +1,21 @@
 //! Text and picture names the class screens show for catalog entries.
 
-use asset_core::{AssetKey, AssetNamespace};
+use asset_core::{AssetIdentity, AssetCategoryScope};
 
-use crate::{ClassLoadoutCatalog, ClassPickerFolder, pretty_weapon_name};
+use crate::{LoadoutRoster, ClassPickerFolder, display_gun_title};
 
 /// Localized text for `key` (a leading `@` is ignored), or `fallback` when
 /// the catalog has none.
-pub fn localized(loc: &asset_game::LocalizeCatalog, key: &str, fallback: &str) -> String {
+pub fn localized(loc: &asset_game::TranslationStringIndex, key: &str, fallback: &str) -> String {
     let text = loc.text(key.trim_start_matches('@'));
     text.unwrap_or(fallback).to_owned()
 }
 
-pub fn category_label(folder: ClassPickerFolder, loc: &asset_game::LocalizeCatalog) -> String {
+pub fn category_label(folder: ClassPickerFolder, loc: &asset_game::TranslationStringIndex) -> String {
     let Some(category) = folder.category else {
         return localized(loc, "MENU_EQUIPMENT_CAPS", "Equipment");
     };
-    localized(loc, category.loc_key().unwrap_or(""), category.menu_label())
+    localized(loc, category.text_lookup_token().unwrap_or(""), category.screen_caption())
 }
 
 /// What a picker entry is called: its catalog name, else the perk's name,
@@ -23,8 +23,8 @@ pub fn category_label(folder: ClassPickerFolder, loc: &asset_game::LocalizeCatal
 /// the attachment).
 pub fn label(
     key: &str,
-    catalog: &ClassLoadoutCatalog,
-    loc: &asset_game::LocalizeCatalog,
+    catalog: &LoadoutRoster,
+    loc: &asset_game::TranslationStringIndex,
 ) -> String {
     if key.is_empty() {
         return localized(loc, "MENU_NONE", "None");
@@ -32,7 +32,7 @@ pub fn label(
     let catalog_name = catalog
         .previews
         .get(key)
-        .and_then(|preview| loc.text(preview.name_key.trim_start_matches('@')));
+        .and_then(|preview| loc.text(preview.title_token.trim_start_matches('@')));
     if let Some(name) = catalog_name {
         return name.to_owned();
     }
@@ -42,19 +42,19 @@ pub fn label(
         return name.to_owned();
     }
     let tail = key.rsplit_once('+').map_or(key, |(_, attachment)| attachment);
-    pretty_weapon_name(tail)
+    display_gun_title(tail)
 }
 
 /// Asset key of the picture for `key`; empty when it has none.
-pub fn preview_image(key: &str, catalog: &ClassLoadoutCatalog) -> String {
+pub fn preview_image(key: &str, catalog: &LoadoutRoster) -> String {
     let Some(preview) = catalog.previews.get(key) else {
         return String::new();
     };
     let image = &preview.image;
-    if image.is_empty() || AssetKey::parse(image).is_ok() {
+    if image.is_empty() || AssetIdentity::parse(image).is_ok() {
         return image.clone();
     }
     // A bare material name: file it under the namespace of the entry itself.
-    let namespace = AssetKey::parse(key).map_or(AssetNamespace::T6, |parsed| parsed.namespace);
+    let namespace = AssetIdentity::parse(key).map_or(AssetCategoryScope::T6, |parsed| parsed.namespace);
     format!("{}:material/{image}", namespace.as_str())
 }

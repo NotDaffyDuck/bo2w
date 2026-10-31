@@ -1,25 +1,28 @@
 //! Commands that arrive with the process: `--cmds`, `BO2MP_CMDS`, and stdin.
 
-use std::{
-    io::BufRead,
-    sync::{
-        Mutex, OnceLock,
-        mpsc::{Receiver, SyncSender, sync_channel},
-    },
-};
+use std::{io::BufRead, sync::mpsc::Receiver, sync::mpsc::sync_channel, sync::mpsc::SyncSender};
+use std::{sync::Mutex, sync::OnceLock};
 
-use bevy::prelude::{App, Res, ResMut, Resource};
+use bevy::{prelude::App, prelude::Res, prelude::ResMut, prelude::Resource};
 
-use crate::{ConsoleQueue, command::split_script};
+use crate::OrderInbox;
+use crate::command::split_script;
 
 /// The most stdin lines the console takes in one frame.
 const STDIN_LINES_PER_FRAME: usize = 256;
 
-/// The values of every `--cmds`, as `--cmds <script>` or `--cmds=<script>`,
-/// and the arguments that are left.
-fn split_cmds_flag(args: impl Iterator<Item = String>) -> (Vec<String>, Vec<String>) {
+/// The arguments split into the values of every `--cmds` and the rest.
+struct CmdsSplit {
+    /// Each `--cmds <script>` or `--cmds=<script>`, in order.
+    scripts: Vec<String>,
+    /// The arguments that are left.
+    rest: Vec<String>,
+}
+
+fn split_cmds_flag(args: impl Iterator<Item = String>) -> CmdsSplit {
     let mut args = args;
-    let (mut scripts, mut rest) = (Vec::new(), Vec::new());
+    let mut scripts: Vec<String> = vec![];
+    let mut rest: Vec<String> = vec![];
     while let Some(arg) = args.next() {
         if arg == "--cmds" {
             scripts.extend(args.next());
@@ -29,31 +32,59 @@ fn split_cmds_flag(args: impl Iterator<Item = String>) -> (Vec<String>, Vec<Stri
             rest.push(arg);
         }
     }
-    (scripts, rest)
+    CmdsSplit { scripts, rest }
 }
 
-/// `args` without `--cmds` and what it carries.
-pub fn strip_cmds_flag(args: impl Iterator<Item = String>) -> Vec<String> {
-    split_cmds_flag(args).1
+/// `argv` without `--cmds` and what it carries.
+pub fn strip_cmds_flag(argv: impl Iterator<Item = String>) -> Vec<String> {
+    split_cmds_flag(argv).rest
 }
 
 /// The commands the process was started with: those of `--cmds` in order,
-/// then those of `env`, each script cut at the `;` outside quotes.
-fn commands_from(args: impl Iterator<Item = String>, env: Option<String>) -> Vec<String> {
-    let (mut scripts, _) = split_cmds_flag(args);
-    scripts.extend(env);
+/// then those of `from_env`, each script cut at the `;` outside quotes.
+fn commands_from(args: impl Iterator<Item = String>, from_env: Option<String>) -> Vec<String> {
+    let mut scripts = split_cmds_flag(args).scripts;
+    scripts.extend(from_env);
     scripts
         .iter()
         .flat_map(|script| split_script(script))
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
-        .collect()
+        .collect::<Vec<String>>()
 }
 
-/// The commands this process was started with.
-pub fn startup_commands() -> Vec<String> {
-    commands_from(std::env::args(), std::env::var("BO2MP_CMDS").ok())
+/// `BO2MP_INPUT_SCRIPT`'s file as a script: a command a line, `#` lines left
+/// out. The commands are the console's own, so `wait spawn`, `wait 2s`,
+/// `keydown shift` and `keyup shift` time the keys a run presses.
+fn input_script(file: &str) -> String {
+    file.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// `env`'s script followed by the input script's.
+fn with_input_script(env: Option<String>, file: Option<String>) -> Option<String> {
+    match (env, file.map(|text| input_script(&text))) {
+        (Some(env), Some(file)) => Some(format!("{env};{file}")),
+        (env, file) => env.or(file),
+    }
+}
+
+/// The commands this process was started with: `--cmds`, `BO2MP_CMDS`, then
+/// the commands in the file `BO2MP_INPUT_SCRIPT` names.
+pub fn boot_orders() -> Vec<String> {
+    let file = std::env::var_os("BO2MP_INPUT_SCRIPT").and_then(|path| {
+        std::fs::read_to_string(&path)
+            .map_err(|err| eprintln!("BO2MP_INPUT_SCRIPT {path:?}: {err}"))
+            .ok()
+    });
+    commands_from(
+        std::env::args(),
+        with_input_script(std::env::var("BO2MP_CMDS").ok(), file),
+    )
 }
 
 /// Whether a script drives this run. Such a run never grabs the cursor and
@@ -62,7 +93,7 @@ pub fn startup_commands() -> Vec<String> {
 /// unfocused window's screenshots read back black.)
 pub fn scripted_run() -> bool {
     static SCRIPTED: OnceLock<bool> = OnceLock::new();
-    *SCRIPTED.get_or_init(|| !startup_commands().is_empty())
+    *SCRIPTED.get_or_init(|| !boot_orders().is_empty())
 }
 
 /// Lines read from stdin, waiting for the console to take them.
@@ -90,11 +121,11 @@ pub(crate) fn install_stdin(app: &mut App) {
 }
 
 /// Hands the stdin lines that have arrived to the console.
-pub(crate) fn drain_stdin(input: Option<Res<StdinCommands>>, mut queue: ResMut<ConsoleQueue>) {
+pub(crate) fn drain_stdin(input: Option<Res<StdinCommands>>, mut queue: ResMut<OrderInbox>) {
     let Some(input) = input else { return };
     let Ok(receiver) = input.0.lock() else { return };
     for line in receiver.try_iter().take(STDIN_LINES_PER_FRAME) {
-        queue.push_line(&line);
+        queue.enqueue_typed_text(&line);
     }
 }
 
@@ -102,9 +133,8 @@ pub(crate) fn drain_stdin(input: Option<Res<StdinCommands>>, mut queue: ResMut<C
 mod tests {
     use std::io::Cursor;
 
-    use bevy::prelude::Update;
-
-    use super::*;
+    use crate::startup::*;
+    use bevy::app::Update;
 
     fn args(list: &[&str]) -> impl Iterator<Item = String> {
         list.iter()
@@ -115,14 +145,10 @@ mod tests {
 
     #[test]
     fn the_flag_takes_the_next_argument_or_an_equals_value() {
-        assert_eq!(
-            commands_from(args(&["bo2mp", "--cmds", "map a; quit"]), None),
-            ["map a", "quit"]
-        );
-        assert_eq!(
-            commands_from(args(&["bo2mp", "--cmds=map a"]), None),
-            ["map a"]
-        );
+        let expected = ["map a", "quit"];
+        assert_eq!(commands_from(args(&["bo2mp", "--cmds", "map a; quit"]), None), expected);
+        let expected = ["map a"];
+        assert_eq!(commands_from(args(&["bo2mp", "--cmds=map a"]), None), expected);
     }
 
     #[test]
@@ -132,6 +158,30 @@ mod tests {
             Some("c;d".to_owned()),
         );
         assert_eq!(lines, ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn the_input_script_follows_the_other_commands_a_line_each() {
+        let file = "# hold shift while running\nwait spawn\n\n  keydown shift \nwait 2s\nkeyup shift\n";
+        let expected = "wait spawn;keydown shift;wait 2s;keyup shift";
+        assert_eq!(input_script(file), expected);
+        let lines = commands_from(
+            args(&["bo2mp", "--cmds", "map a"]),
+            with_input_script(Some("hold +forward".to_owned()), Some(file.to_owned())),
+        );
+        let waited = "wait spawn";
+        let expected = [
+            "map a",
+            "hold +forward",
+            waited,
+            "keydown shift",
+            "wait 2s",
+            "keyup shift"
+        ];
+        assert_eq!(lines, expected);
+        assert_eq!(with_input_script(None, None), None);
+        let expected = Some("quit");
+        assert_eq!(with_input_script(None, Some("quit".to_owned())).as_deref(), expected);
     }
 
     #[test]
@@ -175,30 +225,30 @@ mod tests {
         let (sender, receiver) = sync_channel(8);
         sender.send("map a; wait 1".to_owned()).unwrap();
         sender.send("quit".to_owned()).unwrap();
-        let mut app = App::new();
-        app.init_resource::<ConsoleQueue>()
+        let mut app = App::default();
+        app.init_resource::<OrderInbox>()
             .insert_resource(StdinCommands(Mutex::new(receiver)))
             .add_systems(Update, drain_stdin);
         app.update();
         let names: Vec<String> = app
             .world_mut()
-            .resource_mut::<ConsoleQueue>()
+            .resource_mut::<OrderInbox>()
             .drain()
             .into_iter()
             .map(|command| command.name)
-            .collect();
+            .collect::<Vec<String>>();
         assert_eq!(names, ["map", "wait", "quit"]);
     }
 
     #[test]
     fn without_stdin_the_system_does_nothing() {
-        let mut app = App::new();
-        app.init_resource::<ConsoleQueue>()
+        let mut app = App::default();
+        app.init_resource::<OrderInbox>()
             .add_systems(Update, drain_stdin);
         app.update();
         assert!(
             app.world_mut()
-                .resource_mut::<ConsoleQueue>()
+                .resource_mut::<OrderInbox>()
                 .drain()
                 .is_empty()
         );

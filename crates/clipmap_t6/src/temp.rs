@@ -4,10 +4,10 @@
 
 use trace_t6::{Brush, Trace, TraceWork, test_box_in_brush, trace_through_brush};
 
-use crate::{CAPSULE_MODEL_HANDLE, CModel, ClipMap, Leaf, TEMP_BRUSH_MODEL_HANDLE, dot, normalize_to, sub};
+use crate::{CAPSULE_MODEL_HANDLE, CModel, ClipMap, Leaf, Normalized, TEMP_BRUSH_MODEL_HANDLE, dot, unit_and_length, sub};
 
 /// The trace thread's temporary models: `box_model` with its `box_brush`'s
-/// contents, and the brushes of its geom list (BO2 skips the geoms that
+/// contents, and the brushes of its shape_data list (BO2 skips the geoms that
 /// have none).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TempModels<'a> {
@@ -27,7 +27,7 @@ impl Default for TempModels<'_> {
                 leaf: Leaf {
                     mins: [f32::MAX; 3],
                     maxs: [-f32::MAX; 3],
-                    brush_contents: u32::MAX,
+                    solid_content_flags: u32::MAX,
                     terrain_contents: 0,
                     ..Leaf::default()
                 },
@@ -42,9 +42,9 @@ impl Default for TempModels<'_> {
 impl<'a> ClipMap<'a> {
     /// `CM_TempBoxModel`: the box `mins`..`maxs` with `contents`, as a
     /// model handle a trace can be given.
-    pub fn temp_box_model(&mut self, mins: [f32; 3], maxs: [f32; 3], contents: u32) -> u32 {
+    pub fn temp_box_model(&mut self, mins: [f32; 3], hi_box: [f32; 3], contents: u32) -> u32 {
         self.temp.box_model.mins = mins;
-        self.temp.box_model.maxs = maxs;
+        self.temp.box_model.maxs = hi_box;
         self.temp.box_contents = contents;
         CAPSULE_MODEL_HANDLE
     }
@@ -98,16 +98,16 @@ impl BoxCapsule {
 
 /// `CM_TestCapsuleInCapsule`: is the trace's capsule, standing still,
 /// inside the box's capsule? If so the trace is all solid.
-pub(crate) fn test_capsule_in_capsule(tw: &TraceWork, temp: &TempModels<'_>, trace: &mut Trace) {
-    let s = tw.extents.start;
+pub(crate) fn test_capsule_in_capsule(tw: &TraceWork, temp: &TempModels<'_>, tr_out: &mut Trace) {
+    let s = tw.extents.from;
     let b = BoxCapsule::new(&temp.box_model);
     let top = tw.offset_z + s[2];
     let bottom = s[2] - tw.offset_z;
     let reach = tw.radius + b.radius;
     let reach_sq = reach * reach;
-    let dx = b.centre[0] - s[0];
+    let step_along_x = b.centre[0] - s[0];
     let dy = b.centre[1] - s[1];
-    let apart = |dz: f32| reach_sq <= dy * dy + dx * dx + dz * dz;
+    let apart = |dz: f32| reach_sq <= dy * dy + step_along_x * step_along_x + dz * dz;
     let (box_top, box_bottom) = (b.top()[2], b.bottom()[2]);
     if apart(box_top - top) && apart(box_top - bottom) && apart(box_bottom - top) && apart(box_bottom - bottom) {
         // No end spheres touch: the capsules meet only if their sides do.
@@ -115,14 +115,26 @@ pub(crate) fn test_capsule_in_capsule(tw: &TraceWork, temp: &TempModels<'_>, tra
         if total_half_height < (s[2] - b.centre[2]).abs() {
             return;
         }
-        if reach_sq <= dy * dy + dx * dx {
+        if reach_sq <= dy * dy + step_along_x * step_along_x {
             return;
         }
     }
-    trace.allsolid = true;
-    trace.startsolid = true;
-    trace.fraction = 0.0;
-    trace.sflags = 0;
+    // Inside it from the start: solid all the way, with no surface.
+    tr_out.fully_embedded = true;
+    tr_out.starts_inside = true;
+    tr_out.fraction = 0.0;
+    tr_out.sflags = 0;
+}
+
+/// A hit on a temporary model's capsule at `fraction` (clamped up to the
+/// start), facing `normal`: it carries the box's contents and no surface,
+/// and is never walkable.
+fn record_hit(tr_out: &mut Trace, frac_at: f32, face_dir: [f32; 3], solid_bits: u32) {
+    tr_out.fraction = if frac_at < 0.0 { 0.0 } else { frac_at };
+    tr_out.normal = face_dir;
+    tr_out.walkable = false;
+    tr_out.cflags = solid_bits;
+    tr_out.sflags = 0;
 }
 
 /// `CM_TraceCapsuleThroughCapsule`: sweep the trace's capsule against the
@@ -140,12 +152,12 @@ pub(crate) fn trace_capsule_through_capsule(tw: &TraceWork, temp: &TempModels<'_
             return;
         }
     }
-    let s = tw.extents.start;
-    let e = tw.extents.end;
+    let s = tw.extents.from;
+    let e = tw.extents.to;
     let start_top = [s[0], s[1], tw.offset_z + s[2]];
-    let start_bottom = [s[0], s[1], s[2] - tw.offset_z];
+    let from_foot = [s[0], s[1], s[2] - tw.offset_z];
     let end_top = [e[0], e[1], tw.offset_z + e[2]];
-    let end_bottom = [e[0], e[1], e[2] - tw.offset_z];
+    let to_foot = [e[0], e[1], e[2] - tw.offset_z];
     let b = BoxCapsule::new(m);
     let (box_top, box_bottom) = (b.top(), b.bottom());
     let contents = temp.box_contents;
@@ -153,9 +165,9 @@ pub(crate) fn trace_capsule_through_capsule(tw: &TraceWork, temp: &TempModels<'_
     // sphere against the box's top one.
     let from_below = |trace: &mut Trace| sphere_through_sphere(tw, contents, start_top, end_top, box_bottom, b.radius, trace);
     let from_above =
-        |trace: &mut Trace| sphere_through_sphere(tw, contents, start_bottom, end_bottom, box_top, b.radius, trace);
+        |trace: &mut Trace| sphere_through_sphere(tw, contents, from_foot, to_foot, box_top, b.radius, trace);
 
-    let sides = if start_bottom[2] <= box_top[2] {
+    let sides = if from_foot[2] <= box_top[2] {
         if box_bottom[2] <= start_top[2] {
             true
         } else {
@@ -173,13 +185,13 @@ pub(crate) fn trace_capsule_through_capsule(tw: &TraceWork, temp: &TempModels<'_
     if !sides || cylinder_through_cylinder(tw, contents, &b, trace) {
         return;
     }
-    if end_bottom[2] <= box_top[2] {
+    if to_foot[2] <= box_top[2] {
         if box_bottom[2] <= end_top[2] || start_top[2] < box_bottom[2] {
             return;
         }
         from_below(trace);
     } else {
-        if box_top[2] < start_bottom[2] {
+        if box_top[2] < from_foot[2] {
             return;
         }
         from_above(trace);
@@ -191,90 +203,72 @@ pub(crate) fn trace_capsule_through_capsule(tw: &TraceWork, temp: &TempModels<'_
 /// it hit (or started inside).
 fn sphere_through_sphere(
     tw: &TraceWork,
-    contents: u32,
+    solid_bits: u32,
     from: [f32; 3],
     to: [f32; 3],
     centre: [f32; 3],
-    radius: f32,
-    trace: &mut Trace,
+    reach_r: f32,
+    hit: &mut Trace,
 ) -> bool {
     let d = sub(from, centre);
-    let reach = tw.radius + radius;
+    let reach = tw.radius + reach_r;
     let reach_sq = reach * reach;
     let d_sq = dot(d, d);
     let c = d_sq - reach_sq;
     if c <= 0.0 {
-        trace.fraction = 0.0;
-        trace.startsolid = true;
-        trace.walkable = false;
-        trace.normal = normalize_to(d).0;
-        trace.cflags = contents;
-        trace.sflags = 0;
+        // Touching at the start; solid all the way if still touching at
+        // the end.
+        record_hit(hit, 0.0, unit_and_length(d).unit, solid_bits);
+        hit.starts_inside = true;
         let q = sub(to, centre);
-        if dot(q, q) <= reach_sq {
-            trace.allsolid = true;
-        }
+        hit.fully_embedded |= dot(q, q) <= reach_sq;
         return true;
     }
     let b = dot(tw.delta, d);
-    if b < 0.0 {
-        let a = tw.delta_len_sq;
-        let disc = b * b - a * c;
-        if 0.0 <= disc {
-            let (normal, len) = normalize_to(d);
-            let frac = (-b - libm::sqrtf(disc)) / a + (len * 0.125) / b;
-            if frac < trace.fraction {
-                trace.fraction = if frac < 0.0 { 0.0 } else { frac };
-                trace.normal = normal;
-                trace.cflags = contents;
-                trace.walkable = false;
-                trace.sflags = 0;
-                return true;
-            }
-        }
+    let a = tw.delta_len_sq;
+    let disc = b * b - a * c;
+    if !(b < 0.0 && 0.0 <= disc) {
+        // Moving apart, or passing wide.
+        return false;
     }
-    false
+    let Normalized { unit: normal, length: len } = unit_and_length(d);
+    let frac = (-b - libm::sqrtf(disc)) / a + (len * 0.125) / b;
+    let sooner = frac < hit.fraction;
+    if sooner {
+        record_hit(hit, frac, normal, solid_bits);
+    }
+    sooner
 }
 
 /// `CM_TraceCylinderThroughCylinder`: the sides of the trace's capsule
 /// against the sides of the box's. True if it hit (or started inside).
-fn cylinder_through_cylinder(tw: &TraceWork, contents: u32, b: &BoxCapsule, trace: &mut Trace) -> bool {
-    let s = tw.extents.start;
-    let dx = s[0] - b.centre[0];
+fn cylinder_through_cylinder(tw: &TraceWork, solid_bits: u32, b: &BoxCapsule, trace: &mut Trace) -> bool {
+    let s = tw.extents.from;
+    let step_along_x = s[0] - b.centre[0];
     let dy = s[1] - b.centre[1];
-    let d_sq = dx * dx + dy * dy;
+    let d_sq = step_along_x * step_along_x + dy * dy;
     let reach = tw.radius + b.radius;
     let c = d_sq - reach * reach;
     let total_height = (tw.size[2] - tw.radius) + b.half_height;
     if 0.0 < c {
-        let bb = tw.delta[0] * dx + tw.delta[1] * dy;
+        let bb = tw.delta[0] * step_along_x + tw.delta[1] * dy;
         if bb < 0.0 {
             let a = tw.delta[1] * tw.delta[1] + tw.delta[0] * tw.delta[0];
             let disc = bb * bb - a * c;
             if 0.0 <= disc {
-                let (normal, len) = normalize_to([dx, dy, 0.0]);
+                let Normalized { unit: normal, length: len } = unit_and_length([step_along_x, dy, 0.0]);
                 let epsilon = (len * 0.125) / bb;
                 let frac = (-bb - libm::sqrtf(disc)) / a + epsilon;
                 if frac < trace.fraction && ((frac - epsilon) * tw.delta[2] + s[2] - b.centre[2]).abs() <= total_height {
-                    trace.fraction = if frac < 0.0 { 0.0 } else { frac };
-                    trace.normal = normal;
-                    trace.cflags = contents;
-                    trace.sflags = 0;
-                    trace.walkable = false;
+                    record_hit(trace, frac, normal, solid_bits);
                     return true;
                 }
             }
         }
     } else if (s[2] - b.centre[2]).abs() <= total_height {
-        trace.fraction = 0.0;
-        trace.startsolid = true;
-        trace.walkable = false;
-        trace.normal = normalize_to([dx, dy, 0.0]).0;
-        trace.cflags = contents;
-        trace.sflags = 0;
-        if (tw.extents.end[2] - b.centre[2]).abs() <= total_height {
-            trace.allsolid = true;
-        }
+        record_hit(trace, 0.0, unit_and_length([step_along_x, dy, 0.0]).unit, solid_bits);
+        trace.starts_inside = true;
+        trace.fully_embedded |= (tw.extents.to[2] - b.centre[2]).abs() <= total_height;
         return true;
     }
     false
@@ -286,7 +280,7 @@ pub(crate) fn test_in_temp_brush(tw: &TraceWork, temp: &TempModels<'_>, trace: &
     for brush in temp.brushes {
         if brush.contents & tw.contents != 0 {
             test_box_in_brush(tw, brush, trace);
-            if trace.allsolid {
+            if trace.fully_embedded {
                 return;
             }
         }
@@ -315,9 +309,8 @@ mod tests {
     use crate::{CheckCount, point_contents};
 
     const SOLID: u32 = 1;
-    /// A player's box: 15 wide each way, 72 tall.
-    const MINS: [f32; 3] = [-15.0, -15.0, 0.0];
-    const MAXS: [f32; 3] = [15.0, 15.0, 72.0];
+    /// A player's box, low corner then high: 15 wide each way, 72 tall.
+    const PLAYER_BOX: [[f32; 3]; 2] = [[-15.0, -15.0, 0.0], [15.0, 15.0, 72.0]];
 
     /// The box handed to the traces: 16 wide each way, 72 tall, so its
     /// capsule has radius 16 and end spheres 20 above and below its middle.
@@ -327,15 +320,16 @@ mod tests {
         (map, handle)
     }
 
-    fn sweep(map: &ClipMap<'_>, start: [f32; 3], end: [f32; 3], model: u32, contents: u32) -> Trace {
+    fn sweep(map: &ClipMap<'_>, from_pt: [f32; 3], to_pt: [f32; 3], model: u32, contents: u32) -> Trace {
         let mut check = CheckCount::new(&mut []);
-        map.box_trace(&mut check, start, end, MINS, MAXS, model, contents)
+        let [low, high] = PLAYER_BOX;
+        map.box_trace(&mut check, from_pt, to_pt, low, high, model, contents)
     }
 
-    fn cube(mins: [f32; 3], maxs: [f32; 3], contents: u32) -> Brush<'static> {
+    fn cube(mins: [f32; 3], hi_box: [f32; 3], contents: u32) -> Brush<'static> {
         Brush {
-            mins,
-            maxs,
+            lower: mins,
+            upper: hi_box,
             contents,
             sides: &[],
             axial_cflags: [[contents; 3]; 2],
@@ -347,21 +341,21 @@ mod tests {
     fn the_temp_handles_name_the_box_model() {
         let (map, handle) = boxed();
         assert_eq!(handle, CAPSULE_MODEL_HANDLE);
-        let m = map.brush_model(CAPSULE_MODEL_HANDLE).unwrap();
+        let m = map.solid_model(CAPSULE_MODEL_HANDLE).unwrap();
         assert_eq!((m.mins, m.maxs), ([-16.0, -16.0, 0.0], [16.0, 16.0, 72.0]));
-        assert_eq!(map.brush_model(TEMP_BRUSH_MODEL_HANDLE), Some(m));
-        assert_eq!(map.brush_model(1), None);
+        assert_eq!(map.solid_model(TEMP_BRUSH_MODEL_HANDLE), Some(m));
+        assert_eq!(map.solid_model(1), None);
         // The box model's leaf stays empty, so no point is inside it.
         assert_eq!(point_contents(&map, [0.0, 0.0, 36.0], CAPSULE_MODEL_HANDLE), 0);
         let fresh = TempModels::default();
-        assert_eq!((fresh.box_contents, fresh.box_model.leaf.brush_contents), (u32::MAX, u32::MAX));
+        assert_eq!((fresh.box_contents, fresh.box_model.leaf.solid_content_flags), (u32::MAX, u32::MAX));
     }
 
     #[test]
     fn a_capsule_standing_in_the_temp_box_is_solid() {
         let (map, handle) = boxed();
         let t = sweep(&map, [4.0, 0.0, 0.0], [4.0, 0.0, 0.0], handle, SOLID);
-        assert!(t.allsolid && t.startsolid);
+        assert!(t.fully_embedded && t.starts_inside);
         assert_eq!((t.fraction, t.sflags), (0.0, 0));
     }
 
@@ -370,19 +364,19 @@ mod tests {
         let (map, handle) = boxed();
         // 31 apart is touching: just past it the sides miss.
         let t = sweep(&map, [31.5, 0.0, 0.0], [31.5, 0.0, 0.0], handle, SOLID);
-        assert!(!t.startsolid && t.fraction == 1.0);
+        assert!(!t.starts_inside && t.fraction == 1.0);
         let t = sweep(&map, [30.5, 0.0, 0.0], [30.5, 0.0, 0.0], handle, SOLID);
-        assert!(t.allsolid);
+        assert!(t.fully_embedded);
         // Well above it, the end spheres and the sides both miss.
         let t = sweep(&map, [0.0, 0.0, 200.0], [0.0, 0.0, 200.0], handle, SOLID);
-        assert!(!t.startsolid);
+        assert!(!t.starts_inside);
     }
 
     #[test]
     fn the_temp_box_only_stops_its_own_contents() {
         let (map, handle) = boxed();
         let t = sweep(&map, [0.0; 3], [0.0; 3], handle, 2);
-        assert!(!t.startsolid);
+        assert!(!t.starts_inside);
         let t = sweep(&map, [-100.0, 0.0, 0.0], [100.0, 0.0, 0.0], handle, 2);
         assert_eq!(t.fraction, 1.0);
     }
@@ -394,7 +388,7 @@ mod tests {
         // Touching at 31 apart, an eighth short: x = -31.125.
         assert!((t.fraction - 0.344_375).abs() < 1e-5, "{}", t.fraction);
         assert_eq!((t.normal, t.cflags, t.sflags), ([-1.0, 0.0, 0.0], SOLID, 0));
-        assert!(!t.walkable && !t.startsolid);
+        assert!(!t.walkable && !t.starts_inside);
     }
 
     #[test]
@@ -420,7 +414,7 @@ mod tests {
         let mut map = ClipMap::default();
         let handle = map.temp_box_model([-16.0, -16.0, 200.0], [16.0, 16.0, 272.0], SOLID);
         let t = sweep(&map, [0.0; 3], [0.0, 0.0, 200.0], handle, SOLID);
-        assert!(t.fraction < 1.0 && !t.startsolid);
+        assert!(t.fraction < 1.0 && !t.starts_inside);
         assert!((t.normal[2] + 1.0).abs() < 1e-6 && !t.walkable);
     }
 
@@ -435,8 +429,8 @@ mod tests {
         assert!(t.fraction < 0.5 && 0.4 < t.fraction, "{}", t.fraction);
         assert_eq!((t.normal, t.cflags), ([-1.0, 0.0, 0.0], SOLID));
         let t = map.box_trace(&mut check, [0.0, 0.0, 32.0], [0.0, 0.0, 32.0], [0.0; 3], [0.0; 3], handle, SOLID);
-        assert!(t.allsolid && t.startsolid);
+        assert!(t.fully_embedded && t.starts_inside);
         let t = map.box_trace(&mut check, [-56.0, 0.0, 32.0], [-56.0, 0.0, 32.0], [0.0; 3], [0.0; 3], handle, SOLID);
-        assert!(!t.startsolid);
+        assert!(!t.starts_inside);
     }
 }

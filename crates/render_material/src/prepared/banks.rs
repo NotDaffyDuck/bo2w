@@ -1,139 +1,142 @@
 //! The material-local half of a pass, packed once into flat constant banks
 //! and a sampler lane list.
 
-use super::args::{ExecutableArgumentBinding, PreparedArgBelts};
-use crate::RuntimeShaderStage;
-use crate::catalog::{RuntimeTextureBinding, fnv1a64, fnv1a64_more};
+use super::args::{RunnableParamSource, PreparedParamStrips};
+use crate::LiveShaderStage;
+use crate::catalog::LiveTextureBinding;
+use crate::catalog::hash_text_64;
+use crate::catalog::fnv_extend;
 
 /// Constant rows the material fixes for a pass, laid out like the shader
 /// banks, with a flag per row saying whether the material wrote it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PackedLocalBanks {
-    pub vertex: Vec<[u32; 4]>,
-    pub pixel: Vec<[u32; 4]>,
-    pub written_vertex: Vec<bool>,
-    pub written_pixel: Vec<bool>,
+pub struct LocalSamplerBanks {
+    pub vertex_rows: Vec<[u32; 4]>,
+    pub pixel_rows: Vec<[u32; 4]>,
+    pub vertex_filled: Vec<bool>,
+    pub pixel_filled: Vec<bool>,
 }
 
-impl PackedLocalBanks {
-    fn zeroed(vertex_len: usize, pixel_len: usize) -> Self {
+impl LocalSamplerBanks {
+    fn zeroed(vertex_rows: usize, fragment_stage_length: usize) -> Self {
         Self {
-            vertex: vec![[0; 4]; vertex_len],
-            pixel: vec![[0; 4]; pixel_len],
-            written_vertex: vec![false; vertex_len],
-            written_pixel: vec![false; pixel_len],
+            vertex_rows: vec![[0; 4]; vertex_rows],
+            pixel_rows: vec![[0; 4]; fragment_stage_length],
+            vertex_filled: vec![false; vertex_rows],
+            pixel_filled: vec![false; fragment_stage_length],
         }
     }
 
     /// `None` when the register lies outside the bank.
-    fn write(&mut self, stage: RuntimeShaderStage, register: u16, words: [u32; 4]) -> Option<()> {
-        let (rows, written) = match stage {
-            RuntimeShaderStage::Vertex => (&mut self.vertex, &mut self.written_vertex),
-            RuntimeShaderStage::Pixel => (&mut self.pixel, &mut self.written_pixel),
+    fn put_row(&mut self, stage: LiveShaderStage, reg: u16, value: [u32; 4]) -> Option<()> {
+        let (bank, marks) = match stage {
+            LiveShaderStage::Vertex => (&mut self.vertex_rows, &mut self.vertex_filled),
+            LiveShaderStage::Pixel => (&mut self.pixel_rows, &mut self.pixel_filled),
         };
-        let row = usize::from(register);
-        *rows.get_mut(row)? = words;
-        *written.get_mut(row)? = true;
+        let row = usize::from(reg);
+        *bank.get_mut(row)? = value;
+        *marks.get_mut(row)? = true;
         Some(())
     }
 }
 
 /// `None` when any of the material's constants does not fit the given bank
 /// sizes; the pass then keeps no packed banks for that vertex type.
-pub fn pack_local_banks(
-    vertex_len: usize,
-    pixel_len: usize,
-    belts: &PreparedArgBelts,
-) -> Option<PackedLocalBanks> {
-    let mut banks = PackedLocalBanks::zeroed(vertex_len, pixel_len);
+pub fn encode_local_register_banks(
+    vertex_slots: usize,
+    fragment_stage_length: usize,
+    belts: &PreparedParamStrips,
+) -> Option<LocalSamplerBanks> {
+    let mut banks = LocalSamplerBanks::zeroed(vertex_slots, fragment_stage_length);
     let locals = belts
         .in_bank_order()
         .into_iter()
         .flat_map(|slice| slice.local.iter().flatten());
     for local in locals {
         match *local {
-            ExecutableArgumentBinding::MaterialConstant {
+            RunnableParamSource::ShaderParameterValue {
                 stage,
-                destination,
-                words,
+                slot_reg: dest,
+                lane_bits: words,
                 ..
             }
-            | ExecutableArgumentBinding::LiteralConstant {
+            | RunnableParamSource::InlineConstant {
                 stage,
-                destination,
-                words,
-            } => banks.write(stage, destination, words)?,
-            ExecutableArgumentBinding::MaterialTexture { .. }
-            | ExecutableArgumentBinding::CodeTexture { .. }
-            | ExecutableArgumentBinding::CodeConstant { .. } => {}
+                slot_reg: dest,
+                lane_bits: words,
+            } => banks.put_row(stage, dest, words)?,
+            RunnableParamSource::ShaderSamplerImage { .. }
+            | RunnableParamSource::EngineSuppliedTexture { .. }
+            | RunnableParamSource::EngineConstant { .. } => {}
         }
     }
     Some(banks)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PackedLocalSamplerLane {
-    pub register: u16,
-    pub name_hash: u32,
-    pub texture: RuntimeTextureBinding,
+pub struct CompactSamplerSlot {
+    pub sampler_reg: u16,
+    pub label_digest: u32,
+    pub texture: LiveTextureBinding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PackedLocalSamplers {
+pub struct LocalSamplerBundle {
     /// Content hash of `lanes`; equal ids mean equal sampler sets.
     pub id: u64,
-    pub lanes: Vec<PackedLocalSamplerLane>,
+    pub lanes: Vec<CompactSamplerSlot>,
 }
 
-impl Default for PackedLocalSamplers {
+impl Default for LocalSamplerBundle {
     fn default() -> Self {
-        Self::from_lanes(Vec::new())
+        Self::assemble_from_channels(Vec::new())
     }
 }
 
-impl PackedLocalSamplers {
-    fn from_lanes(lanes: Vec<PackedLocalSamplerLane>) -> Self {
+impl LocalSamplerBundle {
+    fn assemble_from_channels(lanes: Vec<CompactSamplerSlot>) -> Self {
         Self {
             id: lanes_id(&lanes),
             lanes,
         }
     }
 
-    pub fn texture(&self, register: u16, name_hash: u32) -> Option<RuntimeTextureBinding> {
-        self.lanes
+    pub fn binding_at(&self, reg: u16, label_digest: u32) -> Option<LiveTextureBinding> {
+        let held = &self.lanes;
+        held
             .iter()
-            .find(|lane| lane.register == register && lane.name_hash == name_hash)
-            .map(|lane| lane.texture)
+            .find(|lane| lane.sampler_reg == reg && lane.label_digest == label_digest)
+            .map(|slot| slot.texture)
     }
 }
 
-pub fn pack_local_samplers(belts: &PreparedArgBelts) -> PackedLocalSamplers {
+pub fn pack_local_samplers(belts: &PreparedParamStrips) -> LocalSamplerBundle {
     let lanes = belts
         .in_bank_order()
         .into_iter()
         .flat_map(|slice| slice.local.iter().flatten())
         .filter_map(|local| match *local {
-            ExecutableArgumentBinding::MaterialTexture {
-                destination,
-                name_hash,
+            RunnableParamSource::ShaderSamplerImage {
+                slot_reg: dest,
+                label_digest,
                 texture,
-            } => Some(PackedLocalSamplerLane {
-                register: destination,
-                name_hash,
+            } => Some(CompactSamplerSlot {
+                sampler_reg: dest,
+                label_digest,
                 texture,
             }),
             _ => None,
         })
         .collect();
-    PackedLocalSamplers::from_lanes(lanes)
+    LocalSamplerBundle::assemble_from_channels(lanes)
 }
 
-fn lanes_id(lanes: &[PackedLocalSamplerLane]) -> u64 {
-    let seed = fnv1a64(&(lanes.len() as u64).to_le_bytes());
-    lanes.iter().fold(seed, |hash, lane| {
-        let hash = fnv1a64_more(hash, &lane.register.to_le_bytes());
-        let hash = fnv1a64_more(hash, &lane.name_hash.to_le_bytes());
-        let hash = fnv1a64_more(hash, &lane.texture.image.0.to_le_bytes());
-        fnv1a64_more(hash, &[lane.texture.sampler_state, lane.texture.semantic])
+fn lanes_id(lanes: &[CompactSamplerSlot]) -> u64 {
+    let seed = hash_text_64(&(lanes.len() as u64).to_le_bytes());
+    lanes.iter().fold(seed, |acc, slot| {
+        let acc = fnv_extend(acc, &slot.sampler_reg.to_le_bytes());
+        let acc = fnv_extend(acc, &slot.label_digest.to_le_bytes());
+        let acc = fnv_extend(acc, &slot.texture.image.0.to_le_bytes());
+        fnv_extend(acc, &[slot.texture.texture_sampling_mode, slot.texture.semantic])
     })
 }

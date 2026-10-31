@@ -1,0 +1,28 @@
+# D. First raise of a gun picked up off the floor (never held): DSR 50 first raise 1750 after the AN-94 drop 400.
+# Spawn as BO2 does: empty hands, class guns given, the primary comes up with its first raise (AN-94 1600 ms),
+# which marks every held gun as raised before. 50 ms ticks: 1 press tick + 32.
+msec 50
+give an94_mp
+select an94_mp
+run 33
+expect state READY
+expect anim IDLE
+give dsr50_mp                # picked up off the floor after the spawn
+select dsr50_mp
+run 1
+expect state DROPPING
+run 7
+run 1                 # 400 ms
+expect state RAISING
+expect anim FIRST_RAISE
+expect weapon dsr50_mp
+run 34
+expect state RAISING
+run 1                 # 2150 ms
+expect state READY
+select an94_mp        # back: both now ever-held, plain times (DSR drop 750 + AN-94 raise 600)
+run 1
+run 14
+run 1                 # 750 ms
+expect state RAISING
+expect anim RAISE

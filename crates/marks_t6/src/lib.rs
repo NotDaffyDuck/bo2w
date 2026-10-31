@@ -9,19 +9,19 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-mod chop;
+mod fan_clip;
 mod context;
 mod grid;
-mod impact;
+mod hit_rules;
 mod mark;
-mod mesh;
-mod pool;
+mod decal_mesh;
+mod mark_store;
 mod receiver;
 mod staging;
 mod world;
 
-pub use chop::{
-    FxMarkEmitRefuse, FxWorldMarkPoint, MarkClipPlaneSet, R_MARK_CHOP_MAX_POINTS,
+pub use fan_clip::{
+    DecalEmitDenial, WorldDecalVertex, MarkClipPlaneSet, DECAL_CLIP_POLYGON_VERTEX_CEILING,
     mark_chop_world_triangle_points, mark_emit_brush_fragment, mark_fragment_clip_planes,
     mark_is_triangle_rejected,
 };
@@ -35,31 +35,31 @@ pub use grid::{
     FX_MARKS_GRID_UPDATE_MSEC, FxMarksGrid, FxMarksGridCell, marks_grid_cell_from_position,
     marks_grid_hash_from_cell,
 };
-pub use impact::{
-    FX_MARKS_RANGE_DEFAULT, MarkFragmentsAgainst, impact_mark_material,
+pub use hit_rules::{
+    FX_MARKS_RANGE_DEFAULT, DecalClipTarget, impact_mark_material,
     impact_mark_models_generate, impact_mark_outer_gate, impact_mark_skip_world_from_stored_bolt,
     impact_mark_within_range,
 };
 pub use mark::{
-    FX_MARKS_INIT_ALLOCED_COUNT, FxAllocMarkRefuse, FxAllocMarkRequest, FxMarkAlphaFade,
-    FxMarkConstructed, alloc_and_construct_mark, lru_mark_pick,
+    DECAL_INITIAL_CLAIMED, DecalClaimDenial, DecalAllocationAsk, FxMarkAlphaFade,
+    BuiltDecalRecord, alloc_and_construct_mark, lru_mark_pick,
 };
-pub use mesh::{
-    GFX_MARK_MESH_VERTEX_STRIDE, GfxMarkMeshBudget, GfxMarkMeshRefuse, add_mark_mesh_draw_surf,
+pub use decal_mesh::{
+    DECAL_MESH_VERTEX_BYTES, DecalMeshAllowance, DecalMeshDenial, add_mark_mesh_draw_surf,
     generate_mark_verts_begin, pack_mark_model_vertex, pack_mark_world_vertex,
 };
-pub use pool::{
-    FX_MARK_HANDLE_NONE, FX_MARKS_LIMIT, FX_POINT_GROUP_CHAIN_NONE, FX_POINT_GROUP_LIMIT,
-    FX_POINT_GROUP_NEXT_NONE, FX_TRI_GROUP_CHAIN_NONE, FX_TRI_GROUP_LIMIT, FX_TRI_GROUP_NEXT_NONE,
-    FxPointGroup, FxTriGroup, copy_mark_points, copy_mark_tris, init_mark_next_handle,
+pub use mark_store::{
+    DECAL_HANDLE_ABSENT, DECAL_POOL_CAPACITY, POINT_CHUNK_CHAIN_TERMINATOR, DECAL_POINT_BLOCK_CAPACITY,
+    POINT_CHUNK_SUCCESSOR_ABSENT, TRI_CHUNK_CHAIN_TERMINATOR, DECAL_TRIANGLE_BLOCK_CAPACITY, TRI_CHUNK_SUCCESSOR_ABSENT,
+    DecalPointChunk, DecalTriangleChunk, copy_mark_points, copy_mark_tris, init_mark_next_handle,
     init_point_next_slot, init_tri_next_slot, mark_contexts_equal, mark_point_groups_for_count,
     mark_tri_groups_for_staging, marks_active_limit,
 };
-pub use receiver::{FxMarkAllow, MarkReceiver, mark_allow, mark_include_in_world_clip};
+pub use receiver::{DecalAdmit, DecalSurfaceGate, mark_allow, mark_include_in_world_clip};
 pub use staging::{
-    FxMarkStagingPoint, FxMarkStagingTri, R_MARK_FRAGMENTS_MAX_POINTS, R_MARK_FRAGMENTS_MAX_TRIS,
+    EffectStainStagingPoint, EffectStainStagingTri, DECAL_FRAGMENT_VERTEX_CEILING, DECAL_FRAGMENT_TRIANGLE_CEILING,
 };
-pub use world::{MarkWorldStaging, mark_sphere_hits_bounds, mark_stage_world_surfaces};
+pub use world::{StainLevelStaging, mark_sphere_hits_bounds, mark_stage_world_surfaces};
 
 /// The lightmap number of a surface that has no lightmap (models, and marks on them).
-pub const GFX_SURFACE_LIGHTMAP_NONE: u8 = 0x1f;
+pub const SURFACE_BAKED_LIGHT_ABSENT: u8 = 0x1f;

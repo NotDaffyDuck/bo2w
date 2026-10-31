@@ -48,7 +48,7 @@ pub enum XChunkError {
     /// A length field promised more than one chunk.
     TooLarge { at: usize, len: usize },
     /// The file ended inside a payload.
-    Truncated { at: usize, len: usize, have: usize },
+    Truncated { at: usize, len: usize, held_len: usize },
 }
 
 impl core::fmt::Display for XChunkError {
@@ -58,7 +58,7 @@ impl core::fmt::Display for XChunkError {
                 f,
                 "xchunk at file offset {at:#x} claims {len:#x} bytes (max {XCHUNK_SIZE:#x})"
             ),
-            XChunkError::Truncated { at, len, have } => write!(
+            XChunkError::Truncated { at, len, held_len: have } => write!(
                 f,
                 "xchunk at file offset {at:#x} claims {len:#x} bytes, file has {have:#x} left"
             ),
@@ -107,45 +107,36 @@ impl<'a> Iterator for XChunks<'a> {
     type Item = Result<XChunk<'a>, XChunkError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        let left_in_window = VANILLA_BUFFER_SIZE - self.pos % VANILLA_BUFFER_SIZE;
-        if left_in_window < LEN_FIELD {
-            self.pos += left_in_window;
-        }
-        let Some(len_bytes) = self.file.get(self.pos..self.pos + LEN_FIELD) else {
-            self.done = true;
-            return None;
-        };
-        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-        if len == 0 {
-            self.done = true;
-            return None;
-        }
+        let item = if self.done { None } else { self.read_record() };
+        // Anything but a good record (end, zero length, refusal) closes the walk.
+        self.done = !matches!(item, Some(Ok(_)));
+        item
+    }
+}
+
+impl<'a> XChunks<'a> {
+    /// Reads the record at the cursor, first skipping to the next read window
+    /// when too little of this one is left to hold a length field.
+    fn read_record(&mut self) -> Option<Result<XChunk<'a>, XChunkError>> {
+        let window_left = VANILLA_BUFFER_SIZE - self.pos % VANILLA_BUFFER_SIZE;
+        self.pos += if window_left < LEN_FIELD { window_left } else { 0 };
         let at = self.pos;
-        if len > XCHUNK_SIZE {
-            self.done = true;
-            return Some(Err(XChunkError::TooLarge { at, len }));
+        let len_bytes = self.file.get(at..at + LEN_FIELD)?;
+        let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
+        match len {
+            0 => return None,
+            n if n > XCHUNK_SIZE => return Some(Err(XChunkError::TooLarge { at, len })),
+            _ => {}
         }
         let start = at + LEN_FIELD;
         let Some(data) = self.file.get(start..start + len) else {
-            self.done = true;
-            return Some(Err(XChunkError::Truncated {
-                at,
-                len,
-                have: self.file.len().saturating_sub(start),
-            }));
+            let have = self.file.len().saturating_sub(start);
+            return Some(Err(XChunkError::Truncated { at, len, held_len: have }));
         };
-        let chunk = XChunk {
-            index: self.index,
-            stream: self.index % STREAM_COUNT,
-            offset: start,
-            data,
-        };
+        let index = self.index;
         self.pos = start + len;
-        self.index += 1;
-        Some(Ok(chunk))
+        self.index = index + 1;
+        Some(Ok(XChunk { index, stream: index % STREAM_COUNT, offset: start, data }))
     }
 }
 

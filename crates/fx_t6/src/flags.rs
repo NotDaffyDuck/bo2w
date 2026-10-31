@@ -4,18 +4,18 @@
 //! 0x200; in BO2 those are 0x200 and 0x400, and 0x100 is a run mode.
 
 pub const FX_ELEM_SPAWN_RELATIVE_TO_EFFECT: u32 = 0x2;
-pub const FX_ELEM_SPAWN_FRUSTUM_CULL: u32 = 0x4;
-pub const FX_ELEM_RUNNER_USES_RAND_ROT: u32 = 0x8;
+pub const CULL_AT_BIRTH_BIT: u32 = 0x4;
+pub const ELEM_RUNNER_RANDOM_ROLL: u32 = 0x8;
 pub const FX_ELEM_SPAWN_OFFSET_SPHERE: u32 = 0x10;
 pub const FX_ELEM_SPAWN_OFFSET_CYLINDER: u32 = 0x20;
-pub const FX_ELEM_SPAWN_OFFSET_MASK: u32 = 0x30;
-pub const FX_ELEM_RUN_RELATIVE_TO_SPAWN: u32 = 0x40;
-pub const FX_ELEM_RUN_RELATIVE_TO_EFFECT: u32 = 0x80;
-pub const FX_ELEM_RUN_RELATIVE_TO_OFFSET: u32 = 0xc0;
-pub const FX_ELEM_RUN_RELATIVE_TO_OFFSET_EFFECT_NOW: u32 = 0x100;
-pub const FX_ELEM_RUN_MASK: u32 = 0x1c0;
-pub const FX_ELEM_USE_COLLISION: u32 = 0x200;
-pub const FX_ELEM_DIE_ON_TOUCH: u32 = 0x400;
+pub const BIRTH_DISPLACEMENT_BITS: u32 = 0x30;
+pub const RUN_IN_SPAWN_FRAME: u32 = 0x40;
+pub const RUN_IN_EFFECT_FRAME: u32 = 0x80;
+pub const RUN_IN_OFFSET_FRAME: u32 = 0xc0;
+pub const RUN_IN_OFFSET_FRAME_NOW: u32 = 0x100;
+pub const RUN_FRAME_MASK: u32 = 0x1c0;
+pub const ELEM_HITS_WORLD: u32 = 0x200;
+pub const ELEM_DIES_ON_CONTACT: u32 = 0x400;
 pub const FX_ELEM_DRAW_PAST_FOG: u32 = 0x800;
 pub const FX_ELEM_DRAW_WITH_VIEWMODEL: u32 = 0x1000;
 pub const FX_ELEM_BLOCK_SIGHT: u32 = 0x2000;
@@ -52,7 +52,7 @@ pub const FX_EFFECT_BBOX_PORTALLED: u16 = 0x400;
 pub const FX_EFFECT_IGNORE_TELEPORTING: u16 = 0x800;
 pub const FX_EFFECT_FAST_OFFSCREEN_UPDATE: u16 = 0x8000;
 
-pub const FX_STATUS_REF_COUNT_MASK: u32 = 0x3fff;
+pub const EMITTER_HOLDER_TALLY_BITS: u32 = 0x3fff;
 pub const FX_STATUS_STALE_ATTACHED: u32 = 0x4000;
 pub const FX_STATUS_BASE_REF_REMOVED: u32 = 0x8000;
 pub const FX_STATUS_PENDING_LOOPING: u32 = 0x1_0000;
@@ -85,12 +85,12 @@ impl FxRunMode {
     /// None for run bits BO2 does not name (0x140, 0x180, 0x1c0).
     #[inline]
     pub fn from_flags(flags: u32) -> Option<Self> {
-        match flags & FX_ELEM_RUN_MASK {
+        match flags & RUN_FRAME_MASK {
             0 => Some(FxRunMode::World),
-            FX_ELEM_RUN_RELATIVE_TO_SPAWN => Some(FxRunMode::Spawn),
-            FX_ELEM_RUN_RELATIVE_TO_EFFECT => Some(FxRunMode::Effect),
-            FX_ELEM_RUN_RELATIVE_TO_OFFSET => Some(FxRunMode::Offset),
-            FX_ELEM_RUN_RELATIVE_TO_OFFSET_EFFECT_NOW => Some(FxRunMode::OffsetEffectNow),
+            RUN_IN_SPAWN_FRAME => Some(FxRunMode::Spawn),
+            RUN_IN_EFFECT_FRAME => Some(FxRunMode::Effect),
+            RUN_IN_OFFSET_FRAME => Some(FxRunMode::Offset),
+            RUN_IN_OFFSET_FRAME_NOW => Some(FxRunMode::OffsetEffectNow),
             _ => None,
         }
     }
@@ -107,7 +107,7 @@ impl FxSpawnOffset {
     /// None when both offset bits are set.
     #[inline]
     pub fn from_flags(flags: u32) -> Option<Self> {
-        match flags & FX_ELEM_SPAWN_OFFSET_MASK {
+        match flags & BIRTH_DISPLACEMENT_BITS {
             0 => Some(FxSpawnOffset::None),
             FX_ELEM_SPAWN_OFFSET_SPHERE => Some(FxSpawnOffset::Sphere),
             FX_ELEM_SPAWN_OFFSET_CYLINDER => Some(FxSpawnOffset::Cylinder),
@@ -118,7 +118,7 @@ impl FxSpawnOffset {
 
 #[inline]
 pub fn status_ref_count(status: u32) -> u32 {
-    status & FX_STATUS_REF_COUNT_MASK
+    status & EMITTER_HOLDER_TALLY_BITS
 }
 
 #[inline]
@@ -139,24 +139,28 @@ pub fn status_locked(status: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::ELEM_DIES_ON_CONTACT;
+    use super::ELEM_RUNNER_RANDOM_ROLL;
+    use super::CULL_AT_BIRTH_BIT;
+    use super::ELEM_HITS_WORLD;
 
     #[test]
     fn collision_bits_moved_up_one() {
-        assert_eq!(FX_ELEM_USE_COLLISION, 0x100 << 1);
-        assert_eq!(FX_ELEM_DIE_ON_TOUCH, 0x200 << 1);
-        assert_eq!(FX_ELEM_RUN_MASK & FX_ELEM_USE_COLLISION, 0);
+        assert_eq!(ELEM_HITS_WORLD, 0x100 << 1);
+        assert_eq!(ELEM_DIES_ON_CONTACT, 0x200 << 1);
+        assert_eq!(RUN_FRAME_MASK & ELEM_HITS_WORLD, 0);
     }
 
     #[test]
     fn elem_flags_do_not_overlap() {
         let all = [
             FX_ELEM_SPAWN_RELATIVE_TO_EFFECT,
-            FX_ELEM_SPAWN_FRUSTUM_CULL,
-            FX_ELEM_RUNNER_USES_RAND_ROT,
-            FX_ELEM_SPAWN_OFFSET_MASK,
-            FX_ELEM_RUN_MASK,
-            FX_ELEM_USE_COLLISION,
-            FX_ELEM_DIE_ON_TOUCH,
+            CULL_AT_BIRTH_BIT,
+            ELEM_RUNNER_RANDOM_ROLL,
+            BIRTH_DISPLACEMENT_BITS,
+            RUN_FRAME_MASK,
+            ELEM_HITS_WORLD,
+            ELEM_DIES_ON_CONTACT,
             FX_ELEM_DRAW_PAST_FOG,
             FX_ELEM_DRAW_WITH_VIEWMODEL,
             FX_ELEM_BLOCK_SIGHT,

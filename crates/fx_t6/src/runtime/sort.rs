@@ -1,11 +1,9 @@
 //! Where a new element goes in the draw order.
 
 /// The squared distance from the camera to a world point.
-pub fn sort_dist_to_cam_sq(camera_origin: [f32; 3], pos_world: [f32; 3]) -> f32 {
-    let dx = camera_origin[0] - pos_world[0];
-    let dy = camera_origin[1] - pos_world[1];
-    let dz = camera_origin[2] - pos_world[2];
-    dx * dx + dy * dy + dz * dz
+pub fn sort_dist_to_cam_sq(camera_origin: [f32; 3], scene_point: [f32; 3]) -> f32 {
+    let [step_along_x, dy, dz] = core::array::from_fn(|k| camera_origin[k] - scene_point[k]);
+    step_along_x * step_along_x + dy * dy + dz * dz
 }
 
 /// Whether an element already in the list is drawn before a new one. Element
@@ -13,23 +11,21 @@ pub fn sort_dist_to_cam_sq(camera_origin: [f32; 3], pos_world: [f32; 3]) -> f32 
 /// the lower sort order goes first, and at equal orders the farther element
 /// goes first.
 pub fn existing_elem_sorts_before_new(
-    existing_elem_type: u8,
-    existing_visual_count: u8,
-    existing_sort_order: u8,
-    existing_dist_to_cam_sq: f32,
-    new_sort_order: u8,
-    new_dist_to_cam_sq: f32,
+    resident_kind: u8,
+    resident_visuals: u8,
+    resident_rank: u8,
+    resident_eye_sq: f32,
+    incoming_rank: u8,
+    incoming_eye_sq: f32,
 ) -> bool {
-    if existing_elem_type > 3 {
-        return true;
+    match (resident_kind, resident_visuals) {
+        (4.., _) => true,
+        (_, 0) => false,
+        _ => match resident_rank.cmp(&incoming_rank) {
+            core::cmp::Ordering::Equal => incoming_eye_sq < resident_eye_sq,
+            order => order.is_lt(),
+        },
     }
-    if existing_visual_count == 0 {
-        return false;
-    }
-    if existing_sort_order != new_sort_order {
-        return existing_sort_order < new_sort_order;
-    }
-    new_dist_to_cam_sq < existing_dist_to_cam_sq
 }
 
 #[cfg(test)]

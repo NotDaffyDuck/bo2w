@@ -2,13 +2,11 @@
 //! function runs over a fixed stream of inputs (edge values plus a seeded generator) and its outputs are folded into
 //! one FNV-1a hash per function. A changed hash means a changed result somewhere, even in the last bit.
 
-use game_math as gm;
-
 /// FNV-1a over the raw bits of every float fed in.
 struct Fold(u64);
 
 impl Fold {
-    fn new() -> Self {
+    fn seeded() -> Self {
         Fold(0xcbf2_9ce4_8422_2325)
     }
     fn f(&mut self, x: f32) {
@@ -64,7 +62,7 @@ impl Stream {
 const ROUNDS: usize = 20_000;
 
 fn hash(seed: u64, mut each: impl FnMut(&mut Stream, &mut Fold)) -> u64 {
-    let (mut input, mut out) = (Stream::new(seed), Fold::new());
+    let (mut input, mut out) = (Stream::new(seed), Fold::seeded());
     for _ in 0..ROUNDS {
         each(&mut input, &mut out);
     }
@@ -74,82 +72,85 @@ fn hash(seed: u64, mut each: impl FnMut(&mut Stream, &mut Fold)) -> u64 {
 /// Every function's hash, in the order of [`EXPECTED`].
 fn hashes() -> [(&'static str, u64); 18] {
     [
-        ("angle_normalize_360", hash(1, |s, o| o.f(gm::angle_normalize_360(s.next())))),
-        ("angle_subtract", hash(2, |s, o| o.f(gm::angle_subtract(s.next(), s.next())))),
+        ("angle_normalize_360", hash(1, |s, o| o.f(game_math::wrap_degrees(s.next())))),
+        ("angle_subtract", hash(2, |s, o| o.f(game_math::degree_gap(s.next(), s.next())))),
         ("angle_vectors", hash(3, |s, o| {
-            let (f, r, u) = gm::angle_vectors(s.three());
+            let (f, r, u) = game_math::euler_basis(s.three());
             o.m([f, r, u]);
         })),
-        ("angles_to_axis", hash(4, |s, o| o.m(gm::angles_to_axis(s.three())))),
+        ("angles_to_axis", hash(4, |s, o| o.m(game_math::euler_to_rows(s.three())))),
         ("axis_to_angles", hash(5, |s, o| {
-            let axis = gm::angles_to_axis(s.three());
-            o.v(gm::axis_to_angles(axis));
-            o.v(gm::axis_to_angles([s.three(), s.three(), s.three()]));
+            let axis = game_math::euler_to_rows(s.three());
+            o.v(game_math::rows_to_euler(axis));
+            o.v(game_math::rows_to_euler([s.three(), s.three(), s.three()]));
         })),
-        ("pitch_for_yaw_on_normal", hash(6, |s, o| o.f(gm::pitch_for_yaw_on_normal(s.next(), s.three())))),
+        ("pitch_for_yaw_on_normal", hash(6, |s, o| o.f(game_math::slope_pitch(s.next(), s.three())))),
         ("snap_angles", hash(7, |s, o| {
             let near = s.three().map(|x| (x * 4.0).round() / 4.0 + x * 1.0e-6);
-            o.v(gm::snap_angles(near));
-            o.v(gm::snap_angles(s.three()));
+            o.v(game_math::round_degrees(near));
+            o.v(game_math::round_degrees(s.three()));
         })),
-        ("track", hash(8, |s, o| o.f(gm::track(s.next(), s.next(), s.next() * 0.01, s.next() * 0.001)))),
+        ("track", hash(8, |s, o| o.f(game_math::ease_toward(s.next(), s.next(), s.next() * 0.01, s.next() * 0.001)))),
         ("track_angle", hash(9, |s, o| {
             // Bounded: the wrap loops step 360 at a time.
             let (a, b) = (s.next().clamp(-5000.0, 5000.0), s.next().clamp(-5000.0, 5000.0));
-            o.f(gm::track_angle(a, b, s.next() * 0.01, s.next() * 0.001));
+            o.f(game_math::ease_angle_toward(a, b, s.next() * 0.01, s.next() * 0.001));
         })),
-        ("vec_to_yaw", hash(10, |s, o| o.f(gm::vec_to_yaw(s.next(), s.next())))),
+        ("vec_to_yaw", hash(10, |s, o| o.f(game_math::heading_of(s.next(), s.next())))),
         ("vect_to_angles", hash(11, |s, o| {
-            o.v(gm::vect_to_angles(s.three()));
+            o.v(game_math::dir_to_euler(s.three()));
             let [x, _, z] = s.three();
-            o.v(gm::vect_to_angles([0.0, 0.0, z]));
-            o.v(gm::vect_to_angles([x, 0.0, 0.0]));
+            o.v(game_math::dir_to_euler([0.0, 0.0, z]));
+            o.v(game_math::dir_to_euler([x, 0.0, 0.0]));
         })),
         ("yaw_vectors_2d", hash(12, |s, o| {
-            let (f, r) = gm::yaw_vectors_2d(s.next());
+            let (f, r) = game_math::flat_basis(s.next());
             o.v(f);
             o.v(r);
         })),
         ("add_lean_to_position", hash(13, |s, o| {
             let lean = if s.next() < 0.0 { 0.0 } else { s.next() };
-            o.v(gm::add_lean_to_position(s.three(), s.next(), lean, s.next(), s.next()));
+            o.v(game_math::lean_offset(s.three(), s.next(), lean, s.next(), s.next()));
         })),
-        ("get_lean_fraction", hash(14, |s, o| o.f(gm::get_lean_fraction(s.next())))),
+        ("get_lean_fraction", hash(14, |s, o| o.f(game_math::lean_amount(s.next())))),
         ("matrix_multiply", hash(15, |s, o| {
-            o.m(gm::matrix_multiply([s.three(), s.three(), s.three()], [s.three(), s.three(), s.three()]));
+            o.m(game_math::axis_product([s.three(), s.three(), s.three()], [s.three(), s.three(), s.three()]));
         })),
         ("matrix_multiply43", hash(16, |s, o| {
-            let (axis, origin) =
-                gm::matrix_multiply43([s.three(), s.three(), s.three()], s.three(), [s.three(), s.three(), s.three()], s.three());
-            o.m(axis);
-            o.v(origin);
+            let first_axis = [s.three(), s.three(), s.three()];
+            let first_origin = s.three();
+            let second_axis = [s.three(), s.three(), s.three()];
+            let second_origin = s.three();
+            let combined = game_math::frame_product(first_axis, first_origin, second_axis, second_origin);
+            o.m(combined.0);
+            o.v(combined.1);
         })),
         ("matrix_transform_vector43", hash(17, |s, o| {
-            o.v(gm::matrix_transform_vector43(s.three(), [s.three(), s.three(), s.three()], s.three()));
+            o.v(game_math::frame_apply(s.three(), [s.three(), s.three(), s.three()], s.three()));
         })),
-        ("vec3_length", hash(18, |s, o| o.f(gm::vec3_length(s.three())))),
+        ("vec3_length", hash(18, |s, o| o.f(game_math::vec3_norm(s.three())))),
     ]
 }
 
 /// Recorded on the code before the rewrite.
 const EXPECTED: [u64; 18] = [
-    0x0ae06f9427935f40, // angle_normalize_360
-    0xee2493737fa7a06b, // angle_subtract
-    0x264bcd350310e456, // angle_vectors
-    0xd53ccdd136418e7e, // angles_to_axis
-    0xb24c604961ad5b9a, // axis_to_angles
-    0xf96acdf533c0568e, // pitch_for_yaw_on_normal
-    0x0effafbe90cf1b2f, // snap_angles
+    0x0ae06f9427935f40, // wrap into 0..360
+    0xee2493737fa7a06b, // signed degree gap
+    0x264bcd350310e456, // forward, right, up from angles
+    0xd53ccdd136418e7e, // angles to a 3x3 frame
+    0xb24c604961ad5b9a, // 3x3 frame back to angles
+    0xf96acdf533c0568e, // pitch on a slope for a heading
+    0x0effafbe90cf1b2f, // angles rounded to whole degrees
     0x8307d4b059347094, // track
-    0xa35fd21ef2a71ff4, // track_angle
-    0x01ed7beff1a25d3a, // vec_to_yaw
-    0x4694638cc7f0b2fe, // vect_to_angles
-    0xaef14a5cc5e7512d, // yaw_vectors_2d
-    0xdd965d1adc819a60, // add_lean_to_position
-    0x154c10bdaed004f8, // get_lean_fraction
-    0x1009ca9cc70fadb0, // matrix_multiply
-    0xd8cdaec82d1c7a5b, // matrix_multiply43
-    0x7fb884c9da656679, // matrix_transform_vector43
+    0xa35fd21ef2a71ff4, // one angle eased toward another
+    0x01ed7beff1a25d3a, // heading of a direction
+    0x4694638cc7f0b2fe, // direction to pitch and yaw
+    0xaef14a5cc5e7512d, // flat forward and right
+    0xdd965d1adc819a60, // eye moved by a lean
+    0x154c10bdaed004f8, // how far the lean has gone
+    0x1009ca9cc70fadb0, // 3x3 times 3x3
+    0xd8cdaec82d1c7a5b, // 4x3 times 4x3
+    0x7fb884c9da656679, // point through a 4x3 frame
     0xe8b1851c5ed758f5, // vec3_length
 ];
 

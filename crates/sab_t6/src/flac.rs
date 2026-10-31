@@ -30,8 +30,6 @@ impl fmt::Display for FlacError {
     }
 }
 
-type Result<T> = std::result::Result<T, FlacError>;
-
 /// `STREAMINFO`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StreamInfo {
@@ -76,16 +74,16 @@ impl<'a> Bits<'a> {
     #[inline]
     fn peek64(&self) -> u64 {
         let byte = self.pos >> 3;
-        let mut buf = [0u8; 8];
+        let mut window = [0u8; 8];
         if byte < self.data.len() {
             let n = (self.data.len() - byte).min(8);
-            buf[..n].copy_from_slice(&self.data[byte..byte + n]);
+            window[..n].copy_from_slice(&self.data[byte..byte + n]);
         }
-        u64::from_be_bytes(buf) << (self.pos & 7)
+        u64::from_be_bytes(window) << (self.pos & 7)
     }
 
     #[inline]
-    fn read(&mut self, n: u32) -> Result<u32> {
+    fn read(&mut self, n: u32) -> Result<u32, FlacError> {
         if n == 0 {
             return Ok(0);
         }
@@ -99,7 +97,7 @@ impl<'a> Bits<'a> {
     }
 
     #[inline]
-    fn read_signed(&mut self, n: u32) -> Result<i32> {
+    fn read_signed(&mut self, n: u32) -> Result<i32, FlacError> {
         if n == 0 {
             return Ok(0);
         }
@@ -110,7 +108,7 @@ impl<'a> Bits<'a> {
 
     /// Zeros up to the next one bit; the one is consumed.
     #[inline]
-    fn read_unary(&mut self) -> Result<u32> {
+    fn read_unary(&mut self) -> Result<u32, FlacError> {
         let mut count = 0u32;
         loop {
             let w = self.peek64();
@@ -180,7 +178,7 @@ fn crc16(data: &[u8]) -> u16 {
 
 /// Read the metadata blocks; returns the stream info and the byte where
 /// the first frame starts.
-pub fn read_stream_info(data: &[u8]) -> Result<(StreamInfo, usize)> {
+pub fn read_stream_info(data: &[u8]) -> Result<(StreamInfo, usize), FlacError> {
     if data.len() < 4 || &data[0..4] != b"fLaC" {
         return Err(FlacError::NotFlac);
     }
@@ -201,7 +199,7 @@ pub fn read_stream_info(data: &[u8]) -> Result<(StreamInfo, usize)> {
             let max_block = b.read(16)? as u16;
             let _min_frame = b.read(24)?;
             let _max_frame = b.read(24)?;
-            let sample_rate = b.read(20)?;
+            let rate_hz = b.read(20)?;
             let channels = b.read(3)? as u16 + 1;
             let bits_per_sample = b.read(5)? + 1;
             let total_hi = u64::from(b.read(4)?);
@@ -211,7 +209,7 @@ pub fn read_stream_info(data: &[u8]) -> Result<(StreamInfo, usize)> {
             info = Some(StreamInfo {
                 min_block,
                 max_block,
-                sample_rate,
+                sample_rate: rate_hz,
                 channels,
                 bits_per_sample,
                 total_samples: (total_hi << 32) | total_lo,
@@ -228,7 +226,7 @@ pub fn read_stream_info(data: &[u8]) -> Result<(StreamInfo, usize)> {
 }
 
 /// Decode a whole FLAC stream.
-pub fn decode_flac(data: &[u8]) -> Result<FlacStream> {
+pub fn decode_flac(data: &[u8]) -> Result<FlacStream, FlacError> {
     let (info, first) = read_stream_info(data)?;
     let channels = usize::from(info.channels);
     let mut samples: Vec<i16> =
@@ -248,7 +246,8 @@ pub fn decode_flac(data: &[u8]) -> Result<FlacStream> {
             }
             return Err(FlacError::BadFrame("no sync code", start));
         }
-        let (block, frame_channels, bps) = decode_frame(&mut bits, &info, &mut chans)?;
+        let FrameShape { samples_per_channel: block, channels: frame_channels, bps } =
+            decode_frame(&mut bits, &info, &mut chans)?;
         // Interleave as 16-bit.
         let shift_down = bps.saturating_sub(16);
         let shift_up = 16u32.saturating_sub(bps);
@@ -260,7 +259,7 @@ pub fn decode_flac(data: &[u8]) -> Result<FlacStream> {
                 } else {
                     v << shift_up
                 };
-                samples.push(s.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+                samples.push(s.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16);
             }
         }
         if let Some(m) = md5.as_mut() {
@@ -272,7 +271,7 @@ pub fn decode_flac(data: &[u8]) -> Result<FlacStream> {
                     md5_bytes.extend_from_slice(&v.to_le_bytes()[..bytes]);
                 }
             }
-            m.update(&md5_bytes);
+            m.feed_bytes(&md5_bytes);
         }
         if info.total_samples != 0 && samples.len() as u64 >= info.total_samples * channels as u64 {
             break;
@@ -290,13 +289,20 @@ pub fn decode_flac(data: &[u8]) -> Result<FlacStream> {
     })
 }
 
-/// One frame into `chans` (per channel, `block` samples each). Returns
-/// (block size, channels, bits per sample).
+/// The shape of one decoded frame.
+struct FrameShape {
+    samples_per_channel: usize,
+    channels: usize,
+    /// Bits per sample.
+    bps: u32,
+}
+
+/// One frame into `chans` (per channel, `block` samples each).
 fn decode_frame(
     bits: &mut Bits<'_>,
     info: &StreamInfo,
     chans: &mut [Vec<i32>],
-) -> Result<(usize, usize, u32)> {
+) -> Result<FrameShape, FlacError> {
     let start = bits.byte_pos();
     let sync = bits.read(14)?;
     if sync != 0x3ffe {
@@ -375,7 +381,7 @@ fn decode_frame(
         }
         decode_subframe(bits, block, sub_bps, out).map_err(|e| match e {
             FlacError::BadFrame(what, _) => FlacError::BadFrame(what, start),
-            other => other,
+            passed_on => passed_on,
         })?;
     }
     bits.align();
@@ -412,10 +418,10 @@ fn decode_frame(
         }
         _ => {}
     }
-    Ok((block, channels, bps))
+    Ok(FrameShape { samples_per_channel: block, channels, bps })
 }
 
-fn decode_subframe(bits: &mut Bits<'_>, block: usize, bps: u32, out: &mut Vec<i32>) -> Result<()> {
+fn decode_subframe(bits: &mut Bits<'_>, frame_samples: usize, bps: u32, out: &mut Vec<i32>) -> Result<(), FlacError> {
     out.clear();
     if bits.read(1)? != 0 {
         return Err(FlacError::BadFrame("subframe padding bit", 0));
@@ -433,44 +439,44 @@ fn decode_subframe(bits: &mut Bits<'_>, block: usize, bps: u32, out: &mut Vec<i3
     match ty {
         0 => {
             let v = bits.read_signed(bps)?;
-            out.resize(block, v);
+            out.resize(frame_samples, v);
         }
         1 => {
-            for _ in 0..block {
+            for _ in 0..frame_samples {
                 out.push(bits.read_signed(bps)?);
             }
         }
         8..=12 => {
             let order = (ty - 8) as usize;
-            if order > block {
+            if order > frame_samples {
                 return Err(FlacError::BadFrame("fixed order over block", 0));
             }
             for _ in 0..order {
                 out.push(bits.read_signed(bps)?);
             }
-            residual(bits, block, order, out)?;
+            residual(bits, frame_samples, order, out)?;
             match order {
                 0 => {}
                 1 => {
-                    for i in 1..block {
+                    for i in 1..frame_samples {
                         out[i] = out[i].wrapping_add(out[i - 1]);
                     }
                 }
                 2 => {
-                    for i in 2..block {
+                    for i in 2..frame_samples {
                         let p = 2 * i64::from(out[i - 1]) - i64::from(out[i - 2]);
                         out[i] = (i64::from(out[i]) + p) as i32;
                     }
                 }
                 3 => {
-                    for i in 3..block {
+                    for i in 3..frame_samples {
                         let p = 3 * i64::from(out[i - 1]) - 3 * i64::from(out[i - 2])
                             + i64::from(out[i - 3]);
                         out[i] = (i64::from(out[i]) + p) as i32;
                     }
                 }
                 _ => {
-                    for i in 4..block {
+                    for i in 4..frame_samples {
                         let p = 4 * i64::from(out[i - 1]) - 6 * i64::from(out[i - 2])
                             + 4 * i64::from(out[i - 3])
                             - i64::from(out[i - 4]);
@@ -481,7 +487,7 @@ fn decode_subframe(bits: &mut Bits<'_>, block: usize, bps: u32, out: &mut Vec<i3
         }
         32..=63 => {
             let order = (ty - 31) as usize;
-            if order > block {
+            if order > frame_samples {
                 return Err(FlacError::BadFrame("lpc order over block", 0));
             }
             for _ in 0..order {
@@ -500,8 +506,8 @@ fn decode_subframe(bits: &mut Bits<'_>, block: usize, bps: u32, out: &mut Vec<i3
             for c in coefs.iter_mut().take(order) {
                 *c = i64::from(bits.read_signed(precision)?);
             }
-            residual(bits, block, order, out)?;
-            for i in order..block {
+            residual(bits, frame_samples, order, out)?;
+            for i in order..frame_samples {
                 let mut sum = 0i64;
                 for (j, c) in coefs.iter().take(order).enumerate() {
                     sum += c * i64::from(out[i - 1 - j]);
@@ -519,7 +525,7 @@ fn decode_subframe(bits: &mut Bits<'_>, block: usize, bps: u32, out: &mut Vec<i3
     Ok(())
 }
 
-fn residual(bits: &mut Bits<'_>, block: usize, order: usize, out: &mut Vec<i32>) -> Result<()> {
+fn residual(bits: &mut Bits<'_>, frame_samples: usize, pred_order: usize, out: &mut Vec<i32>) -> Result<(), FlacError> {
     let method = bits.read(2)?;
     let (param_bits, escape) = match method {
         0 => (4, 15),
@@ -528,15 +534,15 @@ fn residual(bits: &mut Bits<'_>, block: usize, order: usize, out: &mut Vec<i32>)
     };
     let porder = bits.read(4)?;
     let partitions = 1usize << porder;
-    if block % partitions != 0 {
+    if frame_samples % partitions != 0 {
         return Err(FlacError::BadFrame("partition order", 0));
     }
-    let per = block >> porder;
-    if per < order {
+    let per = frame_samples >> porder;
+    if per < pred_order {
         return Err(FlacError::BadFrame("partition shorter than order", 0));
     }
     for p in 0..partitions {
-        let count = if p == 0 { per - order } else { per };
+        let count = if p == 0 { per - pred_order } else { per };
         let param = bits.read(param_bits)?;
         if param == escape {
             let raw = bits.read(5)?;

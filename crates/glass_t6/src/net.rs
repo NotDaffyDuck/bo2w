@@ -10,8 +10,6 @@
 
 use crate::server::{PaneState, ServerPane};
 
-type V3 = [f32; 3];
-
 /// Every glass message ends with this.
 pub const END_MARKER: u16 = 0x75ca;
 /// A delta entry's pane index has 10 bits.
@@ -23,7 +21,7 @@ pub struct PaneUpdate {
     pub pane: u16,
     pub state: PaneState,
     /// Hit position and direction; only a shattered pane carries them.
-    pub hit: Option<(V3, V3)>,
+    pub hit: Option<([f32; 3], [f32; 3])>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,7 +48,7 @@ fn update_of(i: usize, p: &ServerPane) -> PaneUpdate {
     PaneUpdate {
         pane: i as u16,
         state: p.state,
-        hit: (p.state == PaneState::Shattered).then_some((p.hit_pos, p.hit_dir)),
+        hit: (p.state == PaneState::Shattered).then_some((p.impact_point, p.hit_dir)),
     }
 }
 
@@ -66,7 +64,7 @@ pub fn pick(panes: &[ServerPane], since_ms: i32) -> GlassMsg {
     let changed: Vec<PaneUpdate> = panes
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.changed_ms >= since_ms)
+        .filter(|pair| pair.1.changed_ms >= since_ms)
         .map(|(i, p)| update_of(i, p))
         .collect();
     if changed.is_empty() {
@@ -141,16 +139,16 @@ impl Bits {
     }
 }
 
-struct Reader<'a> {
-    data: &'a [u8],
+struct BitCursor<'a> {
+    src_bytes: &'a [u8],
     at: usize,
 }
 
-impl Reader<'_> {
+impl BitCursor<'_> {
     fn get(&mut self, bits: u32) -> Result<u32, NetError> {
         let mut v = 0u32;
         for b in 0..bits {
-            let byte = *self.data.get(self.at / 8).ok_or(NetError::Truncated)?;
+            let byte = *self.src_bytes.get(self.at / 8).ok_or(NetError::Truncated)?;
             v |= u32::from(byte >> (self.at % 8) & 1) << b;
             self.at += 1;
         }
@@ -192,7 +190,7 @@ pub fn encode(msg: &GlassMsg) -> Vec<u8> {
 /// Reads a glass message for a map with `pane_count` panes. Any error
 /// drops the whole message, as BO2 does.
 pub fn decode(data: &[u8], pane_count: usize) -> Result<GlassMsg, NetError> {
-    let mut r = Reader { data, at: 0 };
+    let mut r = BitCursor { src_bytes: data, at: 0 };
     let msg = if r.get(1)? == 0 {
         GlassMsg::NoData
     } else {
@@ -235,7 +233,7 @@ mod tests {
     fn panes(n: usize) -> Vec<ServerPane> {
         (0..n)
             .map(|_| ServerPane {
-                def: PaneDef { max_health: 100.0, ..Default::default() },
+                def: PaneDef { hit_point_ceiling: 100.0, ..PaneDef::default() },
                 health: 100.0,
                 ..Default::default()
             })
@@ -277,7 +275,7 @@ mod tests {
         p[3].state = PaneState::Cracked;
         p[3].changed_ms = 10;
         p[299].state = PaneState::Shattered;
-        p[299].hit_pos = [1.5, -2.0, 64.25];
+        p[299].impact_point = [1.5, -2.0, 64.25];
         p[299].hit_dir = [0.0, 1.0, 0.0];
         p[299].changed_ms = 10;
         for msg in [pick(&p, 0), pick(&p, 5), GlassMsg::NoData] {

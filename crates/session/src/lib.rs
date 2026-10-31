@@ -1,33 +1,33 @@
 //! The client side of a match's life: setting it up from what was loaded,
 //! swapping it for the next, and what the player sees in between.
 
-mod admission;
+mod entry_gate;
 pub mod bo2mp_setup;
-pub mod combat_table;
-pub mod content_manifest;
-pub mod life_front;
-pub mod lifecycle;
+pub mod fight_table;
+pub mod content_ledger;
+pub mod lives;
+pub mod match_cycle;
 pub mod loadout;
-pub mod local_arm;
-pub mod match_apply;
-pub mod plugin;
+pub mod self_arm;
+pub mod match_install;
+pub mod wiring;
 pub mod startup;
-pub mod view_subject;
+pub mod eye_target;
 
 pub use bo2mp_setup::Bo2mpMatchSetup;
-pub use content_manifest::{
-    AuthorityWeaponProfile, ManifestFact, ManifestGap, RuntimeRuleset, SessionContentManifest,
-    SessionManifestError, SessionWeaponId, SessionWeaponManifestRow,
+pub use content_ledger::{
+    HostArmamentLoadout, ManifestEntryState, ContentShortfall, LiveRuleVariant, GameContentLedger,
+    ContentManifestFault, ManifestGunId, ManifestGunEntry,
 };
-pub use life_front::{LifeFrontCensus, LifeNotifyCensus};
-pub use lifecycle::{
-    LiveWorldIdentity, SessionSwapCompletion, SessionSwapRequest, SessionSwapResult,
-    SessionSwapTarget, TeardownGaps, TeardownRequest,
+pub use lives::{SpawnWaveTally, SpawnAlertTally};
+pub use match_cycle::{
+    RunningWorldLabel, HandoverFinish, SessionHandoverOrder, HandoverVerdict,
+    SessionReplacementGoal, ShutdownLeftovers, ShutdownOrder,
 };
 pub use loadout::{
-    AuthoritativeClassProjection, ClassRow, authoritative_class_lock_reason, perk_catalog_id,
-    project_class, resolve_class_weapon,
+    HostLoadoutMirror, ClassRow, host_loadout_lock_cause, class_perk_slots,
+    fill_default_perks, perk_item_number, project_loadout, resolve_class_weapon,
 };
-pub use match_apply::{apply_prepared_match, install_script_model_id};
-pub use plugin::SessionPlugin;
-pub use startup::{PendingConsoleLines, StartupCommands};
+pub use match_install::{install_staged_game, scripted_prop_id};
+pub use wiring::LobbyLifecyclePlugin;
+pub use startup::{StagedConsoleText, BootConsoleScript};

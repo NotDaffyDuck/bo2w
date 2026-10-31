@@ -8,14 +8,15 @@
 //! below him; never one stuck to him, a teammate's (unless friendly fire is
 //! on), in hardcore, or while he looks through a scope.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
-use frame::ClientSet;
-use net::{LocalPresentClient, PresentedProjectile, PresentedSnapshot};
+use frame::ClientStep;
+use net::{HostViewClient, ShownProjectile, ShownWorldFrame};
 
-use crate::layers::{UiLayer, UiLayerVisibility};
+use crate::{MainWindow, ScreenBox};
+use crate::lui_hud::PictureCache;
+use crate::tiers::{OverlayTier, OverlayStackShown};
 
 #[derive(Component)]
 struct Bo2mpGrenadeNode;
@@ -57,10 +58,10 @@ const POINTER: &str = "hud_grenadepointer";
 
 #[derive(Default)]
 struct GrenadeState {
-    pictures: HashMap<String, Handle<Image>>,
+    pictures: PictureCache,
     missing: HashSet<String>,
     /// His last ADS fraction and whether it was rising (zooming in).
-    last_frac: f32,
+    prior_progress: f32,
     to_ads: bool,
     shown: bool,
     logged_at: f64,
@@ -69,17 +70,17 @@ struct GrenadeState {
 #[allow(clippy::too_many_arguments)]
 fn bo2mp_grenade(
     mut commands: Commands,
-    presented: Option<Res<PresentedSnapshot>>,
-    local: Option<Res<LocalPresentClient>>,
+    presented: Option<Res<ShownWorldFrame>>,
+    local: Option<Res<HostViewClient>>,
     icons: Option<Res<assets::T6HudIcons>>,
-    weapons: Option<Res<assets::PreparedWeapons>>,
-    prediction: Option<Res<net::ClientPredictionState>>,
+    weapons: Option<Res<assets::StagedWeapons>>,
+    prediction: Option<Res<net::ClientGuessState>>,
     cg_clock: Option<Res<net::FrameClock>>,
-    mut images: ResMut<Assets<Image>>,
+    mut pics: ResMut<Assets<Image>>,
     time: Res<Time>,
-    window: Query<&Window, With<PrimaryWindow>>,
+    window: MainWindow,
     nodes: Query<Entity, With<Bo2mpGrenadeNode>>,
-    view: Option<Res<frame::ViewSubject>>,
+    view: Option<Res<frame::EyeSubject>>,
     mut st: Local<GrenadeState>,
 ) {
     // Last frame's warning goes; this frame's is drawn fresh.
@@ -101,41 +102,41 @@ fn bo2mp_grenade(
         return;
     }
     // Alive and playing (not dead, spectating or in a killcam).
-    if view.as_deref().is_some_and(|v| v.in_killcam()) {
+    if view.as_deref().is_some_and(|v| v.replaying_final_death()) {
         return;
     }
-    let Some(ps) = p.player(l.0).filter(|ps| ps.health > 0 && ps.pm_type < 2) else {
+    let Some(pstate) = p.player(l.0).filter(|pstate| pstate.health > 0 && pstate.movement_mode < 2) else {
         return;
     };
     // Looking through a scope (a weapon with an overlay, zoomed in past a
     // hundredth): none.
-    if ps.f_weapon_pos_frac > st.last_frac + 1e-4 {
+    if pstate.weapon_raise_fraction > st.prior_progress + 1e-4 {
         st.to_ads = true;
-    } else if ps.f_weapon_pos_frac + 1e-4 < st.last_frac {
+    } else if pstate.weapon_raise_fraction + 1e-4 < st.prior_progress {
         st.to_ads = false;
     }
-    st.last_frac = ps.f_weapon_pos_frac;
+    st.prior_progress = pstate.weapon_raise_fraction;
     let reg = &weapons.0;
-    let held = playerstate_t6::game::get_viewmodel_weapon_index(ps);
-    if let Some(f) = reg.facts_of(held)
-        && (f.overlay_reticle != 0 || reg.overlay_material_of(held).is_some_and(|m| !m.is_empty()))
-        && ps.f_weapon_pos_frac != 0.0
+    let held = playerstate_t6::game::get_viewmodel_weapon_index(pstate);
+    if let Some(f) = reg.summary_for(held)
+        && (f.hud_crosshair_layer != 0 || reg.scope_surface_for(held).is_some_and(|m| !m.is_empty()))
+        && pstate.weapon_raise_fraction != 0.0
     {
-        let frac = if st.to_ads { f.ads_zoom_in_frac } else { f.ads_zoom_out_frac }.max(1e-3);
-        if (ps.f_weapon_pos_frac - (1.0 - frac)) / frac > 0.01 {
+        let frac = if st.to_ads { f.aim_in_share } else { f.aim_out_share }.max(1e-3);
+        if (pstate.weapon_raise_fraction - (1.0 - frac)) / frac > 0.01 {
             return;
         }
     }
 
     let my_team = snapshot.meta.for_client(l.0).map_or(0, |m| m.client_state_team);
     let friendly_fire = dvars.int("bg_friendlyfire").or_else(|| dvars.int("scr_team_fftype")).unwrap_or(0) != 0;
-    let cg_time = cg_clock
+    let scene_clock_ms = cg_clock
         .as_deref()
         .filter(|c| c.started())
         .map(|c| c.time())
         .unwrap_or_else(|| p.tick().map(sim::level_time_ms).unwrap_or(0));
-    let at_time = p.trajectory_time_ms(cg_time);
-    let me = ps.origin;
+    let at_time = p.trajectory_time_ms(scene_clock_ms);
+    let me = pstate.origin;
     // How high the ceiling over him is (traced once, when a grenade above
     // him needs it).
     let mut ceiling: Option<f32> = None;
@@ -143,7 +144,7 @@ fn bo2mp_grenade(
         *ceiling.get_or_insert_with(|| {
             let Some(world) = prediction
                 .as_deref()
-                .filter(|p| p.0.is_armed() && p.0.world().has_world_clip())
+                .filter(|p| p.0.is_forecast_live() && p.0.world().has_static_collision())
                 .map(|p| p.0.world())
             else {
                 return f32::MAX;
@@ -151,26 +152,26 @@ fn bo2mp_grenade(
             let hit = world.trace_world(
                 me,
                 [me[0], me[1], me[2] + CEILING_TRACE],
-                sim::bullet_collision::PLAYER_MINS,
-                sim::bullet_collision::PLAYER_MAXS,
-                sim::bullet_collision::MASK_PLAYER_SOLID,
+                sim::shot_trace::BODY_BOX_LOWER,
+                sim::shot_trace::BODY_BOX_UPPER,
+                sim::shot_trace::PLAYER_BODY_MASK,
             );
             if hit.fraction < 1.0 { hit.fraction * CEILING_TRACE } else { f32::MAX }
         })
     };
 
-    let mut shown: Vec<([f32; 3], String)> = Vec::new();
+    let mut shown = Vec::new();
     for row in p.presented_projectiles() {
         if shown.len() >= MAX_SHOWN {
             break;
         }
         let w = row.weapon();
-        if reg.namespace_of(w) != Some(asset_core::AssetNamespace::T6) {
+        if reg.scope_for(w) != Some(asset_core::AssetCategoryScope::T6) {
             continue;
         }
-        let Some(f) = reg.facts_of(w) else { continue };
+        let Some(f) = reg.summary_for(w) else { continue };
         if !WEAPTYPE_SHOWN.contains(&f.t6_weap_type)
-            || !EXPLOSION_SHOWN.contains(&f.projectile_explosion_type)
+            || !EXPLOSION_SHOWN.contains(&f.shell_blast_kind)
             || !f.timed_detonation
         {
             continue;
@@ -178,13 +179,13 @@ fn bo2mp_grenade(
         // Never one stuck to him (BO2 links it to him); one stuck to
         // someone else shows however it moves.
         let stuck = match row {
-            PresentedProjectile::Authoritative(s) => {
-                if !s.live || s.rider.is_some_and(|r| r.client == l.0) {
+            ShownProjectile::HostDecided(s) => {
+                if !s.in_flight || s.rider.is_some_and(|r| r.client == l.0) {
                     continue;
                 }
                 s.rider.is_some()
             }
-            PresentedProjectile::Predicted { .. } => false,
+            ShownProjectile::Predicted { .. } => false,
         };
         let owner = row.owner();
         if owner != l.0 && my_team != 0 && !friendly_fire {
@@ -193,23 +194,23 @@ fn bo2mp_grenade(
                 continue;
             }
         }
-        // Still flying fast: not yet (a sitting one, TR_STATIONARY, has no
+        // Still flying fast: not yet (one lying still has no
         // speed).
-        let pos = row.pos();
-        let speed2 = if pos.tr_type == 0 { 0.0 } else { pos.tr_delta.iter().map(|v| v * v).sum::<f32>() };
+        let pos = row.path();
+        let speed2 = if pos.tr_type == 0 { 0.0 } else { pos.rate.iter().map(|v| v * v).sum::<f32>() };
         if !stuck && speed2 > MAX_SPEED * MAX_SPEED {
             continue;
         }
-        let at = row.origin_at(at_time);
+        let at = row.point_at(at_time);
         let d = [at[0] - me[0], at[1] - me[1], at[2] - me[2]];
         let range =
-            if f.indicator_radius != 0 { f.indicator_radius as f32 } else { MIN_RANGE.max(f.explosion_radius as f32) };
+            if f.indicator_radius != 0 { f.indicator_radius as f32 } else { MIN_RANGE.max(f.blast_outer_reach as f32) };
         if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > range * range {
             continue;
         }
         if d[2] >= 0.0 {
             if !STICKS_ALL.contains(&f.stickiness)
-                && d[2] > (ps.view_height_current + MAX_HEIGHT).min(roof() + CEILING_SLACK)
+                && d[2] > (pstate.eye_height_now + MAX_HEIGHT).min(roof() + CEILING_SLACK)
             {
                 continue;
             }
@@ -217,7 +218,7 @@ fn bo2mp_grenade(
             continue;
         }
         let icon = reg
-            .reticle_of(w)
+            .crosshair_for(w)
             .and_then(|r| r.indicator_icon.clone())
             .unwrap_or_else(|| DEFAULT_ICON.to_owned());
         shown.push((d, icon));
@@ -229,13 +230,12 @@ fn bo2mp_grenade(
     // Pictures, loaded the first time each is needed.
     if let Some(icons) = icons.as_deref() {
         for name in std::iter::once(POINTER).chain(shown.iter().map(|(_, n)| n.as_str())) {
-            if st.pictures.contains_key(name) || st.missing.contains(name) {
+            if st.pictures.holds(name) || st.missing.contains(name) {
                 continue;
             }
             match icons.0.iter().find(|(n, _)| n == name) {
                 Some((_, image)) => {
-                    let handle = images.add((**image).clone());
-                    st.pictures.insert(name.to_owned(), handle);
+                    st.pictures.keep(name.to_owned(), &pics.add((**image).clone()));
                 }
                 None => {
                     st.missing.insert(name.to_owned());
@@ -248,29 +248,29 @@ fn bo2mp_grenade(
         st.logged_at = now;
         diag::info!(
             Ui,
-            "bo2mp grenade: showing {} {:?}, facing {:.0}, pictures {:?} missing {:?}",
+            "bo2mp grenade: {} on screen {:?}, view yaw {:.0}, pictures {:?}, not found {:?}",
             shown.len(),
             shown.iter().map(|(d, n)| (d.map(|v| v.round()), n.as_str())).collect::<Vec<_>>(),
-            ps.viewangles[1],
+            pstate.look_angles[1],
             st.pictures.keys().collect::<Vec<_>>(),
             st.missing
         );
     }
 
-    let (sw, sh) = window.single().map_or((1920.0, 1080.0), |w| (w.width(), w.height()));
+    let (sw, sh) = window.shown().map_or((1920.0, 1080.0), |w| (w.width(), w.height()));
     let k = sh / 480.0;
     // White, beating (its alpha capped at full).
     let swing = (PULSE_MAX - PULSE_MIN) * 0.5;
-    let alpha = ((f64::from(cg_time) * 0.006_283_185_4 * PULSE_FREQ).sin() * swing + swing + PULSE_MIN).clamp(0.0, 1.0)
+    let alpha = ((f64::from(scene_clock_ms) * 0.006_283_185_4 * PULSE_FREQ).sin() * swing + swing + PULSE_MIN).clamp(0.0, 1.0)
         as f32;
     let pictures = st.pictures.clone();
     let spawn = |commands: &mut Commands, name: &str, node: Node, turn: f32, z: i32| {
-        let Some(handle) = pictures.get(name) else { return };
+        let Some(art) = pictures.kept(name) else { return };
         commands.spawn((
             Bo2mpGrenadeNode,
-            UiLayer::Hud,
-            UiLayerVisibility,
-            ImageNode::new(handle.clone())
+            OverlayTier::Hud,
+            OverlayStackShown,
+            ImageNode::new(art)
                 .with_color(Color::srgba(1.0, 1.0, 1.0, alpha))
                 .with_mode(bevy::ui::widget::NodeImageMode::Stretch),
             UiTransform { rotation: Rot2::radians(turn), ..UiTransform::IDENTITY },
@@ -281,36 +281,32 @@ fn bo2mp_grenade(
     for (d, icon) in &shown {
         // Clockwise from straight up: where it is, as he faces.
         let yaw = if d[0] == 0.0 && d[1] == 0.0 { 0.0 } else { d[1].atan2(d[0]).to_degrees() };
-        let turn = -(yaw - ps.viewangles[1]).rem_euclid(360.0).to_radians();
+        let turn = -(yaw - pstate.look_angles[1]).rem_euclid(360.0).to_radians();
         let off = ICON_OFFSET * k;
         let (px, py) = (sw * 0.5 + turn.sin() * off, sh * 0.5 - turn.cos() * off);
         // The arrow turns about the picture's middle.
         let (mx, my) = (POINTER_MID.0 * k, POINTER_MID.1 * k);
         let (ax, ay) = (px + mx * turn.cos() - my * turn.sin(), py + mx * turn.sin() + my * turn.cos());
         let (w, h) = (POINTER_W * k, POINTER_H * k);
-        let arrow = Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(ax - w * 0.5),
-            top: Val::Px(ay - h * 0.5),
-            width: Val::Px(w),
-            height: Val::Px(h),
-            ..default()
-        };
+        let arrow = ScreenBox {
+            left_px: ax - w * 0.5,
+            top_px: ay - h * 0.5,
+            width_px: w,
+            height_px: h,
+        }.node();
         spawn(&mut commands, POINTER, arrow, turn, -2070);
         let s = ICON_SIZE * k;
-        let picture = Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(px - s * 0.5),
-            top: Val::Px(py - s * 0.5),
-            width: Val::Px(s),
-            height: Val::Px(s),
-            ..default()
-        };
+        let picture = ScreenBox {
+            left_px: px - s * 0.5,
+            top_px: py - s * 0.5,
+            width_px: s,
+            height_px: s,
+        }.node();
         spawn(&mut commands, icon, picture, 0.0, -2060);
     }
     st.shown = true;
 }
 
-pub(crate) fn register_bo2mp_grenade(app: &mut App) {
-    app.add_systems(Update, bo2mp_grenade.in_set(ClientSet::Ui));
+pub(crate) fn register_bo2mp_grenade(host: &mut App) {
+    host.add_systems(Update, bo2mp_grenade.in_set(ClientStep::Ui));
 }

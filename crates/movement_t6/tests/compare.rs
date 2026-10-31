@@ -4,146 +4,149 @@
 //! (It used to set the MW2 frame beside it; that frame is gone.)
 
 use movement_t6::bridge::{
-    AdsFracContext, AdsIntentContext, AirMoveContext, Bo2Feel, CmdScaleWalkContext,
-    CollisionBackend, FlatMantleAnimLength, GroundTraceInput, JumpLaunchContext,
-    MeleeChargeWeaponDelays, MoveBounds, PRONE_LERP_MS, PmoveSingleContext, SprintContext,
-    ViewAngleClamp, WalkMoveContext, ZeroMantleRootDelta,
+    ScopeBlendArgs, ScopeWishArgs, AirborneStepArgs, Bo2Feel, StrideScaleArgs,
+    SolidProbe, FixedClimbClipDuration, SweepAsk, LeapKickoffArgs,
+    LungeGunTimings, HullExtents, PRONE_LERP_MS, OneTickMotionArgs, DashArgs,
+    LookRotationLimit, FootedStepArgs, StillClimbOffset,
 };
-use playerstate_t6::game::{PlayerState, UserCmd};
+use playerstate_t6::game::{AvatarState, InputCommand};
 use trace_t6::Trace;
 
-const SPRINT: u32 = 0x2;
-const PRONE: u32 = 0x100;
-const CROUCH: u32 = 0x200;
-const JUMP: u32 = 0x400;
+mod key {
+    pub const SPRINT: u32 = 0x2;
 
-/// The trace stops this far short of what it hits (the engine's own gap).
-const CLIP_EPSILON: f32 = 0.125;
+    pub const LYING_FLAT: u32 = 0x100;
+    pub const DUCK_BUTTON_BIT: u32 = 0x200;
+    pub const LEAP: u32 = 0x400;
+    pub const ADS: u32 = 0x0800;
+}
 
-/// A solid box, with the surface flags its faces report.
+/// How far short of a face the swept box stops (the engine's own gap).
+const SKIN: f32 = 0.125;
+
+// ---------------------------------------------------------------- the world
+
+/// An axis-aligned block and the surface bits its faces report.
 #[derive(Clone, Copy)]
-struct Solid {
-    mins: [f32; 3],
-    maxs: [f32; 3],
-    surface_flags: u32,
+struct Block {
+    lo: [f32; 3],
+    hi: [f32; 3],
+    flags: u32,
 }
 
-struct World {
-    solids: Vec<Solid>,
+/// What one block does to a sweep.
+enum Touch {
+    /// The sweep begins inside the block (and maybe ends inside it too).
+    Inside { to_the_end: bool },
+    /// The sweep runs into a face at `at` along its path.
+    Face { at: f32, dim: usize, sign: f32 },
+    Clear,
 }
 
-impl World {
-    /// A floor at z = 0 out to 4000 units.
+impl Block {
+    fn touch(&self, src_pt: [f32; 3], dst_pt: [f32; 3], step: [f32; 3], lo_ext: [f32; 3], hi_ext: [f32; 3]) -> Touch {
+        // Minkowski sum: the block grown by the player's box, the player a point.
+        let lo: [f32; 3] = std::array::from_fn(|k| self.lo[k] - hi_ext[k]);
+        let hi: [f32; 3] = std::array::from_fn(|k| self.hi[k] - lo_ext[k]);
+        let holds = |p: [f32; 3]| p.iter().enumerate().all(|(k, &v)| lo[k] < v && v < hi[k]);
+        if holds(src_pt) {
+            return Touch::Inside { to_the_end: holds(dst_pt) };
+        }
+        let mut entry: Option<(f32, usize, f32)> = None;
+        let mut latest = -1.0_f32;
+        let mut exit = 1.0_f32;
+        for k in 0..3 {
+            let d = step[k];
+            if d == 0.0 {
+                let outside = src_pt[k] <= lo[k] || src_pt[k] >= hi[k];
+                if outside {
+                    return Touch::Clear;
+                }
+                continue;
+            }
+            let (near, far, sign) = match d > 0.0 {
+                true => (lo[k], hi[k], -1.0),
+                false => (hi[k], lo[k], 1.0),
+            };
+            let t_near = (near - src_pt[k]) / d;
+            exit = exit.min((far - src_pt[k]) / d);
+            if t_near > latest {
+                latest = t_near;
+                entry = Some((t_near, k, sign));
+            }
+        }
+        match entry {
+            Some((at, dim, sign)) if at <= exit && (0.0..1.0).contains(&at) => Touch::Face { at, dim, sign },
+            _ => Touch::Clear,
+        }
+    }
+}
+
+struct Room(Vec<Block>);
+
+impl Room {
+    /// Flat ground at z = 0, 4000 units out each way.
     fn floor() -> Self {
-        Self {
-            solids: vec![Solid {
-                mins: [-4000.0, -4000.0, -64.0],
-                maxs: [4000.0, 4000.0, 0.0],
-                surface_flags: 0,
-            }],
-        }
+        Room(vec![Block { lo: [-4000.0, -4000.0, -64.0], hi: [4000.0, 4000.0, 0.0], flags: 0 }])
     }
 
-    fn with(mut self, mins: [f32; 3], maxs: [f32; 3], surface_flags: u32) -> Self {
-        self.solids.push(Solid {
-            mins,
-            maxs,
-            surface_flags,
-        });
-        self
+    fn plus(self, lo: [f32; 3], hi: [f32; 3], flags: u32) -> Self {
+        let Room(mut blocks) = self;
+        blocks.push(Block { lo, hi, flags });
+        Room(blocks)
     }
 }
 
-impl movement_t6::Bo2Collision for World {}
+fn strike(at: f32, len: f32, dim: usize, sign: f32, flags: u32) -> Trace {
+    let mut facing = [0.0_f32; 3];
+    facing[dim] = sign;
+    let mut hit = Trace::new();
+    hit.fraction = ((at * len - SKIN) / len).max(0.0);
+    (hit.normal, hit.sflags, hit.cflags) = (facing, flags, 1);
+    hit.impact_category = trace_t6::TraceHitType::Entity;
+    hit.struck_entity_num = trace_t6::ENTITYNUM_WORLD;
+    hit.walkable = dim == 2 && sign >= 0.7;
+    hit
+}
 
-impl CollisionBackend for World {
-    fn trace(&self, input: GroundTraceInput) -> Trace {
-        let delta = [
-            input.end[0] - input.start[0],
-            input.end[1] - input.start[1],
-            input.end[2] - input.start[2],
-        ];
-        let length = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-        let mut best = Trace {
-            fraction: 1.0,
-            ..Trace::default()
-        };
-        let mut start_solid = false;
-        let mut all_solid = false;
-        for solid in &self.solids {
-            // The box grown by the player's own box, swept as a point.
-            let lo = [
-                solid.mins[0] - input.maxs[0],
-                solid.mins[1] - input.maxs[1],
-                solid.mins[2] - input.maxs[2],
-            ];
-            let hi = [
-                solid.maxs[0] - input.mins[0],
-                solid.maxs[1] - input.mins[1],
-                solid.maxs[2] - input.mins[2],
-            ];
-            let inside = |p: [f32; 3]| (0..3).all(|i| p[i] > lo[i] && p[i] < hi[i]);
-            if inside(input.start) {
-                start_solid = true;
-                if inside(input.end) {
-                    all_solid = true;
+impl movement_t6::Bo2Collision for Room {}
+
+impl SolidProbe for Room {
+    fn trace(&self, input: SweepAsk) -> Trace {
+        let step: [f32; 3] = std::array::from_fn(|k| input.end[k] - input.start[k]);
+        let len = step.iter().map(|d| d * d).sum::<f32>().sqrt();
+        let mut nearest: Option<Trace> = None;
+        let (mut began_inside, mut stuck) = (false, false);
+        let (lo, hi) = (input.lo_corner, input.hi_corner);
+        for block in &self.0 {
+            match block.touch(input.start, input.end, step, lo, hi) {
+                Touch::Inside { to_the_end } => {
+                    began_inside = true;
+                    stuck |= to_the_end;
                 }
-                continue;
-            }
-            let mut enter = -1.0_f32;
-            let mut leave = 1.0_f32;
-            let mut axis = 3;
-            let mut sign = 0.0;
-            let mut missed = false;
-            for i in 0..3 {
-                if delta[i] == 0.0 {
-                    if input.start[i] <= lo[i] || input.start[i] >= hi[i] {
-                        missed = true;
-                        break;
+                Touch::Face { at, dim, sign } => {
+                    let t = strike(at, len, dim, sign, block.flags);
+                    if t.fraction < nearest.as_ref().map_or(1.0, |n| n.fraction) {
+                        nearest = Some(t);
                     }
-                    continue;
                 }
-                let (t0, t1, s) = if delta[i] > 0.0 {
-                    ((lo[i] - input.start[i]) / delta[i], (hi[i] - input.start[i]) / delta[i], -1.0)
-                } else {
-                    ((hi[i] - input.start[i]) / delta[i], (lo[i] - input.start[i]) / delta[i], 1.0)
-                };
-                if t0 > enter {
-                    enter = t0;
-                    axis = i;
-                    sign = s;
-                }
-                leave = leave.min(t1);
-            }
-            if missed || axis == 3 || enter > leave || !(0.0..1.0).contains(&enter) {
-                continue;
-            }
-            let fraction = ((enter * length - CLIP_EPSILON) / length).max(0.0);
-            if fraction < best.fraction {
-                let mut normal = [0.0; 3];
-                normal[axis] = sign;
-                best = Trace {
-                    fraction,
-                    normal,
-                    sflags: solid.surface_flags,
-                    cflags: 1,
-                    hit_type: trace_t6::TraceHitType::Entity,
-                    hit_id: trace_t6::ENTITYNUM_WORLD,
-                    walkable: normal[2] >= 0.7,
-                    ..Trace::default()
-                };
+                Touch::Clear => {}
             }
         }
-        if start_solid {
-            best.startsolid = true;
-            best.allsolid = all_solid;
-            if all_solid {
-                best.fraction = 0.0;
+        let clear = Trace::new();
+        let mut out = nearest.unwrap_or(clear);
+        if began_inside {
+            out.starts_inside = true;
+            out.fully_embedded = stuck;
+            if stuck {
+                out.fraction = 0.0_f32;
             }
         }
-        best
+        out
     }
 }
+
+// ---------------------------------------------------------------- the rules
 
 /// bo2mp's multiplayer rules, as the sim builds them from BO2's dvars.
 fn bo2_feel() -> Bo2Feel {
@@ -162,269 +165,294 @@ fn bo2_feel() -> Bo2Feel {
         omni: false,
         mantle_weapon_height: 39.0,
         mantle_weapon_anim_height: 32.0,
-        jump_height: 39.0,
+        leap_height: 39.0_f32,
         ..Bo2Feel::BO2_MP
     }
 }
 
-fn context(old_buttons: u32, old_move: [i8; 2]) -> PmoveSingleContext {
-    let feel = bo2_feel();
-    let air = AirMoveContext {
-        player_spectate_speed_scale: 1.0,
-        shellshock_gravity_scale: 1.0,
-        shellshock_gravity_bias: 0.0,
+const NO_SHOCK_AIR: AirborneStepArgs = AirborneStepArgs {
+    observer_pace_ratio: 1.0,
+    concussed_fall_ratio: 1.0,
+    concussed_fall_offset: 0.0,
+};
+
+fn walk_rules(last_tick_buttons: u32) -> FootedStepArgs {
+    let cmd_scale = StrideScaleArgs {
+        retreat_pace_ratio: 0.7,
+        sidestep_pace_ratio: 0.8,
+        dash_pace_ratio: 1.5,
+        downed_crawl_pace_ratio: 0.15,
+        gun_stride_ratio: 1.0,
+        scoped_carry_pace: 1.0,
+        shellshock_movement_scale: 1.0,
+        prone_lerp_ms: PRONE_LERP_MS,
     };
-    PmoveSingleContext {
-        walk: WalkMoveContext {
-            cmd_scale: CmdScaleWalkContext {
-                player_back_speed_scale: 0.7,
-                player_strafe_speed_scale: 0.8,
-                player_sprint_speed_scale: 1.5,
-                player_last_stand_crawl_speed_scale: 0.15,
-                weapon_move_speed_scale: 1.0,
-                weapon_ads_move_speed_scale: 1.0,
-                shellshock_movement_scale: 1.0,
-                prone_lerp_ms: PRONE_LERP_MS,
-            },
-            weapon_move_scale: 1.0,
-            old_buttons,
-            jump: JumpLaunchContext {
-                jump_height: 39.0,
-                dive: false,
-                crouch_jump_scale: 1.0,
-                jump_ladder_push_vel: 128.0,
-            },
-            air,
-            feel,
-            lunge: None,
+    let jump = LeapKickoffArgs {
+        leap_height: 39.0_f32,
+        dive: Default::default(),
+        squat_leap_ratio: 1.0,
+        rung_kickoff_speed: 128.0,
+    };
+    FootedStepArgs {
+        cmd_scale,
+        gun_carry_pace: 1.0,
+        last_tick_buttons,
+        jump,
+        air: NO_SHOCK_AIR,
+        feel: bo2_feel(),
+        lunge: None,
+    }
+}
+
+fn sprint_rules() -> DashArgs {
+    DashArgs {
+        gun_dash_cap_secs: 4000,
+        endless_dash: false,
+        dash_least_secs: 1.0,
+        dash_warmup_secs: 0.0,
+        dash_thrust_floor: 105,
+        rise_space_free: true,
+        dash_refill_hold_secs: 0.0,
+    }
+}
+
+fn aim_rules() -> (ScopeWishArgs, ScopeBlendArgs) {
+    let intent = ScopeWishArgs {
+        sights_permitted: true,
+        scoped_weapon: false,
+        dash_keeps_scope: false,
+    };
+    let frac = ScopeBlendArgs {
+        scoped_aiming: false,
+        scope_raise_speed: 1.0 / 200.0,
+        scope_lower_speed: 1.0 / 200.0,
+        rack_bolt_when_scoped: true,
+        fire_only_when_scoped: false,
+        ..ScopeBlendArgs::default()
+    };
+    (intent, frac)
+}
+
+/// Everything one move needs, given last frame's buttons and stick.
+fn rules(last_tick_buttons: u32, old_move: [i8; 2]) -> OneTickMotionArgs {
+    let (ads_intent, ads_frac) = aim_rules();
+    OneTickMotionArgs {
+        walk: walk_rules(last_tick_buttons),
+        air: NO_SHOCK_AIR,
+        bounds: HullExtents {
+            lo_corner: [-15.0_f32, -15.0, 0.0],
+            hi_corner: [15.0_f32, 15.0, 70.0],
+            collide_filter: 0x0281_0011,
         },
-        air,
-        bounds: MoveBounds {
-            mins: [-15.0, -15.0, 0.0],
-            maxs: [15.0, 15.0, 70.0],
-            tracemask: 0x0281_0011,
+        look_rotation: LookRotationLimit {
+            tilt_upper_limit: 85.0,
+            tilt_lower_limit: 85.0,
+            free_tilt_flag: false,
         },
-        view_angles: ViewAngleClamp {
-            pitch_up: 85.0,
-            pitch_down: 85.0,
-            unclamped_pitch_bit: false,
-        },
-        sprint: SprintContext {
-            weapon_max_sprint_time: 4000,
-            sprint_forever: false,
-            min_sprint_time_seconds: 1.0,
-            sprint_delay_seconds: 0.0,
-            sprint_forward_minimum: 105,
-            stand_up_clear: true,
-            sprint_recharge_pause_seconds: 0.0,
-        },
-        ads_intent: AdsIntentContext {
-            ads_allowed: true,
-            weapon_def_scope: false,
-            sprint_hold_ads: false,
-        },
-        ads_frac: AdsFracContext {
-            aim_down_sight: false,
-            ads_in_rate: 1.0 / 200.0,
-            ads_out_rate: 1.0 / 200.0,
-            rechamber_while_ads: true,
-            ads_fire_only: false,
-            ..AdsFracContext::default()
-        },
-        melee_charge: MeleeChargeWeaponDelays {
-            melee_delay_ms: 0,
-            melee_charge_delay_ms: 0,
-        },
-        player_melee_range: movement_t6::bridge::MELEE_CHARGE_PLAYER_MELEE_RANGE_DEFAULT,
-        old_buttons,
+        sprint: sprint_rules(),
+        ads_intent,
+        ads_frac,
+        melee_charge: LungeGunTimings::default(),
+        knife_reach: movement_t6::bridge::MELEE_CHARGE_PLAYER_MELEE_RANGE_DEFAULT,
+        last_tick_buttons,
         old_move,
-        weapon_blocks_prone: false,
+        gun_forbids_lying: false,
     }
 }
 
-fn player() -> PlayerState {
-    let mut ps = PlayerState::ZERO;
-    ps.gravity = 800;
-    ps.speed = 190;
-    ps.move_speed_scale_multiplier = 1.0;
-    ps.ground_entity_num = 1022;
-    ps.view_height_target = 60;
-    ps.view_height_current = 60.0;
-    ps.command_time = 1000;
-    ps
-}
-
-/// One frame's keys: forward, right, buttons, yaw in degrees.
-#[derive(Clone, Copy)]
-struct Keys {
-    forward: i8,
-    right: i8,
-    buttons: u32,
-    yaw: f32,
-}
-
-const fn keys(forward: i8, right: i8, buttons: u32) -> Keys {
-    Keys {
-        forward,
-        right,
-        buttons,
-        yaw: 0.0,
+/// A standing player on the ground, 190 speed, 800 gravity.
+fn fresh_player() -> AvatarState {
+    AvatarState {
+        gravity: 800,
+        speed: 190,
+        run_speed_modifier: 1.0,
+        standing_on: 1022,
+        eye_height_goal: 60,
+        eye_height_now: 60.0,
+        last_cmd_ms: 1000,
+        ..AvatarState::ZERO
     }
 }
 
-struct Scenario {
+// ---------------------------------------------------------------- driving
+
+/// Feeds commands to the real frame, carrying last frame's buttons and stick.
+struct Driver<'w> {
+    avatar: AvatarState,
+    room: &'w Room,
+    prev: (u32, [i8; 2]),
+}
+
+impl<'w> Driver<'w> {
+    fn new(room: &'w Room, avatar: AvatarState) -> Self {
+        Driver { avatar, room, prev: (0, [0, 0]) }
+    }
+
+    fn step(&mut self, msec: i32, ahead: i8, lateral: i8, held: u32, yaw: f32) {
+        self.step_with(msec, ahead, lateral, held, yaw, |_| {});
+    }
+
+    fn step_with(&mut self, msec: i32, ahead: i8, lateral: i8, held: u32, yaw: f32, tweak: impl FnOnce(&mut OneTickMotionArgs)) {
+        let mut ucmd = InputCommand {
+            authority_clock_ms: self.avatar.last_cmd_ms + msec,
+            thrust_ahead: ahead,
+            thrust_lateral: lateral,
+            buttons: held,
+            ..InputCommand::default()
+        };
+        ucmd.angles[1] = ((yaw * 65536.0 / 360.0) as i32) & 0xffff;
+        let mut ctx = rules(self.prev.0, self.prev.1);
+        tweak(&mut ctx);
+        movement_t6::pmove(&mut self.avatar, &mut ucmd, ctx, self.room, &FixedClimbClipDuration::default(), &StillClimbOffset);
+        self.prev = (ucmd.buttons, [ucmd.thrust_ahead, ucmd.thrust_lateral]);
+    }
+}
+
+// ---------------------------------------------------------------- the bench
+
+struct Run {
     name: &'static str,
-    world: fn() -> World,
-    start: [f32; 3],
+    room: fn() -> Room,
+    spawn_at: [f32; 3],
     frames: usize,
     msec: i32,
-    keys: fn(usize) -> Keys,
-    setup: fn(&mut PlayerState),
+    script: fn(usize) -> (i8, i8, u32, f32),
+    prep: fn(&mut AvatarState),
 }
 
-fn as_is(_: &mut PlayerState) {}
-
-/// Where a run stood after each frame.
-#[derive(Clone, Copy)]
-struct Sample {
-    origin: [f32; 3],
-    velocity: [f32; 3],
-    pm_flags: u32,
-    ground: bool,
-    view_height: f32,
-}
-
-type Frame = fn(&mut PlayerState, &mut UserCmd, PmoveSingleContext, &World);
-
-fn new_frame(ps: &mut PlayerState, cmd: &mut UserCmd, context: PmoveSingleContext, world: &World) {
-    movement_t6::pmove(
-        ps,
-        cmd,
-        context,
-        world,
-        &FlatMantleAnimLength::default(),
-        &ZeroMantleRootDelta,
-    );
-}
-
-fn run(scenario: &Scenario, frame: Frame) -> Vec<Sample> {
-    let world = (scenario.world)();
-    let mut ps = player();
-    ps.origin = scenario.start;
-    (scenario.setup)(&mut ps);
-    let mut old_buttons = 0;
-    let mut old_move = [0_i8; 2];
-    let mut out = Vec::with_capacity(scenario.frames);
-    for i in 0..scenario.frames {
-        let k = (scenario.keys)(i);
-        let mut cmd = UserCmd {
-            server_time: ps.command_time + scenario.msec,
-            forwardmove: k.forward,
-            rightmove: k.right,
-            buttons: k.buttons,
-            ..UserCmd::default()
-        };
-        cmd.angles[1] = ((k.yaw * 65536.0 / 360.0) as i32) & 0xffff;
-        frame(&mut ps, &mut cmd, context(old_buttons, old_move), &world);
-        old_buttons = cmd.buttons;
-        old_move = [cmd.forwardmove, cmd.rightmove];
-        out.push(Sample {
-            origin: ps.origin,
-            velocity: ps.velocity,
-            pm_flags: ps.pm_flags,
-            ground: ps.ground_entity_num != playerstate_t6::game::ENTITYNUM_NONE,
-            view_height: ps.view_height_current,
-        });
+impl Run {
+    /// On the floor, from the origin, 50 ms frames, the player untouched.
+    fn new(name: &'static str, frames: usize, script: fn(usize) -> (i8, i8, u32, f32)) -> Self {
+        Run { name, room: Room::floor, spawn_at: Default::default(), frames, msec: 50, script, prep: |_| {} }
     }
-    out
+    fn room(self, room: fn() -> Room) -> Self {
+        Run { room, ..self }
+    }
+    fn at(self, at_pos: [f32; 3]) -> Self {
+        Run { spawn_at: at_pos, ..self }
+    }
+    fn msec(self, msec: i32) -> Self {
+        Run { msec, ..self }
+    }
+    fn prep(self, prep: fn(&mut AvatarState)) -> Self {
+        Run { prep, ..self }
+    }
+
+    /// (origin, velocity, movement_state_bits, on ground, view height) after each frame.
+    fn play(&self) -> Vec<([f32; 3], [f32; 3], u32, bool, f32)> {
+        let room = (self.room)();
+        let mut avatar = fresh_player();
+        avatar.origin = self.spawn_at;
+        (self.prep)(&mut avatar);
+        let mut d = Driver::new(&room, avatar);
+        (0..self.frames)
+            .map(|i| {
+                let (f, r, b, yaw) = (self.script)(i);
+                d.step(self.msec, f, r, b, yaw);
+                let p = &d.avatar;
+                let grounded = p.standing_on != playerstate_t6::game::NO_ENTITY_SLOT;
+                (p.origin, p.velocity, p.movement_state_bits, grounded, p.eye_height_now)
+            })
+            .collect()
+    }
 }
 
-fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
-    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+fn wall() -> Room {
+    // A square wall across the path at x = 200; the player meets it at an angle.
+    Room::floor().plus([200.0, -4000.0, 0.0], [264.0, 4000.0, 200.0], 0)
 }
 
-fn walled() -> World {
-    // A wall across the path at x = 200, turned 30 degrees off square would
-    // need a slanted box; a square wall the player meets at an angle does.
-    World::floor().with([200.0, -4000.0, 0.0], [264.0, 4000.0, 200.0], 0)
+fn step16() -> Room {
+    Room::floor().plus([100.0, -4000.0, 0.0], [4000.0, 4000.0, 16.0], 0)
 }
 
-fn stepped() -> World {
-    // A 16-unit step at x = 100.
-    World::floor().with([100.0, -4000.0, 0.0], [4000.0, 4000.0, 16.0], 0)
+fn ledge40() -> Room {
+    Room::floor().plus([60.0, -4000.0, 0.0], [4000.0, 4000.0, 40.0], 0)
 }
 
-fn ledge() -> World {
-    // A 40-unit ledge at x = 60 (a climb).
-    World::floor().with([60.0, -4000.0, 0.0], [4000.0, 4000.0, 40.0], 0)
+fn drop200() -> Room {
+    // A block 200 up that ends at x = 50, the player on top of it.
+    Room::floor().plus([-4000.0, -4000.0, 0.0], [50.0, 4000.0, 200.0], 0)
 }
 
-fn cliff() -> World {
-    // Standing on a block 200 up that ends at x = 50.
-    World::floor().with([-4000.0, -4000.0, 0.0], [50.0, 4000.0, 200.0], 0)
+fn ladder_face() -> Room {
+    // A 300-tall ladder face at x = 30.
+    Room::floor().plus([30.0, -40.0, 0.0], [34.0, 40.0, 300.0], movement_t6::bridge::FLOOR_IS_RUNGS)
 }
 
-fn ladder() -> World {
-    // A ladder face at x = 30, 300 tall.
-    World::floor().with([30.0, -40.0, 0.0], [34.0, 40.0, 300.0], movement_t6::bridge::SURF_LADDER)
-}
-
-fn scenarios() -> Vec<Scenario> {
+fn runs() -> Vec<Run> {
+    use key::*;
+    use playerstate_t6::game::{MOVE_MODE_DOWNED, MOVE_MODE_INTERLUDE, MOVE_MODE_WALK_ATTACHED, MOVE_KIND_DEAD, entity_flag_bits, movement_state_bits};
     vec![
-        Scenario { name: "stand still", world: World::floor, start: [0.0; 3], frames: 40, msec: 50, keys: |_| keys(0, 0, 0), setup: as_is },
-        Scenario { name: "walk forward", world: World::floor, start: [0.0; 3], frames: 40, msec: 50, keys: |_| keys(127, 0, 0), setup: as_is },
-        Scenario { name: "walk 60fps", world: World::floor, start: [0.0; 3], frames: 120, msec: 16, keys: |_| keys(127, 0, 0), setup: as_is },
-        Scenario { name: "strafe right", world: World::floor, start: [0.0; 3], frames: 40, msec: 50, keys: |_| keys(0, 127, 0), setup: as_is },
-        Scenario { name: "diagonal", world: World::floor, start: [0.0; 3], frames: 40, msec: 50, keys: |_| keys(127, 127, 0), setup: as_is },
-        Scenario { name: "back", world: World::floor, start: [0.0; 3], frames: 40, msec: 50, keys: |_| keys(-127, 0, 0), setup: as_is },
-        Scenario { name: "walk then stop", world: World::floor, start: [0.0; 3], frames: 40, msec: 50, keys: |i| keys(if i < 20 { 127 } else { 0 }, 0, 0), setup: as_is },
-        Scenario { name: "sprint", world: World::floor, start: [0.0; 3], frames: 80, msec: 50, keys: |_| keys(127, 0, SPRINT), setup: as_is },
-        Scenario { name: "sprint strafe", world: World::floor, start: [0.0; 3], frames: 40, msec: 50, keys: |_| keys(127, 127, SPRINT), setup: as_is },
-        Scenario { name: "jump standing", world: World::floor, start: [0.0; 3], frames: 30, msec: 50, keys: |i| keys(0, 0, if i == 2 { JUMP } else { 0 }), setup: as_is },
-        Scenario { name: "running jump", world: World::floor, start: [0.0; 3], frames: 40, msec: 50, keys: |i| keys(127, 0, if i == 10 { JUMP } else { 0 }), setup: as_is },
-        Scenario { name: "jump twice", world: World::floor, start: [0.0; 3], frames: 60, msec: 50, keys: |i| keys(127, 0, if i == 10 || i == 30 { JUMP } else { 0 }), setup: as_is },
-        Scenario { name: "crouch walk", world: World::floor, start: [0.0; 3], frames: 40, msec: 50, keys: |_| keys(127, 0, CROUCH), setup: as_is },
-        Scenario { name: "prone crawl", world: World::floor, start: [0.0; 3], frames: 80, msec: 50, keys: |i| keys(if i > 30 { 127 } else { 0 }, 0, if i >= 1 { PRONE } else { 0 }), setup: as_is },
-        Scenario { name: "dive", world: World::floor, start: [0.0; 3], frames: 60, msec: 50, keys: |i| keys(127, 0, if i >= 15 { PRONE } else { SPRINT }), setup: as_is },
-        Scenario { name: "wall at an angle", world: walled, start: [0.0; 3], frames: 40, msec: 50, keys: |_| Keys { forward: 127, right: 0, buttons: 0, yaw: 30.0 }, setup: as_is },
-        Scenario { name: "step up 16", world: stepped, start: [0.0; 3], frames: 30, msec: 50, keys: |_| keys(127, 0, 0), setup: as_is },
-        Scenario { name: "ledge 40 + jump", world: ledge, start: [0.0; 3], frames: 40, msec: 50, keys: |i| keys(127, 0, if i == 8 { JUMP } else { 0 }), setup: as_is },
-        Scenario { name: "walk off 200", world: cliff, start: [0.0, 0.0, 200.0], frames: 40, msec: 50, keys: |_| keys(127, 0, 0), setup: as_is },
-        Scenario { name: "turning walk", world: World::floor, start: [0.0; 3], frames: 60, msec: 50, keys: |i| Keys { forward: 127, right: 0, buttons: 0, yaw: i as f32 * 6.0 }, setup: as_is },
-        Scenario { name: "ladder", world: ladder, start: [0.0; 3], frames: 60, msec: 50, keys: |_| keys(127, 0, 0), setup: as_is },
-        Scenario { name: "dead slide", world: World::floor, start: [0.0; 3], frames: 20, msec: 50, keys: |_| keys(127, 0, 0), setup: |ps| { ps.pm_type = playerstate_t6::game::PM_TYPE_DEAD; ps.velocity = [300.0, 0.0, 0.0]; } },
-        Scenario { name: "last stand crawl", world: World::floor, start: [0.0; 3], frames: 40, msec: 50, keys: |_| keys(127, 0, 0), setup: |ps| { ps.pm_type = playerstate_t6::game::PM_TYPE_LAST_STAND; ps.pm_flags = playerstate_t6::game::pm_flags::PRONE; } },
-        Scenario { name: "linked", world: World::floor, start: [0.0, 0.0, 50.0], frames: 20, msec: 50, keys: |_| keys(127, 0, 0), setup: |ps| { ps.pm_type = playerstate_t6::game::PM_TYPE_NORMAL_LINKED; ps.velocity = [100.0, 0.0, 0.0]; } },
-        Scenario { name: "on a turret", world: World::floor, start: [0.0; 3], frames: 20, msec: 50, keys: |_| keys(127, 0, 0), setup: |ps| { ps.e_flags = 0x400; } },
-        Scenario { name: "end of match", world: World::floor, start: [0.0; 3], frames: 20, msec: 50, keys: |_| keys(127, 0, 0), setup: |ps| { ps.pm_type = playerstate_t6::game::PM_TYPE_INTERMISSION; ps.velocity = [100.0, 0.0, 0.0]; } },
-        Scenario { name: "noclip", world: World::floor, start: [0.0, 0.0, 50.0], frames: 20, msec: 50, keys: |_| keys(127, 0, 0), setup: |ps| { ps.pm_type = movement_t6::bridge::ufo::PM_TYPE_NOCLIP; } },
+        Run::new("stand still", 40, |_| (0, 0, 0, 0.0)),
+        Run::new("walk forward", 40, |_| (127, 0, 0, 0.0)),
+        Run::new("walk 60fps", 120, |_| (127, 0, 0, 0.0)).msec(16),
+        Run::new("strafe right", 40, |_| (0, 127, 0, 0.0)),
+        Run::new("diagonal", 40, |_| (127, 127, 0, 0.0)),
+        Run::new("back", 40, |_| (-127, 0, 0, 0.0)),
+        Run::new("walk then stop", 40, |i| (if i < 20 { 127 } else { 0 }, 0, 0, 0.0)),
+        Run::new("sprint", 80, |_| (127, 0, SPRINT, 0.0)),
+        Run::new("sprint strafe", 40, |_| (127, 127, SPRINT, 0.0)),
+        Run::new("jump standing", 30, |i| (0, 0, if i == 2 { LEAP } else { 0 }, 0.0)),
+        Run::new("running jump", 40, |i| (127, 0, if i == 10 { LEAP } else { 0 }, 0.0)),
+        Run::new("jump twice", 60, |i| (127, 0, if matches!(i, 10 | 30) { LEAP } else { 0 }, 0.0)),
+        Run::new("crouch walk", 40, |_| (127, 0, DUCK_BUTTON_BIT, 0.0)),
+        Run::new("prone crawl", 80, |i| (if i > 30 { 127 } else { 0 }, 0, if i == 0 { 0 } else { LYING_FLAT }, 0.0)),
+        Run::new("dive", 60, |i| (127, 0, if i < 15 { SPRINT } else { LYING_FLAT }, 0.0)),
+        Run::new("wall at an angle", 40, |_| (127, 0, 0, 30.0)).room(wall),
+        Run::new("step up 16", 30, |_| (127, 0, 0, 0.0)).room(step16),
+        Run::new("ledge 40 + jump", 40, |i| (127, 0, if i == 8 { LEAP } else { 0 }, 0.0)).room(ledge40),
+        Run::new("walk off 200", 40, |_| (127, 0, 0, 0.0)).room(drop200).at([0.0, 0.0, 200.0]),
+        Run::new("turning walk", 60, |i| (127, 0, 0, i as f32 * 6.0)),
+        Run::new("ladder", 60, |_| (127, 0, 0, 0.0)).room(ladder_face),
+        Run::new("dead slide", 20, |_| (127, 0, 0, 0.0)).prep(|avatar| {
+            avatar.movement_mode = MOVE_KIND_DEAD;
+            avatar.velocity = [300.0, 0.0, 0.0];
+        }),
+        Run::new("last stand crawl", 40, |_| (127, 0, 0, 0.0)).prep(|avatar| {
+            avatar.movement_mode = MOVE_MODE_DOWNED;
+            avatar.movement_state_bits = movement_state_bits::LYING_FLAT;
+        }),
+        Run::new("linked", 20, |_| (127, 0, 0, 0.0)).at([0.0, 0.0, 50.0]).prep(|avatar| {
+            avatar.movement_mode = MOVE_MODE_WALK_ATTACHED;
+            avatar.velocity = [100.0, 0.0, 0.0];
+        }),
+        Run::new("on a turret", 20, |_| (127, 0, 0, 0.0)).prep(|avatar| avatar.e_flags = entity_flag_bits::TURRET_STAND),
+        Run::new("end of match", 20, |_| (127, 0, 0, 0.0)).prep(|avatar| {
+            avatar.movement_mode = MOVE_MODE_INTERLUDE;
+            avatar.velocity = [100.0, 0.0, 0.0];
+        }),
+        Run::new("noclip", 20, |_| (127, 0, 0, 0.0))
+            .at([0.0, 0.0, 50.0])
+            .prep(|avatar| avatar.movement_mode = movement_t6::bridge::ufo::PM_TYPE_NOCLIP),
     ]
 }
 
 #[test]
 fn bench() {
-    println!(
-        "{:<18} {:>16} {:>8} {:>6} {:>6}",
-        "scenario", "end x,z", "max_vel", "ground", "view"
-    );
-    for scenario in scenarios() {
-        let new = run(&scenario, new_frame);
-        let mut max_vel = 0.0_f32;
-        for b in &new {
-            assert!(b.origin.iter().chain(&b.velocity).all(|v| v.is_finite()), "{}: not finite", scenario.name);
-            max_vel = max_vel.max(distance([0.0; 3], b.velocity));
+    let trace_name = std::env::var("BENCH_TRACE").ok();
+    println!("{:<18} {:>16} {:>8} {:>6} {:>6}", "scenario", "end x,z", "max_vel", "ground", "view");
+    for run in runs() {
+        let frames = run.play();
+        let mut fastest = 0.0_f32;
+        let mut grounded = 0;
+        for (spot, motion_vec, _, ground, _) in &frames {
+            let finite = spot.iter().chain(motion_vec.iter()).all(|v| v.is_finite());
+            assert!(finite, "{}: not finite", run.name);
+            let speed = (motion_vec[0].powi(2) + motion_vec[1].powi(2) + motion_vec[2].powi(2)).sqrt();
+            fastest = fastest.max(speed);
+            grounded += usize::from(*ground);
         }
-        let end = new.last().map_or(String::new(), |s| format!("{:.1},{:.1}", s.origin[0], s.origin[2]));
-        let ground = new.iter().filter(|s| s.ground).count();
-        let view = new.last().map_or(0.0, |s| s.view_height);
-        println!("{:<18} {:>16} {:>8.2} {:>6} {:>6.1}", scenario.name, end, max_vel, ground, view);
-        if std::env::var("BENCH_TRACE").is_ok_and(|v| v == scenario.name) {
-            for (i, b) in new.iter().enumerate() {
-                println!(
-                    "  {i:>3} o={:?} v={:?} f={:#x} g={} vh={:.1}",
-                    b.origin, b.velocity, b.pm_flags, b.ground, b.view_height
-                );
-            }
+        let (end, view) = match frames.last() {
+            Some((o, _, _, _, vh)) => (format!("{:.1},{:.1}", o[0], o[2]), *vh),
+            None => (String::new(), 0.0),
+        };
+        println!("{:<18} {:>16} {:>8.2} {:>6} {:>6.1}", run.name, end, fastest, grounded, view);
+        if trace_name.as_deref() != Some(run.name) {
+            continue;
+        }
+        for (i, (o, v, f, g, vh)) in frames.iter().enumerate() {
+            println!("  {i:>3} o={o:?} v={v:?} f={f:#x} g={g} vh={vh:.1}");
         }
     }
 }
@@ -434,102 +462,145 @@ fn bench() {
 /// aiming while climbing), not a frame later.
 #[test]
 fn the_frame_a_climb_starts_lets_go_of_the_aim() {
-    use playerstate_t6::game::pm_flags::{ADS_INTENT, MANTLE, WALKING};
-    const ADS: u32 = 0x800;
-    // The 40-unit ledge, its face climbable onto (BO2's mantle-on bit).
-    let world = World::floor().with([60.0, -4000.0, 0.0], [4000.0, 4000.0, 40.0], 0x0200_0000);
-    let mut ps = player();
-    let mut old_buttons = 0;
-    let mut old_move = [0_i8; 2];
-    let mut climb = None;
-    for i in 0..60 {
-        let buttons = ADS | if ps.origin[0] >= 25.0 { JUMP } else { 0 };
-        let mut cmd = UserCmd {
-            server_time: ps.command_time + 50,
-            forwardmove: 127,
-            buttons,
-            ..UserCmd::default()
-        };
+    use playerstate_t6::game::movement_state_bits::{ADS_INTENT, MANTLE, WALKING};
+    // The 40-unit ledge with BO2's mantle-on bit on its faces.
+    let room = Room::floor().plus([60.0, -4000.0, 0.0], [4000.0, 4000.0, 40.0], 0x0200_0000);
+    let mut d = Driver::new(&room, fresh_player());
+    let started = (0..60).find_map(|i| {
+        let jump = if d.avatar.origin[0] >= 25.0 { key::LEAP } else { 0 };
+        let aiming_before = d.avatar.movement_state_bits & ADS_INTENT != 0;
         // The sim refuses the aim once the player is climbing (PM_IsAdsAllowed).
-        let mut ctx = context(old_buttons, old_move);
-        ctx.ads_intent.ads_allowed = ps.pm_flags & MANTLE == 0;
-        let aimed = ps.pm_flags & ADS_INTENT != 0;
-        new_frame(&mut ps, &mut cmd, ctx, &world);
-        old_buttons = cmd.buttons;
-        old_move = [cmd.forwardmove, cmd.rightmove];
-        if ps.pm_flags & MANTLE != 0 {
-            climb = Some((i, aimed));
-            break;
-        }
-    }
-    let (frame, aimed) = climb.expect("the climb never started");
-    assert!(aimed, "frame {frame}: not aiming before the climb");
-    assert_eq!(ps.pm_flags & (ADS_INTENT | WALKING), 0, "frame {frame}: {:#x}", ps.pm_flags);
+        let climbing = d.avatar.movement_state_bits & MANTLE != 0;
+        d.step_with(50, 127, 0, key::ADS | jump, 0.0, |ctx| ctx.ads_intent.sights_permitted = !climbing);
+        (d.avatar.movement_state_bits & MANTLE != 0).then_some((i, aiming_before))
+    });
+    let Some((frame, aiming_before)) = started else { panic!("the climb never started") };
+    assert!(aiming_before, "frame {frame}: not aiming before the climb");
+    let left = d.avatar.movement_state_bits & (ADS_INTENT | WALKING);
+    assert_eq!(left, 0, "frame {frame}: {:#x}", d.avatar.movement_state_bits);
 }
 
-/// The client's stance latch as the game keeps it: the crouch toggle sets
-/// it, and the predicted state's stance events (BO2's 8 stand, 9 crouch,
-/// 10 prone) overwrite it before the next move is built, as BO2's client does.
-fn down_then_sprint(prone: bool) -> Vec<(u32, f32)> {
-    const SPRINT: u32 = 0x2;
-    const CROUCH: u32 = 0x200;
-    const PRONE: u32 = 0x100;
-    let world = World::floor();
-    let mut ps = player();
-    let (flags, view, mut latch) = if prone {
-        (playerstate_t6::game::pm_flags::PRONE, 11, PRONE)
-    } else {
-        (playerstate_t6::game::pm_flags::CROUCH, 40, CROUCH)
-    };
-    ps.pm_flags = flags;
-    ps.view_height_target = view;
-    ps.view_height_current = view as f32;
-    let mut seen = ps.predictable_event_sequence;
-    let mut pending: Vec<(usize, i32)> = Vec::new();
-    let mut old_buttons = 0;
-    let mut old_move = [0_i8; 2];
-    let mut out = Vec::new();
+/// Crouched or prone, then holding sprint from frame 5. The client's stance
+/// latch is kept as the game keeps it: the toggle sets it, and the predicted
+/// stance events (BO2's 8 stand, 9 crouch, 10 prone) overwrite it before the
+/// next move is built, one frame after they are raised.
+fn crouched_then_sprint(prone: bool) -> Vec<(u32, f32)> {
+    use entity_t6::event::{STANCE_FORCE_CROUCH, STANCE_FORCE_PRONE, STANCE_FORCE_STAND};
+    use playerstate_t6::game::movement_state_bits;
+    let room = Room::floor();
+    let mut avatar = fresh_player();
+    let mut latch = if prone { key::LYING_FLAT } else { key::DUCK_BUTTON_BIT };
+    avatar.movement_state_bits = if prone { movement_state_bits::LYING_FLAT } else { movement_state_bits::DUCK_BUTTON_BIT };
+    avatar.eye_height_goal = if prone { 11 } else { 40 };
+    avatar.eye_height_now = avatar.eye_height_goal as f32;
+    let mut d = Driver::new(&room, avatar);
+    let mut receipt_confirmed = d.avatar.predictable_event_sequence;
+    // Events raised last frame, oldest first; they land before this frame's move.
+    let mut landing: Vec<i32> = Vec::new();
+    let mut out = Vec::with_capacity(30);
     for i in 0..30 {
-        for &(_, ev) in pending.iter().filter(|(at, _)| *at <= i) {
-            use entity_t6::event::{STANCE_FORCE_CROUCH, STANCE_FORCE_PRONE, STANCE_FORCE_STAND};
-            latch = match u8::try_from(ev) {
-                Ok(STANCE_FORCE_STAND) => 0,
-                Ok(STANCE_FORCE_CROUCH) => CROUCH,
-                Ok(STANCE_FORCE_PRONE) => PRONE,
-                _ => latch,
-            };
+        for ev in landing.drain(..) {
+            match u8::try_from(ev) {
+                Ok(STANCE_FORCE_STAND) => latch = 0,
+                Ok(STANCE_FORCE_CROUCH) => latch = key::DUCK_BUTTON_BIT,
+                Ok(STANCE_FORCE_PRONE) => latch = key::LYING_FLAT,
+                _ => {}
+            }
         }
-        pending.retain(|(at, _)| *at > i);
-        let mut cmd = UserCmd {
-            server_time: ps.command_time + 16,
-            forwardmove: 127,
-            buttons: latch | if i >= 5 { SPRINT } else { 0 },
-            ..UserCmd::default()
-        };
-        new_frame(&mut ps, &mut cmd, context(old_buttons, old_move), &world);
-        old_buttons = cmd.buttons;
-        old_move = [cmd.forwardmove, cmd.rightmove];
-        let events = [ps.predictable_events[0], ps.predictable_events[1], ps.predictable_events[2], ps.predictable_events[3]];
-        let fresh = ps.predictable_event_sequence.wrapping_sub(seen).clamp(0, 4);
-        for age in (0..fresh).rev() {
-            let seq = ps.predictable_event_sequence.wrapping_sub(1 + age);
-            pending.push((i + 1, events[(seq & 3) as usize]));
-        }
-        seen = ps.predictable_event_sequence;
-        out.push((ps.pm_flags, ps.view_height_current));
+        let sprint = if i < 5 { 0 } else { key::SPRINT };
+        d.step(16, 127, 0, latch | sprint, 0.0);
+        let seq = d.avatar.predictable_event_sequence;
+        let new_count = seq.wrapping_sub(receipt_confirmed).clamp(0, 4);
+        landing.extend((1..=new_count).rev().map(|back| d.avatar.predictable_events[(seq.wrapping_sub(back) & 3) as usize]));
+        receipt_confirmed = seq;
+        out.push((d.avatar.movement_state_bits, d.avatar.eye_height_now));
     }
     out
 }
 
 #[test]
 fn crouched_the_sprint_key_stands_and_sprints_at_once() {
-    use playerstate_t6::game::pm_flags::{CROUCH, PRONE, SPRINTING};
+    use playerstate_t6::game::movement_state_bits::{DUCK_BUTTON_BIT, LYING_FLAT, SPRINTING};
     for prone in [false, true] {
-        for (i, (flags, view)) in down_then_sprint(prone).iter().enumerate().skip(5) {
-            assert!(
-                flags & SPRINTING != 0 && flags & (CROUCH | PRONE) == 0,
-                "prone {prone} frame {i}: flags {flags:#x} view {view}"
-            );
+        let frames = crouched_then_sprint(prone);
+        for (i, &(flags, view)) in frames.iter().enumerate().skip(5) {
+            let sprinting_upright = flags & SPRINTING != 0 && flags & (DUCK_BUTTON_BIT | LYING_FLAT) == 0;
+            assert!(sprinting_upright, "prone {prone} frame {i}: flags {flags:#x} view {view}");
         }
+    }
+}
+
+/// One dive at full sprint, 10 ms frames: sprint 750 ms, press prone and
+/// hold it, let it go at `release_ms` after the press. Returns, per frame,
+/// (time since the press, origin, movement bits, view height).
+fn dive_then_get_up(room: &Room, release_ms: i32) -> Vec<(i32, [f32; 3], u32, f32)> {
+    let mut d = Driver::new(room, fresh_player());
+    let mut out = Vec::new();
+    for i in 0..400 {
+        let t = (i - 75) * 10;
+        let held = if t < 0 { key::SPRINT } else if t < release_ms { key::LYING_FLAT } else { 0 };
+        d.step(10, 127, 0, held, 0.0);
+        out.push((t, d.avatar.origin, d.avatar.movement_state_bits, d.avatar.eye_height_now));
+    }
+    out
+}
+
+/// The dive's times and heights beside BO2's own (bg_dtp.cpp and
+/// PM_GetViewHeightLerpTime): the take-off rises to a jump's height (39) and
+/// hangs there until 400 ms after take-off (dtp_max_apex_duration), the slide
+/// lasts 300 ms from touch-down (dtp_max_slide_duration), and getting up from
+/// prone takes 400 ms to crouch and 200 ms more to stand, 600 ms in all.
+/// Run with `--nocapture` for the numbers.
+#[test]
+fn a_dive_rises_slides_and_gets_up_at_bo2s_times() {
+    use movement_t6::dive::{PMF_DIVE, PMF_DIVE_PRONE};
+    let room = Room::floor();
+    let frames = dive_then_get_up(&room, 1500);
+    let first = |pred: &dyn Fn(&(i32, [f32; 3], u32, f32)) -> bool| frames.iter().find(|f| pred(f)).map(|f| f.0);
+    let takeoff = first(&|f| f.2 & PMF_DIVE != 0).expect("no dive");
+    let apex = frames.iter().map(|f| f.1[2]).fold(0.0_f32, f32::max);
+    // While the dive hangs, each frame starts at rest, so it sinks the same
+    // small step every frame; the fall begins on the first frame whose drop
+    // is bigger than the one before.
+    let drops: Vec<(i32, f32)> = frames.windows(2).filter(|w| w[1].0 > takeoff + 100).map(|w| (w[1].0, w[0].1[2] - w[1].1[2])).collect();
+    let falls = drops.windows(2).find(|w| w[1].1 > w[0].1 + 0.01).map(|w| w[1].0).expect("no fall");
+    // The body rests a hair above the floor (the ground trace's gap).
+    let touchdown = first(&|f| f.0 > takeoff && f.1[2] <= 0.2).expect("no touch-down");
+    let slide_end = first(&|f| f.2 & PMF_DIVE_PRONE != 0).expect("no slide end");
+    let lying = first(&|f| f.3 <= 11.0).expect("never lay flat");
+    let crouched = first(&|f| f.0 >= 1500 && f.3 >= 40.0).expect("never crouched");
+    let standing = first(&|f| f.0 >= 1500 && f.3 >= 60.0).expect("never stood");
+    println!("dive (ours vs BO2):");
+    println!("  take-off at {takeoff} ms after the prone press");
+    println!("  apex {apex:.1} units (BO2: jump height 39)");
+    println!("  holds the apex until {} ms after take-off (BO2: 400)", falls - takeoff);
+    println!("  touch-down {} ms after take-off", touchdown - takeoff);
+    println!("  slide {} ms from touch-down (BO2: up to 300)", slide_end - touchdown);
+    println!("  view flat (11) {} ms after take-off", lying - takeoff);
+    println!("  get-up: crouch view at +{} ms (BO2: 400), standing at +{} ms (BO2: 600)", crouched - 1500, standing - 1500);
+    // Capped at a jump's height from the start of each frame, so the
+    // take-off frame that crosses it overshoots by up to one frame's rise.
+    assert!((39.0..=39.0 + 5.0).contains(&apex), "apex {apex}");
+    assert!((390..=410).contains(&(falls - takeoff)), "apex hold {}", falls - takeoff);
+    assert!((290..=310).contains(&(slide_end - touchdown)), "slide {}", slide_end - touchdown);
+    assert!((390..=410).contains(&(crouched - 1500)), "crouch {}", crouched - 1500);
+    assert!((590..=610).contains(&(standing - 1500)), "stand {}", standing - 1500);
+}
+
+/// Diving at a low box: one under a jump's height (39) is dived over, as in
+/// BO2, where the dive rises to that height and hangs there; a taller one
+/// stops the dive at its face.
+#[test]
+fn a_dive_goes_over_a_low_box_and_not_a_tall_one() {
+    // The player reaches about x = 196 at the prone press and is at the
+    // dive's top by x = 222; the box is 30 deep.
+    for (top, over) in [(24.0_f32, true), (36.0, true), (48.0, false)] {
+        let room = Room::floor().plus([240.0, -4000.0, 0.0], [270.0, 4000.0, top], 0);
+        let frames = dive_then_get_up(&room, 1500);
+        let at_press = frames.iter().find(|f| f.0 == 0).map(|f| f.1[0]).unwrap_or_default();
+        let furthest = frames.iter().map(|f| f.1[0]).fold(f32::MIN, f32::max);
+        let highest = frames.iter().filter(|f| f.1[0] > 230.0 && f.1[0] < 280.0).map(|f| f.1[2]).fold(0.0_f32, f32::max);
+        println!("box {top} tall at x 240..270: press at x {at_press:.0}, furthest x {furthest:.0}, highest over it {highest:.1}");
+        assert_eq!(furthest > 270.0, over, "box {top}: furthest {furthest}");
     }
 }

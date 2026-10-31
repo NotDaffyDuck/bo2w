@@ -1,17 +1,17 @@
 [package]
 name = "asset_audio"
 version = "0.1.0"
+description = "Black Ops II sound for a match: alias tables, the catalog that finds them, bank files and what a map's scripts place."
 edition.workspace = true
-license.workspace = true
-description = "Sound aliases, banks, decoded samples and the sound facts of a map."
-
-[dependencies]
-asset_core.workspace = true
-asset_t6.workspace = true
-asset_transport.workspace = true
-bevy.workspace = true
-diag.workspace = true
-sab_t6.workspace = true
+publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+bevy.workspace = true
+asset_t6 = { path = "../asset_t6" }
+sab_t6 = { path = "../sab_t6" }
+asset_core = { path = "../asset_core" }
+asset_transport = { path = "../asset_transport" }
+diag = { path = "../diag" }

@@ -5,7 +5,7 @@
 
 /// One player's movement and weapon state after a server tick.
 #[inline]
-pub fn player_tick(
+pub fn avatar_step_mark(
     _client_id: u32,
     _is_bot: bool,
     _time_ms: i32,
@@ -84,11 +84,11 @@ pub fn remote(
 
 /// A model was drawn without its lighting.
 #[inline]
-pub fn lighting_fail() {}
+pub fn illumination_fault_mark() {}
 
 /// What the renderer planned for one owner's model this frame.
 #[inline]
-pub fn render_owner_plan(
+pub fn draw_thread_layout_mark(
     _frame: u64,
     _world_generation: Option<u64>,
     _owner_kind: &str,
@@ -109,15 +109,15 @@ pub fn match_torn(_reason: &str) {}
 
 /// A match was set up on `zone`.
 #[inline]
-pub fn match_installed(_zone: &str, _has_world: i64) {}
+pub fn match_ready_mark(_zone: &str, _has_world: i64) {}
 
 /// The world is not shown yet; what it still waits for.
 #[inline]
-pub fn world_hold(_spawned: i64, _gpu_plan: i64, _glass: i64) {}
+pub fn level_hold(_spawned: i64, _gpu_plan: i64, _glass: i64) {}
 
 /// The world is up.
 #[inline]
-pub fn world_ready(_spawned: i64) {}
+pub fn level_ready(_spawned: i64) {}
 
 /// The simulation is held; what it still waits for.
 #[inline]
@@ -141,4 +141,4 @@ pub fn theater(_present: i64, _quit_on_end: Option<i64>, _runs_authority: Option
 
 /// The client game view is held; which snapshot it would show.
 #[inline]
-pub fn cgame_hold(_present_choice: &str, _has_player_state: i64) {}
+pub fn view_freeze_mark(_present_choice: &str, _has_player_state: i64) {}

@@ -1,105 +1,106 @@
 //! Picture lookup for the class screens: which image stem stands for a
 //! weapon, attachment or perk, and the cache those images are loaded into.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures_lite::future};
 use frame::showcase_classes;
 
-use crate::classes::setup::picker_icon_stems;
+use crate::classes::setup::chooser_thumb_stems;
+use crate::lui_hud::PictureCache;
 
 /// Folder the interface pictures are read from, once it is known.
 #[derive(Resource, Clone, Debug, Default)]
-pub struct UiAssetRoot(pub Option<PathBuf>);
+pub struct MenuMediaAnchor(pub Option<PathBuf>);
 
 #[derive(Resource, Default)]
-pub struct ClassSelectIconCache {
-    pub images: HashMap<String, Handle<Image>>,
-    /// Set together with the images, so an open menu rebuilds exactly once.
-    pub warmed: bool,
+pub struct LoadoutPickerThumbs {
+    pics: PictureCache,
+    /// Flipped in the same step the images land, so an open menu is rebuilt
+    /// a single time.
+    pub loaded_once: bool,
 }
 
-impl ClassSelectIconCache {
-    pub fn get(&self, stem: &str) -> Option<Handle<Image>> {
-        self.images.get(stem).cloned()
+impl LoadoutPickerThumbs {
+    pub fn thumb_for(&self, base: &str) -> Option<Handle<Image>> {
+        self.pics.kept(base)
     }
 }
 
-type DecodedClassIcons = Vec<(String, Image)>;
 
-/// Starts decoding the class pictures on a worker thread and, when it
-/// finishes, moves them into the cache.
-pub fn warm_class_select_icons(
-    root: Res<UiAssetRoot>,
-    mut cache: ResMut<ClassSelectIconCache>,
-    mut images: ResMut<Assets<Image>>,
-    mut decoding: Local<Option<Task<DecodedClassIcons>>>,
+/// Per-frame driver for the background decode: idle until the asset folder is
+/// known, then one job is spawned; once it reports, its pictures go into the
+/// cache and the system stays quiet from then on.
+pub fn preload_kit_pictures(
+    asset_root: Res<MenuMediaAnchor>,
+    mut icons: ResMut<LoadoutPickerThumbs>,
+    mut pics: ResMut<Assets<Image>>,
+    mut decoding: Local<Option<Task<Vec<(String, Image)>>>>,
 ) {
-    if cache.warmed {
+    if icons.loaded_once {
         return;
     }
-    if let Some(task) = decoding.as_mut() {
-        if let Some(decoded) = future::block_on(future::poll_once(task)) {
-            for (stem, image) in decoded {
-                cache.images.insert(stem, images.add(image));
+
+    match decoding.as_mut() {
+        Some(job) => {
+            let Some(finished) = future::block_on(future::poll_once(job)) else {
+                return;
+            };
+            for (stem, image) in finished {
+                icons.pics.keep(stem, &pics.add(image));
             }
-            cache.warmed = true;
-            *decoding = None;
+            decoding.take();
+            icons.loaded_once = true;
         }
-        return;
-    }
-    if root.0.is_some() {
-        let task = AsyncComputeTaskPool::get().spawn(async { decode_class_select_icons() });
-        *decoding = Some(task);
+        None if asset_root.0.is_some() => {
+            *decoding =
+                Some(AsyncComputeTaskPool::get().spawn(async { decode_class_select_icons() }));
+        }
+        None => {}
     }
 }
 
-/// Works out which stems the screens would want. No image source for them
-/// exists yet, so nothing is decoded and the count is only reported.
-fn decode_class_select_icons() -> DecodedClassIcons {
-    let mut wanted: BTreeSet<&str> = BTreeSet::new();
+/// Collects every stem the screens could ask for. There is no image source
+/// for them yet, so nothing is decoded; the count is only logged.
+fn decode_class_select_icons() -> Vec<(String, Image)> {
+    let mut wanted: BTreeSet<&str> = chooser_thumb_stems().into_iter().collect();
     for preset in showcase_classes() {
-        let weapons = [
+        let loadout_names = [
             preset.primary,
             preset.secondary,
             preset.lethal,
             preset.tactical,
         ];
-        wanted.extend(weapons.into_iter().filter_map(cac_weapon_image));
-        wanted.extend(
-            preset
-                .primary_attachments
-                .iter()
-                .chain(preset.secondary_attachments)
-                .filter_map(|attachment| cac_attachment_image(attachment)),
-        );
-        wanted.extend(
-            preset
-                .perks
-                .iter()
-                .chain([&preset.deathstreak])
-                .map(|perk| cac_material_iwd_stem(perk)),
-        );
+        let (first, second) = (preset.main_gun_parts, preset.side_gun_parts);
+        let attachment_names = first.iter().chain(second);
+        wanted.extend(loadout_names.into_iter().filter_map(loadout_gun_thumb));
+        wanted.extend(attachment_names.filter_map(|name| loadout_addon_thumb(name)));
     }
-    wanted.extend(picker_icon_stems());
 
     diag::info!(
         Ui,
-        "class icons: {} wanted, none decoded (no BO2 image source yet)",
+        "class icons: {} asked for, none turned into pictures (no BO2 picture source yet)",
         wanted.len()
     );
-    Vec::new()
+    <Vec<(String, Image)>>::new()
 }
 
-/// The part of a path after its last slash.
+/// Everything after the final '/', or the whole text when there is none.
 fn last_segment(path: &str) -> &str {
-    path.rsplit_once('/').map_or(path, |(_, tail)| tail)
+    match path.rfind('/') {
+        Some(at) => &path[at + 1..],
+        None => path,
+    }
 }
 
+/// Drops one trailing `_mp` when present.
 fn without_mp_suffix(name: &str) -> &str {
-    name.strip_suffix("_mp").unwrap_or(name)
+    match name.strip_suffix("_mp") {
+        Some(base) => base,
+        None => name,
+    }
 }
 
 /// Weapon name to picture stem.
@@ -157,13 +158,13 @@ const WEAPON_PICTURES: &[(&str, &str)] = &[
     ("flare", "specialty_tactical_insert"),
 ];
 
-/// Picture stem for a weapon given by name or path, if one is known.
-pub fn cac_weapon_image(weapon_name: &str) -> Option<&'static str> {
-    let stem = without_mp_suffix(last_segment(weapon_name)).to_ascii_lowercase();
+/// Picture stem for a weapon given by name or path, if one is known. Path,
+/// a trailing `_mp` and letter case do not matter.
+pub fn loadout_gun_thumb(weapon_name: &str) -> Option<&'static str> {
+    let key = without_mp_suffix(last_segment(weapon_name)).to_ascii_lowercase();
     WEAPON_PICTURES
         .iter()
-        .find(|(name, _)| *name == stem)
-        .map(|&(_, picture)| picture)
+        .find_map(|&(name, picture)| (name == key).then_some(picture))
 }
 
 /// Materials whose picture goes by a different name.
@@ -183,49 +184,143 @@ const RENAMED_MATERIALS: &[(&str, &str)] = &[
     ("killiconmelee", "cardicon_throwing_knive"),
 ];
 
-/// The picture stem for a material, which is the material's own name unless
-/// its picture was filed under another one.
-pub fn cac_material_iwd_stem(material: &str) -> &str {
-    RENAMED_MATERIALS
-        .iter()
-        .find(|(name, _)| *name == material)
-        .map_or(material, |&(_, picture)| picture)
+/// Picture stem for a material: a handful were filed under another name, all
+/// the rest use the material name as it is.
+pub fn loadout_surface_pack_stem(material: &str) -> &str {
+    for &(name, picture) in RENAMED_MATERIALS {
+        if name == material {
+            return picture;
+        }
+    }
+    material
 }
 
-/// Picture stem for an attachment. A compound name such as `acog_mp` or
-/// `m4_acog` is matched by its last recognised word.
-pub fn cac_attachment_image(token: &str) -> Option<&'static str> {
-    let token = last_segment(token).trim();
-    let name = without_mp_suffix(token).to_ascii_lowercase();
-    name.split('_')
-        .rev()
-        .find_map(attachment_material)
-        .or_else(|| attachment_material(&name))
+/// Picture stem for an attachment. Compound names (`acog_mp`, `m4_acog`) are
+/// resolved by the right-most word that is a known attachment.
+pub fn loadout_addon_thumb(token: &str) -> Option<&'static str> {
+    let lowered = without_mp_suffix(last_segment(token).trim()).to_ascii_lowercase();
+    // No attachment word contains an underscore, so testing the words alone
+    // also covers a plain single-word name.
+    lowered.rsplit('_').find_map(attachment_material)
 }
+
+/// Attachment words (any one of each group) to picture stem.
+const ATTACHMENT_PICTURES: &[(&[&str], &str)] = &[
+    (&["tactical"], "weapon_attachment_tactical"),
+    (&["akimbo"], "weapon_attachment_akimbo"),
+    (&["heartbeat"], "weapon_attachment_heartbeat"),
+    (&["shotgun"], "weapon_attachment_shotgun"),
+    (&["gl", "m203", "gp25"], "weapon_attachment_m203"),
+    (&["xmags", "mags"], "weapon_attachment_mags"),
+    (&["fmj"], "weapon_attachment_fmj"),
+    (&["grip"], "weapon_attachment_grip"),
+    (&["silencer", "suppressor"], "weapon_attachment_suppressor"),
+    (&["thermal"], "weapon_attachment_thermal"),
+    (&["reflex"], "weapon_attachment_reflex"),
+    (&["eotech"], "weapon_attachment_eotech"),
+    (&["acog"], "weapon_attachment_acog"),
+];
 
 fn attachment_material(word: &str) -> Option<&'static str> {
-    let stem = match word {
-        "acog" => "weapon_attachment_acog",
-        "eotech" => "weapon_attachment_eotech",
-        "reflex" => "weapon_attachment_reflex",
-        "thermal" => "weapon_attachment_thermal",
-        "silencer" | "suppressor" => "weapon_attachment_suppressor",
-        "grip" => "weapon_attachment_grip",
-        "fmj" => "weapon_attachment_fmj",
-        "xmags" | "mags" => "weapon_attachment_mags",
-        "gl" | "m203" | "gp25" => "weapon_attachment_m203",
-        "shotgun" => "weapon_attachment_shotgun",
-        "heartbeat" => "weapon_attachment_heartbeat",
-        "akimbo" => "weapon_attachment_akimbo",
-        "tactical" => "weapon_attachment_tactical",
-        _ => return None,
-    };
-    Some(stem)
+    ATTACHMENT_PICTURES
+        .iter()
+        .find(|(words, _)| words.contains(&word))
+        .map(|&(_, picture)| picture)
 }
 
-/// Display form of a weapon name: no path, no `_mp`, spaces, upper case.
-pub fn pretty_weapon_name(weapon: &str) -> String {
-    without_mp_suffix(last_segment(weapon))
-        .replace('_', " ")
-        .to_ascii_uppercase()
+/// Display form of a weapon name: path and `_mp` removed, underscores turned
+/// into spaces, letters upper-cased.
+pub fn display_gun_title(weapon: &str) -> String {
+    let base = without_mp_suffix(last_segment(weapon));
+    base.chars()
+        .map(|c| {
+            if c == '_' {
+                ' '
+            } else {
+                c.to_ascii_uppercase()
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weapon_lookup_ignores_path_suffix_and_case() {
+        assert_eq!(loadout_gun_thumb("weapon/AK47_mp"), Some("weapon_ak47"));
+        assert_eq!(loadout_gun_thumb("m4"), Some("weapon_m4carbine"));
+        assert_eq!(
+            loadout_gun_thumb("a/b/c/flare_mp"),
+            Some("specialty_tactical_insert")
+        );
+        assert_eq!(loadout_gun_thumb("nothing_mp"), None);
+        assert_eq!(loadout_gun_thumb(""), None);
+        assert_eq!(loadout_gun_thumb("m4_mp_mp"), None);
+        assert_eq!(loadout_gun_thumb("m4/"), None);
+    }
+
+    #[test]
+    fn material_stem_is_renamed_or_unchanged() {
+        assert_eq!(
+            loadout_surface_pack_stem("specialty_localjammer"),
+            "specialty_scrambler"
+        );
+        assert_eq!(
+            loadout_surface_pack_stem("killiconmelee"),
+            "cardicon_throwing_knive"
+        );
+        assert_eq!(loadout_surface_pack_stem("specialty_other"), "specialty_other");
+        assert_eq!(loadout_surface_pack_stem(""), "");
+    }
+
+    #[test]
+    fn attachment_matches_last_known_word() {
+        assert_eq!(
+            loadout_addon_thumb("acog_mp"),
+            Some("weapon_attachment_acog")
+        );
+        assert_eq!(
+            loadout_addon_thumb("x/m4_ACOG"),
+            Some("weapon_attachment_acog")
+        );
+        assert_eq!(
+            loadout_addon_thumb("  silencer_mp "),
+            Some("weapon_attachment_suppressor")
+        );
+        assert_eq!(
+            loadout_addon_thumb("gl_grip"),
+            Some("weapon_attachment_grip")
+        );
+        assert_eq!(
+            loadout_addon_thumb("grip_unknown"),
+            Some("weapon_attachment_grip")
+        );
+        assert_eq!(loadout_addon_thumb("gp25"), Some("weapon_attachment_m203"));
+        assert_eq!(
+            loadout_addon_thumb("xmags"),
+            Some("weapon_attachment_mags")
+        );
+        assert_eq!(loadout_addon_thumb("bogus_word"), None);
+        assert_eq!(loadout_addon_thumb(""), None);
+        assert_eq!(loadout_addon_thumb("_"), None);
+    }
+
+    #[test]
+    fn pretty_name_strips_path_and_suffix() {
+        assert_eq!(display_gun_title("weapon/deserteagle_mp"), "DESERTEAGLE");
+        assert_eq!(display_gun_title("frag_grenade_mp"), "FRAG GRENADE");
+        assert_eq!(display_gun_title("a_mp/b"), "B");
+        assert_eq!(display_gun_title("_mp"), "");
+    }
+
+    #[test]
+    fn cache_get_clones_stored_handle() {
+        let mut cache = LoadoutPickerThumbs::default();
+        assert!(cache.thumb_for("x").is_none());
+        cache.pics.keep("x".into(), &Handle::default());
+        assert!(cache.thumb_for("x").is_some());
+        assert!(cache.thumb_for("y").is_none());
+    }
 }

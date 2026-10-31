@@ -1,6 +1,6 @@
 //! Window 6: Melee — the knife swing, the knife lunge and use-as-melee weapons.
 //!
-//! The spec with every number is docs/gun/MELEE.md. This file holds the swing as the weapon
+//! The spec with every number is docs/gun/CLOSE_COMBAT.md. This file holds the swing as the weapon
 //! tick runs it: the press check, the start (normal swing or lunge), the hit and the end.
 //! [`anims`] picks the first-person animation a melee anim number plays; [`lunge`] is the
 //! lunge's target pick and movement (run by movement, not by the weapon tick).
@@ -12,12 +12,12 @@ use super::Pm;
 use crate::anim;
 use crate::base;
 use crate::cmd::button;
-use crate::env::{T6Dvars, ef, ef2, pm_type, pmf};
+use crate::env::{T6Dvars, ef, ef2, movement_mode, pmf};
 use crate::events::{AnimScript, EV_FIRE_MELEE, EV_MELEE_SWIPE};
-use crate::facts::weap_type;
+use crate::facts::gun_family_code;
 use crate::player::{Hand, wf};
 use crate::state;
-use fastfile_t6::layout::{WeaponDef as D, WeaponVariantDef as V};
+use fastfile_t6::layout::{WeaponDef, WeaponVariantDef};
 
 /// Hit reach without a bayonet (`player_meleeRange` default; the swing reads the dvar).
 pub const MELEE_RANGE: f32 = 55.0;
@@ -41,33 +41,33 @@ pub struct MeleeFacts {
     /// attachment's own `bUseAsMelee` is not in our weapon ids yet.
     pub use_as_melee: bool,
     /// `overlayReticle`: a scope overlay.
-    pub overlay_reticle: i32,
+    pub hud_crosshair_layer: i32,
     /// BG_UsingVariableZoomWeapon: the three ADS zoom fields differ.
     pub variable_zoom: bool,
 }
 
 impl MeleeFacts {
     pub fn read(variant: &[u8], def: &[u8]) -> Self {
-        let has_bayonet = rd_u8(def, D::bHasBayonet) != 0;
+        let has_bayonet = rd_u8(def, WeaponDef::bHasBayonet) != 0;
         let fov = |at| f32::from_bits(rd_i32(variant, at) as u32);
-        let (z1, z2, z3) = (fov(V::fAdsZoomFov1), fov(V::fAdsZoomFov2), fov(V::fAdsZoomFov3));
+        let (z1, z2, z3) = (fov(WeaponVariantDef::fAdsZoomFov1), fov(WeaponVariantDef::fAdsZoomFov2), fov(WeaponVariantDef::fAdsZoomFov3));
         Self {
-            damage: rd_i32(def, D::iMeleeDamage),
-            time: rd_i32(def, D::iMeleeTime),
-            delay: rd_i32(def, D::iMeleeDelay),
-            charge_time: rd_i32(def, D::meleeChargeTime),
-            charge_delay: rd_i32(def, D::meleeChargeDelay),
-            charge_range: f32::from_bits(rd_i32(def, D::meleeChargeRange) as u32),
+            damage: rd_i32(def, WeaponDef::iMeleeDamage),
+            time: rd_i32(def, WeaponDef::iMeleeTime),
+            delay: rd_i32(def, WeaponDef::iMeleeDelay),
+            charge_time: rd_i32(def, WeaponDef::meleeChargeTime),
+            charge_delay: rd_i32(def, WeaponDef::meleeChargeDelay),
+            charge_range: f32::from_bits(rd_i32(def, WeaponDef::meleeChargeRange) as u32),
             has_bayonet,
-            use_as_melee: has_bayonet || rd_u8(def, D::bUseAsMelee) != 0,
-            overlay_reticle: rd_i32(def, D::overlayReticle),
+            use_as_melee: has_bayonet || rd_u8(def, WeaponDef::bUseAsMelee) != 0,
+            hud_crosshair_layer: rd_i32(def, WeaponDef::overlayReticle),
             variable_zoom: z1 != z2 || z1 != z3,
         }
     }
 
     /// The hit reach of this weapon's swing (`player_meleeRange`, or `player_bayonetRange`).
     pub fn reach(&self, d: &T6Dvars) -> f32 {
-        if self.has_bayonet { d.player_bayonet_range } else { d.player_melee_range }
+        if self.has_bayonet { d.player_bayonet_range } else { d.knife_reach }
     }
 }
 
@@ -84,12 +84,12 @@ fn rd_u8(b: &[u8], at: usize) -> u8 {
 /// The third-person melee anim: a riot shield bashes; a swing without a lunge (or with no gun
 /// model) is a knife swing, a bare melee attack with no gun model, or the left-hand swing;
 /// a lunge with a gun model is the knife charge.
-pub fn pick_script(melee_weap_type: u8, has_gun_model: bool, lunge: bool, left: bool) -> AnimScript {
-    if melee_weap_type == weap_type::RIOTSHIELD {
+pub fn pick_script(melee_weap_type: u8, has_gun_model: bool, lunge: bool, left_hand: bool) -> AnimScript {
+    if melee_weap_type == gun_family_code::RIOTSHIELD {
         AnimScript::MeleeAttack
     } else if has_gun_model && lunge {
         AnimScript::KnifeMeleeCharge
-    } else if left {
+    } else if left_hand {
         AnimScript::MeleeLeft
     } else if has_gun_model {
         AnimScript::KnifeMelee
@@ -134,34 +134,34 @@ pub fn check_for_melee(pm: &mut Pm, r: i32) {
     let held = pm.weapon_facts();
     let dual = held.core.dual_wield;
     let now = pm.cmd.buttons;
-    let old = pm.cmd.old_buttons;
+    let old = pm.cmd.last_tick_buttons;
     // The left trigger only exists with two guns out (window 1's dual-wield mapping).
     let left_trig = crate::pm::fire::fire_button(pm, true);
     let left_held = dual && now & left_trig != 0;
-    let melee_held = now & button::MELEE != 0;
-    let attack_held = now & button::ATTACK != 0;
+    let melee_held = now & button::CLOSE_COMBAT != 0;
+    let attack_held = now & button::FIRE_BIT != 0;
     let mut right = melee_held || attack_held;
     let mut left = left_held;
 
-    if pm.env.pm_flags & (pmf::LADDER | pmf::GATE_2000) != 0
-        || pm.ps.weap_flags & wf::DISABLE_SWITCH_TO_NONE != 0
+    if pm.env.movement_state_bits & (pmf::LADDER | pmf::GATE_2000) != 0
+        || pm.ps.weapon_state_bits & wf::DISABLE_SWITCH_TO_NONE != 0
     {
         return;
     }
-    let is_melee_type = held.core.weap_type == weap_type::MELEE;
+    let is_melee_type = held.core.gun_family_code == gun_family_code::CLOSE_COMBAT;
     let mw = melee_weapon(pm);
     let mdef = pm.facts.get(mw);
-    let s = pm.ps.weaponstate;
-    if pm.env.e_flags & ef::GATE_4000 != 0
+    let s = pm.ps.gun_phase;
+    if pm.env.ent_bits & ef::GATE_4000 != 0
         || pm.env.in_vehicle
         || blocks_melee(s)
-        || pm.env.pm_flags & pmf::MANTLE != 0
+        || pm.env.movement_state_bits & pmf::MANTLE != 0
     {
         return;
     }
     // A left trigger swing needs a melee weapon in the left hand.
     let partner = pm.facts.get(held.core.dual_wield_weapon);
-    let left_ok = !left_held || partner.core.weap_type == weap_type::MELEE;
+    let left_ok = !left_held || partner.core.gun_family_code == gun_family_code::CLOSE_COMBAT;
     let nothing_else = (!is_melee_type || !attack_held) && !melee_held && !left_held;
     if !left_ok || (!nothing_else && crate::pm::fire::check_friendly_fire(pm)) {
         return;
@@ -174,17 +174,17 @@ pub fn check_for_melee(pm: &mut Pm, r: i32) {
         left = false;
     }
 
-    let new_press = (melee_held && old & button::MELEE == 0)
+    let new_press = (melee_held && old & button::CLOSE_COMBAT == 0)
         || (left_held && old & left_trig == 0)
-        || (is_melee_type && attack_held && old & button::ATTACK == 0);
-    let scoped = pm.ps.f_weapon_pos_frac > 0.0
-        && (held.melee.overlay_reticle != OVERLAY_NONE || held.melee.variable_zoom);
+        || (is_melee_type && attack_held && old & button::FIRE_BIT == 0);
+    let scoped = pm.ps.weapon_raise_fraction > 0.0
+        && (held.melee.hud_crosshair_layer != OVERLAY_NONE || held.melee.variable_zoom);
     if mdef.melee.damage == 0
         || r != 0
-        || !(pm.ps.weapon_delay == 0 || melee_cuts_in(s))
+        || !(pm.ps.weapon_ready_wait == 0 || melee_cuts_in(s))
         || !new_press
         || scoped
-        || !anims::has(mdef.core.anim_slots, anims::file::MELEE)
+        || !anims::has(mdef.core.anim_slots, anims::file::CLOSE_COMBAT)
         || pm.env.e_flags2 & ef2::WEAPON_LOCKED != 0
         || (1..=5).contains(&s)
         || !(right || left)
@@ -202,28 +202,28 @@ pub fn charge_start(pm: &mut Pm) {
         charge_clear(pm);
         return;
     }
-    pm.env.pm_flags |= pmf::MELEE_CHARGE;
-    pm.ps.melee_charge_time = 0;
+    pm.env.movement_state_bits |= pmf::MELEE_CHARGE;
+    pm.ps.lunge_clock = 0;
     pm.ps.melee_charge_ent = pm.cmd.melee_charge_ent;
-    pm.ps.melee_charge_dist = u32::from(pm.cmd.melee_charge_dist);
+    pm.ps.lunge_reach = u32::from(pm.cmd.lunge_reach);
 }
 
 /// PM_MeleeChargeIsValid: no lunge running, the command names a target, a normal player on
 /// the ground, not mantling or on a ladder. One more player-state gate (bits 0x300 of an
 /// unidentified field) is taken as clear.
 fn charge_valid(pm: &Pm) -> bool {
-    pm.env.pm_flags & (pmf::MELEE_CHARGE | pmf::MANTLE | pmf::LADDER) == 0
+    pm.env.movement_state_bits & (pmf::MELEE_CHARGE | pmf::MANTLE | pmf::LADDER) == 0
         && pm.cmd.melee_charge_ent.is_some()
-        && pm.env.pm_type == pm_type::NORMAL
-        && pm.env.on_ground
+        && pm.env.movement_mode == movement_mode::NORMAL
+        && pm.env.grounded_now
 }
 
 /// PM_MeleeChargeClear, the weapon side: no lunge, no target. Movement also caps the
 /// upward speed ([`lunge::Lunge::clear`]).
 pub fn charge_clear(pm: &mut Pm) {
-    pm.env.pm_flags &= !pmf::MELEE_CHARGE;
-    pm.ps.melee_charge_time = 0;
-    pm.ps.melee_charge_dist = 0;
+    pm.env.movement_state_bits &= !pmf::MELEE_CHARGE;
+    pm.ps.lunge_clock = 0;
+    pm.ps.lunge_reach = 0;
     pm.ps.melee_charge_ent = None;
 }
 
@@ -233,19 +233,19 @@ pub fn melee_init(pm: &mut Pm, right: bool, left: bool) {
     let mw = melee_weapon(pm);
     let mdef = pm.facts.get(mw);
     let m = mdef.melee;
-    let lunge = pm.env.pm_flags & pmf::MELEE_CHARGE != 0 && pm.ps.melee_charge_dist as f32 > m.reach(&pm.env.dvars);
+    let lunge = pm.env.movement_state_bits & pmf::MELEE_CHARGE != 0 && pm.ps.lunge_reach as f32 > m.reach(&pm.env.dvars);
     let empty = clip_empty(pm);
-    let alive = pm.env.pm_type < pm_type::DEAD;
+    let alive = pm.env.movement_mode < movement_mode::DEAD;
     if lunge {
         let timers = (m.charge_time, m.charge_delay);
         if left {
             (pm.ps.weapon_time_left, pm.ps.weapon_delay_left) = timers;
         } else {
-            (pm.ps.weapon_time, pm.ps.weapon_delay) = timers;
+            (pm.ps.gun_timer_ms, pm.ps.weapon_ready_wait) = timers;
         }
         if alive {
             let a = if empty { anim::MELEE_CHARGE_EMPTY } else { anim::MELEE_CHARGE };
-            pm.ps.weap_anim = anim::start(pm.ps.weap_anim, a);
+            pm.ps.gun_clip = anim::start(pm.ps.gun_clip, a);
         }
     } else {
         if left {
@@ -255,20 +255,20 @@ pub fn melee_init(pm: &mut Pm, right: bool, left: bool) {
             }
         }
         if right {
-            (pm.ps.weapon_time, pm.ps.weapon_delay) = (m.time, m.delay);
+            (pm.ps.gun_timer_ms, pm.ps.weapon_ready_wait) = (m.time, m.delay);
             if alive {
                 let a = if empty { anim::MELEE_ATTACK_EMPTY } else { anim::MELEE_ATTACK };
-                pm.ps.weap_anim = anim::start(pm.ps.weap_anim, a);
+                pm.ps.gun_clip = anim::start(pm.ps.gun_clip, a);
             }
         }
     }
-    let script = pick_script(mdef.core.weap_type, mdef.core.has_gun_model, lunge, left);
+    let script = pick_script(mdef.core.gun_family_code, mdef.core.has_gun_model, lunge, left);
     pm.out.scripts.push(script);
     if left {
         pm.ps.weaponstate_left = state::MELEE_INIT;
     }
     if right {
-        pm.ps.weaponstate = state::MELEE_INIT;
+        pm.ps.gun_phase = state::MELEE_INIT;
     }
     pm.add_event(EV_MELEE_SWIPE);
     base::set_prone_override(pm);
@@ -279,7 +279,7 @@ pub fn melee_fire(pm: &mut Pm, left: bool) {
     if left {
         pm.ps.weaponstate_left = state::MELEE_FIRE;
     } else {
-        pm.ps.weaponstate = state::MELEE_FIRE;
+        pm.ps.gun_phase = state::MELEE_FIRE;
     }
     pm.add_event(EV_FIRE_MELEE);
     base::set_prone_override(pm);
@@ -291,27 +291,27 @@ pub fn melee_end(pm: &mut Pm, left: bool) {
     let held = pm.weapon_facts();
     if pm.ps.weapon != melee_weapon(pm) {
         let h = Hand {
-            state: state::MELEE_END,
+            phase: state::MELEE_END,
             time: held.switch.quick_raise,
             delay: 0,
-            shot_count: pm.ps.hand(left).shot_count,
+            rounds_fired: pm.ps.hand(left).rounds_fired,
         };
         pm.ps.set_hand(left, h);
-        if pm.env.waterlevel < 4 && pm.env.pm_type < pm_type::DEAD {
-            pm.ps.weap_anim = anim::start(pm.ps.weap_anim, anim::QUICK_RAISE);
+        if pm.env.waterlevel < 4 && pm.env.movement_mode < movement_mode::DEAD {
+            pm.ps.gun_clip = anim::start(pm.ps.gun_clip, anim::FAST_TAKE_OUT);
         }
         base::set_prone_override(pm);
         return;
     }
     if held.core.dual_wield {
         let h = Hand {
-            state: state::READY,
+            phase: state::READY,
             time: 0,
             delay: 0,
-            shot_count: pm.ps.hand(left).shot_count,
+            rounds_fired: pm.ps.hand(left).rounds_fired,
         };
         pm.ps.set_hand(left, h);
-        base::start_anim(pm, anim::IDLE, left);
+        base::start_anim(pm, anim::REST, left);
         return;
     }
     base::idle(pm);
@@ -322,7 +322,7 @@ pub fn melee_end(pm: &mut Pm, left: bool) {
 mod tests {
     use super::*;
     use crate::facts::{FactsTable, T6WeaponFacts};
-    use crate::trace::Runner;
+    use crate::trace::ScenarioDriver;
 
     const GUN: u32 = 1;
     const KNIFE: u32 = 2;
@@ -331,7 +331,7 @@ mod tests {
 
     fn gun(clip: i32, drop: i32, raise: i32, quick_raise: i32, first_raise: i32) -> T6WeaponFacts {
         let mut g = T6WeaponFacts::default();
-        g.core.clip_size = clip;
+        g.core.magazine_capacity = clip;
         g.switch.drop = drop;
         g.switch.raise = raise;
         g.switch.quick_raise = quick_raise;
@@ -341,11 +341,11 @@ mod tests {
 
     fn knife(m: MeleeFacts, quick_raise: i32) -> T6WeaponFacts {
         let mut k = T6WeaponFacts::default();
-        k.core.weap_type = weap_type::MELEE;
-        k.core.clip_size = 1;
+        k.core.gun_family_code = gun_family_code::CLOSE_COMBAT;
+        k.core.magazine_capacity = 1;
         k.core.unlimited_ammo = true;
         k.switch.quick_raise = quick_raise;
-        k.core.anim_slots = 1 << anims::file::MELEE | 1 << anims::file::MELEE_CHARGE;
+        k.core.anim_slots = 1 << anims::file::CLOSE_COMBAT | 1 << anims::file::MELEE_CHARGE;
         k.core.has_gun_model = true;
         k.melee = m;
         k
@@ -384,12 +384,12 @@ mod tests {
             ("g_lunge", include_str!("../../../../docs/gun/melee-traces/g_lunge.txt")),
         ];
         let out_dir = std::env::var("MELEE_TRACE_OUT").ok();
-        let mut failed = Vec::new();
+        let mut failed = Vec::<_>::new();
         for (name, script) in scripts {
-            let mut runner = Runner::new(&t);
+            let mut runner = ScenarioDriver::new(&t);
             runner.ps.melee_weapon = KNIFE;
             let r = runner.run_script(script).expect(name);
-            let text = r.lines.join("\n");
+            let text = r.log_rows.join("\n");
             if let Some(d) = &out_dir {
                 std::fs::write(format!("{d}/{name}.trace.txt"), &text).expect("write trace");
             }
@@ -401,7 +401,7 @@ mod tests {
     }
 
     /// Zombies numbers (zm_transit knife_zm, zm_highrise m1911_zm): the trace that sits next to
-    /// the real BO2 clip in MELEE.md section 9.
+    /// the real BO2 clip in CLOSE_COMBAT.md section 9.
     #[test]
     fn zombies_knife_trace_passes_on_the_real_numbers() {
         const ZM_GUN: u32 = 5;
@@ -410,10 +410,10 @@ mod tests {
         let k = MeleeFacts { damage: 150, time: 500, delay: 50, charge_time: 1000, charge_delay: 150, charge_range: 128.0, ..MeleeFacts::default() };
         t.set(ZM_GUN, "m1911_zm", gun(8, 250, 250, 250, 250));
         t.set(ZM_KNIFE, "knife_zm", knife(k, 0));
-        let mut runner = Runner::new(&t);
+        let mut runner = ScenarioDriver::new(&t);
         runner.ps.melee_weapon = ZM_KNIFE;
         let r = runner.run_script(include_str!("../../../../docs/gun/melee-traces/h_zm_knife_m1911.txt")).unwrap();
-        let text = r.lines.join("\n");
+        let text = r.log_rows.join("\n");
         if let Ok(d) = std::env::var("MELEE_TRACE_OUT") {
             std::fs::write(format!("{d}/h_zm_knife_m1911.trace.txt"), &text).expect("write trace");
         }
@@ -424,12 +424,12 @@ mod tests {
     /// failed `expect`.
     fn run(script: &str, knife: bool) -> String {
         let t = table();
-        let mut r = Runner::new(&t);
+        let mut r = ScenarioDriver::new(&t);
         if knife {
             r.ps.melee_weapon = KNIFE;
         }
         let res = r.run_script(script).unwrap();
-        let text = res.lines.join("\n");
+        let text = res.log_rows.join("\n");
         assert_eq!(res.failures, 0, "{text}");
         text
     }
@@ -437,12 +437,12 @@ mod tests {
     #[test]
     fn reads_melee_facts_at_layout_offsets() {
         let mut def = vec![0u8; 4096];
-        def[D::iMeleeDamage..D::iMeleeDamage + 4].copy_from_slice(&150i32.to_le_bytes());
-        def[D::iMeleeTime..D::iMeleeTime + 4].copy_from_slice(&800i32.to_le_bytes());
-        def[D::meleeChargeRange..D::meleeChargeRange + 4].copy_from_slice(&150f32.to_le_bytes());
-        def[D::bUseAsMelee] = 1;
+        def[WeaponDef::iMeleeDamage..WeaponDef::iMeleeDamage + 4].copy_from_slice(&150i32.to_le_bytes());
+        def[WeaponDef::iMeleeTime..WeaponDef::iMeleeTime + 4].copy_from_slice(&800i32.to_le_bytes());
+        def[WeaponDef::meleeChargeRange..WeaponDef::meleeChargeRange + 4].copy_from_slice(&150f32.to_le_bytes());
+        def[WeaponDef::bUseAsMelee] = 1;
         let mut variant = vec![0u8; 1024];
-        variant[V::fAdsZoomFov1..V::fAdsZoomFov1 + 4].copy_from_slice(&30f32.to_le_bytes());
+        variant[WeaponVariantDef::fAdsZoomFov1..WeaponVariantDef::fAdsZoomFov1 + 4].copy_from_slice(&30f32.to_le_bytes());
         let f = MeleeFacts::read(&variant, &def);
         assert_eq!((f.damage, f.time, f.charge_range), (150, 800, 150.0));
         assert!(f.use_as_melee && !f.has_bayonet && f.variable_zoom);
@@ -452,11 +452,11 @@ mod tests {
     #[test]
     fn third_person_picks() {
         use AnimScript::*;
-        assert_eq!(pick_script(weap_type::RIOTSHIELD, true, true, false), MeleeAttack);
-        assert_eq!(pick_script(weap_type::MELEE, true, true, false), KnifeMeleeCharge);
-        assert_eq!(pick_script(weap_type::MELEE, true, false, false), KnifeMelee);
-        assert_eq!(pick_script(weap_type::MELEE, false, false, false), MeleeAttack);
-        assert_eq!(pick_script(weap_type::MELEE, true, false, true), MeleeLeft);
+        assert_eq!(pick_script(gun_family_code::RIOTSHIELD, true, true, false), MeleeAttack);
+        assert_eq!(pick_script(gun_family_code::CLOSE_COMBAT, true, true, false), KnifeMeleeCharge);
+        assert_eq!(pick_script(gun_family_code::CLOSE_COMBAT, true, false, false), KnifeMelee);
+        assert_eq!(pick_script(gun_family_code::CLOSE_COMBAT, false, false, false), MeleeAttack);
+        assert_eq!(pick_script(gun_family_code::CLOSE_COMBAT, true, false, true), MeleeLeft);
     }
 
     /// 50 ms ticks: the press tick starts the swing; the 125 ms hit lands on the 3rd tick

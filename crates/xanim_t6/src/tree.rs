@@ -3,161 +3,165 @@
 
 use std::sync::Arc;
 
-use dobj_t6::PartBits;
+use dobj_t6::PartSet;
 
-use crate::{AnimClip, advance_leaf_time};
+use crate::{SkeletalClip, advance_leaf_time};
 
 /// A node's place in its tree's node list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct XAnimNodeId(pub u16);
+pub struct GraphSlot(pub u16);
 
 #[derive(Clone, Debug)]
-pub enum XAnimNodeKind {
+pub enum AnimGraphNodeType {
     /// Its children's poses, mixed by weight.
     Blend,
     /// Its children's poses laid on top of the pose under it.
     Additive,
     /// A clip, on the given parts (every part when `None`).
     Leaf {
-        clip: Arc<AnimClip>,
-        parts: Option<PartBits>,
+        clip: Arc<SkeletalClip>,
+        parts: Option<PartSet>,
     },
 }
 
 #[derive(Clone, Debug)]
-pub struct XAnimNodeDefinition {
+pub struct AnimGraphNodeSpec {
     /// `None` for a root.
-    pub parent: Option<XAnimNodeId>,
-    pub kind: XAnimNodeKind,
+    pub owner: Option<GraphSlot>,
+    pub kind: AnimGraphNodeType,
 }
 
 /// A tree's shape: its nodes, each listed after its parent.
 #[derive(Clone, Debug)]
-pub struct XAnimTreeDefinition {
-    nodes: Vec<XAnimNodeDefinition>,
+pub struct AnimGraphBlueprint {
+    nodes: Vec<AnimGraphNodeSpec>,
 }
 
 /// Why a tree or a state was refused. Nodes are given by index.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum XAnimTreeError {
+pub enum AnimGraphFault {
     Empty,
-    TooManyNodes { count: usize },
-    ParentOutOfRange { node: usize, parent: usize },
-    ParentNotBeforeChild { node: usize, parent: usize },
-    LeafHasChildren { node: usize },
-    NonFiniteState { node: usize },
+    NodeCountOver { count: usize },
+    ParentMissing { node_ix: usize, parent_ix: usize },
+    ParentAfterChild { node_ix: usize, parent_ix: usize },
+    LeafWithChildren { node: usize },
+    NanInNode { node: usize },
 }
 
-impl core::fmt::Display for XAnimTreeError {
+impl core::fmt::Display for AnimGraphFault {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{self:?}")
+        f.write_str(&format!("{self:?}"))
     }
 }
 
-impl std::error::Error for XAnimTreeError {}
+impl std::error::Error for AnimGraphFault {}
 
-impl XAnimTreeDefinition {
-    pub fn new(nodes: Vec<XAnimNodeDefinition>) -> Result<Self, XAnimTreeError> {
-        if nodes.is_empty() {
-            return Err(XAnimTreeError::Empty);
+impl AnimGraphBlueprint {
+    pub fn new(nodes: Vec<AnimGraphNodeSpec>) -> Result<Self, AnimGraphFault> {
+        let count = nodes.len();
+        match count {
+            0 => return Err(AnimGraphFault::Empty),
+            c if c > usize::from(u16::MAX) => return Err(AnimGraphFault::NodeCountOver { count }),
+            _ => {}
         }
-        if nodes.len() > usize::from(u16::MAX) {
-            return Err(XAnimTreeError::TooManyNodes { count: nodes.len() });
+        match (0..count).find_map(|at| parent_flaw(&nodes, at)) {
+            Some(flaw) => Err(flaw),
+            None => Ok(Self { nodes }),
         }
-        for (node, definition) in nodes.iter().enumerate() {
-            let Some(XAnimNodeId(parent)) = definition.parent else {
-                continue;
-            };
-            let parent = usize::from(parent);
-            if parent >= nodes.len() {
-                return Err(XAnimTreeError::ParentOutOfRange { node, parent });
-            }
-            if parent >= node {
-                return Err(XAnimTreeError::ParentNotBeforeChild { node, parent });
-            }
-            if matches!(nodes[parent].kind, XAnimNodeKind::Leaf { .. }) {
-                return Err(XAnimTreeError::LeafHasChildren { node: parent });
-            }
-        }
-        Ok(Self { nodes })
     }
 
-    pub fn nodes(&self) -> &[XAnimNodeDefinition] {
+    pub fn nodes(&self) -> &[AnimGraphNodeSpec] {
         &self.nodes
+    }
+}
+
+/// What is wrong with how `nodes[at]` is hung under its parent, if anything.
+fn parent_flaw(nodes: &[AnimGraphNodeSpec], at: usize) -> Option<AnimGraphFault> {
+    let parent = usize::from(nodes[at].owner?.0);
+    if nodes.len() <= parent {
+        Some(AnimGraphFault::ParentMissing { node_ix: at, parent_ix: parent })
+    } else if parent >= at {
+        Some(AnimGraphFault::ParentAfterChild { node_ix: at, parent_ix: parent })
+    } else if matches!(nodes[parent].kind, AnimGraphNodeType::Leaf { .. }) {
+        Some(AnimGraphFault::LeafWithChildren { node: parent })
+    } else {
+        None
     }
 }
 
 /// One node's playback state.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct XAnimNodeState {
+pub struct NodeClock {
     /// How far a leaf is through its clip, 0..1.
     pub time: f32,
     /// `time` at the start of the last update.
-    pub old_time: f32,
+    pub prev_t: f32,
     /// How many times a looping leaf has wrapped.
-    pub cycle_count: i16,
-    pub old_cycle_count: i16,
+    pub laps: i16,
+    pub prev_laps: i16,
     /// Seconds left to reach `goal_weight`.
-    pub goal_time: f32,
-    pub goal_weight: f32,
+    pub blend_left: f32,
+    pub target_w: f32,
     pub weight: f32,
     /// Playback speed; 1 is the clip's own.
     pub rate: f32,
 }
 
-impl Default for XAnimNodeState {
+impl Default for NodeClock {
+    /// At the start, weightless with no weight to ease toward, at the clip's own speed.
     fn default() -> Self {
-        Self {
-            time: 0.0,
-            old_time: 0.0,
-            cycle_count: 0,
-            old_cycle_count: 0,
-            goal_time: 0.0,
-            goal_weight: 0.0,
-            weight: 0.0,
-            rate: 1.0,
-        }
+        let (time, t_prev, laps, laps_prev) = (0.0, 0.0, 0, 0);
+        let (w0, target_w, goal_t) = (0.0, 0.0, 0.0);
+        Self { time, prev_t: t_prev, laps, prev_laps: laps_prev, blend_left: goal_t, target_w, weight: w0, rate: 1.0 }
     }
 }
 
-impl XAnimNodeState {
+impl NodeClock {
+    /// Standing still at `weight`, with nothing left to ease.
+    fn resting_at(weight: f32) -> Self {
+        Self {
+            target_w: weight,
+            weight,
+            ..Self::default()
+        }
+    }
+
     fn is_finite(&self) -> bool {
-        [
-            self.time,
-            self.old_time,
-            self.goal_time,
-            self.goal_weight,
-            self.weight,
+        let fields = [
             self.rate,
-        ]
-        .iter()
-        .all(|v| v.is_finite())
+            self.weight,
+            self.target_w,
+            self.blend_left,
+            self.time,
+            self.prev_t,
+        ];
+        fields.into_iter().all(f32::is_finite)
     }
 }
 
 /// A tree playing: its shape and a state per node.
 #[derive(Clone, Debug)]
-pub struct XAnimTreeRuntime {
-    definition: Arc<XAnimTreeDefinition>,
-    states: Vec<XAnimNodeState>,
+pub struct AnimGraphInstance {
+    blueprint: Arc<AnimGraphBlueprint>,
+    node_states: Vec<NodeClock>,
 }
 
 /// A leaf that poses the model this frame.
-pub(crate) struct ActiveXAnimLeaf<'a> {
-    pub clip: &'a AnimClip,
+pub(crate) struct LiveClipLeaf<'a> {
+    pub reel: &'a SkeletalClip,
     /// Seconds into the clip.
     pub time: f32,
     /// Its weight times every weight above it.
     pub weight: f32,
-    pub parts: Option<&'a PartBits>,
+    pub pieces: Option<&'a PartSet>,
 }
 
 /// An additive node with weight: its own leaves and the additive nodes under it, laid on
 /// the pose below.
-pub(crate) struct ActiveAdditiveLayer<'a> {
+pub(crate) struct LiveOverlayLayer<'a> {
     pub weight: f32,
-    pub leaves: Vec<ActiveXAnimLeaf<'a>>,
-    pub inner: Vec<ActiveAdditiveLayer<'a>>,
+    pub leaves: Vec<LiveClipLeaf<'a>>,
+    pub inner: Vec<LiveOverlayLayer<'a>>,
 }
 
 /// Under this an eased weight is not kept as it is (bits `0x358637be`, just over 1e-6).
@@ -168,88 +172,82 @@ const SMALL_WEIGHT: f32 = f32::from_bits(0x3586_37be);
 /// its goal at once.
 ///
 /// TODO(fact): BO2's own step is open (QUESTIONS.md 66); this one matches MW2's.
-fn goal_weight_step(state: &XAnimNodeState, dtime: f32, parent_has_weight: bool) -> (f32, f32) {
-    if !parent_has_weight || state.goal_time <= dtime {
-        return (state.goal_weight, 0.0);
+fn goal_weight_step(state: &NodeClock, dtime: f32, parent_has_weight: bool) -> (f32, f32) {
+    let arrives_now = !parent_has_weight || state.blend_left <= dtime;
+    if arrives_now {
+        return (state.target_w, 0.0);
     }
-    let mut weight = (state.goal_weight - state.weight) * dtime / state.goal_time + state.weight;
-    if weight < SMALL_WEIGHT {
-        weight = state.goal_weight * 0.001;
-    }
-    (weight, state.goal_time - dtime)
+    let travelled = (state.target_w - state.weight) * dtime / state.blend_left;
+    let eased = state.weight + travelled;
+    let kept = if eased < SMALL_WEIGHT {
+        state.target_w * 0.001
+    } else {
+        eased
+    };
+    (kept, state.blend_left - dtime)
 }
 
-impl XAnimTreeRuntime {
+impl AnimGraphInstance {
     /// Every node at rest, the roots at full weight.
-    pub fn new(definition: Arc<XAnimTreeDefinition>) -> Self {
-        let states = definition
+    pub fn new(blueprint: Arc<AnimGraphBlueprint>) -> Self {
+        let states = blueprint
             .nodes
             .iter()
-            .map(|node| {
-                let weight = if node.parent.is_none() { 1.0 } else { 0.0 };
-                XAnimNodeState {
-                    weight,
-                    goal_weight: weight,
-                    ..Default::default()
-                }
-            })
+            .map(|node| NodeClock::resting_at(if node.owner.is_some() { 0.0 } else { 1.0 }))
             .collect();
-        Self { definition, states }
+        Self { node_states: states, blueprint }
     }
 
-    pub fn set_state(
-        &mut self,
-        node: XAnimNodeId,
-        state: XAnimNodeState,
-    ) -> Result<(), XAnimTreeError> {
-        let index = usize::from(node.0);
-        if !state.is_finite() {
-            return Err(XAnimTreeError::NonFiniteState { node: index });
+    pub fn set_state(&mut self, id: GraphSlot, next: NodeClock) -> Result<(), AnimGraphFault> {
+        let at = usize::from(id.0);
+        if !next.is_finite() {
+            return Err(AnimGraphFault::NanInNode { node: at });
         }
-        let slot = self
-            .states
-            .get_mut(index)
-            .ok_or(XAnimTreeError::ParentOutOfRange {
-                node: index,
-                parent: index,
-            })?;
-        *slot = state;
+        let missing = AnimGraphFault::ParentMissing {
+            node_ix: at,
+            parent_ix: at,
+        };
+        self.node_states.get_mut(at).ok_or(missing)?.clone_from(&next);
         Ok(())
     }
 
-    /// Moves the tree on `dtime` seconds: weights first, parents before children, then each
+    /// Moves the tree on `step_s` seconds: weights first, parents before children, then each
     /// leaf that still has weight along its clip.
-    pub fn update(&mut self, dtime: f32) -> Result<(), XAnimTreeError> {
-        if !dtime.is_finite() || dtime < 0.0 {
-            return Err(XAnimTreeError::NonFiniteState { node: 0 });
+    pub fn refresh(&mut self, step_s: f32) -> Result<(), AnimGraphFault> {
+        if !step_s.is_finite() || step_s < 0.0 {
+            return Err(AnimGraphFault::NanInNode { node: 0 });
         }
-        for node in 0..self.states.len() {
-            let parent_has_weight = match self.definition.nodes[node].parent {
-                None => true,
-                Some(XAnimNodeId(parent)) => self.states[usize::from(parent)].weight != 0.0,
+        for at in 0..self.node_states.len() {
+            let parent_has_weight = self.blueprint.nodes[at]
+                .owner
+                .map_or(true, |id| self.node_states[usize::from(id.0)].weight != 0.0);
+            let node_state = &mut self.node_states[at];
+            let (w_now, t_goal) = goal_weight_step(node_state, step_s, parent_has_weight);
+            *node_state = NodeClock {
+                weight: w_now,
+                blend_left: t_goal,
+                prev_t: node_state.time,
+                prev_laps: node_state.laps,
+                ..*node_state
             };
-            let state = &mut self.states[node];
-            (state.weight, state.goal_time) = goal_weight_step(state, dtime, parent_has_weight);
-            state.old_time = state.time;
-            state.old_cycle_count = state.cycle_count;
         }
-        for (node, state) in self.definition.nodes.iter().zip(&mut self.states) {
-            let XAnimNodeKind::Leaf { clip, .. } = &node.kind else {
-                continue;
-            };
-            if state.weight == 0.0 {
-                continue;
-            }
-            if let Some((time, cycle_count)) = advance_leaf_time(
-                state.old_time,
-                state.cycle_count,
-                state.rate,
-                clip.frequency(),
-                dtime,
-                clip.looping,
-            ) {
-                state.time = time;
-                state.cycle_count = cycle_count;
+        let weighted = self
+            .blueprint
+            .nodes
+            .iter()
+            .zip(self.node_states.iter_mut())
+            .filter(|(_, st)| st.weight != 0.0);
+        for (entry, node_state) in weighted {
+            if let AnimGraphNodeType::Leaf { clip, .. } = &entry.kind {
+                let per_second = clip.plays_per_second();
+                let wraps = clip.looping;
+                let (since, cycles) = (node_state.prev_t, node_state.laps);
+                if let Some(advanced) =
+                    advance_leaf_time(since, cycles, node_state.rate, per_second, step_s, wraps)
+                {
+                    node_state.time = advanced.0;
+                    node_state.laps = advanced.1;
+                }
             }
         }
         Ok(())
@@ -257,62 +255,70 @@ impl XAnimTreeRuntime {
 
     /// The leaves that pose the model and the additive layers laid on them, each weighted
     /// by every node above it. Branches with no weight are left out.
-    pub(crate) fn active_pose(&self) -> (Vec<ActiveXAnimLeaf<'_>>, Vec<ActiveAdditiveLayer<'_>>) {
-        let nodes = &self.definition.nodes;
-        let mut children = vec![Vec::new(); nodes.len()];
-        for (node, definition) in nodes.iter().enumerate() {
-            if let Some(XAnimNodeId(parent)) = definition.parent {
-                children[usize::from(parent)].push(node);
+    pub(crate) fn active_pose(&self) -> (Vec<LiveClipLeaf<'_>>, Vec<LiveOverlayLayer<'_>>) {
+        let graph_nodes = &self.blueprint.nodes;
+        let mut children_of: Vec<Vec<usize>> = vec![vec![]; graph_nodes.len()];
+        for (at, node_def) in graph_nodes.iter().enumerate() {
+            if let Some(parent) = node_def.owner {
+                children_of[usize::from(parent.0)].push(at);
             }
         }
-        let mut leaves = Vec::new();
-        let mut layers = Vec::new();
-        for (root, definition) in nodes.iter().enumerate() {
-            if definition.parent.is_none() {
-                self.collect(root, 1.0, &children, &mut leaves, &mut layers);
-            }
+        let (mut clips_on, mut overlays) = (vec![], vec![]);
+        let roots = graph_nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, nd)| nd.owner.is_none())
+            .map(|(at, _)| at);
+        for root in roots {
+            self.gather(root, 1.0, &children_of, &mut clips_on, &mut overlays);
         }
-        (leaves, layers)
+        (clips_on, overlays)
     }
 
-    fn collect<'a>(
+    /// Adds what `at` and its subtree pose to `out_leaves` and `out_layers`; `above` is the weight
+    /// of everything over it.
+    fn gather<'a>(
         &'a self,
-        node: usize,
-        incoming: f32,
-        children: &[Vec<usize>],
-        leaves: &mut Vec<ActiveXAnimLeaf<'a>>,
-        layers: &mut Vec<ActiveAdditiveLayer<'a>>,
+        at: usize,
+        above: f32,
+        kids: &[Vec<usize>],
+        out_leaves: &mut Vec<LiveClipLeaf<'a>>,
+        out_layers: &mut Vec<LiveOverlayLayer<'a>>,
     ) {
-        let state = &self.states[node];
-        let weight = incoming * state.weight;
-        if weight <= 0.0 {
+        let state = &self.node_states[at];
+        let weight = above * state.weight;
+        let weightless = weight <= 0.0;
+        if weightless {
             return;
         }
-        match &self.definition.nodes[node].kind {
-            XAnimNodeKind::Leaf { clip, parts } => leaves.push(ActiveXAnimLeaf {
-                clip,
-                time: clip.duration() * state.time,
+        let kind = &self.blueprint.nodes[at].kind;
+        if let AnimGraphNodeType::Leaf { clip: cut, parts: part_mask } = kind {
+            let parts = part_mask.as_ref();
+            out_leaves.push(LiveClipLeaf {
+                pieces: parts,
                 weight,
-                parts: parts.as_ref(),
-            }),
-            XAnimNodeKind::Blend => {
-                for &child in &children[node] {
-                    self.collect(child, weight, children, leaves, layers);
-                }
+                time: cut.duration() * state.time,
+                reel: cut,
+            });
+            return;
+        }
+        if matches!(kind, AnimGraphNodeType::Blend) {
+            for &kid in &kids[at] {
+                self.gather(kid, weight, kids, out_leaves, out_layers);
             }
-            XAnimNodeKind::Additive => {
-                let mut layer = ActiveAdditiveLayer {
-                    weight,
-                    leaves: Vec::new(),
-                    inner: Vec::new(),
-                };
-                for &child in &children[node] {
-                    self.collect(child, 1.0, children, &mut layer.leaves, &mut layer.inner);
-                }
-                if !layer.leaves.is_empty() || !layer.inner.is_empty() {
-                    layers.push(layer);
-                }
-            }
+            return;
+        }
+        // An additive node: its children make a layer of their own.
+        let mut layer = LiveOverlayLayer {
+            inner: Vec::new(),
+            leaves: Vec::new(),
+            weight,
+        };
+        for &kid in &kids[at] {
+            self.gather(kid, 1.0, kids, &mut layer.leaves, &mut layer.inner);
+        }
+        if layer.leaves.len() + layer.inner.len() > 0 {
+            out_layers.push(layer);
         }
     }
 }
@@ -320,148 +326,142 @@ impl XAnimTreeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Translation;
+    use crate::RootShift;
 
     /// A looping clip two seconds long.
-    fn clip(name: &str) -> Arc<AnimClip> {
-        Arc::new(AnimClip {
+    fn reel(name: &str) -> Arc<SkeletalClip> {
+        Arc::new(SkeletalClip {
             name: name.into(),
-            framerate: 10.0,
-            numframes: 20,
+            fps: 10.0,
+            frame_total: 20,
             looping: true,
             tracks: Vec::new(),
             notifies: Vec::new(),
-            delta_translation: Translation::Default,
+            root_motion_shift: RootShift::Default,
         })
     }
 
-    fn node(parent: Option<u16>, kind: XAnimNodeKind) -> XAnimNodeDefinition {
-        XAnimNodeDefinition {
-            parent: parent.map(XAnimNodeId),
+    fn node(owner: Option<u16>, kind: AnimGraphNodeType) -> AnimGraphNodeSpec {
+        AnimGraphNodeSpec {
+            owner: owner.map(GraphSlot),
             kind,
         }
     }
 
-    fn leaf(parent: u16, name: &str) -> XAnimNodeDefinition {
-        node(
-            Some(parent),
-            XAnimNodeKind::Leaf {
-                clip: clip(name),
-                parts: None,
-            },
-        )
+    fn leaf(owner: u16, name: &str) -> AnimGraphNodeSpec {
+        node(Some(owner), AnimGraphNodeType::Leaf { clip: reel(name), parts: None })
     }
 
-    fn weighted(weight: f32) -> XAnimNodeState {
-        XAnimNodeState {
+    fn weighted(weight: f32) -> NodeClock {
+        NodeClock {
             weight,
-            goal_weight: weight,
+            target_w: weight,
             ..Default::default()
         }
     }
 
     #[test]
     fn a_tree_lists_parents_first() {
-        let err = |nodes| XAnimTreeDefinition::new(nodes).unwrap_err();
-        assert_eq!(err(Vec::new()), XAnimTreeError::Empty);
+        let err = |nodes| AnimGraphBlueprint::new(nodes).unwrap_err();
+        assert_eq!(err(Vec::new()), AnimGraphFault::Empty);
         assert_eq!(
-            err(vec![node(None, XAnimNodeKind::Blend), leaf(5, "a")]),
-            XAnimTreeError::ParentOutOfRange { node: 1, parent: 5 }
+            err(vec![node(None, AnimGraphNodeType::Blend), leaf(5, "a")]),
+            AnimGraphFault::ParentMissing { node_ix: 1, parent_ix: 5 }
         );
         assert_eq!(
-            err(vec![node(Some(1), XAnimNodeKind::Blend), leaf(0, "a")]),
-            XAnimTreeError::ParentNotBeforeChild { node: 0, parent: 1 }
+            err(vec![node(Some(1), AnimGraphNodeType::Blend), leaf(0, "a")]),
+            AnimGraphFault::ParentAfterChild { node_ix: 0, parent_ix: 1 }
         );
         assert_eq!(
             err(vec![
-                node(None, XAnimNodeKind::Blend),
+                node(None, AnimGraphNodeType::Blend),
                 leaf(0, "a"),
                 leaf(1, "b")
             ]),
-            XAnimTreeError::LeafHasChildren { node: 1 }
+            AnimGraphFault::LeafWithChildren { node: 1 }
         );
-        let tree = XAnimTreeDefinition::new(vec![node(None, XAnimNodeKind::Blend), leaf(0, "a")]);
+        let tree = AnimGraphBlueprint::new(vec![node(None, AnimGraphNodeType::Blend), leaf(0, "a")]);
         assert_eq!(tree.unwrap().nodes().len(), 2);
     }
 
-    fn runtime(nodes: Vec<XAnimNodeDefinition>) -> XAnimTreeRuntime {
-        XAnimTreeRuntime::new(Arc::new(XAnimTreeDefinition::new(nodes).unwrap()))
+    fn runtime(nodes: Vec<AnimGraphNodeSpec>) -> AnimGraphInstance {
+        AnimGraphInstance::new(Arc::new(AnimGraphBlueprint::new(nodes).unwrap()))
     }
 
     #[test]
     fn roots_start_at_full_weight() {
-        let tree = runtime(vec![node(None, XAnimNodeKind::Blend), leaf(0, "a")]);
-        assert_eq!(tree.states[0], weighted(1.0));
-        assert_eq!(tree.states[1], XAnimNodeState::default());
+        let tree = runtime(vec![node(None, AnimGraphNodeType::Blend), leaf(0, "a")]);
+        assert_eq!(tree.node_states[0], weighted(1.0));
+        assert_eq!(tree.node_states[1], NodeClock::default());
     }
 
     #[test]
     fn states_must_be_finite_and_in_the_tree() {
-        let mut tree = runtime(vec![node(None, XAnimNodeKind::Blend)]);
-        let bad = XAnimNodeState {
+        let mut tree = runtime(vec![node(None, AnimGraphNodeType::Blend)]);
+        let bad = NodeClock {
             rate: f32::NAN,
             ..Default::default()
         };
         assert_eq!(
-            tree.set_state(XAnimNodeId(0), bad),
-            Err(XAnimTreeError::NonFiniteState { node: 0 })
+            tree.set_state(GraphSlot(0), bad),
+            Err(AnimGraphFault::NanInNode { node: 0 })
         );
         assert_eq!(
-            tree.set_state(XAnimNodeId(3), weighted(1.0)),
-            Err(XAnimTreeError::ParentOutOfRange { node: 3, parent: 3 })
+            tree.set_state(GraphSlot(3), weighted(1.0)),
+            Err(AnimGraphFault::ParentMissing { node_ix: 3, parent_ix: 3 })
         );
         assert_eq!(
-            tree.update(-1.0),
-            Err(XAnimTreeError::NonFiniteState { node: 0 })
+            tree.refresh(-1.0),
+            Err(AnimGraphFault::NanInNode { node: 0 })
         );
     }
 
     #[test]
     fn weights_ease_to_their_goal() {
-        let mut tree = runtime(vec![node(None, XAnimNodeKind::Blend), leaf(0, "a")]);
-        let easing = XAnimNodeState {
-            goal_weight: 1.0,
-            goal_time: 0.5,
+        let mut tree = runtime(vec![node(None, AnimGraphNodeType::Blend), leaf(0, "a")]);
+        let easing = NodeClock {
+            target_w: 1.0,
+            blend_left: 0.5,
             ..Default::default()
         };
-        tree.set_state(XAnimNodeId(1), easing).unwrap();
-        tree.update(0.25).unwrap();
+        tree.set_state(GraphSlot(1), easing).unwrap();
+        tree.refresh(0.25).unwrap();
         assert_eq!(
-            (tree.states[1].weight, tree.states[1].goal_time),
+            (tree.node_states[1].weight, tree.node_states[1].blend_left),
             (0.5, 0.25)
         );
-        tree.update(0.25).unwrap();
+        tree.refresh(0.25).unwrap();
         assert_eq!(
-            (tree.states[1].weight, tree.states[1].goal_time),
+            (tree.node_states[1].weight, tree.node_states[1].blend_left),
             (1.0, 0.0)
         );
         // A weight too small to keep is set to a thousandth of the goal.
-        let faint = XAnimNodeState {
-            goal_weight: 0.001,
-            goal_time: 1000.0,
+        let faint = NodeClock {
+            target_w: 0.001,
+            blend_left: 1000.0,
             ..Default::default()
         };
-        tree.set_state(XAnimNodeId(1), faint).unwrap();
-        tree.update(0.001).unwrap();
-        assert_eq!(tree.states[1].weight, 0.001 * 0.001);
+        tree.set_state(GraphSlot(1), faint).unwrap();
+        tree.refresh(0.001).unwrap();
+        assert_eq!(tree.node_states[1].weight, 0.001 * 0.001);
     }
 
     #[test]
     fn under_a_weightless_parent_the_goal_is_reached_at_once() {
         let mut tree = runtime(vec![
-            node(None, XAnimNodeKind::Blend),
-            node(Some(0), XAnimNodeKind::Blend),
+            node(None, AnimGraphNodeType::Blend),
+            node(Some(0), AnimGraphNodeType::Blend),
             leaf(1, "a"),
         ]);
-        let easing = XAnimNodeState {
-            goal_weight: 1.0,
-            goal_time: 10.0,
+        let easing = NodeClock {
+            target_w: 1.0,
+            blend_left: 10.0,
             ..Default::default()
         };
-        tree.set_state(XAnimNodeId(2), easing).unwrap();
-        tree.update(0.1).unwrap();
+        tree.set_state(GraphSlot(2), easing).unwrap();
+        tree.refresh(0.1).unwrap();
         assert_eq!(
-            (tree.states[2].weight, tree.states[2].goal_time),
+            (tree.node_states[2].weight, tree.node_states[2].blend_left),
             (1.0, 0.0)
         );
     }
@@ -469,36 +469,36 @@ mod tests {
     #[test]
     fn leaves_with_weight_play() {
         let mut tree = runtime(vec![
-            node(None, XAnimNodeKind::Blend),
+            node(None, AnimGraphNodeType::Blend),
             leaf(0, "on"),
             leaf(0, "off"),
         ]);
-        tree.set_state(XAnimNodeId(1), weighted(1.0)).unwrap();
-        tree.update(0.5).unwrap();
+        tree.set_state(GraphSlot(1), weighted(1.0)).unwrap();
+        tree.refresh(0.5).unwrap();
         // A quarter of the two-second clip.
-        assert_eq!((tree.states[1].old_time, tree.states[1].time), (0.0, 0.25));
-        assert_eq!(tree.states[2].time, 0.0);
-        tree.update(1.75).unwrap();
+        assert_eq!((tree.node_states[1].prev_t, tree.node_states[1].time), (0.0, 0.25));
+        assert_eq!(tree.node_states[2].time, 0.0);
+        tree.refresh(1.75).unwrap();
         assert_eq!(
-            (tree.states[1].time, tree.states[1].cycle_count),
+            (tree.node_states[1].time, tree.node_states[1].laps),
             (0.125, 1)
         );
-        assert_eq!(tree.states[1].old_cycle_count, 0);
+        assert_eq!(tree.node_states[1].prev_laps, 0);
     }
 
     #[test]
     fn the_active_pose_multiplies_weights_down_the_tree() {
         let mut tree = runtime(vec![
-            node(None, XAnimNodeKind::Blend),
-            node(Some(0), XAnimNodeKind::Blend),
+            node(None, AnimGraphNodeType::Blend),
+            node(Some(0), AnimGraphNodeType::Blend),
             leaf(1, "walk"),
             leaf(1, "run"),
-            node(Some(0), XAnimNodeKind::Additive),
+            node(Some(0), AnimGraphNodeType::Additive),
             leaf(4, "lean"),
             leaf(0, "idle"),
         ]);
-        let set = |tree: &mut XAnimTreeRuntime, node, weight| {
-            tree.set_state(XAnimNodeId(node), weighted(weight)).unwrap();
+        let set = |tree: &mut AnimGraphInstance, node, weight| {
+            tree.set_state(GraphSlot(node), weighted(weight)).unwrap();
         };
         set(&mut tree, 1, 0.5);
         set(&mut tree, 2, 0.25);
@@ -506,23 +506,23 @@ mod tests {
         set(&mut tree, 4, 0.5);
         set(&mut tree, 5, 1.0);
         tree.set_state(
-            XAnimNodeId(3),
-            XAnimNodeState {
+            GraphSlot(3),
+            NodeClock {
                 time: 0.5,
                 ..weighted(0.75)
             },
         )
         .unwrap();
-        let (leaves, layers) = tree.active_pose();
-        let named: Vec<_> = leaves
+        let (live_clips, layers) = tree.active_pose();
+        let named: Vec<_> = live_clips
             .iter()
-            .map(|l| (l.clip.name.as_str(), l.weight, l.time))
+            .map(|l| (l.reel.name.as_str(), l.weight, l.time))
             .collect();
         // "idle" has no weight and is left out; "run" is halfway, one second in.
         assert_eq!(named, [("walk", 0.125, 0.0), ("run", 0.375, 1.0)]);
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].weight, 0.5);
-        assert_eq!(layers[0].leaves[0].clip.name, "lean");
+        assert_eq!(layers[0].leaves[0].reel.name, "lean");
         assert_eq!(layers[0].leaves[0].weight, 1.0);
         assert!(layers[0].inner.is_empty());
         // An additive node whose leaves have no weight lays nothing.

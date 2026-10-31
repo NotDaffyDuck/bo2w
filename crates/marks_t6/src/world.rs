@@ -1,132 +1,132 @@
 //! Staging a mark on the world: every surface its box reaches, triangle by triangle.
 
 use crate::{
-    FxMarkEmitRefuse, FxMarkStagingPoint, FxMarkStagingTri, FxWorldMarkPoint, GfxMarkContext,
-    R_MARK_CHOP_MAX_POINTS, mark_chop_world_triangle_points, mark_emit_brush_fragment,
+    DecalEmitDenial, EffectStainStagingPoint, EffectStainStagingTri, WorldDecalVertex, GfxMarkContext,
+    DECAL_CLIP_POLYGON_VERTEX_CEILING, mark_chop_world_triangle_points, mark_emit_brush_fragment,
     mark_fragment_clip_planes, mark_is_triangle_rejected,
 };
 
 /// The most world surfaces one mark is cut against.
 const SURFACE_LIMIT: u32 = 256;
 
-/// Whether a sphere (`origin`, squared radius) reaches a box given by its middle and half
+/// Whether a sphere (`centre`, squared radius) reaches a box given by its middle and half
 /// size.
 pub fn mark_sphere_hits_bounds(
-    origin: [f32; 3],
-    radius_sq: f32,
+    centre: [f32; 3],
+    reach_squared: f32,
     mid: [f32; 3],
     half: [f32; 3],
 ) -> bool {
-    let gap = |k: usize| ((origin[k] - mid[k]).abs() - half[k]).max(0.0);
+    let gap = |k: usize| ((centre[k] - mid[k]).abs() - half[k]).max(0.0);
     let (x, y, z) = (gap(0), gap(1), gap(2));
-    x * x + y * y + z * z <= radius_sq
+    x * x + y * y + z * z <= reach_squared
 }
 
 /// How far staging a mark on the world got.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MarkWorldStaging {
-    pub used_tri: u32,
-    pub used_point: u32,
+pub struct StainLevelStaging {
+    pub triangles_consumed: u32,
+    pub points_consumed: u32,
     /// The staging ran out of room and the mark stopped there.
     pub overflow: bool,
 }
 
-/// Cuts the mark's box (`origin`, `radius`, `axis`; `axis[0]` is the way the mark faces)
+/// Cuts the mark's box (`hub_pt`, `reach`, `frame_axes`; `frame_axes[0]` is the way the mark faces)
 /// against the world surfaces in order and stages every piece.
 ///
 /// Surface `s` has bounds `mids[s]`/`halves[s]`, its triangles as the `(start, count)` run
-/// `surface_index_ranges[s]` of `packed_indices` (three per triangle), and its context
-/// `contexts[s]`. The corner numbers index `positions`, `lightmap_uvs` and `normals`. With
-/// `retest_sphere` a surface the mark's sphere misses is passed over. At most 256 surfaces
+/// `facet_index_ranges[s]` of `compact_indices` (three per triangle), and its context
+/// `contexts[s]`. The corner numbers index `vert_pos`, `lightbake_uvs` and `surface_directions`. With
+/// `recheck_ball` a surface the mark's sphere misses is passed over. At most 256 surfaces
 /// are cut; a full staging stops everything and sets `overflow`.
 #[allow(clippy::too_many_arguments)]
 pub fn mark_stage_world_surfaces(
-    origin: [f32; 3],
-    radius: f32,
-    axis: [[f32; 3]; 3],
-    mids: &[[f32; 3]],
-    halves: &[[f32; 3]],
-    positions: &[[f32; 3]],
-    lightmap_uvs: &[[f32; 2]],
-    normals: &[[f32; 3]],
-    packed_indices: &[u32],
-    surface_index_ranges: &[(u32, u32)],
+    hub_pt: [f32; 3],
+    reach: f32,
+    frame_axes: [[f32; 3]; 3],
+    centres: &[[f32; 3]],
+    extents: &[[f32; 3]],
+    vert_pos: &[[f32; 3]],
+    lightbake_uvs: &[[f32; 2]],
+    surface_directions: &[[f32; 3]],
+    compact_indices: &[u32],
+    facet_index_ranges: &[(u32, u32)],
     contexts: &[GfxMarkContext],
-    max_tris: u32,
-    max_points: u32,
-    tris: &mut [FxMarkStagingTri],
-    points: &mut [FxMarkStagingPoint],
-    retest_sphere: bool,
-) -> MarkWorldStaging {
-    let planes = mark_fragment_clip_planes(origin, axis, radius);
-    let radius_sq = radius * radius;
-    let mut staged = MarkWorldStaging::default();
-    let mut piece = [FxWorldMarkPoint::ZERO; R_MARK_CHOP_MAX_POINTS];
+    tri_cap: u32,
+    point_cap: u32,
+    triangle_list: &mut [EffectStainStagingTri],
+    points: &mut [EffectStainStagingPoint],
+    recheck_ball: bool,
+) -> StainLevelStaging {
+    let planes = mark_fragment_clip_planes(hub_pt, frame_axes, reach);
+    let reach_squared = reach * reach;
+    let mut staged = StainLevelStaging::default();
+    let mut piece = [WorldDecalVertex::ZERO; DECAL_CLIP_POLYGON_VERTEX_CEILING];
     let mut taken = 0u32;
-    let surfaces = mids
+    let surfaces = centres
         .iter()
-        .zip(halves)
-        .zip(surface_index_ranges)
+        .zip(extents)
+        .zip(facet_index_ranges)
         .enumerate();
     for (s, ((&mid, &half), &(start, count))) in surfaces {
         if taken >= SURFACE_LIMIT {
             break;
         }
-        if retest_sphere && !mark_sphere_hits_bounds(origin, radius_sq, mid, half) {
+        if recheck_ball && !mark_sphere_hits_bounds(hub_pt, reach_squared, mid, half) {
             continue;
         }
         taken += 1;
-        let start = start as usize;
-        if count < 3 || start >= packed_indices.len() {
+        let run_at = start as usize;
+        if count < 3 || run_at >= compact_indices.len() {
             continue;
         }
-        let end = start
+        let end = run_at
             .saturating_add(count as usize)
-            .min(packed_indices.len());
+            .min(compact_indices.len());
         let context = contexts.get(s).copied().unwrap_or(GfxMarkContext::ZERO);
-        for corners in packed_indices[start..end].chunks_exact(3) {
+        for corners in compact_indices[run_at..end].chunks_exact(3) {
             let ids = [corners[0], corners[1], corners[2]].map(|i| i as usize);
-            let Some([v0, v1, v2]) = corner_values(positions, ids) else {
+            let Some([v0, v1, v2]) = corner_values(vert_pos, ids) else {
                 continue;
             };
-            if mark_is_triangle_rejected(axis[0], v0, v1, v2) {
+            if mark_is_triangle_rejected(frame_axes[0], v0, v1, v2) {
                 continue;
             }
             let n = mark_chop_world_triangle_points(&planes, v0, v1, v2, &mut piece) as usize;
             if n < 3 {
                 continue;
             }
-            let (Some(lmap), Some(normal)) = (
-                corner_values(lightmap_uvs, ids),
-                corner_values(normals, ids),
+            let (Some(baked_light_slot), Some(normal)) = (
+                corner_values(lightbake_uvs, ids),
+                corner_values(surface_directions, ids),
             ) else {
                 continue;
             };
             match mark_emit_brush_fragment(
-                staged.used_tri,
-                staged.used_point,
-                max_tris,
-                max_points,
+                staged.triangles_consumed,
+                staged.points_consumed,
+                tri_cap,
+                point_cap,
                 &piece[..n],
-                lmap[0],
-                lmap[1],
-                lmap[2],
+                baked_light_slot[0],
+                baked_light_slot[1],
+                baked_light_slot[2],
                 normal[0],
                 normal[1],
                 normal[2],
                 context,
-                tris,
+                triangle_list,
                 points,
             ) {
-                Ok((used_tri, used_point)) => {
-                    staged.used_tri = used_tri;
-                    staged.used_point = used_point;
+                Ok((triangles_consumed, points_consumed)) => {
+                    staged.triangles_consumed = triangles_consumed;
+                    staged.points_consumed = points_consumed;
                 }
-                Err(FxMarkEmitRefuse::Overflow) => {
+                Err(DecalEmitDenial::Overflow) => {
                     staged.overflow = true;
                     return staged;
                 }
-                Err(FxMarkEmitRefuse::FragmentTooSmall) => {}
+                Err(DecalEmitDenial::SliverFragment) => {}
             }
         }
     }
@@ -145,7 +145,7 @@ fn corner_values<T: Copy>(values: &[T], ids: [usize; 3]) -> Option<[T; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{R_MARK_FRAGMENTS_MAX_POINTS, R_MARK_FRAGMENTS_MAX_TRIS};
+    use crate::{DECAL_FRAGMENT_VERTEX_CEILING, DECAL_FRAGMENT_TRIANGLE_CEILING};
 
     #[test]
     fn sphere_against_box() {
@@ -161,8 +161,8 @@ mod tests {
     /// A floor of two triangles, 40 units square, facing +z.
     struct Floor {
         positions: [[f32; 3]; 4],
-        uvs: [[f32; 2]; 4],
-        normals: [[f32; 3]; 4],
+        texcoord_set: [[f32; 2]; 4],
+        surface_directions: [[f32; 3]; 4],
         indices: [u32; 6],
     }
 
@@ -173,8 +173,8 @@ mod tests {
             [20.0, 20.0, 0.0],
             [-20.0, 20.0, 0.0],
         ],
-        uvs: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
-        normals: [[0.0, 0.0, 1.0]; 4],
+        texcoord_set: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        surface_directions: [[0.0, 0.0, 1.0]; 4],
         // Wound so (v2 - v0) × (v1 - v0) is +z.
         indices: [0, 2, 1, 0, 3, 2],
     };
@@ -182,13 +182,13 @@ mod tests {
     const DOWN_ONTO_FLOOR: [[f32; 3]; 3] = [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
 
     fn stage(
-        ranges: &[(u32, u32)],
-        mids: &[[f32; 3]],
-        max_tris: u32,
+        spans: &[(u32, u32)],
+        centre_pts: &[[f32; 3]],
+        tri_room: u32,
         retest: bool,
-    ) -> (MarkWorldStaging, [FxMarkStagingTri; 255]) {
-        let mut tris = [FxMarkStagingTri::ZERO; R_MARK_FRAGMENTS_MAX_TRIS as usize];
-        let mut points = [FxMarkStagingPoint::ZERO; R_MARK_FRAGMENTS_MAX_POINTS as usize];
+    ) -> (StainLevelStaging, [EffectStainStagingTri; 255]) {
+        let mut triangle_list = [EffectStainStagingTri::ZERO; DECAL_FRAGMENT_TRIANGLE_CEILING as usize];
+        let mut points = [EffectStainStagingPoint::ZERO; DECAL_FRAGMENT_VERTEX_CEILING as usize];
         let halves = [[20.0, 20.0, 0.0]; 4];
         let contexts = [
             GfxMarkContext::world_surface(1, 2, 3),
@@ -198,57 +198,57 @@ mod tests {
             [0.0, 0.0, 1.0],
             8.0,
             DOWN_ONTO_FLOOR,
-            mids,
-            &halves[..mids.len()],
+            centre_pts,
+            &halves[..centre_pts.len()],
             &FLOOR.positions,
-            &FLOOR.uvs,
-            &FLOOR.normals,
+            &FLOOR.texcoord_set,
+            &FLOOR.surface_directions,
             &FLOOR.indices,
-            ranges,
+            spans,
             &contexts,
-            max_tris,
-            R_MARK_FRAGMENTS_MAX_POINTS,
-            &mut tris,
+            tri_room,
+            DECAL_FRAGMENT_VERTEX_CEILING,
+            &mut triangle_list,
             &mut points,
             retest,
         );
-        (staged, tris)
+        (staged, triangle_list)
     }
 
     #[test]
     fn a_mark_on_the_floor_covers_its_square() {
-        let (staged, tris) = stage(&[(0, 6)], &[[0.0; 3]], R_MARK_FRAGMENTS_MAX_TRIS, true);
+        let (staged, triangle_list) = stage(&[(0, 6)], &[[0.0; 3]], DECAL_FRAGMENT_TRIANGLE_CEILING, true);
         assert!(!staged.overflow);
         // Each floor triangle keeps its half of the 16-unit square: one triangle, three points.
-        assert_eq!((staged.used_tri, staged.used_point), (2, 6));
-        assert_eq!(tris[0].context, GfxMarkContext::world_surface(1, 2, 3));
+        assert_eq!((staged.triangles_consumed, staged.points_consumed), (2, 6));
+        assert_eq!(triangle_list[0].context, GfxMarkContext::world_surface(1, 2, 3));
     }
 
     #[test]
     fn surfaces_the_sphere_misses_are_skipped_only_when_asked() {
         let far = [[0.0, 0.0, 500.0]];
         assert_eq!(
-            stage(&[(0, 6)], &far, R_MARK_FRAGMENTS_MAX_TRIS, true).0,
-            MarkWorldStaging::default()
+            stage(&[(0, 6)], &far, DECAL_FRAGMENT_TRIANGLE_CEILING, true).0,
+            StainLevelStaging::default()
         );
         assert!(
-            stage(&[(0, 6)], &far, R_MARK_FRAGMENTS_MAX_TRIS, false)
+            stage(&[(0, 6)], &far, DECAL_FRAGMENT_TRIANGLE_CEILING, false)
                 .0
-                .used_tri
+                .triangles_consumed
                 > 0
         );
     }
 
     #[test]
     fn each_surface_uses_its_own_context_and_short_runs_are_nothing() {
-        let (staged, tris) = stage(
+        let (staged, triangle_list) = stage(
             &[(0, 2), (3, 3)],
             &[[0.0; 3]; 2],
-            R_MARK_FRAGMENTS_MAX_TRIS,
+            DECAL_FRAGMENT_TRIANGLE_CEILING,
             false,
         );
-        assert!(staged.used_tri > 0);
-        let used = &tris[..staged.used_tri as usize];
+        assert!(staged.triangles_consumed > 0);
+        let used = &triangle_list[..staged.triangles_consumed as usize];
         assert!(
             used.iter()
                 .all(|t| t.context == GfxMarkContext::world_surface(4, 5, 6))

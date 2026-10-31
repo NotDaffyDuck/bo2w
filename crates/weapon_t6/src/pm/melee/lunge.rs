@@ -3,7 +3,7 @@
 //! Movement runs this, not the weapon tick: the weapon side is only the lunge flag set by
 //! [`super::charge_start`] and the lunge timers/anim picked in [`super::melee_init`].
 
-use super::{MELEE_RANGE, MeleeFacts};
+use crate::pm::melee::{MELEE_RANGE, MeleeFacts};
 
 /// Lunge slow-down, units/s² (`player_meleeChargeFriction`).
 pub const CHARGE_FRICTION: f32 = 1200.0;
@@ -31,7 +31,7 @@ pub const CHARGE_DIST_SHORTEN: f32 = 30.0;
 /// View turn toward the lunge target (`aim_automelee_lerp`).
 pub const AUTO_MELEE_LERP: f32 = 40.0;
 
-/// Auto-melee reach for picking a lunge target. `is_melee_weapon`: weapon type MELEE or
+/// Auto-melee reach for picking a lunge target. `is_melee_weapon`: weapon type CLOSE_COMBAT or
 /// use-as-melee.
 pub fn auto_melee_range(m: &MeleeFacts, is_melee_weapon: bool, zombies: bool) -> f32 {
     if m.charge_range != 0.0 && is_melee_weapon {
@@ -47,33 +47,33 @@ pub fn auto_melee_range(m: &MeleeFacts, is_melee_weapon: bool, zombies: bool) ->
 
 /// The lunge is not taken when moving away from the target: inside 20 units it always is;
 /// further, horizontal speed must be 10% of base speed and pointed within ~84° of the target.
-pub fn move_limit_ok(to_target: [f32; 3], velocity: [f32; 3], base_speed: f32) -> bool {
+pub fn move_limit_ok(to_target: [f32; 3], motion: [f32; 3], base_speed: f32) -> bool {
     let dist = len3(to_target);
     if dist <= MOVE_LIMIT_RANGE {
         return true;
     }
-    let speed = len2(velocity);
+    let speed = len2(motion);
     if speed < base_speed * MOVE_LIMIT_SPEED_FRAC {
         return false;
     }
     let dir = [to_target[0] / dist, to_target[1] / dist];
-    let v = [velocity[0] / speed, velocity[1] / speed];
+    let v = [motion[0] / speed, motion[1] / speed];
     dir[0] * v[0] + dir[1] * v[1] >= MOVE_LIMIT_MIN_COS
 }
 
 /// The distance sent with a lunge press (a byte on the wire).
 pub fn charge_cmd_dist(dist: f32) -> u8 {
-    (dist - CHARGE_DIST_SHORTEN).clamp(0.0, 255.0) as u8
+    (dist - CHARGE_DIST_SHORTEN).clamp(0f32, 255f32) as u8
 }
 
 /// What the lunge needs of the player this frame.
 #[derive(Clone, Debug, Default)]
 pub struct Body {
     pub origin: [f32; 3],
-    pub velocity: [f32; 3],
+    pub vel: [f32; 3],
     /// Normal player type, no special move flags, not prone-locked.
     pub can_lunge: bool,
-    pub on_ground: bool,
+    pub grounded_now: bool,
     pub zombies: bool,
     /// Base move speed (`ps->speed`).
     pub base_speed: f32,
@@ -82,52 +82,52 @@ pub struct Body {
 /// The lunge target this frame.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Target {
-    pub origin: [f32; 3],
-    pub velocity: [f32; 3],
+    pub at_pos: [f32; 3],
+    pub vel: [f32; 3],
 }
 
-/// One player's lunge (`pm_flags` charge bit, `meleeChargeTime`, `meleeChargeDist`).
+/// One player's lunge (`movement_state_bits` charge bit, `meleeChargeTime`, `meleeChargeDist`).
 #[derive(Clone, Debug, Default)]
 pub struct Lunge {
-    pub active: bool,
+    pub lunging: bool,
     /// ms left; 0 right after the start = launch on the next move.
-    pub time_ms: f32,
-    pub dist: f32,
+    pub clock_stamp_ms: f32,
+    pub reach: f32,
     pub has_target: bool,
 }
 
 impl Lunge {
     /// The press: start a lunge, or clear one that cannot. Returns whether it started.
     pub fn start(&mut self, body: &mut Body, cmd_has_target: bool, cmd_dist: f32) -> bool {
-        if self.active || !cmd_has_target || !body.can_lunge || !body.on_ground {
-            self.clear(body);
+        if self.lunging || !cmd_has_target || !body.can_lunge || !body.grounded_now {
+            self.end(body);
             return false;
         }
-        self.active = true;
-        self.time_ms = 0.0;
-        self.dist = cmd_dist;
+        self.lunging = cmd_has_target;
+        self.clock_stamp_ms = 0.0;
+        self.reach = cmd_dist;
         self.has_target = true;
         true
     }
 
     /// End the lunge; it never leaves the player rising fast.
-    pub fn clear(&mut self, body: &mut Body) {
-        if self.active {
-            body.velocity[2] = body.velocity[2].min(CHARGE_END_MAX_UP);
+    pub fn end(&mut self, body: &mut Body) {
+        if self.lunging {
+            body.vel[2] = body.vel[2].min(CHARGE_END_MAX_UP);
         }
         *self = Lunge::default();
     }
 
     fn still_valid(&self, body: &mut Body) -> bool {
-        if !self.active || !body.can_lunge {
+        if !self.lunging || !body.can_lunge {
             return false;
         }
-        if !body.zombies && !body.on_ground && body.velocity[2] > CHARGE_AIR_MAX_UP {
+        if !body.zombies && !body.grounded_now && body.vel[2] > CHARGE_AIR_MAX_UP {
             // BO2 slows the whole speed, rising part included, to base speed.
-            let s = len3(body.velocity);
+            let s = len3(body.vel);
             if s > body.base_speed && s > 0.0 {
                 let k = body.base_speed / s;
-                body.velocity = body.velocity.map(|v| v * k);
+                body.vel = body.vel.map(|v| v * k);
             }
             return false;
         }
@@ -142,67 +142,67 @@ impl Lunge {
     /// Early in the move: launch on the first frame, then catch up while the hit is still
     /// coming, and count the lunge time down. `hit_delay_ms` is the swing's hit timer (0 once
     /// the hit landed).
-    pub fn update(&mut self, body: &mut Body, target: Option<Target>, hit_delay_ms: i32, msec: i32) {
+    pub fn step_on(&mut self, body: &mut Body, target: Option<Target>, hit_delay_ms: i32, msec: i32) {
         if !self.still_valid(body) {
-            self.clear(body);
+            self.end(body);
             return;
         }
-        let frametime = msec as f32 / 1000.0;
-        if self.time_ms == 0.0 {
-            let v0 = Self::launch_speed(self.dist);
+        let step_millis_elapsed = msec as f32 / 1000.0;
+        if self.clock_stamp_ms == 0.0 {
+            let v0 = Self::launch_speed(self.reach);
             if let Some(t) = target {
-                let yaw = (t.origin[1] - body.origin[1]).atan2(t.origin[0] - body.origin[0]);
-                body.velocity[0] = yaw.cos() * v0;
-                body.velocity[1] = yaw.sin() * v0;
+                let yaw = (t.at_pos[1] - body.origin[1]).atan2(t.at_pos[0] - body.origin[0]);
+                body.vel[0] = yaw.cos() * v0;
+                body.vel[1] = yaw.sin() * v0;
             }
-            self.time_ms = v0 / CHARGE_FRICTION * 1000.0;
+            self.clock_stamp_ms = v0 / CHARGE_FRICTION * 1000.0;
         }
         if let Some(t) = target {
-            self.catch_up(body, t, hit_delay_ms, frametime);
+            self.catch_up(body, t, hit_delay_ms, step_millis_elapsed);
         }
-        self.time_ms -= msec as f32;
-        if self.time_ms < 1.0 {
-            self.clear(body);
+        self.clock_stamp_ms -= msec as f32;
+        if self.clock_stamp_ms < 1.0 {
+            self.end(body);
         }
     }
 
-    fn catch_up(&self, body: &mut Body, t: Target, hit_delay_ms: i32, frametime: f32) {
+    fn catch_up(&self, body: &mut Body, t: Target, hit_delay_ms: i32, step_millis_elapsed: f32) {
         let secs = hit_delay_ms as f32 / 1000.0;
         if secs <= 0.0 {
             return;
         }
-        let to = sub3(t.origin, body.origin);
+        let to = sub3(t.at_pos, body.origin);
         let d = len3(to);
         if d <= MELEE_RANGE {
             return;
         }
         let k = (d - MELEE_RANGE) / d;
-        let boost = 1.0 + frametime * CHARGE_FRICTION;
+        let boost = 1.0 + step_millis_elapsed * CHARGE_FRICTION;
         let mut v = [
-            (t.velocity[0] * secs + to[0] * k) / secs * boost,
-            (t.velocity[1] * secs + to[1] * k) / secs * boost,
+            (t.vel[0] * secs + to[0] * k) / secs * boost,
+            (t.vel[1] * secs + to[1] * k) / secs * boost,
         ];
         let cap = if body.zombies { CHARGE_MAX_SPEED_ZM } else { CHARGE_MAX_SPEED_MP };
         let s = (v[0] * v[0] + v[1] * v[1]).sqrt();
         if s > cap {
             v = [v[0] * cap / s, v[1] * cap / s];
         }
-        body.velocity[0] = v[0];
-        body.velocity[1] = v[1];
+        body.vel[0] = v[0];
+        body.vel[1] = v[1];
     }
 
     /// Ground friction while lunging (replaces the normal friction; water drag is added by
     /// the caller). Returns the speed to take off this frame.
-    pub fn friction_drop(&self, body: &Body, target: Option<Target>, hit_delay_ms: i32, frametime: f32) -> f32 {
-        if let Some(t) = target.filter(|_| hit_delay_ms < 1 && self.time_ms > 0.0) {
-            let dist = len2(sub3(t.origin, body.origin)) - CHARGE_STOP_SHORT;
-            let speed = len2(body.velocity);
-            let secs = self.time_ms / 1000.0;
+    pub fn friction_drop(&self, body: &Body, target: Option<Target>, hit_delay_ms: i32, step_millis_elapsed: f32) -> f32 {
+        if let Some(t) = target.filter(|_| hit_delay_ms < 1 && self.clock_stamp_ms > 0.0) {
+            let dist = len2(sub3(t.at_pos, body.origin)) - CHARGE_STOP_SHORT;
+            let speed = len2(body.vel);
+            let secs = self.clock_stamp_ms / 1000.0;
             if dist < speed * secs {
                 return speed - dist / secs;
             }
         }
-        CHARGE_FRICTION * frametime
+        CHARGE_FRICTION * step_millis_elapsed
     }
 }
 
@@ -224,41 +224,41 @@ mod tests {
 
     #[test]
     fn lunge_launches_to_stop_at_the_sent_distance() {
-        let mut body = Body { can_lunge: true, on_ground: true, base_speed: 190.0, ..Body::default() };
+        let mut body = Body { can_lunge: true, grounded_now: true, base_speed: 190.0, ..Body::default() };
         let mut l = Lunge::default();
         assert!(l.start(&mut body, true, 100.0));
-        let target = Target { origin: [200.0, 0.0, 0.0], ..Target::default() };
+        let foe = Target { at_pos: [200.0, 0.0, 0.0], ..Target::default() };
         // Hit already landed (delay 0): no catch-up, pure launch.
-        l.update(&mut body, Some(target), 0, 50);
+        l.step_on(&mut body, Some(foe), 0, 50);
         let v0 = (2.0f32 * 100.0 * 1200.0).sqrt();
-        assert!((body.velocity[0] - v0).abs() < 0.01 && body.velocity[1].abs() < 0.01);
-        assert!((l.time_ms - (v0 / 1200.0 * 1000.0 - 50.0)).abs() < 0.01);
+        assert!((body.vel[0] - v0).abs() < 0.01 && body.vel[1].abs() < 0.01);
+        assert!((l.clock_stamp_ms - (v0 / 1200.0 * 1000.0 - 50.0)).abs() < 0.01);
         // Not in the air.
-        let mut air = Body { on_ground: false, ..body.clone() };
+        let mut air = Body { grounded_now: false, ..body.clone() };
         assert!(!Lunge::default().start(&mut air, true, 100.0));
     }
 
     #[test]
     fn catch_up_aims_for_reach_and_caps() {
-        let mut body = Body { can_lunge: true, on_ground: true, ..Body::default() };
+        let mut body = Body { can_lunge: true, grounded_now: true, ..Body::default() };
         let mut l = Lunge::default();
         l.start(&mut body, true, 100.0);
-        let target = Target { origin: [155.0, 0.0, 0.0], ..Target::default() };
+        let foe = Target { at_pos: [155.0, 0.0, 0.0], ..Target::default() };
         // 250 ms to the hit, 100 units to close: 400 u/s, x (1 + 0.05 x 1200) = 61x, capped at 800.
-        l.update(&mut body, Some(target), 250, 50);
-        assert!((body.velocity[0] - 800.0).abs() < 0.01);
-        let mut zb = Body { can_lunge: true, on_ground: true, zombies: true, ..Body::default() };
+        l.step_on(&mut body, Some(foe), 250, 50);
+        assert!((body.vel[0] - 800.0).abs() < 0.01);
+        let mut zb = Body { can_lunge: true, grounded_now: true, zombies: true, ..Body::default() };
         let mut l = Lunge::default();
         l.start(&mut zb, true, 100.0);
-        l.update(&mut zb, Some(target), 250, 50);
-        assert!((zb.velocity[0] - 600.0).abs() < 0.01);
+        l.step_on(&mut zb, Some(foe), 250, 50);
+        assert!((zb.vel[0] - 600.0).abs() < 0.01);
     }
 
     #[test]
     fn after_the_hit_friction_stops_15_short() {
-        let body = Body { velocity: [600.0, 0.0, 0.0], ..Body::default() };
-        let l = Lunge { active: true, time_ms: 200.0, dist: 100.0, has_target: true };
-        let t = Target { origin: [65.0, 0.0, 0.0], ..Target::default() };
+        let body = Body { vel: [600.0, 0.0, 0.0], ..Body::default() };
+        let l = Lunge { lunging: true, clock_stamp_ms: 200.0, reach: 100.0, has_target: true };
+        let t = Target { at_pos: [65.0, 0.0, 0.0], ..Target::default() };
         // 50 units to go in 0.2 s: speed drops to 250.
         assert!((l.friction_drop(&body, Some(t), 0, 0.05) - 350.0).abs() < 0.01);
         // Before the hit: plain 1200/s.
@@ -268,21 +268,21 @@ mod tests {
     #[test]
     fn rising_fast_in_the_air_ends_it_at_base_speed() {
         let mut body =
-            Body { velocity: [400.0, 0.0, 250.0], can_lunge: true, base_speed: 190.0, ..Body::default() };
-        let l = Lunge { active: true, time_ms: 100.0, dist: 100.0, has_target: true };
+            Body { vel: [400.0, 0.0, 250.0], can_lunge: true, base_speed: 190.0, ..Body::default() };
+        let l = Lunge { lunging: true, clock_stamp_ms: 100.0, reach: 100.0, has_target: true };
         assert!(!l.still_valid(&mut body));
         let k = 190.0 / (400.0f32 * 400.0 + 250.0 * 250.0).sqrt();
-        assert!((body.velocity[0] - 400.0 * k).abs() < 0.01);
-        assert!((body.velocity[2] - 250.0 * k).abs() < 0.01);
+        assert!((body.vel[0] - 400.0 * k).abs() < 0.01);
+        assert!((body.vel[2] - 250.0 * k).abs() < 0.01);
     }
 
     #[test]
     fn ending_a_lunge_caps_upward_speed() {
-        let mut body = Body { velocity: [0.0, 0.0, 500.0], can_lunge: true, on_ground: true, ..Body::default() };
+        let mut body = Body { vel: [0.0, 0.0, 500.0], can_lunge: true, grounded_now: true, ..Body::default() };
         let mut l = Lunge::default();
         l.start(&mut body, true, 50.0);
-        l.clear(&mut body);
-        assert_eq!(body.velocity[2], 300.0);
+        l.end(&mut body);
+        assert_eq!(body.vel[2], 300.0);
     }
 
     #[test]

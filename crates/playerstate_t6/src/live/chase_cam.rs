@@ -1,17 +1,15 @@
 //! The chase camera: when the view leaves the player's eyes, and where the camera sits once it has.
 
-use game_math::{angle_vectors, vec_to_yaw};
-
-use super::flag_bits::other_flags;
-use super::killcam::{KillCamMode, filmed_from_outside};
-use super::record::{PM_TYPE_DEAD, PM_TYPE_INTERMISSION, PM_TYPE_SPECTATOR};
+use super::flag_bits::secondary_state_bits;
+use super::kill_view::{DeathReplayStyle, filmed_from_outside};
+use super::record::*;
 
 /// How far behind the player the camera sits unless the player changed it.
-pub const CG_THIRD_PERSON_RANGE_DEFAULT: f32 = 120.0;
+pub const CHASE_CAM_DISTANCE_FALLBACK: f32 = 120.0;
 /// Half the edge of the box the camera traces with while it backs away.
-pub const CG_CAMERA_PULLBACK_BOX_HALF: f32 = 4.0;
+pub const CHASE_CAM_PROBE_HALF_EXTENT: f32 = 4.0;
 /// The contents that stop the camera backing away.
-pub const CG_CAMERA_PULLBACK_CLIPMASK: u32 = 0x0281_0011;
+pub const CHASE_CAM_RETREAT_MASK: u32 = 0x0281_0011;
 /// Set on whatever the player is linked to when riding it puts the camera outside.
 pub const LINK_FLAGS_FORCE_THIRD_PERSON: u32 = 1 << 2;
 
@@ -27,55 +25,55 @@ const AIM_POINT_REACH: f32 = 512.0;
 const RISE_WHEN_BLOCKED: f32 = 32.0;
 /// Radians to degrees, negated because a positive pitch looks down.
 const RADIANS_TO_PITCH: f32 = -57.2957795;
-/// An `other_flags` bit that on its own puts the camera outside.
+/// An `secondary_state_bits` bit that on its own puts the camera outside.
 const FORCED_OUTSIDE: u32 = 1 << 1;
 
 /// What decides whether the camera is outside the player's head this frame.
 #[derive(Clone, Copy, Debug)]
 pub struct ThirdPersonViewInputs {
-    pub pm_type: i32,
-    pub other_flags: u32,
-    pub link_flags: u32,
+    pub movement_mode: i32,
+    pub secondary_state_bits: u32,
+    pub attach_bits: u32,
     /// The player's own third-person setting.
-    pub cg_third_person: bool,
-    pub in_killcam: bool,
-    pub killcam_mode: KillCamMode,
+    pub chase_cam_enabled: bool,
+    pub replaying_final_death: bool,
+    pub killcam_mode: DeathReplayStyle,
 }
 
 /// True when the camera is outside the head: the player is dead, a flag or a vehicle forces it, the kill cam films
 /// from outside, or the player asked for it (which a kill-cam seat only honours while the kill cam runs).
 pub fn is_third_person_view(view: ThirdPersonViewInputs) -> bool {
-    let asked_for = view.cg_third_person && (view.in_killcam || view.other_flags & other_flags::DEAD_KILLCAM_TPV == 0);
-    view.pm_type >= PM_TYPE_DEAD
-        || view.other_flags & FORCED_OUTSIDE != 0
+    let asked_for = view.chase_cam_enabled && (view.replaying_final_death || view.secondary_state_bits & secondary_state_bits::DEAD_KILLCAM_TPV == 0);
+    view.movement_mode >= MOVE_KIND_DEAD
+        || view.secondary_state_bits & FORCED_OUTSIDE != 0
         || asked_for
-        || filmed_from_outside(view.in_killcam, view.killcam_mode)
-        || view.link_flags & LINK_FLAGS_FORCE_THIRD_PERSON != 0
+        || filmed_from_outside(view.replaying_final_death, view.killcam_mode)
+        || view.attach_bits & LINK_FLAGS_FORCE_THIRD_PERSON != 0
 }
 
 /// The yaw a dead player's camera turns to: towards the killer if there is one, otherwise where the player looked.
 /// Whole degrees, cut towards zero.
-pub fn look_at_killer_yaw(attacker_origin: Option<[f32; 3]>, self_origin: [f32; 3], self_view_yaw: f32) -> i32 {
-    let yaw = attacker_origin.map_or(self_view_yaw, |at| vec_to_yaw(at[0] - self_origin[0], at[1] - self_origin[1]));
+pub fn look_at_killer_yaw(killer_pos: Option<[f32; 3]>, own_pos: [f32; 3], own_yaw: f32) -> i32 {
+    let yaw = killer_pos.map_or(own_yaw, |at| game_math::heading_of(at[0] - own_pos[0], at[1] - own_pos[1]));
     yaw as i32
 }
 
 /// What places the chase camera this frame.
 #[derive(Clone, Copy, Debug)]
-pub struct OffsetThirdPersonViewInputs {
+pub struct ChaseCamPlacementInputs {
     pub origin: [f32; 3],
-    pub view_height_current: f32,
-    pub viewangles: [f32; 3],
-    pub pm_type: i32,
+    pub eye_height_now: f32,
+    pub look_angles: [f32; 3],
+    pub move_mode: i32,
     /// Where a dead player's camera turns ([`look_at_killer_yaw`]).
-    pub look_at_killer_yaw: f32,
+    pub killer_facing_yaw: f32,
     /// The corpse's root bone, when the body is in the world; a dead player's camera follows it.
-    pub corpse_j_mainroot: Option<[f32; 3]>,
-    pub other_flags: u32,
-    pub delta_time: i32,
+    pub body_root_joint_pos: Option<[f32; 3]>,
+    pub secondary_state_bits: u32,
+    pub time_slice: i32,
     /// The player's camera swing around them, in degrees.
-    pub cg_third_person_angle: f32,
-    pub cg_third_person_range: f32,
+    pub chase_cam_yaw_offset: f32,
+    pub chase_cam_back_distance: f32,
 }
 
 /// Where the chase camera ended up and which way it points.
@@ -85,14 +83,14 @@ pub struct ChaseView {
     pub angles: [f32; 3],
 }
 
-/// `from + (to - from) * share` on each axis.
-fn toward(from: [f32; 3], to: [f32; 3], share: f32) -> [f32; 3] {
-    core::array::from_fn(|k| from[k] + (to[k] - from[k]) * share)
+/// `start + (goal - start) * share` on each axis.
+fn toward(start: [f32; 3], goal: [f32; 3], share: f32) -> [f32; 3] {
+    core::array::from_fn(|k| start[k] + (goal[k] - start[k]) * share)
 }
 
-/// `from + dir * reach` on each axis.
-fn along(from: [f32; 3], dir: [f32; 3], reach: f32) -> [f32; 3] {
-    core::array::from_fn(|k| from[k] + dir[k] * reach)
+/// `start + heading * reach` on each axis.
+fn along(start: [f32; 3], heading: [f32; 3], reach: f32) -> [f32; 3] {
+    core::array::from_fn(|k| start[k] + heading[k] * reach)
 }
 
 /// Backs the camera from the eye to where it wants to be. If something is in the way it stops there, rises a little
@@ -113,34 +111,36 @@ fn back_away(eye: [f32; 3], wanted: [f32; 3], mut reach: impl FnMut([f32; 3], [f
 ///
 /// # Panics
 /// On a kill-cam seat that claims to be a live tick: seats are always built from archived records.
-pub fn offset_third_person_view(
-    i: OffsetThirdPersonViewInputs,
-    trace_fraction: impl FnMut([f32; 3], [f32; 3]) -> f32,
+pub fn place_chase_camera(
+    cam: ChaseCamPlacementInputs,
+    trace_clear_share: impl FnMut([f32; 3], [f32; 3]) -> f32,
 ) -> ChaseView {
     assert!(
-        i.other_flags & other_flags::DEAD_KILLCAM_TPV == 0 || i.delta_time != 0,
+        cam.secondary_state_bits & secondary_state_bits::DEAD_KILLCAM_TPV == 0 || cam.time_slice != 0,
         "kill-cam seat on a live tick: only archived records become seats"
     );
-    let dead = i.pm_type >= PM_TYPE_DEAD;
-    let eye = match i.corpse_j_mainroot {
+    let dead = cam.move_mode >= MOVE_KIND_DEAD;
+    let eye = match cam.body_root_joint_pos {
         Some(body) if dead => body,
-        _ => [i.origin[0], i.origin[1], i.origin[2] + i.view_height_current],
+        _ => [cam.origin[0], cam.origin[1], cam.origin[2] + cam.eye_height_now],
     };
-    let yaw = if dead { i.look_at_killer_yaw } else { i.viewangles[1] };
-    let pitch = if i.viewangles[0] > STEEPEST_PITCH { STEEPEST_PITCH } else { i.viewangles[0] };
-    let aim_point = along(eye, angle_vectors([pitch, yaw, 0.0]).0, AIM_POINT_REACH);
+    let yaw = if dead { cam.killer_facing_yaw } else { cam.look_angles[1] };
+    let pitch = if cam.look_angles[0] > STEEPEST_PITCH { STEEPEST_PITCH } else { cam.look_angles[0] };
+    let aim_point = along(eye, game_math::euler_basis([pitch, yaw, 0.0]).0, AIM_POINT_REACH);
 
-    let cam_yaw = yaw - i.cg_third_person_angle;
-    let behind = angle_vectors([pitch * TILT_SHARE, cam_yaw, 0.0]).0;
+    let cam_yaw = yaw - cam.chase_cam_yaw_offset;
+    let behind = game_math::euler_basis([pitch * TILT_SHARE, cam_yaw, 0.0]).0;
     let pivot = [eye[0], eye[1], eye[2] + PIVOT_LIFT];
-    let origin = back_away(eye, along(pivot, behind, -i.cg_third_person_range), trace_fraction);
+    let origin = back_away(eye, along(pivot, behind, -cam.chase_cam_back_distance), trace_clear_share);
 
-    let [dx, dy, dz]: [f32; 3] = core::array::from_fn(|k| aim_point[k] - origin[k]);
-    let flat = libm::sqrtf(dx * dx + dy * dy).max(1.0);
+    let [step_along_x, dy, dz]: [f32; 3] = core::array::from_fn(|k| aim_point[k] - origin[k]);
+    let flat = libm::sqrtf(step_along_x * step_along_x + dy * dy).max(1.0);
     ChaseView { origin, angles: [libm::atan2f(dz, flat) * RADIANS_TO_PITCH, cam_yaw, 0.0] }
 }
 
 /// True when the first-person gun runs this frame: not for spectators, the end-of-match screen or the dead.
-pub fn viewweapon_frame_runs(pm_type: i32) -> bool {
-    pm_type < PM_TYPE_DEAD && !matches!(pm_type, PM_TYPE_SPECTATOR | PM_TYPE_INTERMISSION)
+pub fn viewweapon_frame_runs(
+    movement_mode: i32,
+) -> bool {
+    movement_mode < MOVE_KIND_DEAD && !matches!(movement_mode, MOVE_MODE_OBSERVER | MOVE_MODE_INTERLUDE)
 }

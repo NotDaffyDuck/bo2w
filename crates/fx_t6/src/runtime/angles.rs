@@ -4,82 +4,82 @@
 //! `base + amplitude * random` range; the angle at a given age is the start
 //! plus the age times the velocity.
 
-use crate::runtime::origin::sample_float_range;
-use crate::runtime::random::{
-    FX_RAND_CH_ANG_VEL_PITCH, FX_RAND_CH_ANG_VEL_ROLL, FX_RAND_CH_ANG_VEL_YAW,
-    FX_RAND_CH_SPAWN_ANGLES_PITCH, FX_RAND_CH_SPAWN_ANGLES_ROLL, FX_RAND_CH_SPAWN_ANGLES_YAW,
+use crate::runtime::birth_spot::sample_float_range;
+use crate::runtime::dice::{
     random_table_f32,
-};
 
-/// Pitch, yaw and roll (radians) at `age_msec`.
+};
+use crate::runtime::dice::DICE_LANE_SPIN_TILT;
+use crate::runtime::dice::DICE_LANE_SPIN_ROLL;
+use crate::runtime::dice::DICE_LANE_SPIN_TURN;
+use crate::runtime::dice::DICE_LANE_BIRTH_TILT;
+use crate::runtime::dice::DICE_LANE_BIRTH_ROLL;
+use crate::runtime::dice::DICE_LANE_BIRTH_TURN;
+
+/// Pitch, yaw and roll (radians) at `lived_ms`.
 fn elem_angles(
-    spawn_angles: [[f32; 2]; 3],
-    angular_velocity: [[f32; 2]; 3],
+    birth_orientation: [[f32; 2]; 3],
+    twirl_rate: [[f32; 2]; 3],
     seed: u32,
-    age_msec: f32,
+    lived_ms: f32,
 ) -> [f32; 3] {
-    let start_channels = [
-        FX_RAND_CH_SPAWN_ANGLES_PITCH,
-        FX_RAND_CH_SPAWN_ANGLES_YAW,
-        FX_RAND_CH_SPAWN_ANGLES_ROLL,
+    // Per axis (pitch, yaw, roll): the channel for its start, the one for its spin.
+    const CHANNELS: [(u32, u32); 3] = [
+        (DICE_LANE_BIRTH_TILT, DICE_LANE_SPIN_TILT),
+        (DICE_LANE_BIRTH_TURN, DICE_LANE_SPIN_TURN),
+        (DICE_LANE_BIRTH_ROLL, DICE_LANE_SPIN_ROLL),
     ];
-    let spin_channels = [
-        FX_RAND_CH_ANG_VEL_PITCH,
-        FX_RAND_CH_ANG_VEL_YAW,
-        FX_RAND_CH_ANG_VEL_ROLL,
-    ];
-    let mut angles = [0.0; 3];
-    for i in 0..3 {
-        let start = sample_float_range(
-            spawn_angles[i][0],
-            spawn_angles[i][1],
-            random_table_f32(seed, start_channels[i]),
-        );
-        let spin = sample_float_range(
-            angular_velocity[i][0],
-            angular_velocity[i][1],
-            random_table_f32(seed, spin_channels[i]),
-        );
-        angles[i] = start + age_msec * spin;
-    }
-    angles
+    let range_at = |[base, amp]: [f32; 2], channel| {
+        sample_float_range(base, amp, random_table_f32(seed, channel))
+    };
+    core::array::from_fn::<f32, 3, _>(|axis| {
+        let (start_ch, spin_ch) = CHANNELS[axis];
+        range_at(birth_orientation[axis], start_ch)
+            + lived_ms * range_at(twirl_rate[axis], spin_ch)
+    })
 }
 
 /// The frame `[forward, right, up]` for pitch, yaw and roll in radians.
-fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
-    let [pitch, yaw, roll] = angles;
-    let (sy, cy) = (libm::sinf(yaw), libm::cosf(yaw));
-    let (sp, cp) = (libm::sinf(pitch), libm::cosf(pitch));
-    let (sr, cr) = (libm::sinf(roll), libm::cosf(roll));
+fn angles_to_axis(pitch: f32, yaw: f32, roll: f32) -> [[f32; 3]; 3] {
+    let (sp, codepoint) = libm::sincosf(pitch);
+    let (sr, cr) = libm::sincosf(roll);
+    let (sy, cy) = libm::sincosf(yaw);
+    // The heading on the ground and the direction a quarter turn left of it.
+    let heading = [cy, sy];
+    let left = [-sy, cy];
+    let grounded_now = |along: f32, across: f32, z: f32| {
+        [
+            along * heading[0] + across * left[0],
+            along * heading[1] + across * left[1],
+            z,
+        ]
+    };
     [
-        [cy * cp, sy * cp, -sp],
-        [sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, sr * cp],
-        [cr * sp * cy + sr * sy, cr * sp * sy - sr * cy, cr * cp],
+        grounded_now(codepoint, 0.0, -sp),
+        grounded_now(sr * sp, cr, sr * codepoint),
+        grounded_now(cr * sp, -sr, cr * codepoint),
     ]
 }
 
-/// `a` times `b`.
-pub fn mat3_mul(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut product = [[0.0; 3]; 3];
-    for (row, out_row) in a.iter().zip(product.iter_mut()) {
-        for (col, cell) in out_row.iter_mut().enumerate() {
-            *cell = row[0] * b[0][col] + row[1] * b[1][col] + row[2] * b[2][col];
-        }
-    }
-    product
+/// `a` times `rhs`.
+pub fn mat3_mul(a: [[f32; 3]; 3], rhs: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    a.map(|row| {
+        core::array::from_fn(|col| row[0] * rhs[0][col] + row[1] * rhs[1][col] + row[2] * rhs[2][col])
+    })
 }
 
-/// The element's frame at `age_msec`: its own angles applied inside the
+/// The element's frame at `lived_ms`: its own angles applied inside the
 /// effect's axes.
 pub fn get_elem_angles_axis(
-    spawn_angles: [[f32; 2]; 3],
-    angular_velocity: [[f32; 2]; 3],
+    birth_orientation: [[f32; 2]; 3],
+    twirl_rate: [[f32; 2]; 3],
     seed: u32,
-    age_msec: f32,
-    effect_axis: [[f32; 3]; 3],
+    lived_ms: f32,
+    fx_basis: [[f32; 3]; 3],
 ) -> [[f32; 3]; 3] {
-    let own = angles_to_axis(elem_angles(spawn_angles, angular_velocity, seed, age_msec));
-    mat3_mul(own, effect_axis)
+    let [pitch, yaw, roll] = elem_angles(birth_orientation, twirl_rate, seed, lived_ms);
+    let own = angles_to_axis(pitch, yaw, roll);
+    mat3_mul(own, fx_basis)
 }
 
 #[cfg(test)]
@@ -91,12 +91,12 @@ mod tests {
 
     #[test]
     fn no_angles_is_the_identity_frame() {
-        assert_eq!(angles_to_axis([0.0; 3]), IDENTITY);
+        assert_eq!(angles_to_axis(0.0, 0.0, 0.0), IDENTITY);
     }
 
     #[test]
     fn a_quarter_yaw_points_forward_along_y() {
-        let frame = angles_to_axis([0.0, core::f32::consts::FRAC_PI_2, 0.0]);
+        let frame = angles_to_axis(0.0, core::f32::consts::FRAC_PI_2, 0.0);
         assert!(frame[0][0].abs() < 1e-6);
         assert!((frame[0][1] - 1.0).abs() < 1e-6);
     }
@@ -122,5 +122,27 @@ mod tests {
             get_elem_angles_axis(NO_RANGE, NO_RANGE, 3, 100.0, effect),
             effect
         );
+    }
+
+    #[test]
+    fn any_angles_give_an_orthonormal_frame_with_the_known_forward() {
+        let (pitch, yaw, roll) = (0.4f32, -1.1f32, 2.3f32);
+        let f = angles_to_axis(pitch, yaw, roll);
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        for i in 0..3 {
+            for j in 0..3 {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((dot(f[i], f[j]) - want).abs() < 1e-5, "{i} {j}");
+            }
+        }
+        assert!((f[0][2] + pitch.sin()).abs() < 1e-6);
+        assert!((f[0][0] - yaw.cos() * pitch.cos()).abs() < 1e-6);
+        // right x forward = up (a right-handed turn from right to up about forward)
+        let cross = [
+            f[1][1] * f[0][2] - f[1][2] * f[0][1],
+            f[1][2] * f[0][0] - f[1][0] * f[0][2],
+            f[1][0] * f[0][1] - f[1][1] * f[0][0],
+        ];
+        assert!(dot(cross, f[2]).abs() > 0.999);
     }
 }

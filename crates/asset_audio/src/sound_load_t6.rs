@@ -4,83 +4,101 @@
 //! variants (volume, pitch, distances, falloff curves, the file each one
 //! plays, by the hash of its name). The audio itself lives beside the
 //! zones in `sound/*.sabl` (loaded, 16-bit PCM) and `*.sabs` (streamed,
-//! FLAC) files, read by `sab_t6`. Aliases become `CapturedSound`s whose
+//! FLAC) files, read by `sab_t6`. Aliases become `SnapshotSoundEntry`s whose
 //! variants name their clip as streamed `(bank file, entry id)`; the clip
 //! store decodes a clip on first use through `decode_t6_clip`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{
-    CapturedAlias, CapturedSndCurve, CapturedSound, SndDuck, SoundCatalog, StereoPan, VoicePriority,
+    SnapshotSoundAlias, SnapshotAudioCurve, SnapshotSoundEntry, SndDuck, AudioRoster, StereoPan, VoicePriority,
 };
 
 /// Every bank file a set of bank names reads, indexed by entry id.
 #[derive(Default)]
 pub struct T6BankIndex {
-    by_id: HashMap<u32, (Arc<sab_t6::BankFile>, sab_t6::BankEntry)>,
+    clips_by_id: HashMap<u32, (Arc<sab_t6::BankFile>, sab_t6::BankEntry)>,
     pub files: Vec<PathBuf>,
 }
 
+/// Whether `path` names one of `bank`'s loaded / streamed files in a language we play.
+fn is_bank_file(path: &Path, bank: &str) -> bool {
+    const TAILS: [&str; 4] = [".all.sabl", ".all.sabs", ".english.sabl", ".english.sabs"];
+    let lower = match path.file_name().and_then(|n| n.to_str()) {
+        Some(file) => file.to_ascii_lowercase(),
+        None => return false,
+    };
+    lower
+        .strip_prefix(bank)
+        .is_some_and(|tail| TAILS.contains(&tail))
+}
+
+/// The banks found in a sound folder, with one line of news per folder gap, bad bank and the
+/// final file and clip count.
+pub struct OpenedBanks {
+    pub index: T6BankIndex,
+    pub notes: Vec<String>,
+}
+
 impl T6BankIndex {
-    /// Open every `<bank>.<language>.sab*` in `sound_dir` whose name starts
-    /// with one of `banks` (and the languages `all` / `english`). Earlier
+    /// Read every `<bank>.<language>.sab*` in `folder` whose name starts
+    /// with one of `wanted` (and the languages `all` / `english`). Earlier
     /// banks win an id they share with a later one.
-    pub fn open(sound_dir: &Path, banks: &[&str]) -> (Self, Vec<String>) {
+    pub fn load(folder: &Path, wanted: &[&str]) -> OpenedBanks {
         let mut index = Self::default();
-        let mut report = Vec::new();
-        let Ok(read) = std::fs::read_dir(sound_dir) else {
-            report.push(format!("t6 sound: no sound folder at {}", sound_dir.display()));
-            return (index, report);
+        let mut notes: Vec<String> = vec![];
+        let Ok(read) = std::fs::read_dir(folder) else {
+            let shown = folder.display();
+            notes.push(format!("t6 sound: {shown} has no sound folder"));
+            return OpenedBanks { index, notes };
         };
-        let mut paths: Vec<PathBuf> = read.filter_map(|e| e.ok().map(|e| e.path())).collect();
-        paths.sort();
-        for bank in banks {
-            for path in &paths {
-                let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                let lower = file.to_ascii_lowercase();
-                let wanted = [".all.sabl", ".all.sabs", ".english.sabl", ".english.sabs"]
-                    .iter()
-                    .any(|tail| lower == format!("{bank}{tail}"));
-                if !wanted {
-                    continue;
-                }
+        let sorted: BTreeSet<PathBuf> = read.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        // bo2zm: then the extra folders' banks (`BO2MP_T6_EXTRA`), after the game's own.
+        let paths: Vec<PathBuf> = sorted
+            .into_iter()
+            .chain(asset_transport::t6_extra::extra_files("sabl"))
+            .chain(asset_transport::t6_extra::extra_files("sabs"))
+            .collect();
+        for bank in wanted {
+            for path in paths.iter().filter(|p| is_bank_file(p, bank)) {
                 match sab_t6::BankFile::open(path) {
                     Ok(file) => {
                         let file = Arc::new(file);
                         for e in &file.entries {
                             index
-                                .by_id
+                                .clips_by_id
                                 .entry(e.id)
                                 .or_insert_with(|| (Arc::clone(&file), *e));
                         }
                         index.files.push(path.clone());
                     }
-                    Err(e) => report.push(format!("t6 sound bank gap: {e}")),
+                    Err(e) => notes.push(format!("t6 sound bank gap: {e}")),
                 }
             }
         }
-        report.push(format!(
-            "t6 sound banks: {} files, {} clips",
-            index.files.len(),
-            index.by_id.len()
-        ));
-        (index, report)
+        let (file_total, clip_total) = (index.files.len(), index.clips_by_id.len());
+        notes.push(format!("t6 sound banks: {file_total} files hold {clip_total} clips"));
+        OpenedBanks { index, notes }
     }
 
-    pub fn get(&self, id: u32) -> Option<&(Arc<sab_t6::BankFile>, sab_t6::BankEntry)> {
-        self.by_id.get(&id)
+    /// Older spelling the assets lanes still call; the rename sweep moves them to `load`.
+    pub fn open(folder: &Path, wanted: &[&str]) -> (Self, Vec<String>) {
+        let OpenedBanks { index, notes } = Self::load(folder, wanted);
+        (index, notes)
+    }
+
+    pub fn clip_by_id(&self, wanted: u32) -> Option<&(Arc<sab_t6::BankFile>, sab_t6::BankEntry)> {
+        self.clips_by_id.get(&wanted)
     }
 
     pub fn len(&self) -> usize {
-        self.by_id.len()
+        self.clips_by_id.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.clips_by_id.is_empty()
     }
 }
 
@@ -115,7 +133,7 @@ pub fn decode_t6_clip(bank: &str, id: &str) -> Result<sab_t6::Pcm16, String> {
 }
 
 /// The curve name a falloff curve index stands for in the driver globals.
-fn curve(globals: Option<&asset_t6::SndDriverGlobalsRef>, index: u32) -> Option<CapturedSndCurve> {
+fn curve(globals: Option<&asset_t6::SndDriverGlobalsRef>, index: u32) -> Option<SnapshotAudioCurve> {
     let c = globals?.curves.get(index as usize)?;
     // Curves end at the first point whose x falls back below the last.
     let mut knots: Vec<(f32, f32)> = Vec::with_capacity(8);
@@ -125,7 +143,7 @@ fn curve(globals: Option<&asset_t6::SndDriverGlobalsRef>, index: u32) -> Option<
         }
         knots.push((p[0], p[1]));
     }
-    Some(CapturedSndCurve {
+    Some(SnapshotAudioCurve {
         name: format!("t6/curve/{}", c.name),
         knots,
     })
@@ -144,55 +162,56 @@ fn stereo_pan(
         return None;
     }
     let p = pans.get(usize::from(a.pan))?;
-    Some(StereoPan::from_pan(p.front, p.back, p.left, p.right))
+    Some(StereoPan::from_weights([p.front, p.back, p.left, p.right]))
 }
 
 fn alias_variant(
     a: &asset_t6::SndAliasRef,
     index: &T6BankIndex,
     globals: Option<&asset_t6::SndDriverGlobalsRef>,
-) -> CapturedAlias {
+) -> SnapshotSoundAlias {
     // BO2 scales every variant by its volume group and the group's parents.
     let group_scalar = a.group_scalar(globals);
     let (vol_min, vol_max) = a.volume();
     let (vol_min, vol_max) = (vol_min * group_scalar, vol_max * group_scalar);
-    let (pitch_min, pitch_max) = a.pitch();
+    let (pitch_lower_bound, pitch_upper_bound) = a.pitch();
     let streamed = index
-        .get(a.asset_id)
+        .clip_by_id(a.asset_id)
         .map(|(file, _)| (file.path.to_string_lossy().into_owned(), format!("{:08x}", a.asset_id)));
-    CapturedAlias {
-        secondary: (!a.secondary.is_empty()).then(|| a.secondary.clone()),
-        file_name: (!a.asset_file.is_empty()).then(|| a.asset_file.clone()),
+    SnapshotSoundAlias {
+        layered_alias: (!a.secondary.is_empty()).then(|| a.secondary.clone()),
+        clip_file: (!a.asset_file.is_empty()).then(|| a.asset_file.clone()),
         streamed,
-        vol_min,
-        vol_max,
-        pitch_min: if pitch_min > 0.0 { pitch_min } else { 1.0 },
-        pitch_max: if pitch_max > 0.0 { pitch_max } else { 1.0 },
-        dist_min: f32::from(a.dist_min),
-        dist_max: f32::from(a.dist_max),
-        flags: Some(a.flags[0]),
-        probability: f32::from(a.probability) / 255.0,
+        volume_low: vol_min,
+        volume_high: vol_max,
+        pitch_lower_bound: if pitch_lower_bound > 0.0 { pitch_lower_bound } else { 1.0 },
+        pitch_upper_bound: if pitch_upper_bound > 0.0 { pitch_upper_bound } else { 1.0 },
+        reach_lower: f32::from(a.reach_lower),
+        reach_upper: f32::from(a.reach_upper),
+        alias_bits: Some(a.flags[0]),
+        chance_weight: f32::from(a.chance_weight) / 255.0,
         volume_falloff: curve(globals, a.volume_falloff_curve()),
         near_falloff: curve(globals, a.volume_min_falloff_curve()),
         voice_priority: Some(VoicePriority {
             thresholds: [a.min_priority_threshold, a.max_priority_threshold],
             values: [a.min_priority, a.max_priority],
-            distance_max: f32::from(a.dist_max),
+            distance_max: f32::from(a.reach_upper),
         }),
-        limit_count: Some(a.limit_count),
-        entity_limit_count: Some(a.entity_limit_count),
+        reverb_send: f32::from(a.reverb_send) / 65535.0,
+        cap_total: Some(a.cap_total),
+        actor_cap_total: Some(a.actor_cap_total),
         menu_category: Some(a.menu_category(globals) as u8),
         stereo_pan: stereo_pan(a, globals),
         duck: (a.duck != 0).then_some(a.duck),
         duck_group: Some(a.duck_group),
-        ..CapturedAlias::default()
+        ..SnapshotSoundAlias::default()
     }
 }
 
 /// What a T6 catalog build found.
 #[derive(Clone, Debug, Default)]
 pub struct T6SoundCensus {
-    pub aliases: usize,
+    pub alias_count: usize,
     pub variants: usize,
     pub with_clip: usize,
     pub without_clip: usize,
@@ -204,8 +223,8 @@ pub fn build_t6_sound_catalog(
     banks: &[&asset_t6::SndBankRef],
     globals: Option<&asset_t6::SndDriverGlobalsRef>,
     index: &T6BankIndex,
-) -> (SoundCatalog, T6SoundCensus) {
-    let mut catalog = SoundCatalog::default();
+) -> (AudioRoster, T6SoundCensus) {
+    let mut catalog = AudioRoster::default();
     let mut census = T6SoundCensus::default();
     if let Some(g) = globals {
         catalog.duck_groups = g.duck_groups.iter().map(|(name, _)| name.clone()).collect();
@@ -243,10 +262,10 @@ pub fn build_t6_sound_catalog(
                 SndDuck {
                     name: d.name.clone(),
                     id: d.id,
-                    fade_in: d.fade_in,
-                    fade_out: d.fade_out,
+                    ease_on: d.ease_on,
+                    ease_off: d.ease_off,
                     start_delay: d.start_delay,
-                    distance: d.distance,
+                    fade_range: d.distance,
                     length: d.length,
                     update_while_paused: d.update_while_paused,
                     attenuation: per_group(&d.attenuation),
@@ -254,21 +273,24 @@ pub fn build_t6_sound_catalog(
                 },
             );
         }
+        for r in &bank.radverbs {
+            catalog.radverbs.insert(r.name.clone(), r.values);
+        }
         for list in &bank.aliases {
             if list.name.is_empty() {
                 continue;
             }
-            let aliases: Vec<CapturedAlias> = list
+            let aliases: Vec<SnapshotSoundAlias> = list
                 .entries
                 .iter()
                 .map(|a| alias_variant(a, index, globals))
                 .collect();
-            census.aliases += 1;
+            census.alias_count += 1;
             census.variants += aliases.len();
             let with = aliases.iter().filter(|a| a.streamed.is_some()).count();
             census.with_clip += with;
             census.without_clip += aliases.len() - with;
-            catalog.add_sound(CapturedSound {
+            catalog.add_sound(SnapshotSoundEntry {
                 name: list.name.clone(),
                 aliases,
             });
@@ -276,4 +298,21 @@ pub fn build_t6_sound_catalog(
     }
     catalog.publish();
     (catalog, census)
+}
+
+#[cfg(test)]
+mod bank_file_tests {
+    use super::*;
+
+    #[test]
+    fn bank_files_match_exact_bank_and_language() {
+        let yes = |f: &str| is_bank_file(Path::new(f), "zm_transit");
+        assert!(yes("zm_transit.all.sabl"));
+        assert!(yes("ZM_Transit.English.SABS".to_ascii_lowercase().as_str()));
+        assert!(yes("zm_transit.english.sabl"));
+        assert!(!yes("zm_transit.german.sabl"));
+        assert!(!yes("zm_transit_patch.all.sabl"));
+        assert!(!yes("zm_transit.all.sab"));
+        assert!(!is_bank_file(Path::new("ZM_Transit.all.sabl"), "ZM_Transit"));
+    }
 }

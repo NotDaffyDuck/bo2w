@@ -4,90 +4,13 @@
 resolver = "3"
 # Built on its own through the patch below, not as a member.
 exclude = ["third_party/wgpu-hal"]
-members = [
-    # Process entry, tooling and delivery
-    "crates/bootstrap",
-    "crates/console",
-    "crates/diag",
-    "crates/launcher",
-    "crates/perf",
-    "crates/updater",
-    "xtask",
-
-    # Network and servers
-    "crates/bo2mp-master",
-    "crates/bots",
-    "crates/master_protocol",
-    "crates/net",
-
-    # Reading game data
-    "crates/asset_anim",
-    "crates/asset_audio",
-    "crates/asset_core",
-    "crates/asset_game",
-    "crates/asset_material",
-    "crates/asset_model",
-    "crates/asset_source",
-    "crates/asset_t6",
-    "crates/asset_transport",
-    "crates/asset_world",
-    "crates/assets",
-    "crates/bo2_profile",
-    "crates/bo2zm_tools",
-    "crates/fastfile_t5",
-    "crates/fastfile_t6",
-    "crates/gsc_t6",
-    "crates/hks_t6",
-    "crates/ipak_t6",
-    "crates/sab_t6",
-    "crates/xanim_t6",
-    "crates/xmodel_runtime",
-
-    # Simulation and game rules
-    "crates/anim_t6",
-    "crates/clipmap_t6",
-    "crates/dobj_t6",
-    "crates/dpvs_t6",
-    "crates/entity_t6",
-    "crates/game_math",
-    "crates/gamemode_t6",
-    "crates/glass_t6",
-    "crates/input_t6",
-    "crates/killcam_t6",
-    "crates/marks_t6",
-    "crates/movement_t6",
-    "crates/playerstate_t6",
-    "crates/replay",
-    "crates/session",
-    "crates/sim",
-    "crates/trace_t6",
-    "crates/weapon_t6",
-
-    # What the player sees and hears
-    "crates/audio",
-    "crates/d3d9_decl",
-    "crates/d3d9_sm3",
-    "crates/d3d9_state",
-    "crates/frame",
-    "crates/fx",
-    "crates/fx_t6",
-    "crates/hud",
-    "crates/hud_t6",
-    "crates/lighting_t6",
-    "crates/render",
-    "crates/render_anim",
-    "crates/render_frame",
-    "crates/render_frontend",
-    "crates/render_fx",
-    "crates/render_gpu",
-    "crates/render_material",
-    "crates/render_scene",
-    "crates/ui",
-]
+# Every directory under crates/ holds one crate of the workspace (the 68 there on 10-27
+# were exactly the old hand-kept list); xtask is the build runner.
+members = ["crates/*", "xtask"]
 
 [workspace.package]
 edition = "2024"
-license = "Apache-2.0"
+publish = false
 
 # Third-party crates, then the workspace's own, both alphabetical.
 [workspace.dependencies]
@@ -127,7 +50,7 @@ sha2 = "0.10"
 zip = { version = "6", default-features = false, features = ["deflate"] }
 
 anim_t6 = { path = "crates/anim_t6" }
-asset_anim = { path = "crates/asset_anim" }
+anim_bank = { path = "crates/asset_anim" }
 asset_audio = { path = "crates/asset_audio" }
 asset_core = { path = "crates/asset_core" }
 asset_game = { path = "crates/asset_game" }
@@ -168,6 +91,7 @@ killcam_t6 = { path = "crates/killcam_t6" }
 launcher = { path = "crates/launcher" }
 lighting_t6 = { path = "crates/lighting_t6" }
 marks_t6 = { path = "crates/marks_t6" }
+bo2mp-master = { path = "crates/bo2mp-master" }
 master_protocol = { path = "crates/master_protocol" }
 movement_t6 = { path = "crates/movement_t6" }
 net = { path = "crates/net" }
@@ -191,21 +115,20 @@ weapon_t6 = { path = "crates/weapon_t6" }
 xanim_t6 = { path = "crates/xanim_t6" }
 xmodel_runtime = { path = "crates/xmodel_runtime" }
 
-# Two upstream bugs worked around until a release carries the fix.
-#
-# quinn-proto 0.11.17 counts the bytes of an evicted DATAGRAM twice and panics
-# when the relay backs up. The git revision below has the fix (client and
-# master both use it). Drop it once a crates.io release includes
-# quinn-rs/quinn#2806.
+# An upstream bug worked around until a release carries the fix.
 #
 # wgpu-hal 29.0.4 and 30.0.1 report a swap-chain image that takes longer than a
 # second to come back from the presentation engine as a lost device, which
-# ends the game. The copy under third_party/wgpu-hal waits again instead (see
-# "bo2mp patch" in src/vulkan/swapchain/native.rs). Drop it once an upstream
-# release stops turning that VK_TIMEOUT into DeviceError::Unexpected.
+# ends the game. third_party/wgpu-hal is the crates.io 29.0.4 with
+# third_party/wgpu-hal-patch/acquire-wait.diff on top, which waits again
+# instead; run `python third_party/wgpu-hal-patch/prepare.py` once after a clone
+# to write it. Drop them once an upstream release stops turning that VK_TIMEOUT
+# into DeviceError::Unexpected.
 [patch.crates-io]
-quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "f650e0f213b01ea7bebd60023e5df7df65e5c2bd" }
 wgpu-hal = { path = "third_party/wgpu-hal" }
+# bo2mp: a master bus with a meter and a limiter between every sound and the
+# device (third_party/bevy_audio/src/master_bus.rs); the rest is crates.io 0.19.1.
+bevy_audio = { path = "third_party/bevy_audio" }
 
 [workspace.lints.clippy]
 # Constants taken from the retail game are written at the precision they were

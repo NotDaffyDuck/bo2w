@@ -2,140 +2,142 @@
 //! hand state a weapon starts in.
 
 use crate::damage::catalog::WEAPCLASS_SPREAD;
-use crate::fire_type::FireType;
-
-/// Fast reload (perks bit).
-pub const PERK_FASTRELOAD: u32 = 4;
-
-/// Sprint recovery (specialty_sprintrecovery).
-pub const PERK_SPRINTRECOVERY: u32 = 1 << 10;
+use crate::fire_type::TriggerPattern;
 
 /// What a perk-trimmed reload multiplies by when the weapon file gives none.
-pub const PERK_WEAP_RELOAD_MULTIPLIER_DEFAULT: f32 = 0.5;
+pub const QUICK_HANDS_FACTOR_STOCK: f32 = 0.5;
 
-/// A weapon speeds its reload up with the fast reload perk only if it inherits perks.
-pub fn perk_fastreload_eligible(perks0: u32, inherits_perks: bool) -> bool {
-    inherits_perks && perks0 & PERK_FASTRELOAD != 0
+/// A weapon speeds its reload up with the fast reload perk only if it inherits perks. `perks` is the player's two
+/// perk words.
+pub fn perk_fastreload_eligible(perks: [u32; 2], carries_over_talents: bool) -> bool {
+    carries_over_talents && crate::env::perk::held(perks, crate::env::perk::FASTRELOAD)
 }
 
 /// What a weapon file left out or got wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MissingCombatFacts {
+pub enum AbsentBattleProfile {
     /// A burst weapon with no time between bursts.
-    BurstCooldown,
+    VolleyRest,
     /// A segmented reload that adds no rounds a step.
-    SegmentedReloadAmmoAdd,
+    PerRoundReloadGain,
     /// A bullet weapon that reaches nowhere.
-    BulletRange,
-    UnknownFireType,
+    ShotReach,
+    UnrecognisedTriggerPattern,
     /// A hit location table with a value that cannot scale damage.
     LocationDamage,
 }
 
 /// A weapon file's combat fields as read, before they are checked.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct CapturedCombatInput {
+pub struct RecordedBattleFeed {
     /// Between shots.
-    pub fire_time_ms: i32,
+    pub shot_gap_ms: i32,
     /// bo2zm: Black Ops II's faster first shots of a trigger pull
     /// (`iIntroFireTime`, `iIntroFireLength`): the HAMR, AN-94 and B23R.
     pub intro_fire_time_ms: i32,
     pub intro_fire_length: i32,
+    /// bo2zm: Black Ops II's charge shot (fire type 8).
+    pub charge_shot: bool,
     /// From the trigger to the shot.
-    pub fire_delay_ms: i32,
-    pub raise_time_ms: i32,
-    pub drop_time_ms: i32,
+    pub shot_lead_ms: i32,
+    pub draw_ms: i32,
+    pub holster_ms: i32,
     pub alternate_weapon: u32,
     pub alternate_raise_time_ms: i32,
     pub alternate_drop_time_ms: i32,
-    pub reload_time_ms: i32,
-    pub reload_empty_time_ms: i32,
-    pub clip_size: i32,
-    pub start_ammo: i32,
-    pub max_ammo: i32,
+    pub reload_duration_millis: i32,
+    pub refill_dry_millis: i32,
+    pub magazine_capacity: i32,
+    pub spawn_rounds: i32,
+    pub reserve_cap: i32,
     /// Key of the stock row in the ammo table (0: the weapon itself).
-    pub ammo_index: i32,
+    pub ammo_type_slot: i32,
     /// Key of the clip row in the clip table (0: the weapon itself).
-    pub clip_index: i32,
-    /// A [`FireType`] number.
-    pub fire_type: i32,
-    pub weap_type: i32,
-    pub weap_class: i32,
-    pub player_anim_type: i32,
-    pub inventory_type: i32,
+    pub motion_clip_slot: i32,
+    /// A [`TriggerPattern`] number.
+    pub trigger_mode: i32,
+    pub gun_family_code: i32,
+    pub gun_kind: i32,
+    pub player_motion_kind: i32,
+    pub carry_slot_kind: i32,
     /// bo2mp: switches to and from it are quick (BO2 `BG_IsQuickSwitch`).
     pub quick_switch: bool,
     /// bo2mp: a switch to it is quick (pistol, pistol spread, melee).
     pub quick_switch_target: bool,
-    pub impact_type: i32,
-    pub shots_per_fire: i32,
-    pub burst_cooldown_ms: i32,
-    pub bolt_action: bool,
-    pub rechamber_time_ms: i32,
-    pub rechamber_bolt_time_ms: i32,
-    pub rechamber_bolt_delay_ms: i32,
-    pub segmented_reload: bool,
-    pub reload_start_time_ms: i32,
-    pub reload_end_time_ms: i32,
-    pub reload_ammo_add: i32,
-    pub reload_add_time_ms: i32,
-    pub reload_empty_add_time_ms: i32,
-    pub reload_start_add_time_ms: i32,
-    pub reload_start_add: i32,
-    pub no_partial_reload: bool,
-    pub inherits_perks: bool,
-    pub sprint_raise_time_ms: i32,
-    pub sprint_drop_time_ms: i32,
+    pub impact_kind_id: i32,
+    pub rounds_each_trigger: i32,
+    pub volley_rest_millis: i32,
+    pub manual_cycle: bool,
+    pub cycle_ms: i32,
+    pub bolt_rack_duration_millis: i32,
+    pub bolt_rack_wait_millis: i32,
+    pub staged_reload: bool,
+    pub refill_begin_millis: i32,
+    pub refill_finish_millis: i32,
+    pub reload_rounds_gained: i32,
+    pub reload_refill_millis: i32,
+    pub empty_reload_refill_millis: i32,
+    pub reload_begin_refill_millis: i32,
+    pub reload_begin_bonus: i32,
+    pub forbid_topup_reload: bool,
+    /// bo2zm: fires with an empty clip and never uses ammo.
+    pub unlimited_ammo: bool,
+    pub carries_over_talents: bool,
+    pub run_lift_millis: i32,
+    pub run_lower_millis: i32,
     pub damage: i32,
-    pub min_damage: i32,
-    pub max_damage_range: f32,
-    pub min_damage_range: f32,
+    pub hurt_floor: i32,
+    pub full_damage_reach: f32,
+    pub minimum_damage_reach: f32,
     pub damage_steps: Option<crate::damage::DamageSteps>,
-    pub hip_spread_stand_min: f32,
-    pub hip_spread_ducked_min: f32,
-    pub hip_spread_prone_min: f32,
-    pub hip_spread_stand_max: f32,
-    pub hip_spread_ducked_max: f32,
-    pub hip_spread_prone_max: f32,
-    pub hip_spread_decay_rate: f32,
-    pub hip_spread_fire_add: f32,
-    pub hip_spread_turn_add: f32,
-    pub hip_spread_move_add: f32,
-    pub hip_spread_ducked_decay: f32,
-    pub hip_spread_prone_decay: f32,
-    pub ads_spread: f32,
-    pub aim_down_sight: bool,
-    pub no_ads_when_mag_empty: bool,
-    pub ads_in_rate: f32,
-    pub ads_out_rate: f32,
-    pub rechamber_while_ads: bool,
+    pub hip_cone_up_lo: f32,
+    pub hip_cone_crouch_lo: f32,
+    pub hip_cone_lie_lo: f32,
+    pub hip_cone_up_hi: f32,
+    pub hip_cone_crouch_hi: f32,
+    pub hip_cone_lie_hi: f32,
+    pub hip_cone_settle: f32,
+    pub hip_cone_per_shot: f32,
+    pub hip_cone_per_turn: f32,
+    pub hip_cone_per_step: f32,
+    pub hip_cone_crouch_settle: f32,
+    pub hip_cone_lie_settle: f32,
+    pub aimed_cone: f32,
+    pub scoped_aiming: bool,
+    pub block_aim_if_clip_dry: bool,
+    pub scope_raise_speed: f32,
+    pub scope_lower_speed: f32,
+    pub rack_bolt_when_scoped: bool,
     /// BO2: a reload lowers the sights (!bReloadWhileAds).
     pub reload_lowers_ads: bool,
     /// BO2 iPositionReloadTransTime: the sights come back up when this
     /// much of the reload is left.
     pub position_reload_trans_ms: i32,
-    pub ads_fire_only: bool,
+    pub fire_only_when_scoped: bool,
     /// bo2mp: Hybrid Optic gun: its alternate weapon is the other sight.
     pub optic_switch: bool,
-    pub melee_damage: i32,
-    pub overlay_reticle: i32,
-    pub melee_time_ms: i32,
-    pub melee_delay_ms: i32,
-    pub melee_charge_time_ms: i32,
-    pub melee_charge_delay_ms: i32,
-    pub melee_charge_anim: bool,
-    pub knife_model: u32,
-    pub quick_raise_time_ms: i32,
-    pub quick_drop_time_ms: i32,
+    pub bash_hurt: i32,
+    pub hud_crosshair_layer: i32,
+    pub bash_ms: i32,
+    pub strike_wait_millis: i32,
+    pub bash_windup_ms: i32,
+    pub lunge_windup_wait_millis: i32,
+    pub lunge_has_clip: bool,
+    pub blade_mesh: u32,
+    pub fast_draw_ms: i32,
+    pub fast_holster_ms: i32,
     pub select_requires_ammo: Option<bool>,
     pub offhand_hold_is_cancelable: Option<bool>,
-    pub ads_gun_kick_reduced_kick_bullets: i32,
-    pub hip_gun_kick_reduced_kick_bullets: i32,
+    pub aim_soft_kick_shots: i32,
+    pub hip_soft_kick_shots: i32,
     pub location_damage: [f32; crate::hitloc::HITLOC_COUNT],
     pub dual_mag: Option<crate::dual_mag::DualMagTimes>,
     /// bo2zm fix list 2: aim each shot with the spread before its own
     /// fire add (Black Ops II); false = Modern Warfare 2's order.
     pub spread_before_fire_add: bool,
+    /// bo2zm: pellets in a flat line across the aim (Black Ops II Zombies'
+    /// accuracy-perk weapons, the Blundergat).
+    pub flat_spread: bool,
 }
 
 /// How far each kind of aim assist reaches.
@@ -147,7 +149,7 @@ pub struct AimAssistRanges {
 }
 
 impl AimAssistRanges {
-    pub const NONE: Self = Self {
+    pub const OFF: Self = Self {
         auto_aim: 0.0,
         hip: 0.0,
         ads: 0.0,
@@ -156,7 +158,7 @@ impl AimAssistRanges {
 
 /// A weapon's combat fields, checked.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WeaponCombatFacts {
+pub struct GunBattleProfile {
     pub aim_assist: AimAssistRanges,
     /// bo2zm: Black Ops II footstep rhythm scales while sprinting, sprinting
     /// crouched and diving (1.0: unchanged).
@@ -164,353 +166,382 @@ pub struct WeaponCombatFacts {
     pub ducked_sprint_cycle_scale: f32,
     pub dtp_cycle_scale: f32,
     /// Between shots.
-    pub fire_time_ms: i32,
+    pub shot_gap_ms: i32,
     /// bo2zm: the first `intro_fire_length` shots of a trigger pull come
     /// `intro_fire_time_ms` apart (Black Ops II's HAMR, AN-94, B23R).
     pub intro_fire_time_ms: i32,
     pub intro_fire_length: i32,
+    /// bo2zm: Black Ops II's charge shot (fire type 8).
+    pub charge_shot: bool,
     /// From the trigger to the shot.
-    pub fire_delay_ms: i32,
-    pub raise_time_ms: i32,
-    pub drop_time_ms: i32,
+    pub shot_lead_ms: i32,
+    pub draw_ms: i32,
+    pub holster_ms: i32,
     pub alternate_weapon: u32,
     pub alternate_raise_time_ms: i32,
     pub alternate_drop_time_ms: i32,
-    pub reload_time_ms: i32,
-    pub reload_empty_time_ms: i32,
-    pub clip_size: i32,
-    pub start_ammo: i32,
-    pub max_ammo: i32,
+    pub reload_duration_millis: i32,
+    pub refill_dry_millis: i32,
+    pub magazine_capacity: i32,
+    pub spawn_rounds: i32,
+    pub reserve_cap: i32,
     /// Key of the stock row in the ammo table (0: the weapon itself).
-    pub ammo_index: i32,
+    pub ammo_type_slot: i32,
     /// Key of the clip row in the clip table (0: the weapon itself).
-    pub clip_index: i32,
-    /// A [`FireType`] number.
-    pub fire_type: i32,
-    pub weap_type: i32,
-    pub weap_class: i32,
-    pub player_anim_type: i32,
-    pub inventory_type: i32,
+    pub motion_clip_slot: i32,
+    /// A [`TriggerPattern`] number.
+    pub trigger_mode: i32,
+    pub gun_family_code: i32,
+    pub gun_kind: i32,
+    pub player_motion_kind: i32,
+    pub carry_slot_kind: i32,
     /// bo2mp: switches to and from it are quick (BO2 `BG_IsQuickSwitch`).
     pub quick_switch: bool,
     /// bo2mp: a switch to it is quick (pistol, pistol spread, melee).
     pub quick_switch_target: bool,
-    pub impact_type: i32,
-    pub shots_per_fire: i32,
-    pub burst_cooldown_ms: i32,
-    pub bolt_action: bool,
-    pub rechamber_time_ms: i32,
-    pub rechamber_bolt_time_ms: i32,
-    pub rechamber_bolt_delay_ms: i32,
-    pub segmented_reload: bool,
-    pub reload_start_time_ms: i32,
-    pub reload_end_time_ms: i32,
-    pub reload_ammo_add: i32,
-    pub reload_add_time_ms: i32,
-    pub reload_empty_add_time_ms: i32,
-    pub reload_start_add_time_ms: i32,
-    pub reload_start_add: i32,
-    pub no_partial_reload: bool,
-    pub inherits_perks: bool,
-    pub sprint_raise_time_ms: i32,
-    pub sprint_drop_time_ms: i32,
+    pub impact_kind_id: i32,
+    pub rounds_each_trigger: i32,
+    pub volley_rest_millis: i32,
+    pub manual_cycle: bool,
+    pub cycle_ms: i32,
+    pub bolt_rack_duration_millis: i32,
+    pub bolt_rack_wait_millis: i32,
+    pub staged_reload: bool,
+    pub refill_begin_millis: i32,
+    pub refill_finish_millis: i32,
+    pub reload_rounds_gained: i32,
+    pub reload_refill_millis: i32,
+    pub empty_reload_refill_millis: i32,
+    pub reload_begin_refill_millis: i32,
+    pub reload_begin_bonus: i32,
+    pub forbid_topup_reload: bool,
+    /// bo2zm: fires with an empty clip and never uses ammo.
+    pub unlimited_ammo: bool,
+    pub carries_over_talents: bool,
+    pub run_lift_millis: i32,
+    pub run_lower_millis: i32,
     pub damage: i32,
-    pub min_damage: i32,
-    pub max_damage_range: f32,
-    pub min_damage_range: f32,
+    pub hurt_floor: i32,
+    pub full_damage_reach: f32,
+    pub minimum_damage_reach: f32,
     pub damage_steps: Option<crate::damage::DamageSteps>,
-    pub hip_spread_stand_min: f32,
-    pub hip_spread_ducked_min: f32,
-    pub hip_spread_prone_min: f32,
-    pub hip_spread_stand_max: f32,
-    pub hip_spread_ducked_max: f32,
-    pub hip_spread_prone_max: f32,
-    pub hip_spread_decay_rate: f32,
-    pub hip_spread_fire_add: f32,
-    pub hip_spread_turn_add: f32,
-    pub hip_spread_move_add: f32,
-    pub hip_spread_ducked_decay: f32,
-    pub hip_spread_prone_decay: f32,
-    pub ads_spread: f32,
-    pub aim_down_sight: bool,
-    pub no_ads_when_mag_empty: bool,
-    pub ads_in_rate: f32,
-    pub ads_out_rate: f32,
-    pub rechamber_while_ads: bool,
+    pub hip_cone_up_lo: f32,
+    pub hip_cone_crouch_lo: f32,
+    pub hip_cone_lie_lo: f32,
+    pub hip_cone_up_hi: f32,
+    pub hip_cone_crouch_hi: f32,
+    pub hip_cone_lie_hi: f32,
+    pub hip_cone_settle: f32,
+    pub hip_cone_per_shot: f32,
+    pub hip_cone_per_turn: f32,
+    pub hip_cone_per_step: f32,
+    pub hip_cone_crouch_settle: f32,
+    pub hip_cone_lie_settle: f32,
+    pub aimed_cone: f32,
+    pub scoped_aiming: bool,
+    pub block_aim_if_clip_dry: bool,
+    pub scope_raise_speed: f32,
+    pub scope_lower_speed: f32,
+    pub rack_bolt_when_scoped: bool,
     /// BO2: a reload lowers the sights (!bReloadWhileAds).
     pub reload_lowers_ads: bool,
     /// BO2 iPositionReloadTransTime: the sights come back up when this
     /// much of the reload is left.
     pub position_reload_trans_ms: i32,
-    pub ads_fire_only: bool,
+    pub fire_only_when_scoped: bool,
     pub optic_switch: bool,
-    pub melee_damage: i32,
-    pub overlay_reticle: i32,
-    pub melee_time_ms: i32,
-    pub melee_delay_ms: i32,
-    pub melee_charge_time_ms: i32,
-    pub melee_charge_delay_ms: i32,
-    pub melee_charge_anim: bool,
-    pub knife_model: u32,
-    pub quick_raise_time_ms: i32,
-    pub quick_drop_time_ms: i32,
+    pub bash_hurt: i32,
+    pub hud_crosshair_layer: i32,
+    pub bash_ms: i32,
+    pub strike_wait_millis: i32,
+    pub bash_windup_ms: i32,
+    pub lunge_windup_wait_millis: i32,
+    pub lunge_has_clip: bool,
+    pub blade_mesh: u32,
+    pub fast_draw_ms: i32,
+    pub fast_holster_ms: i32,
     pub select_requires_ammo: Option<bool>,
     pub offhand_hold_is_cancelable: Option<bool>,
-    pub ads_gun_kick_reduced_kick_bullets: i32,
-    pub hip_gun_kick_reduced_kick_bullets: i32,
+    pub aim_soft_kick_shots: i32,
+    pub hip_soft_kick_shots: i32,
     pub location_damage: [f32; crate::hitloc::HITLOC_COUNT],
     pub dual_mag: Option<crate::dual_mag::DualMagTimes>,
-    /// bo2zm fix list 2: see `CapturedCombatInput::spread_before_fire_add`.
+    /// bo2zm fix list 2: see `RecordedBattleFeed::spread_before_fire_add`.
     pub spread_before_fire_add: bool,
+    /// bo2zm: see `RecordedBattleFeed::flat_spread`.
+    pub flat_spread: bool,
     /// bo2zm: a Black Ops II dual-wield weapon's left-hand weapon (0: not
     /// dual wield): given, it holds two clips and fires from both hands.
     pub dual_wield_weapon: u32,
+    /// bo2zm: the grenade a Black Ops II gun's shot becomes for the
+    /// scripts (`szSpawnedGrenadeWeaponName`: the Sliquifier's slip bolt);
+    /// 0: none.
+    pub spawned_grenade: u32,
+    /// bo2zm: picked back up once placed (Black Ops II `bRetrievable`).
+    pub retrievable: bool,
 }
 
-impl Default for WeaponCombatFacts {
+impl Default for GunBattleProfile {
     fn default() -> Self {
-        Self::none()
+        GunBattleProfile::none()
     }
 }
 
-impl WeaponCombatFacts {
+/// The zero, unset and off values every field of [`GunBattleProfile::none`] starts from.
+const NIL_INT: i32 = 0;
+const NIL_UINT: u32 = 0;
+const NIL_FLOAT: f32 = 0.0;
+const FLAG_OFF: bool = false;
+
+impl GunBattleProfile {
     /// A weapon that does nothing.
     pub const fn none() -> Self {
         Self {
-            aim_assist: AimAssistRanges::NONE,
+            aim_assist: AimAssistRanges::OFF,
             sprint_cycle_scale: 1.0,
             ducked_sprint_cycle_scale: 1.0,
             dtp_cycle_scale: 1.0,
-            fire_time_ms: 0,
-            intro_fire_time_ms: 0,
-            intro_fire_length: 0,
-            fire_delay_ms: 0,
-            raise_time_ms: 0,
-            drop_time_ms: 0,
-            alternate_weapon: 0,
-            alternate_raise_time_ms: 0,
-            alternate_drop_time_ms: 0,
-            reload_time_ms: 0,
-            reload_empty_time_ms: 0,
-            clip_size: 0,
-            start_ammo: 0,
-            max_ammo: 0,
-            ammo_index: 0,
-            clip_index: 0,
-            fire_type: 0,
-            weap_type: 0,
-            weap_class: 0,
-            player_anim_type: 0,
-            inventory_type: 0,
-            quick_switch: false,
-            quick_switch_target: false,
-            impact_type: 0,
-            shots_per_fire: 0,
-            burst_cooldown_ms: 0,
-            bolt_action: false,
-            rechamber_time_ms: 0,
-            rechamber_bolt_time_ms: 0,
-            rechamber_bolt_delay_ms: 0,
-            segmented_reload: false,
-            reload_start_time_ms: 0,
-            reload_end_time_ms: 0,
-            reload_ammo_add: 0,
-            reload_add_time_ms: 0,
-            reload_empty_add_time_ms: 0,
-            reload_start_add_time_ms: 0,
-            reload_start_add: 0,
-            no_partial_reload: false,
-            inherits_perks: false,
-            sprint_raise_time_ms: 0,
-            sprint_drop_time_ms: 0,
-            damage: 0,
-            min_damage: 0,
-            max_damage_range: 0.0,
-            min_damage_range: 0.0,
+            shot_gap_ms: NIL_INT,
+            intro_fire_time_ms: NIL_INT,
+            intro_fire_length: NIL_INT,
+            charge_shot: FLAG_OFF,
+            shot_lead_ms: NIL_INT,
+            draw_ms: NIL_INT,
+            holster_ms: NIL_INT,
+            alternate_weapon: NIL_UINT,
+            alternate_raise_time_ms: NIL_INT,
+            alternate_drop_time_ms: NIL_INT,
+            reload_duration_millis: NIL_INT,
+            refill_dry_millis: NIL_INT,
+            magazine_capacity: NIL_INT,
+            spawn_rounds: NIL_INT,
+            reserve_cap: NIL_INT,
+            ammo_type_slot: NIL_INT,
+            motion_clip_slot: NIL_INT,
+            trigger_mode: NIL_INT,
+            gun_family_code: NIL_INT,
+            gun_kind: NIL_INT,
+            player_motion_kind: NIL_INT,
+            carry_slot_kind: NIL_INT,
+            quick_switch: FLAG_OFF,
+            quick_switch_target: FLAG_OFF,
+            impact_kind_id: NIL_INT,
+            rounds_each_trigger: NIL_INT,
+            volley_rest_millis: NIL_INT,
+            manual_cycle: FLAG_OFF,
+            cycle_ms: NIL_INT,
+            bolt_rack_duration_millis: NIL_INT,
+            bolt_rack_wait_millis: NIL_INT,
+            staged_reload: FLAG_OFF,
+            refill_begin_millis: NIL_INT,
+            refill_finish_millis: NIL_INT,
+            reload_rounds_gained: NIL_INT,
+            reload_refill_millis: NIL_INT,
+            empty_reload_refill_millis: NIL_INT,
+            reload_begin_refill_millis: NIL_INT,
+            reload_begin_bonus: NIL_INT,
+            forbid_topup_reload: FLAG_OFF,
+            unlimited_ammo: FLAG_OFF,
+            carries_over_talents: FLAG_OFF,
+            run_lift_millis: NIL_INT,
+            run_lower_millis: NIL_INT,
+            damage: NIL_INT,
+            hurt_floor: NIL_INT,
+            full_damage_reach: NIL_FLOAT,
+            minimum_damage_reach: NIL_FLOAT,
             damage_steps: None,
-            hip_spread_stand_min: 0.0,
-            hip_spread_ducked_min: 0.0,
-            hip_spread_prone_min: 0.0,
-            hip_spread_stand_max: 0.0,
-            hip_spread_ducked_max: 0.0,
-            hip_spread_prone_max: 0.0,
-            hip_spread_decay_rate: 0.0,
-            hip_spread_fire_add: 0.0,
-            hip_spread_turn_add: 0.0,
-            hip_spread_move_add: 0.0,
-            hip_spread_ducked_decay: 0.0,
-            hip_spread_prone_decay: 0.0,
-            ads_spread: 0.0,
-            aim_down_sight: false,
-            no_ads_when_mag_empty: false,
-            ads_in_rate: 0.0,
-            ads_out_rate: 0.0,
-            rechamber_while_ads: true,
-            reload_lowers_ads: false,
-            position_reload_trans_ms: 0,
-            ads_fire_only: false,
-            optic_switch: false,
-            melee_damage: 0,
-            overlay_reticle: 0,
-            melee_time_ms: 0,
-            melee_delay_ms: 0,
-            melee_charge_time_ms: 0,
-            melee_charge_delay_ms: 0,
-            melee_charge_anim: false,
-            knife_model: 0,
-            quick_raise_time_ms: 0,
-            quick_drop_time_ms: 0,
+            hip_cone_up_lo: NIL_FLOAT,
+            hip_cone_crouch_lo: NIL_FLOAT,
+            hip_cone_lie_lo: NIL_FLOAT,
+            hip_cone_up_hi: NIL_FLOAT,
+            hip_cone_crouch_hi: NIL_FLOAT,
+            hip_cone_lie_hi: NIL_FLOAT,
+            hip_cone_settle: NIL_FLOAT,
+            hip_cone_per_shot: NIL_FLOAT,
+            hip_cone_per_turn: NIL_FLOAT,
+            hip_cone_per_step: NIL_FLOAT,
+            hip_cone_crouch_settle: NIL_FLOAT,
+            hip_cone_lie_settle: NIL_FLOAT,
+            aimed_cone: NIL_FLOAT,
+            scoped_aiming: FLAG_OFF,
+            block_aim_if_clip_dry: FLAG_OFF,
+            scope_raise_speed: NIL_FLOAT,
+            scope_lower_speed: NIL_FLOAT,
+            rack_bolt_when_scoped: true,
+            reload_lowers_ads: FLAG_OFF,
+            position_reload_trans_ms: NIL_INT,
+            fire_only_when_scoped: FLAG_OFF,
+            optic_switch: FLAG_OFF,
+            bash_hurt: NIL_INT,
+            hud_crosshair_layer: NIL_INT,
+            bash_ms: NIL_INT,
+            strike_wait_millis: NIL_INT,
+            bash_windup_ms: NIL_INT,
+            lunge_windup_wait_millis: NIL_INT,
+            lunge_has_clip: FLAG_OFF,
+            blade_mesh: NIL_UINT,
+            fast_draw_ms: NIL_INT,
+            fast_holster_ms: NIL_INT,
             select_requires_ammo: Some(false),
             offhand_hold_is_cancelable: Some(false),
-            ads_gun_kick_reduced_kick_bullets: 0,
-            hip_gun_kick_reduced_kick_bullets: 0,
+            aim_soft_kick_shots: NIL_INT,
+            hip_soft_kick_shots: NIL_INT,
             location_damage: crate::damage::LOCATION_DAMAGE_IDENTITY,
             dual_mag: None,
-            spread_before_fire_add: false,
-            dual_wield_weapon: 0,
+            spread_before_fire_add: FLAG_OFF,
+            flat_spread: FLAG_OFF,
+            dual_wield_weapon: NIL_UINT,
+            spawned_grenade: NIL_UINT,
+            retrievable: FLAG_OFF,
         }
     }
 
     /// The captured fields checked and taken in. A weapon with no fire time, raise time,
     /// damage or clip is [`Self::none`].
-    pub fn try_from_captured(input: CapturedCombatInput) -> Result<Self, MissingCombatFacts> {
-        let nothing = input.fire_time_ms <= 0
-            && input.raise_time_ms <= 0
-            && input.damage <= 0
-            && input.clip_size <= 0;
+    pub fn try_from_captured(cap: RecordedBattleFeed) -> Result<Self, AbsentBattleProfile> {
+        let nothing = cap.shot_gap_ms <= 0
+            && cap.draw_ms <= 0
+            && cap.damage <= 0
+            && cap.magazine_capacity <= 0;
         if nothing {
-            return Ok(Self::none());
+            return Ok(GunBattleProfile::none());
         }
-        let fire_type =
-            FireType::from_i32(input.fire_type).map_err(|_| MissingCombatFacts::UnknownFireType)?;
-        if fire_type.is_burst() && input.burst_cooldown_ms <= 0 {
-            return Err(MissingCombatFacts::BurstCooldown);
+        let Ok(fire_type) = TriggerPattern::from_i32(cap.trigger_mode) else {
+            return Err(AbsentBattleProfile::UnrecognisedTriggerPattern);
+        };
+        if fire_type.fires_volleys() && cap.volley_rest_millis <= 0 {
+            return Err(AbsentBattleProfile::VolleyRest);
         }
-        if input.segmented_reload && input.reload_ammo_add <= 0 {
-            return Err(MissingCombatFacts::SegmentedReloadAmmoAdd);
+        if cap.staged_reload && cap.reload_rounds_gained <= 0 {
+            return Err(AbsentBattleProfile::PerRoundReloadGain);
         }
-        if input.damage > 0 && input.max_damage_range <= 0.0 && input.min_damage_range <= 0.0 {
-            return Err(MissingCombatFacts::BulletRange);
+        if cap.damage > 0 && cap.full_damage_reach <= 0.0 && cap.minimum_damage_reach <= 0.0 {
+            return Err(AbsentBattleProfile::ShotReach);
         }
-        if !crate::damage::location_damage_is_valid(&input.location_damage) {
-            return Err(MissingCombatFacts::LocationDamage);
+        if !crate::damage::location_damage_is_valid(&cap.location_damage) {
+            return Err(AbsentBattleProfile::LocationDamage);
         }
         Ok(Self {
-            aim_assist: AimAssistRanges::NONE,
+            aim_assist: AimAssistRanges::OFF,
             sprint_cycle_scale: 1.0,
             ducked_sprint_cycle_scale: 1.0,
             dtp_cycle_scale: 1.0,
-            fire_time_ms: input.fire_time_ms,
-            intro_fire_time_ms: input.intro_fire_time_ms,
-            intro_fire_length: input.intro_fire_length,
-            fire_delay_ms: input.fire_delay_ms,
-            raise_time_ms: input.raise_time_ms,
-            drop_time_ms: input.drop_time_ms,
-            alternate_weapon: input.alternate_weapon,
-            alternate_raise_time_ms: input.alternate_raise_time_ms,
-            alternate_drop_time_ms: input.alternate_drop_time_ms,
-            reload_time_ms: input.reload_time_ms,
-            reload_empty_time_ms: input.reload_empty_time_ms,
-            clip_size: input.clip_size,
-            start_ammo: input.start_ammo,
-            max_ammo: input.max_ammo,
-            ammo_index: input.ammo_index,
-            clip_index: input.clip_index,
-            fire_type: input.fire_type,
-            weap_type: input.weap_type,
-            weap_class: input.weap_class,
-            player_anim_type: input.player_anim_type,
-            inventory_type: input.inventory_type,
-            quick_switch: input.quick_switch,
-            quick_switch_target: input.quick_switch_target,
-            impact_type: input.impact_type,
-            shots_per_fire: input.shots_per_fire,
-            burst_cooldown_ms: input.burst_cooldown_ms,
-            bolt_action: input.bolt_action,
-            rechamber_time_ms: input.rechamber_time_ms,
-            rechamber_bolt_time_ms: input.rechamber_bolt_time_ms,
-            rechamber_bolt_delay_ms: input.rechamber_bolt_delay_ms,
-            segmented_reload: input.segmented_reload,
-            reload_start_time_ms: input.reload_start_time_ms,
-            reload_end_time_ms: input.reload_end_time_ms,
-            reload_ammo_add: input.reload_ammo_add,
-            reload_add_time_ms: input.reload_add_time_ms,
-            reload_empty_add_time_ms: input.reload_empty_add_time_ms,
-            reload_start_add_time_ms: input.reload_start_add_time_ms,
-            reload_start_add: input.reload_start_add,
-            no_partial_reload: input.no_partial_reload,
-            inherits_perks: input.inherits_perks,
-            sprint_raise_time_ms: input.sprint_raise_time_ms,
-            sprint_drop_time_ms: input.sprint_drop_time_ms,
-            damage: input.damage,
-            min_damage: input.min_damage,
-            max_damage_range: input.max_damage_range,
-            min_damage_range: input.min_damage_range,
-            damage_steps: input.damage_steps,
-            hip_spread_stand_min: input.hip_spread_stand_min,
-            hip_spread_ducked_min: input.hip_spread_ducked_min,
-            hip_spread_prone_min: input.hip_spread_prone_min,
-            hip_spread_stand_max: input.hip_spread_stand_max,
-            hip_spread_ducked_max: input.hip_spread_ducked_max,
-            hip_spread_prone_max: input.hip_spread_prone_max,
-            hip_spread_decay_rate: input.hip_spread_decay_rate,
-            hip_spread_fire_add: input.hip_spread_fire_add,
-            hip_spread_turn_add: input.hip_spread_turn_add,
-            hip_spread_move_add: input.hip_spread_move_add,
-            hip_spread_ducked_decay: input.hip_spread_ducked_decay,
-            hip_spread_prone_decay: input.hip_spread_prone_decay,
-            ads_spread: input.ads_spread,
-            aim_down_sight: input.aim_down_sight,
-            no_ads_when_mag_empty: input.no_ads_when_mag_empty,
-            ads_in_rate: input.ads_in_rate,
-            ads_out_rate: input.ads_out_rate,
-            rechamber_while_ads: input.rechamber_while_ads,
-            reload_lowers_ads: input.reload_lowers_ads,
-            position_reload_trans_ms: input.position_reload_trans_ms,
-            ads_fire_only: input.ads_fire_only,
-            optic_switch: input.optic_switch,
-            melee_damage: input.melee_damage,
-            overlay_reticle: input.overlay_reticle,
-            melee_time_ms: input.melee_time_ms,
-            melee_delay_ms: input.melee_delay_ms,
-            melee_charge_time_ms: input.melee_charge_time_ms,
-            melee_charge_delay_ms: input.melee_charge_delay_ms,
-            melee_charge_anim: input.melee_charge_anim,
-            knife_model: input.knife_model,
-            quick_raise_time_ms: input.quick_raise_time_ms,
-            quick_drop_time_ms: input.quick_drop_time_ms,
-            select_requires_ammo: input.select_requires_ammo,
-            offhand_hold_is_cancelable: input.offhand_hold_is_cancelable,
-            ads_gun_kick_reduced_kick_bullets: input.ads_gun_kick_reduced_kick_bullets,
-            hip_gun_kick_reduced_kick_bullets: input.hip_gun_kick_reduced_kick_bullets,
-            location_damage: input.location_damage,
-            dual_mag: input.dual_mag,
-            spread_before_fire_add: input.spread_before_fire_add,
+            shot_gap_ms: cap.shot_gap_ms,
+            intro_fire_time_ms: cap.intro_fire_time_ms,
+            intro_fire_length: cap.intro_fire_length,
+            charge_shot: cap.charge_shot,
+            shot_lead_ms: cap.shot_lead_ms,
+            draw_ms: cap.draw_ms,
+            holster_ms: cap.holster_ms,
+            alternate_weapon: cap.alternate_weapon,
+            alternate_raise_time_ms: cap.alternate_raise_time_ms,
+            alternate_drop_time_ms: cap.alternate_drop_time_ms,
+            reload_duration_millis: cap.reload_duration_millis,
+            refill_dry_millis: cap.refill_dry_millis,
+            magazine_capacity: cap.magazine_capacity,
+            spawn_rounds: cap.spawn_rounds,
+            reserve_cap: cap.reserve_cap,
+            ammo_type_slot: cap.ammo_type_slot,
+            motion_clip_slot: cap.motion_clip_slot,
+            trigger_mode: cap.trigger_mode,
+            gun_family_code: cap.gun_family_code,
+            gun_kind: cap.gun_kind,
+            player_motion_kind: cap.player_motion_kind,
+            carry_slot_kind: cap.carry_slot_kind,
+            quick_switch: cap.quick_switch,
+            quick_switch_target: cap.quick_switch_target,
+            impact_kind_id: cap.impact_kind_id,
+            rounds_each_trigger: cap.rounds_each_trigger,
+            volley_rest_millis: cap.volley_rest_millis,
+            manual_cycle: cap.manual_cycle,
+            cycle_ms: cap.cycle_ms,
+            bolt_rack_duration_millis: cap.bolt_rack_duration_millis,
+            bolt_rack_wait_millis: cap.bolt_rack_wait_millis,
+            staged_reload: cap.staged_reload,
+            refill_begin_millis: cap.refill_begin_millis,
+            refill_finish_millis: cap.refill_finish_millis,
+            reload_rounds_gained: cap.reload_rounds_gained,
+            reload_refill_millis: cap.reload_refill_millis,
+            empty_reload_refill_millis: cap.empty_reload_refill_millis,
+            reload_begin_refill_millis: cap.reload_begin_refill_millis,
+            reload_begin_bonus: cap.reload_begin_bonus,
+            forbid_topup_reload: cap.forbid_topup_reload,
+            unlimited_ammo: cap.unlimited_ammo,
+            carries_over_talents: cap.carries_over_talents,
+            run_lift_millis: cap.run_lift_millis,
+            run_lower_millis: cap.run_lower_millis,
+            damage: cap.damage,
+            hurt_floor: cap.hurt_floor,
+            full_damage_reach: cap.full_damage_reach,
+            minimum_damage_reach: cap.minimum_damage_reach,
+            damage_steps: cap.damage_steps,
+            hip_cone_up_lo: cap.hip_cone_up_lo,
+            hip_cone_crouch_lo: cap.hip_cone_crouch_lo,
+            hip_cone_lie_lo: cap.hip_cone_lie_lo,
+            hip_cone_up_hi: cap.hip_cone_up_hi,
+            hip_cone_crouch_hi: cap.hip_cone_crouch_hi,
+            hip_cone_lie_hi: cap.hip_cone_lie_hi,
+            hip_cone_settle: cap.hip_cone_settle,
+            hip_cone_per_shot: cap.hip_cone_per_shot,
+            hip_cone_per_turn: cap.hip_cone_per_turn,
+            hip_cone_per_step: cap.hip_cone_per_step,
+            hip_cone_crouch_settle: cap.hip_cone_crouch_settle,
+            hip_cone_lie_settle: cap.hip_cone_lie_settle,
+            aimed_cone: cap.aimed_cone,
+            scoped_aiming: cap.scoped_aiming,
+            block_aim_if_clip_dry: cap.block_aim_if_clip_dry,
+            scope_raise_speed: cap.scope_raise_speed,
+            scope_lower_speed: cap.scope_lower_speed,
+            rack_bolt_when_scoped: cap.rack_bolt_when_scoped,
+            reload_lowers_ads: cap.reload_lowers_ads,
+            position_reload_trans_ms: cap.position_reload_trans_ms,
+            fire_only_when_scoped: cap.fire_only_when_scoped,
+            optic_switch: cap.optic_switch,
+            bash_hurt: cap.bash_hurt,
+            hud_crosshair_layer: cap.hud_crosshair_layer,
+            bash_ms: cap.bash_ms,
+            strike_wait_millis: cap.strike_wait_millis,
+            bash_windup_ms: cap.bash_windup_ms,
+            lunge_windup_wait_millis: cap.lunge_windup_wait_millis,
+            lunge_has_clip: cap.lunge_has_clip,
+            blade_mesh: cap.blade_mesh,
+            fast_draw_ms: cap.fast_draw_ms,
+            fast_holster_ms: cap.fast_holster_ms,
+            select_requires_ammo: cap.select_requires_ammo,
+            offhand_hold_is_cancelable: cap.offhand_hold_is_cancelable,
+            aim_soft_kick_shots: cap.aim_soft_kick_shots,
+            hip_soft_kick_shots: cap.hip_soft_kick_shots,
+            location_damage: cap.location_damage,
+            dual_mag: cap.dual_mag,
+            spread_before_fire_add: cap.spread_before_fire_add,
+            flat_spread: cap.flat_spread,
             dual_wield_weapon: 0,
+            spawned_grenade: 0,
+            retrievable: false,
         })
     }
 
     pub fn is_none(self) -> bool {
-        self.fire_time_ms <= 0 && self.raise_time_ms <= 0 && self.damage <= 0 && self.clip_size <= 0
+        self.shot_gap_ms <= 0 && self.draw_ms <= 0 && self.damage <= 0 && self.magazine_capacity <= 0
     }
 
-    pub fn is_usable(self) -> bool {
+    pub fn ready_for_use(self) -> bool {
         !self.is_none()
     }
 
     /// Bullets a shot sends: a spread weapon's pellets, else 1.
-    pub fn pellet_count(self) -> i32 {
-        if self.weap_class == WEAPCLASS_SPREAD {
-            self.shots_per_fire.max(1)
+    pub fn shot_pellet_total(self) -> i32 {
+        if self.gun_kind == WEAPCLASS_SPREAD {
+            self.rounds_each_trigger.max(1)
         } else {
             1
         }
     }
 
     /// How far a bullet reaches: a spread weapon's own range, else the world's.
-    pub fn bullet_range(self) -> f32 {
-        if self.weap_class == WEAPCLASS_SPREAD {
-            self.min_damage_range
+    pub fn shot_reach(self) -> f32 {
+        if self.gun_kind == WEAPCLASS_SPREAD {
+            self.minimum_damage_reach
         } else {
             crate::damage::BULLET_MAX_RANGE
         }
@@ -521,22 +552,22 @@ impl WeaponCombatFacts {
         crate::hitloc::location_scale(&self.location_damage, hitloc)
     }
 
-    pub fn ads_allow_facts(self) -> crate::ads_allow::AdsAllowWeaponFacts {
-        crate::ads_allow::AdsAllowWeaponFacts {
-            aim_down_sight: self.aim_down_sight,
-            no_ads_when_mag_empty: self.no_ads_when_mag_empty,
-            clip_index: self.clip_index,
+    pub fn ads_allow_facts(self) -> crate::ads_allow::ScopePermitGunInfo {
+        crate::ads_allow::ScopePermitGunInfo {
+            scoped_aiming: self.scoped_aiming,
+            block_aim_if_clip_dry: self.block_aim_if_clip_dry,
+            motion_clip_slot: self.motion_clip_slot,
             optic_switch: self.optic_switch,
         }
     }
 
     /// What moves the sights: (rate in, rate out, rechamber while aimed, aimed fire only).
-    pub fn ads_frac_context(self) -> (f32, f32, bool, bool) {
+    pub fn scope_blend_bundle(self) -> (f32, f32, bool, bool) {
         (
-            self.ads_in_rate,
-            self.ads_out_rate,
-            self.rechamber_while_ads,
-            self.ads_fire_only,
+            self.scope_raise_speed,
+            self.scope_lower_speed,
+            self.rack_bolt_when_scoped,
+            self.fire_only_when_scoped,
         )
     }
 
@@ -546,221 +577,214 @@ impl WeaponCombatFacts {
         (
             self.reload_lowers_ads,
             self.position_reload_trans_ms,
-            self.segmented_reload,
+            self.staged_reload,
         )
     }
 }
 
 /// A hand's weapon, its state and its rounds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WeaponHandState {
+pub struct GunGripState {
     pub weapon: u32,
-    pub weaponstate: i32,
-    pub weapon_time: i32,
-    pub weapon_delay: i32,
-    pub weap_anim: i32,
-    pub hand_index: u8,
-    pub clip: i32,
-    pub stock: i32,
-    pub shot_count: u8,
-    pub burst_latch: bool,
-    pub rechamber_pending: bool,
-    pub delayed_rechamber: bool,
-    pub weapon_restrict_kick_time: i32,
+    pub gun_phase: i32,
+    pub gun_timer_ms: i32,
+    pub weapon_ready_wait: i32,
+    pub gun_clip: i32,
+    pub grip_slot: u8,
+    pub mag_rounds: i32,
+    pub spare_rounds: i32,
+    pub rounds_fired: u8,
+    pub burst_hold: bool,
+    pub cycle_owed: bool,
+    pub late_bolt_cycle: bool,
+    pub gun_lockout_kick_stamp: i32,
     pub quick_reload: bool,
 }
 
 /// The rounds a weapon spawns with, as (right clip, left clip, stock). The left clip is
 /// only filled once the left hand has been used.
-pub fn spawn_clip_stock(facts: &WeaponCombatFacts, last_hand: i32) -> (i32, i32, i32) {
-    let total = facts.start_ammo.max(0);
-    let mag = facts.clip_size.max(0);
-    let right = if mag > 0 { total.min(mag) } else { 0 };
-    let rest = total - right;
-    let left = if last_hand >= 1 && mag > 0 {
-        rest.min(mag)
+pub fn spawn_clip_stock(stats: &GunBattleProfile, hand_idx: i32) -> (i32, i32, i32) {
+    let pool = stats.spawn_rounds.max(0);
+    let clip_cap = stats.magazine_capacity.max(0);
+    let right = if clip_cap > 0 { pool.min(clip_cap) } else { 0 };
+    let spare = pool - right;
+    let left = if hand_idx >= 1 && clip_cap > 0 {
+        spare.min(clip_cap)
     } else {
         0
     };
-    (right, left, rest - left)
+    (right, left, spare - left)
 }
 
-/// A hand just given `weapon`: raising it if the file has a raise time, else ready.
-pub fn spawn_weapon_hand(weapon: u32, facts: &WeaponCombatFacts) -> WeaponHandState {
-    let total = facts.start_ammo.max(0);
-    let clip = if facts.clip_size > 0 {
-        total.min(facts.clip_size)
-    } else {
-        0
+/// The right hand right after `weapon` is handed over: magazine filled from the start
+/// ammo, the rest in stock, and the gun coming up when it has a raise time (ready at once
+/// otherwise).
+pub fn spawn_weapon_hand(gun: u32, stats: &GunBattleProfile) -> GunGripState {
+    let (clip, _, stock) = spawn_clip_stock(stats, 0);
+    let mut hand = GunGripState {
+        weapon: gun,
+        mag_rounds: clip,
+        spare_rounds: stock,
+        quick_reload: stats.dual_mag.is_some(),
+        gun_phase: crate::state::READY,
+        ..GunGripState::default()
     };
-    let raise = facts.raise_time_ms.max(0);
-    let mut weap_anim = 0;
-    if raise > 0 {
-        crate::weap_anim::start_weapon_anim(
-            &mut weap_anim,
-            crate::weap_anim::weap_anim_event::RAISE,
-        );
+    let lift_ms = stats.draw_ms;
+    if lift_ms > 0 {
+        hand.gun_phase = crate::state::RAISING;
+        hand.gun_timer_ms = lift_ms;
+        crate::gun_anim::begin_gun_clip(&mut hand.gun_clip, crate::gun_anim::gun_clip_cue::LIFT);
     }
-    WeaponHandState {
-        weapon,
-        weaponstate: if raise > 0 {
-            crate::state::RAISING
-        } else {
-            crate::state::READY
-        },
-        weapon_time: raise,
-        weap_anim,
-        clip,
-        stock: total - clip,
-        quick_reload: facts.dual_mag.is_some(),
-        ..WeaponHandState::default()
-    }
+    hand
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn rifle() -> CapturedCombatInput {
-        CapturedCombatInput {
-            fire_time_ms: 90,
-            raise_time_ms: 400,
+    fn rifle() -> RecordedBattleFeed {
+        RecordedBattleFeed {
+            shot_gap_ms: 90,
+            draw_ms: 400,
             damage: 30,
-            clip_size: 30,
-            start_ammo: 90,
-            max_damage_range: 1000.0,
-            min_damage_range: 2000.0,
-            fire_type: 0,
+            magazine_capacity: 30,
+            spawn_rounds: 90,
+            full_damage_reach: 1000.0,
+            minimum_damage_reach: 2000.0,
             location_damage: crate::damage::LOCATION_DAMAGE_IDENTITY,
-            ..CapturedCombatInput::default()
+            ..RecordedBattleFeed::default()
         }
     }
 
     #[test]
     fn an_empty_weapon_file_is_nothing() {
-        let facts = WeaponCombatFacts::try_from_captured(CapturedCombatInput::default()).unwrap();
-        assert!(facts.is_none() && !facts.is_usable());
-        assert_eq!(facts, WeaponCombatFacts::none());
+        let facts = GunBattleProfile::try_from_captured(RecordedBattleFeed::default()).unwrap();
+        assert!(facts.is_none() && !facts.ready_for_use());
+        assert_eq!(facts, GunBattleProfile::none());
     }
 
     #[test]
     fn a_rifle_is_taken_in_and_a_bad_file_names_what_is_missing() {
-        let facts = WeaponCombatFacts::try_from_captured(rifle()).unwrap();
-        assert!(facts.is_usable());
-        assert_eq!((facts.fire_time_ms, facts.clip_size), (90, 30));
-        assert_eq!(facts.pellet_count(), 1);
-        assert_eq!(facts.bullet_range(), crate::damage::BULLET_MAX_RANGE);
+        let facts = GunBattleProfile::try_from_captured(rifle()).unwrap();
+        assert!(facts.ready_for_use());
+        assert_eq!((facts.shot_gap_ms, facts.magazine_capacity), (90, 30));
+        assert_eq!(facts.shot_pellet_total(), 1);
+        assert_eq!(facts.shot_reach(), crate::damage::BULLET_MAX_RANGE);
 
-        let burst = CapturedCombatInput {
-            fire_type: 2,
+        let burst = RecordedBattleFeed {
+            trigger_mode: 2,
             ..rifle()
         };
         assert_eq!(
-            WeaponCombatFacts::try_from_captured(burst),
-            Err(MissingCombatFacts::BurstCooldown)
+            GunBattleProfile::try_from_captured(burst),
+            Err(AbsentBattleProfile::VolleyRest)
         );
-        let odd = CapturedCombatInput {
-            fire_type: 9,
+        let odd = RecordedBattleFeed {
+            trigger_mode: 9,
             ..rifle()
         };
         assert_eq!(
-            WeaponCombatFacts::try_from_captured(odd),
-            Err(MissingCombatFacts::UnknownFireType)
+            GunBattleProfile::try_from_captured(odd),
+            Err(AbsentBattleProfile::UnrecognisedTriggerPattern)
         );
-        let shells = CapturedCombatInput {
-            segmented_reload: true,
+        let shells = RecordedBattleFeed {
+            staged_reload: true,
             ..rifle()
         };
         assert_eq!(
-            WeaponCombatFacts::try_from_captured(shells),
-            Err(MissingCombatFacts::SegmentedReloadAmmoAdd)
+            GunBattleProfile::try_from_captured(shells),
+            Err(AbsentBattleProfile::PerRoundReloadGain)
         );
-        let short = CapturedCombatInput {
-            max_damage_range: 0.0,
-            min_damage_range: 0.0,
+        let short = RecordedBattleFeed {
+            full_damage_reach: 0.0,
+            minimum_damage_reach: 0.0,
             ..rifle()
         };
         assert_eq!(
-            WeaponCombatFacts::try_from_captured(short),
-            Err(MissingCombatFacts::BulletRange)
+            GunBattleProfile::try_from_captured(short),
+            Err(AbsentBattleProfile::ShotReach)
         );
         let mut bad = rifle();
         bad.location_damage[0] = f32::NAN;
         assert_eq!(
-            WeaponCombatFacts::try_from_captured(bad),
-            Err(MissingCombatFacts::LocationDamage)
+            GunBattleProfile::try_from_captured(bad),
+            Err(AbsentBattleProfile::LocationDamage)
         );
     }
 
     #[test]
     fn a_shotgun_sends_its_pellets_and_reaches_its_own_range() {
-        let spread = CapturedCombatInput {
-            weap_class: WEAPCLASS_SPREAD,
-            shots_per_fire: 8,
+        let spread = RecordedBattleFeed {
+            gun_kind: WEAPCLASS_SPREAD,
+            rounds_each_trigger: 8,
             ..rifle()
         };
-        let facts = WeaponCombatFacts::try_from_captured(spread).unwrap();
-        assert_eq!(facts.pellet_count(), 8);
-        assert_eq!(facts.bullet_range(), 2000.0);
-        let none = WeaponCombatFacts {
-            weap_class: WEAPCLASS_SPREAD,
+        let facts = GunBattleProfile::try_from_captured(spread).unwrap();
+        assert_eq!(facts.shot_pellet_total(), 8);
+        assert_eq!(facts.shot_reach(), 2000.0);
+        let none = GunBattleProfile {
+            gun_kind: WEAPCLASS_SPREAD,
             ..facts
         };
         assert_eq!(
-            WeaponCombatFacts {
-                shots_per_fire: 0,
+            GunBattleProfile {
+                rounds_each_trigger: 0,
                 ..none
             }
-            .pellet_count(),
+            .shot_pellet_total(),
             1
         );
     }
 
     #[test]
     fn spawn_ammo_fills_the_clip_then_the_left_clip_then_stock() {
-        let facts = WeaponCombatFacts {
-            start_ammo: 100,
-            clip_size: 30,
-            ..WeaponCombatFacts::none()
+        let facts = GunBattleProfile {
+            spawn_rounds: 100,
+            magazine_capacity: 30,
+            ..GunBattleProfile::none()
         };
         assert_eq!(spawn_clip_stock(&facts, 0), (30, 0, 70));
         assert_eq!(spawn_clip_stock(&facts, 1), (30, 30, 40));
-        let small = WeaponCombatFacts {
-            start_ammo: 40,
+        let small = GunBattleProfile {
+            spawn_rounds: 40,
             ..facts
         };
         assert_eq!(spawn_clip_stock(&small, 1), (30, 10, 0));
-        assert_eq!(spawn_clip_stock(&WeaponCombatFacts::none(), 1), (0, 0, 0));
+        assert_eq!(spawn_clip_stock(&GunBattleProfile::none(), 1), (0, 0, 0));
     }
 
     #[test]
     fn a_spawned_hand_raises_the_weapon_if_it_has_a_raise_time() {
-        let facts = WeaponCombatFacts::try_from_captured(rifle()).unwrap();
+        let facts = GunBattleProfile::try_from_captured(rifle()).unwrap();
         let hand = spawn_weapon_hand(7, &facts);
         assert_eq!(
-            (hand.weapon, hand.weaponstate, hand.weapon_time),
+            (hand.weapon, hand.gun_phase, hand.gun_timer_ms),
             (7, crate::state::RAISING, 400)
         );
-        assert_eq!((hand.clip, hand.stock), (30, 60));
-        assert_ne!(hand.weap_anim, 0);
+        assert_eq!((hand.mag_rounds, hand.spare_rounds), (30, 60));
+        assert_ne!(hand.gun_clip, 0);
 
         let ready = spawn_weapon_hand(
             7,
-            &WeaponCombatFacts {
-                raise_time_ms: 0,
+            &GunBattleProfile {
+                draw_ms: Default::default(),
                 ..facts
             },
         );
         assert_eq!(
-            (ready.weaponstate, ready.weapon_time, ready.weap_anim),
+            (ready.gun_phase, ready.gun_timer_ms, ready.gun_clip),
             (crate::state::READY, 0, 0)
         );
     }
 
     #[test]
     fn fast_reload_needs_the_perk_and_a_weapon_that_inherits_perks() {
-        assert!(perk_fastreload_eligible(PERK_FASTRELOAD, true));
-        assert!(!perk_fastreload_eligible(PERK_FASTRELOAD, false));
-        assert!(!perk_fastreload_eligible(0, true));
+        // BO2's perk 20 is bit 20 of the first word.
+        let fast = [1 << 20, 0];
+        assert!(perk_fastreload_eligible(fast, true));
+        assert!(!perk_fastreload_eligible(fast, false));
+        assert!(!perk_fastreload_eligible([0, 0], true));
+        // Another perk's bit is not it, in either word.
+        assert!(!perk_fastreload_eligible([1 << 4, !0 << 1], true));
     }
 }

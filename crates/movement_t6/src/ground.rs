@@ -1,533 +1,607 @@
-//! Black Ops II's PM_GroundTrace with its two helpers: PM_CorrectAllSolid
-//! (a player stuck inside something is moved to the first free spot around
-//! him) and PM_GroundTraceMissed (nothing under the feet: is the ground
-//! still close?).
+//! The per-frame look under the player's feet: is there ground, may it be
+//! stood on, and what changes when it appears or vanishes.
 //!
-//! Where BO2 differs from the shared (MW2) ground check:
-//! - Stuck inside something, the free spot's drop to the floor looks 1.25
-//!   units down (MW2 0.25), and a spot is taken even if that drop starts
-//!   inside something.
-//! - With no free spot at all, BO2 keeps the player on whatever he is stuck
-//!   in (MW2 drops him into the air).
-//! - Another player is never ground to stand on (G_IsEntWalkable); it is the
-//!   entity that says no, not the body's contents.
+//! Three cases are handled here:
+//! - The box is buried in solid. The 26 one-unit steps around the player are
+//!   tried in turn; from the first clear one the box drops up to 1.25 units
+//!   and rests there, even if that drop starts inside something. When no
+//!   step is clear the player stays where he is, standing on whatever holds
+//!   him, and is not on walkable ground.
+//! - Nothing is under the feet. A longer look down decides whether the
+//!   ground is still close enough to count as almost touching.
+//! - Something is under the feet. It is walkable ground unless it is another
+//!   player; that is decided by the entity number, not by contents.
 //!
-//! Landing (PM_CrashLand, with BO2's water rules) is crate::crash.
+//! Landings themselves live in crate::crash.
 //!
-//! The legs' animations it asks for come back as `BodyAnims`: leaving the
-//! ground with nothing under the feet for a 64th of the 64-unit look plays
-//! the jump (not in a dive), and a landing from over 12 units the landing.
+//! Leg animations requested come back as `BodyAnims`: stepping off ground
+//! with nothing within a 64th of a 64-unit look down plays the jump (unless
+//! diving); touching down after a fall of over 12 units plays the landing.
 //!
-//! Slide ground (a surface with the slick flag) sets `PMF_SLIDING` while the
-//! player's ground look sees it, and keeps the time he first stood on it in
-//! `slide_time`. Stepping on asks for crouch, stepping off (the air counts)
-//! for stand, both as predicted stance events. The server's move (not a
-//! client's prediction) follows each with a slide start or stop event whose
-//! parm is the ground's slide sound class.
+//! Slick ground sets `PMF_SLIDING` while it is under the feet and records
+//! the moment it was first stood on in `slide_time`. Stepping onto it asks
+//! for a crouch and stepping off it (into the air too) for a stand, both as
+//! predicted stance events. On the server only, each is followed by a slide
+//! start or stop event carrying the ground's slide sound class.
 //!
-//! Not done here yet: the ground's surface type for the footstep sounds (no
-//! field for it), and the deployed riot shield and the dogs as ground that
-//! is not walkable.
+//! Still missing: the ground's surface type for footstep sounds (there is no
+//! field for it yet), and riot shields and dogs as unwalkable ground.
 
 use crate::bridge::{
-    Bo2Feel, BG_CORRECT_SOLID_DELTAS, GroundTraceInput, MoveBounds, Pml, add_predictable_event, jump,
+    Bo2Feel, SweepAsk, HullExtents, TickLocals, UNSTICK_NUDGES, leap,
+    queue_forecast_happening,
 };
-use playerstate_t6::game::{ENTITYNUM_NONE, PLAYER_CORPSE_ENTITY_BASE, PlayerState};
+use playerstate_t6::game::{AvatarState, BODY_ENTITY_FIRST_SLOT, NO_ENTITY_SLOT};
 use trace_t6::Trace;
 
 use crate::crash::crash_land;
 use crate::dive;
-use crate::footstep::ground_surface_type;
-use crate::feel::EF_TURRET;
+use playerstate_t6::game::entity_flag_bits::TURRET_MASK;
+use crate::gait_cycle::ground_surface_type;
 use crate::frame::BodyAnims;
 use crate::gjk::Bo2Collision;
 
-/// How far above and below the feet the ground check looks; on a turret
-/// from the feet to 1 unit down.
+/// Reach of the ground look above and below the feet. Mounted on a turret
+/// the look starts at the feet and reaches one unit down.
 const PROBE: f32 = 0.25;
 const TURRET_PROBE: f32 = 1.0;
 
-/// Black Ops II's pm_flags 0x400000: the player is on slide ground. Under
-/// the shared (MW2) movement the same bit is the last-stand flag; Black Ops
-/// II keeps last stand in the move type alone.
+/// Movement state bit: the ground under the player is slick. (Last stand is
+/// carried by the move type, so this bit is free for sliding.)
 pub const PMF_SLIDING: u32 = 0x40_0000;
 
-/// The surface flag that makes ground slide ground.
+/// Surface flag marking slick ground.
 const SURF_SLICK: u32 = 0x2;
 
-/// The predicted stance events slide ground asks for.
+/// Predicted stance events asked for when slick ground starts or ends.
 const EV_STANCE_FORCE_STAND: i32 = entity_t6::event::STANCE_FORCE_STAND as i32;
 const EV_STANCE_FORCE_CROUCH: i32 = entity_t6::event::STANCE_FORCE_CROUCH as i32;
 
-/// Black Ops II's slide start and stop events, sent by the server's move only.
+/// Slide start and stop events, sent only by the server's move.
 const EV_SLIDE_START: i32 = entity_t6::event::SLIDE_START as i32;
 const EV_SLIDE_STOP: i32 = entity_t6::event::SLIDE_STOP as i32;
 
-/// Dtp_CalcSurfaceType's table: each surface type's slide sound class
-/// (0 default, 1 metal, 2 concrete, 3 wood, 4 snow, 5 dirt, 6 gravel,
-/// 7 grass, 8 mud).
+/// Slide sound class for each of the 32 surface types (0 default, 1 metal,
+/// 2 concrete, 3 wood, 4 snow, 5 dirt, 6 gravel, 7 grass, 8 mud).
 const SLIDE_SOUND_CLASS: [i32; 32] = [
     0, 3, 2, 4, 4, 2, 5, 2, 7, 5, 7, 6, 4, 1, 8, 2, 2, 2, 5, 4, 8, 3, 2, 2, 2, 2, 5, 5, 1, 5, 7, 0,
 ];
 
-/// Stuck in the floor: try again from just below the feet.
+/// When the look starts inside the floor, it is retried from this far below
+/// the feet.
 const STARTSOLID_RETRY: f32 = 0.001;
 
-/// PM_CorrectAllSolid: from the free spot, the drop to the floor.
+/// How far a box freed from solid drops looking for something to rest on.
 const CORRECT_SOLID_DROP: f32 = 1.25;
 
-/// PM_GroundTraceMissed: in the air a 1-unit look down, on leaving the
-/// ground a 64-unit one, and the gap that still counts as almost on the
-/// ground.
+/// With nothing under the feet: the look down from the air, the look down
+/// on stepping off, and the share of the latter that still counts as almost
+/// on the ground.
 const MISSED_AIR_PROBE: f32 = 1.0;
 const MISSED_LEFT_PROBE: f32 = 64.0;
 const MISSED_ALMOST_FRACTION: f32 = 1.0 / 64.0;
 
-/// PM_GroundTrace, and the legs' animations it starts.
-pub(crate) fn ground_trace<C: Bo2Collision>(
-    ps: &mut PlayerState,
-    pml: &mut Pml,
-    bounds: MoveBounds,
-    collision: &C,
+/// Write how the feet relate to the floor this frame.
+fn set_contact(tick_vars: &mut TickLocals, on_floor: bool, near_floor: bool, walking: bool) {
+    tick_vars.standing_on_floor = u32::from(on_floor);
+    tick_vars.near_floor_contact = u32::from(near_floor);
+    tick_vars.walking = u32::from(walking);
+}
+
+/// Look under the feet, settle the ground state for the frame, and return
+/// the leg animations that asks for.
+pub(crate) fn floor_probe<C: Bo2Collision>(
+    avatar: &mut AvatarState,
+    tick_vars: &mut TickLocals,
+    bounds: HullExtents,
+    solids: &C,
     feel: Bo2Feel,
-    server_time: i32,
+    authority_clock_ms: i32,
     server: bool,
 ) -> BodyAnims {
-    let origin = ps.origin;
-    let (above, below) = if ps.e_flags & EF_TURRET != 0 {
+    let [x, y, z] = avatar.origin;
+    let mounted = avatar.e_flags & TURRET_MASK != 0;
+    let (lift, reach) = if mounted {
         (0.0, TURRET_PROBE)
     } else {
         (PROBE, PROBE)
     };
-    let end = [origin[0], origin[1], origin[2] - below];
-    // Where the kept trace ran from and to (its end is a lerp along it).
-    let mut span = [[origin[0], origin[1], origin[2] + above], end];
-    let mut trace = ground_probe(collision, span[0], end, bounds);
-    copy_ground_trace(pml, &trace);
-    slide_ground(ps, trace.sflags, server_time, server);
+    let below_feet = [x, y, z - reach];
+    // The sweep the kept result came from; its hit point lies along it.
+    let (mut from, mut to) = ([x, y, z + lift], below_feet);
+    let mut strike = ground_probe(solids, from, to, bounds);
+    record_floor(tick_vars, &strike);
+    slide_ground(avatar, strike.sflags, authority_clock_ms, server);
 
-    if trace.allsolid && !correct_all_solid(ps, pml, bounds, collision, &mut trace, &mut span) {
-        return BodyAnims::default();
+    if strike.fully_embedded {
+        let Some((freed, path)) = escape_solid(avatar, tick_vars, bounds, solids) else {
+            return BodyAnims::default();
+        };
+        strike = freed;
+        [from, to] = path;
     }
 
-    let mut walkable = trace.walkable && ent_walkable(entity_hit(&trace));
-    if trace.startsolid {
-        let start = [ps.origin[0], ps.origin[1], ps.origin[2] - STARTSOLID_RETRY];
-        trace = ground_probe(collision, start, end, bounds);
-        span = [start, end];
-        if trace.startsolid {
-            // Still stuck: he stays on what he is stuck in.
-            ps.ground_entity_num = entity_hit(&trace);
-            pml.ground_plane = 1;
-            pml.almost_ground_plane = 1;
-            pml.walking = u32::from(trace.walkable);
+    let mut walkable = strike.walkable && ent_walkable(entity_hit(&strike));
+    if strike.starts_inside {
+        let [x, y, z] = avatar.origin;
+        from = [x, y, z - STARTSOLID_RETRY];
+        to = below_feet;
+        strike = ground_probe(solids, from, to, bounds);
+        if strike.starts_inside {
+            // Still inside: rest on whatever holds the box.
+            avatar.standing_on = entity_hit(&strike);
+            set_contact(tick_vars, true, true, strike.walkable);
             return BodyAnims::default();
         }
-        copy_ground_trace(pml, &trace);
-        walkable = trace.walkable;
+        record_floor(tick_vars, &strike);
+        walkable = strike.walkable;
     }
 
-    if trace.fraction == 1.0 {
-        let jump = ground_trace_missed(ps, pml, bounds, collision);
-        return BodyAnims { jump, ..BodyAnims::default() };
+    if strike.fraction == 1.0 {
+        return BodyAnims {
+            jump: nothing_underfoot(avatar, tick_vars, bounds, solids),
+            ..BodyAnims::default()
+        };
     }
 
-    // BO2's kick-off from a slope only runs in its old collision mode; its
-    // players use mode 1, so there is none.
+    // There is no kick-off from steep slopes: that only exists in a
+    // collision mode players never use.
 
-    pml.ground_plane = 1;
-    pml.almost_ground_plane = 1;
     if !walkable {
-        ps.ground_entity_num = ENTITYNUM_NONE;
-        pml.walking = 0;
-        jump::clear_state(ps);
+        avatar.standing_on = NO_ENTITY_SLOT;
+        set_contact(tick_vars, true, true, false);
+        leap::clear_state(avatar);
         return BodyAnims::default();
     }
-    pml.walking = 1;
-    let land = ps.ground_entity_num == ENTITYNUM_NONE && crash_land(ps, pml, feel);
-    let entity = entity_hit(&trace);
-    ps.ground_entity_num = entity;
-    collision.touch_entity(&trace, trace.end_pos(span[0], span[1]));
-    BodyAnims { land, ..BodyAnims::default() }
-}
-
-/// PM_CorrectAllSolid: the player's box is inside something. Try the 26
-/// spots one unit around him; at the first free one, drop to the floor
-/// (1.25 down) and keep that as the ground. With none free he stays put on
-/// what he is stuck in, off the ground plane, and any jump is over.
-fn correct_all_solid<C: Bo2Collision>(
-    ps: &mut PlayerState,
-    pml: &mut Pml,
-    bounds: MoveBounds,
-    collision: &C,
-    trace: &mut Trace,
-    span: &mut [[f32; 3]; 2],
-) -> bool {
-    for delta in BG_CORRECT_SOLID_DELTAS {
-        let point = [
-            ps.origin[0] + delta[0],
-            ps.origin[1] + delta[1],
-            ps.origin[2] + delta[2],
-        ];
-        *trace = player_trace(collision, point, point, bounds);
-        if !trace.startsolid {
-            let end = [point[0], point[1], point[2] - CORRECT_SOLID_DROP];
-            *trace = player_trace(collision, point, end, bounds);
-            *span = [point, end];
-            copy_ground_trace(pml, trace);
-            ps.origin = [point[0], point[1], point[2] + (end[2] - point[2]) * trace.fraction];
-            return true;
-        }
+    set_contact(tick_vars, true, true, true);
+    let was_airborne = avatar.standing_on == NO_ENTITY_SLOT;
+    let land = was_airborne && crash_land(avatar, tick_vars, feel);
+    avatar.standing_on = entity_hit(&strike);
+    solids.brush_against(&strike, strike.finish_location(from, to));
+    BodyAnims {
+        land,
+        ..BodyAnims::default()
     }
-    ps.ground_entity_num = entity_hit(trace);
-    pml.walking = 0;
-    pml.ground_plane = 0;
-    pml.almost_ground_plane = 0;
-    jump::clear_state(ps);
-    false
 }
 
-/// PM_GroundTraceMissed. True when the player just left the ground with
-/// the ground not almost under him: the legs play the jump (not in a dive).
-fn ground_trace_missed<C: Bo2Collision>(
-    ps: &mut PlayerState,
-    pml: &mut Pml,
-    bounds: MoveBounds,
-    collision: &C,
+/// The box is buried. Step to the first clear neighbouring spot, drop from
+/// it, record that drop as the floor and move the player to where it
+/// stopped; give back the drop and its path. With every spot blocked the
+/// player keeps his place on what the last blocked look hit, off the
+/// ground, and any jump ends.
+fn escape_solid<C: Bo2Collision>(
+    avatar: &mut AvatarState,
+    tick_vars: &mut TickLocals,
+    bounds: HullExtents,
+    solids: &C,
+) -> Option<(Trace, [[f32; 3]; 2])> {
+    let mut last_blocked = Trace::default();
+    for step in UNSTICK_NUDGES {
+        let spot: [f32; 3] = core::array::from_fn(|axis| avatar.origin[axis] + step[axis]);
+        let probe = player_trace(solids, spot, spot, bounds);
+        if probe.starts_inside {
+            last_blocked = probe;
+            continue;
+        }
+        let [sx, sy, sz] = spot;
+        let floor = [sx, sy, sz - CORRECT_SOLID_DROP];
+        let drop = player_trace(solids, spot, floor, bounds);
+        record_floor(tick_vars, &drop);
+        avatar.origin = [sx, sy, sz + (floor[2] - sz) * drop.fraction];
+        return Some((drop, [spot, floor]));
+    }
+    avatar.standing_on = entity_hit(&last_blocked);
+    set_contact(tick_vars, false, false, false);
+    leap::clear_state(avatar);
+    None
+}
+
+/// No ground right under the feet: look further down to see if it is still
+/// close. True when the player has just stepped off and the ground is not
+/// close, which plays the jump on the legs (unless diving).
+fn nothing_underfoot<C: Bo2Collision>(
+    avatar: &mut AvatarState,
+    tick_vars: &mut TickLocals,
+    bounds: HullExtents,
+    solids: &C,
 ) -> bool {
-    let origin = ps.origin;
-    let airborne = ps.ground_entity_num == ENTITYNUM_NONE;
-    let depth = if airborne { MISSED_AIR_PROBE } else { MISSED_LEFT_PROBE };
-    let trace = player_trace(collision, origin, [origin[0], origin[1], origin[2] - depth], bounds);
-    let almost = if airborne {
-        trace.fraction != 1.0
+    let [x, y, z] = avatar.origin;
+    let was_airborne = avatar.standing_on == NO_ENTITY_SLOT;
+    let look = if was_airborne {
+        MISSED_AIR_PROBE
     } else {
-        trace.fraction < MISSED_ALMOST_FRACTION
+        MISSED_LEFT_PROBE
     };
-    pml.almost_ground_plane = u32::from(almost);
-    ps.ground_entity_num = ENTITYNUM_NONE;
-    pml.ground_plane = 0;
-    pml.walking = 0;
-    !airborne && !almost && ps.pm_flags & dive::PMF_DIVE == 0
+    let below = player_trace(solids, [x, y, z], [x, y, z - look], bounds);
+    let close = match was_airborne {
+        true => below.fraction != 1.0,
+        false => below.fraction < MISSED_ALMOST_FRACTION,
+    };
+    avatar.standing_on = NO_ENTITY_SLOT;
+    set_contact(tick_vars, false, close, false);
+    let diving = avatar.movement_state_bits & dive::PMF_DIVE != 0;
+    !(was_airborne || close || diving)
 }
 
-/// G_IsEntWalkable: players are not ground.
+/// Whether an entity may be stood on: every one but a player.
 fn ent_walkable(entity: i32) -> bool {
     !is_player(entity)
 }
 
-/// Entity numbers below 18 are the players.
+/// The first `BODY_ENTITY_FIRST_SLOT` entity numbers are players.
 pub(crate) fn is_player(entity: i32) -> bool {
-    entity != ENTITYNUM_NONE && (0..PLAYER_CORPSE_ENTITY_BASE).contains(&entity)
+    entity != NO_ENTITY_SLOT && (0..BODY_ENTITY_FIRST_SLOT).contains(&entity)
 }
 
-/// PM_playerTrace: with BO2's collision on, a sweep of the body.
-fn player_trace<C: Bo2Collision>(collision: &C, start: [f32; 3], end: [f32; 3], bounds: MoveBounds) -> Trace {
-    if collision.gjk_on() {
-        return crate::gjk::trace::player_trace(collision, start, end, bounds.mins, bounds.maxs, bounds.tracemask);
+/// Sweep the player's box: by the hull solver when it is on, otherwise by
+/// the plain box trace.
+fn player_trace<C: Bo2Collision>(
+    solids: &C,
+    from_pt: [f32; 3],
+    end: [f32; 3],
+    bounds: HullExtents,
+) -> Trace {
+    let HullExtents {
+        lo_corner: box_lo,
+        hi_corner: box_hi,
+        collide_filter,
+    } = bounds;
+    if solids.gjk_on() {
+        crate::gjk::trace::player_trace(solids, from_pt, end, box_lo, box_hi, collide_filter)
+    } else {
+        solids.trace(SweepAsk {
+            start: from_pt,
+            end,
+            lo_corner: box_lo,
+            hi_corner: box_hi,
+            collide_filter,
+        })
     }
-    collision.trace(GroundTraceInput {
-        start,
-        end,
-        mins: bounds.mins,
-        maxs: bounds.maxs,
-        tracemask: bounds.tracemask,
-    })
 }
 
-/// The ground check's own look under the feet: with BO2's collision on,
-/// its ground trace (PM_gjk_ground_trace); off, the player trace.
-fn ground_probe<C: Bo2Collision>(collision: &C, start: [f32; 3], end: [f32; 3], bounds: MoveBounds) -> Trace {
-    if collision.gjk_on() {
-        return crate::gjk::trace::ground_trace(collision, start, end, bounds.mins, bounds.maxs, bounds.tracemask);
+/// The look under the feet: the hull solver's own ground sweep when it is
+/// on, otherwise the ordinary box sweep.
+fn ground_probe<C: Bo2Collision>(
+    solids: &C,
+    from_pt: [f32; 3],
+    end: [f32; 3],
+    bounds: HullExtents,
+) -> Trace {
+    if !solids.gjk_on() {
+        return player_trace(solids, from_pt, end, bounds);
     }
-    player_trace(collision, start, end, bounds)
+    let HullExtents {
+        lo_corner: box_lo,
+        hi_corner: box_hi,
+        collide_filter,
+    } = bounds;
+    crate::gjk::trace::floor_probe(solids, from_pt, end, box_lo, box_hi, collide_filter)
 }
 
 fn entity_hit(trace: &Trace) -> i32 {
-    i32::from(trace_t6::trace_get_entity_hit_id(&trace))
+    trace_t6::trace_get_entity_hit_id(trace).into()
 }
 
-/// The ground trace kept for the frame, in the shared layout the other
-/// moves read.
-/// On slide ground the flag is set and, on the first frame, the time and a
-/// crouch; off it (or in the air) the flag is cleared and, on the first
-/// frame, the time and a stand. The server also sends the slide start or
-/// stop, with the ground's slide sound class.
-fn slide_ground(ps: &mut PlayerState, surface_flags: u32, server_time: i32, server: bool) {
-    if surface_flags & SURF_SLICK != 0 {
-        ps.pm_flags |= PMF_SLIDING;
-        if ps.slide_time == 0 {
-            ps.slide_time = server_time;
-            add_predictable_event(ps, EV_STANCE_FORCE_CROUCH, 0);
-            if server {
-                let class = slide_sound_class(ps, surface_flags);
-                add_predictable_event(ps, EV_SLIDE_START, class);
-            }
-        }
+/// Slick ground under the feet sets the sliding bit and, on the first such
+/// frame, stamps the time and asks for a crouch. Anything else (the air
+/// included) clears the bit and, on the first such frame, clears the time
+/// and asks for a stand. The server follows either with a slide start or
+/// stop carrying the ground's slide sound class.
+fn slide_ground(avatar: &mut AvatarState, surf: u32, authority_clock_ms: i32, server: bool) {
+    let slick = surf & SURF_SLICK != 0;
+    let was_sliding = avatar.slide_time != 0;
+    if slick {
+        avatar.movement_state_bits |= PMF_SLIDING;
     } else {
-        ps.pm_flags &= !PMF_SLIDING;
-        if ps.slide_time != 0 {
-            ps.slide_time = 0;
-            add_predictable_event(ps, EV_STANCE_FORCE_STAND, 0);
-            if server {
-                let class = slide_sound_class(ps, surface_flags);
-                add_predictable_event(ps, EV_SLIDE_STOP, class);
-            }
-        }
+        avatar.movement_state_bits &= !PMF_SLIDING;
+    }
+    if slick == was_sliding {
+        return;
+    }
+    let (stance, slide_event) = if slick {
+        avatar.slide_time = authority_clock_ms;
+        (EV_STANCE_FORCE_CROUCH, EV_SLIDE_START)
+    } else {
+        avatar.slide_time = 0;
+        (EV_STANCE_FORCE_STAND, EV_SLIDE_STOP)
+    };
+    queue_forecast_happening(avatar, stance, 0);
+    if server {
+        let class = slide_sound_class(avatar, surf);
+        queue_forecast_happening(avatar, slide_event, class);
     }
 }
 
-/// Dtp_CalcSurfaceType: the ground's surface type as a slide sound class.
-fn slide_sound_class(ps: &PlayerState, surface_flags: u32) -> i32 {
-    usize::try_from(ground_surface_type(ps, surface_flags))
+/// The slide sound class of the ground's surface type (default for types
+/// outside the table).
+fn slide_sound_class(avatar: &AvatarState, surf: u32) -> i32 {
+    let surface = ground_surface_type(avatar, surf);
+    usize::try_from(surface)
         .ok()
-        .and_then(|surface| SLIDE_SOUND_CLASS.get(surface))
-        .copied()
-        .unwrap_or(0)
+        .and_then(|index| SLIDE_SOUND_CLASS.get(index).copied())
+        .unwrap_or_default()
 }
 
-fn copy_ground_trace(pml: &mut Pml, trace: &Trace) {
-    pml.ground_trace = [
-        trace.fraction.to_bits(),
-        trace.normal[0].to_bits(),
-        trace.normal[1].to_bits(),
-        trace.normal[2].to_bits(),
-        trace.sflags,
-        trace.cflags,
+/// Keep the frame's floor result in the packed eleven-word form the other
+/// moves read.
+fn record_floor(tick_vars: &mut TickLocals, strike: &Trace) {
+    let [nx, ny, nz] = strike.normal.map(f32::to_bits);
+    let entity_and_model = u32::from(strike.struck_entity_num) | u32::from(strike.mesh_slot_number) << 16;
+    let part_and_group = u32::from(strike.hit_part_label) | u32::from(strike.hit_body_group) << 16;
+    let solidity = u32::from(strike.fully_embedded)
+        | u32::from(strike.starts_inside) << 8
+        | u32::from(strike.walkable) << 16;
+    tick_vars.floor_probe = [
+        strike.fraction.to_bits(),
+        nx,
+        ny,
+        nz,
+        strike.sflags,
+        strike.cflags,
         0,
-        trace.hit_type as u32,
-        u32::from(trace.hit_id) | (u32::from(trace.model_index) << 16),
-        u32::from(trace.part_name) | (u32::from(trace.part_group) << 16),
-        u32::from(trace.allsolid) | (u32::from(trace.startsolid) << 8) | (u32::from(trace.walkable) << 16),
+        strike.impact_category as u32,
+        entity_and_model,
+        part_and_group,
+        solidity,
     ];
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::CollisionBackend;
-    use playerstate_t6::game::pm_flags;
+    use crate::bridge::SolidProbe;
+    use playerstate_t6::game::movement_state_bits;
     use trace_t6::TraceHitType;
 
     const WORLD: u16 = trace_t6::ENTITYNUM_WORLD;
+    const ON_WORLD: i32 = WORLD as i32;
 
-    /// A floor at z = 0 (solid below), with optional solid regions that trap
-    /// a box whose start lies inside them.
+    /// Solid floor at z = 0, optionally a solid block that traps any box
+    /// starting inside it, and optionally a player body as what is hit.
     struct Floor {
-        /// A player body's entity number standing under the feet, if any.
         body: Option<u16>,
-        /// Points inside this box (by the start's origin) are stuck.
-        stuck: Option<([f32; 3], [f32; 3])>,
+        block: Option<([f32; 3], [f32; 3])>,
     }
 
-    impl Floor {
-        fn inside(&self, p: [f32; 3]) -> bool {
-            self.stuck
-                .is_some_and(|(lo, hi)| (0..3).all(|i| p[i] >= lo[i] && p[i] <= hi[i]))
-        }
+    const BARE: Floor = Floor {
+        body: None,
+        block: None,
+    };
+
+    fn within(lo: [f32; 3], hi: [f32; 3], p: [f32; 3], axes: usize) -> bool {
+        (0..axes).all(|i| (lo[i]..=hi[i]).contains(&p[i]))
     }
 
     impl crate::gjk::Bo2Collision for Floor {}
 
-    impl CollisionBackend for Floor {
-        fn trace(&self, input: GroundTraceInput) -> Trace {
-            let mut t = Trace {
-                fraction: 1.0,
-                hit_type: TraceHitType::Entity,
-                hit_id: self.body.unwrap_or(WORLD),
-                ..Trace::default()
-            };
-            if self.inside(input.start) {
-                t.startsolid = true;
-                t.allsolid = self.inside(input.end);
-                t.fraction = 0.0;
-                return t;
+    impl SolidProbe for Floor {
+        fn trace(&self, input: SweepAsk) -> Trace {
+            let mut out = Trace::new();
+            out.impact_category = TraceHitType::Entity;
+            out.struck_entity_num = self.body.unwrap_or(WORLD);
+            let (start, end) = (input.start, input.end);
+            if let Some((lo, hi)) = self.block {
+                if within(lo, hi, start, 3) {
+                    out.starts_inside = true;
+                    out.fully_embedded = within(lo, hi, end, 3);
+                    out.fraction = 0.0_f32;
+                    return out;
+                }
             }
-            // The floor, or the top of the stuck block under the feet.
-            let top = match self.stuck {
-                Some((lo, hi)) if (0..2).all(|i| input.start[i] >= lo[i] && input.start[i] <= hi[i]) => hi[2].max(0.0),
+            // The highest surface under the start: the block's top or the floor.
+            let surface = match self.block {
+                Some((lo, hi)) if within(lo, hi, start, 2) => hi[2].max(0.0),
                 _ => 0.0,
             };
-            if input.end[2] < top && input.start[2] >= top {
-                t.fraction = (input.start[2] - top) / (input.start[2] - input.end[2]);
-                t.normal = [0.0, 0.0, 1.0];
-                t.walkable = true;
+            if start[2] >= surface && end[2] < surface {
+                out.fraction = (start[2] - surface) / (start[2] - end[2]);
+                out.normal = [0.0, 0.0, 1.0];
+                out.walkable = true;
             }
-            t
+            out
         }
     }
 
-    fn bounds() -> MoveBounds {
-        MoveBounds {
-            mins: [-15.0, -15.0, 0.0],
-            maxs: [15.0, 15.0, 70.0],
-            tracemask: 1,
+    fn body_box() -> HullExtents {
+        let half_width = 15.0;
+        HullExtents {
+            lo_corner: [-half_width, -half_width, 0.0],
+            hi_corner: [half_width, half_width, 70.0],
+            collide_filter: 1,
         }
     }
 
-    fn run(floor: &Floor, origin: [f32; 3], ground: i32) -> (PlayerState, Pml) {
-        let mut ps = PlayerState::ZERO;
-        ps.origin = origin;
-        ps.ground_entity_num = ground;
-        let mut pml = crate::testing::pml(false);
-        ground_trace(&mut ps, &mut pml, bounds(), floor, Bo2Feel::default(), 0, false);
-        (ps, pml)
+    fn standing(at: [f32; 3], on: i32) -> AvatarState {
+        AvatarState {
+            origin: at,
+            standing_on: on,
+            ..AvatarState::ZERO
+        }
+    }
+
+    fn probe(world: &Floor, avatar: &mut AvatarState, tick_vars: &mut TickLocals) -> BodyAnims {
+        floor_probe(avatar, tick_vars, body_box(), world, Bo2Feel::default(), 0, false)
+    }
+
+    fn run(world: &Floor, at: [f32; 3], on: i32) -> (AvatarState, TickLocals) {
+        let mut avatar = standing(at, on);
+        let mut tick_vars = crate::testing::tick_vars(false);
+        probe(world, &mut avatar, &mut tick_vars);
+        (avatar, tick_vars)
+    }
+
+    fn contact(tick_vars: &TickLocals) -> (u32, u32, u32) {
+        (tick_vars.walking, tick_vars.standing_on_floor, tick_vars.near_floor_contact)
     }
 
     #[test]
-    fn standing_on_the_floor_walks() {
-        let floor = Floor { body: None, stuck: None };
-        let (ps, pml) = run(&floor, [0.0, 0.0, 0.0], i32::from(WORLD));
-        assert_eq!(ps.ground_entity_num, i32::from(WORLD));
-        assert_eq!((pml.walking, pml.ground_plane, pml.almost_ground_plane), (1, 1, 1));
+    fn feet_on_the_floor_are_walking() {
+        let (avatar, tick_vars) = run(&BARE, [0.0; 3], ON_WORLD);
+        assert_eq!(avatar.standing_on, ON_WORLD);
+        assert_eq!(contact(&tick_vars), (1, 1, 1));
     }
 
     #[test]
-    fn another_player_is_not_ground() {
-        let floor = Floor { body: Some(3), stuck: None };
-        let mut ps = PlayerState::ZERO;
-        ps.pm_flags = pm_flags::JUMPING;
-        ps.ground_entity_num = 3;
-        let mut pml = crate::testing::pml(false);
-        ground_trace(&mut ps, &mut pml, bounds(), &floor, Bo2Feel::default(), 0, false);
-        assert_eq!(ps.ground_entity_num, ENTITYNUM_NONE);
-        assert_eq!((pml.walking, pml.ground_plane), (0, 1));
-        assert_eq!(ps.pm_flags & pm_flags::JUMPING, 0, "the jump is over");
-        // A corpse or a thing (18 and up) is.
-        let floor = Floor { body: Some(18), stuck: None };
-        let (ps, pml) = run(&floor, [0.0, 0.0, 0.0], 18);
-        assert_eq!(ps.ground_entity_num, 18);
-        assert_eq!(pml.walking, 1);
-    }
-
-    #[test]
-    fn stuck_moves_to_the_first_free_spot_and_drops_to_the_floor() {
-        // Stuck in a block whose top is just over the feet; one unit up is
-        // free.
-        let floor = Floor {
-            body: None,
-            stuck: Some(([-0.5, -0.5, -1.0], [0.5, 0.5, 0.5])),
+    fn players_are_not_ground_but_later_entities_are() {
+        let on_player = Floor {
+            body: Some(3),
+            block: None,
         };
-        let (ps, pml) = run(&floor, [0.0, 0.0, 0.2], i32::from(WORLD));
-        // Up one (1.2), then the 1.25 drop lands on the block's top at 0.5.
-        assert!((ps.origin[2] - 0.5).abs() < 1e-5, "{:?}", ps.origin);
-        assert_eq!(pml.walking, 1);
-    }
-
-    #[test]
-    fn no_free_spot_keeps_him_on_what_he_is_stuck_in() {
-        let floor = Floor {
-            body: None,
-            stuck: Some(([-5.0; 3], [5.0; 3])),
-        };
-        let mut ps = PlayerState::ZERO;
-        ps.ground_entity_num = ENTITYNUM_NONE;
-        ps.pm_flags = pm_flags::JUMPING;
-        let mut pml = crate::testing::pml(true);
-        ground_trace(&mut ps, &mut pml, bounds(), &floor, Bo2Feel::default(), 0, false);
-        assert_eq!(ps.ground_entity_num, i32::from(WORLD));
-        assert_eq!((pml.walking, pml.ground_plane, pml.almost_ground_plane), (0, 0, 0));
-        assert_eq!(ps.pm_flags & pm_flags::JUMPING, 0);
-        assert_eq!(ps.origin, [0.0; 3], "he is not moved");
-    }
-
-    #[test]
-    fn walking_off_a_ledge_looks_64_down() {
-        let floor = Floor { body: None, stuck: None };
-        // 0.5 up: the 0.25 probe misses, the 64 one finds the floor at a
-        // fraction under 1/64, so still almost on the ground.
-        let (ps, pml) = run(&floor, [0.0, 0.0, 0.5], i32::from(WORLD));
-        assert_eq!(ps.ground_entity_num, ENTITYNUM_NONE);
-        assert_eq!((pml.walking, pml.ground_plane, pml.almost_ground_plane), (0, 0, 1));
-        // In the air 0.5 up, the 1-unit look finds it too.
-        let (_, pml) = run(&floor, [0.0, 0.0, 0.5], ENTITYNUM_NONE);
-        assert_eq!(pml.almost_ground_plane, 1);
-        // 2 up in the air, it does not.
-        let (_, pml) = run(&floor, [0.0, 0.0, 2.0], ENTITYNUM_NONE);
-        assert_eq!(pml.almost_ground_plane, 0);
-    }
-
-    #[test]
-    fn slide_ground_crouches_once_and_stands_on_leaving() {
-        let mut ps = PlayerState::ZERO;
-        slide_ground(&mut ps, SURF_SLICK, 5000, false);
-        assert_ne!(ps.pm_flags & PMF_SLIDING, 0);
-        assert_eq!(ps.slide_time, 5000);
-        assert_eq!((ps.predictable_event_sequence, ps.predictable_events[0]), (1, EV_STANCE_FORCE_CROUCH));
-        // Still on it: the start time and the one crouch stay.
-        slide_ground(&mut ps, SURF_SLICK | 0x10, 5050, false);
-        assert_eq!((ps.slide_time, ps.predictable_event_sequence), (5000, 1));
-        // Off it (or in the air): cleared, and one stand.
-        slide_ground(&mut ps, 0, 5100, false);
-        assert_eq!(ps.pm_flags & PMF_SLIDING, 0);
-        assert_eq!(ps.slide_time, 0);
-        assert_eq!((ps.predictable_event_sequence, ps.predictable_events[1]), (2, EV_STANCE_FORCE_STAND));
-        slide_ground(&mut ps, 0, 5150, false);
-        assert_eq!(ps.predictable_event_sequence, 2);
-    }
-
-    #[test]
-    fn the_server_also_sends_the_slide_start_and_stop_with_the_ground_class() {
-        let mut ps = PlayerState::ZERO;
-        // Surface type 8 is the grass class (7).
-        slide_ground(&mut ps, SURF_SLICK | (8 << 20), 5000, true);
-        assert_eq!(ps.predictable_event_sequence, 2);
+        let mut avatar = standing([0.0; 3], 3);
+        avatar.movement_state_bits = movement_state_bits::JUMPING;
+        let mut tick_vars = crate::testing::tick_vars(false);
+        probe(&on_player, &mut avatar, &mut tick_vars);
+        assert_eq!(avatar.standing_on, NO_ENTITY_SLOT);
+        assert_eq!((tick_vars.walking, tick_vars.standing_on_floor), (0, 1));
         assert_eq!(
-            (ps.predictable_events[0], ps.predictable_events[1], ps.predictable_event_parms[1]),
+            avatar.movement_state_bits & movement_state_bits::JUMPING,
+            0,
+            "jump ended"
+        );
+
+        let on_thing = Floor {
+            body: Some(18),
+            block: None,
+        };
+        let (avatar, tick_vars) = run(&on_thing, [0.0; 3], 18);
+        assert_eq!(avatar.standing_on, 18);
+        assert_eq!(tick_vars.walking, 1);
+    }
+
+    #[test]
+    fn buried_box_steps_up_and_rests_on_the_block() {
+        let world = Floor {
+            body: None,
+            block: Some(([-0.5, -0.5, -1.0], [0.5, 0.5, 0.5])),
+        };
+        // Up a unit to 1.2 is clear; the drop from there meets the top at 0.5.
+        let (avatar, tick_vars) = run(&world, [0.0, 0.0, 0.2], ON_WORLD);
+        assert!((avatar.origin[2] - 0.5).abs() < 1e-5, "{:?}", avatar.origin);
+        assert_eq!(tick_vars.walking, 1);
+    }
+
+    #[test]
+    fn fully_trapped_box_stays_put_off_the_ground() {
+        let world = Floor {
+            body: None,
+            block: Some(([-5.0; 3], [5.0; 3])),
+        };
+        let mut avatar = standing([0.0; 3], NO_ENTITY_SLOT);
+        avatar.movement_state_bits = movement_state_bits::JUMPING;
+        let mut tick_vars = crate::testing::tick_vars(true);
+        probe(&world, &mut avatar, &mut tick_vars);
+        assert_eq!(avatar.standing_on, ON_WORLD);
+        assert_eq!(contact(&tick_vars), (0, 0, 0));
+        assert_eq!(avatar.movement_state_bits & movement_state_bits::JUMPING, 0);
+        assert_eq!(avatar.origin, [0.0; 3], "not moved");
+    }
+
+    #[test]
+    fn stepping_off_looks_far_down_and_the_air_looks_one_unit() {
+        // Half a unit up after stepping off: the short look misses, the long
+        // one hits within a 64th, so still almost grounded.
+        let (avatar, tick_vars) = run(&BARE, [0.0, 0.0, 0.5], ON_WORLD);
+        assert_eq!(avatar.standing_on, NO_ENTITY_SLOT);
+        assert_eq!(contact(&tick_vars), (0, 0, 1));
+        let (_, tick_vars) = run(&BARE, [0.0, 0.0, 0.5], NO_ENTITY_SLOT);
+        assert_eq!(tick_vars.near_floor_contact, 1);
+        let (_, tick_vars) = run(&BARE, [0.0, 0.0, 2.0], NO_ENTITY_SLOT);
+        assert_eq!(tick_vars.near_floor_contact, 0);
+    }
+
+    #[test]
+    fn slick_ground_crouches_once_and_stands_once_on_leaving() {
+        let mut avatar = AvatarState::ZERO;
+        slide_ground(&mut avatar, SURF_SLICK, 5000, false);
+        assert_ne!(avatar.movement_state_bits & PMF_SLIDING, 0);
+        assert_eq!(avatar.slide_time, 5000);
+        assert_eq!(
+            (avatar.predictable_event_sequence, avatar.predictable_events[0]),
+            (1, EV_STANCE_FORCE_CROUCH)
+        );
+        slide_ground(&mut avatar, SURF_SLICK | 0x10, 5050, false);
+        assert_eq!((avatar.slide_time, avatar.predictable_event_sequence), (5000, 1));
+        slide_ground(&mut avatar, 0, 5100, false);
+        assert_eq!(avatar.movement_state_bits & PMF_SLIDING, 0);
+        assert_eq!(avatar.slide_time, 0);
+        assert_eq!(
+            (avatar.predictable_event_sequence, avatar.predictable_events[1]),
+            (2, EV_STANCE_FORCE_STAND)
+        );
+        slide_ground(&mut avatar, 0, 5150, false);
+        assert_eq!(avatar.predictable_event_sequence, 2);
+    }
+
+    #[test]
+    fn server_adds_slide_start_and_stop_with_the_sound_class() {
+        let grass = SURF_SLICK | (8 << 20);
+        let mut avatar = AvatarState::ZERO;
+        slide_ground(&mut avatar, grass, 5000, true);
+        assert_eq!(avatar.predictable_event_sequence, 2);
+        assert_eq!(
+            (
+                avatar.predictable_events[0],
+                avatar.predictable_events[1],
+                avatar.predictable_event_parms[1]
+            ),
             (EV_STANCE_FORCE_CROUCH, EV_SLIDE_START, 7)
         );
-        slide_ground(&mut ps, SURF_SLICK | (8 << 20), 5050, true);
-        assert_eq!(ps.predictable_event_sequence, 2);
-        // Off into the air: the stand, then the stop on the default class.
-        slide_ground(&mut ps, 0, 5100, true);
-        assert_eq!(ps.predictable_event_sequence, 4);
+        slide_ground(&mut avatar, grass, 5050, true);
+        assert_eq!(avatar.predictable_event_sequence, 2);
+        slide_ground(&mut avatar, 0, 5100, true);
+        assert_eq!(avatar.predictable_event_sequence, 4);
         assert_eq!(
-            (ps.predictable_events[2], ps.predictable_events[3], ps.predictable_event_parms[3]),
+            (
+                avatar.predictable_events[2],
+                avatar.predictable_events[3],
+                avatar.predictable_event_parms[3]
+            ),
             (EV_STANCE_FORCE_STAND, EV_SLIDE_STOP, 0)
         );
-        // In water the class is the water surface's (mud).
-        let mut ps = PlayerState::ZERO;
-        ps.waterlevel = 1;
-        slide_ground(&mut ps, SURF_SLICK, 5000, true);
-        assert_eq!(ps.predictable_event_parms[1], 8);
+        // Wading, the class comes from the water (mud).
+        let mut wading = AvatarState {
+            waterlevel: 1,
+            ..AvatarState::ZERO
+        };
+        slide_ground(&mut wading, SURF_SLICK, 5000, true);
+        assert_eq!(wading.predictable_event_parms[1], 8);
     }
 
-    fn anims(floor: &Floor, origin: [f32; 3], ground: i32, flags: u32) -> BodyAnims {
-        let mut ps = PlayerState::ZERO;
-        ps.origin = origin;
-        ps.ground_entity_num = ground;
-        ps.pm_flags = flags;
-        ps.gravity = 800;
-        ps.velocity = [0.0, 0.0, -300.0];
-        let mut pml = crate::testing::pml(false);
-        pml.previous_velocity = ps.velocity;
-        ground_trace(&mut ps, &mut pml, bounds(), floor, Bo2Feel::default(), 0, false)
-    }
-
-    #[test]
-    fn walking_off_a_drop_plays_the_jump() {
-        let floor = Floor { body: None, stuck: None };
-        let world = i32::from(WORLD);
-        // Off the ground with the floor 2 units down (past a 64th of 64):
-        // the legs jump.
-        assert_eq!(anims(&floor, [0.0, 0.0, 2.0], world, 0), BodyAnims { jump: true, ..BodyAnims::default() });
-        // Nothing under the 64-unit look: the same.
-        assert!(anims(&floor, [0.0, 0.0, 100.0], world, 0).jump);
-        // Half a unit down is still almost on the ground: no jump.
-        assert!(!anims(&floor, [0.0, 0.0, 0.5], world, 0).jump);
-        // Already in the air, or diving: none.
-        assert!(!anims(&floor, [0.0, 0.0, 2.0], ENTITYNUM_NONE, 0).jump);
-        assert!(!anims(&floor, [0.0, 0.0, 2.0], world, dive::PMF_DIVE).jump);
+    fn falling_anims(world: &Floor, at: [f32; 3], on: i32, bits: u32) -> BodyAnims {
+        let fall = [0.0, 0.0, -300.0];
+        let mut avatar = AvatarState {
+            movement_state_bits: bits,
+            gravity: 800,
+            velocity: fall,
+            ..standing(at, on)
+        };
+        let mut tick_vars = crate::testing::tick_vars(false);
+        tick_vars.prior_tick_speed_vec = fall;
+        probe(world, &mut avatar, &mut tick_vars)
     }
 
     #[test]
-    fn coming_down_hard_plays_the_landing() {
-        let floor = Floor { body: None, stuck: None };
-        // Touching down at 300 a second is a 56-unit fall.
-        assert_eq!(anims(&floor, [0.0; 3], ENTITYNUM_NONE, 0), BodyAnims { land: true, ..BodyAnims::default() });
-        // Already on the ground, or landing a dive: no landing.
-        assert!(!anims(&floor, [0.0; 3], i32::from(WORLD), 0).land);
-        assert!(!anims(&floor, [0.0; 3], ENTITYNUM_NONE, dive::PMF_DIVE).land);
+    fn stepping_off_a_drop_plays_the_jump() {
+        let jumped = BodyAnims {
+            jump: true,
+            ..BodyAnims::default()
+        };
+        assert_eq!(falling_anims(&BARE, [0.0, 0.0, 2.0], ON_WORLD, 0), jumped);
+        assert!(falling_anims(&BARE, [0.0, 0.0, 100.0], ON_WORLD, 0).jump);
+        assert!(!falling_anims(&BARE, [0.0, 0.0, 0.5], ON_WORLD, 0).jump);
+        assert!(!falling_anims(&BARE, [0.0, 0.0, 2.0], NO_ENTITY_SLOT, 0).jump);
+        assert!(!falling_anims(&BARE, [0.0, 0.0, 2.0], ON_WORLD, dive::PMF_DIVE).jump);
+    }
+
+    #[test]
+    fn hard_touchdown_plays_the_landing() {
+        // 300 units a second downward is a 56-unit fall.
+        let landed = BodyAnims {
+            land: true,
+            ..BodyAnims::default()
+        };
+        assert_eq!(falling_anims(&BARE, [0.0; 3], NO_ENTITY_SLOT, 0), landed);
+        assert!(!falling_anims(&BARE, [0.0; 3], ON_WORLD, 0).land);
+        assert!(!falling_anims(&BARE, [0.0; 3], NO_ENTITY_SLOT, dive::PMF_DIVE).land);
     }
 }

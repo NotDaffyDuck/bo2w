@@ -10,6 +10,6 @@ pub use clip_mixer::*;
 pub use xmodel_runtime::*;
 
 /// The clip types, under the name the animation and weapon code reaches them by.
-pub mod xanim_clip {
+pub mod motion_clip {
     pub use xmodel_runtime::*;
 }

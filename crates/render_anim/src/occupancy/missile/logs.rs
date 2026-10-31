@@ -1,4 +1,5 @@
 use super::*;
+use diag::warn;
 
 /// True about once every five seconds while `BO2MP_T6_SMLOG` is set.
 pub(super) fn script_model_log_due() -> bool {
@@ -7,8 +8,9 @@ pub(super) fn script_model_log_due() -> bool {
     if !*ENABLED.get_or_init(|| std::env::var_os("BO2MP_T6_SMLOG").is_some()) {
         return false;
     }
+    let epoch = std::time::UNIX_EPOCH;
     let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+        .duration_since(epoch)
         .map_or(0, |d| d.as_secs());
     let last = LAST.load(Ordering::Relaxed);
     now >= last + 5
@@ -17,7 +19,7 @@ pub(super) fn script_model_log_due() -> bool {
             .is_ok()
 }
 
-pub(super) fn log_script_model(names: &[&str], at: Vec3, visibility: &Visibility) {
+pub(super) fn log_script_model(names: &[&str], at: Vec3, vis: &Visibility) {
     if names
         .iter()
         .any(|n| n.contains("vending") || n.contains("packapunch"))
@@ -27,7 +29,7 @@ pub(super) fn log_script_model(names: &[&str], at: Vec3, visibility: &Visibility
             "t6 script model: {:?} at {:?} {:?}",
             names,
             at,
-            visibility
+            vis
         );
     }
 }
@@ -36,11 +38,11 @@ pub(super) fn log_script_model(names: &[&str], at: Vec3, visibility: &Visibility
 /// playing such a clip: each frame the time past the snapshot, the clip time
 /// sent and the place.
 pub(super) fn log_pose_sample(
-    state: &xmodel_runtime::DObjSemanticState,
+    state: &xmodel_runtime::RigPoseRecord,
     id: u32,
     clock: Option<&net::FrameClock>,
     since_snapshot: f32,
-    origin: [f32; 3],
+    org: [f32; 3],
 ) {
     static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     static PICKED: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -73,24 +75,24 @@ pub(super) fn log_pose_sample(
         "t6 pose #{id}: clock {} since {since_snapshot:.4} leaf {leaf:?} drawn {:.4} at ({:.2} {:.2} {:.2})",
         clock.map_or(0, |c| c.time()),
         leaf.as_ref().map_or(0.0, |l| l.1 + l.2 * since_snapshot),
-        origin[0],
-        origin[1],
-        origin[2]
+        org[0],
+        org[1],
+        org[2]
     );
 }
 
-pub(super) fn warn_model_missing_once(model: &str) {
+pub(super) fn warn_model_missing_once(mdl: &str) {
     static MISSING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = MISSING.lock()
-        && !seen.iter().any(|m| m == model)
+        && !seen.iter().any(|m| m == mdl)
     {
-        seen.push(model.to_owned());
-        diag::warn!(World, "t6 script model not in the catalog: {}", model);
+        seen.push(mdl.to_owned());
+        warn!(World, "t6 script model not in the catalog: {}", mdl);
     }
 }
 
 /// With `BO2MP_T6_HITLOG` set, a sample of the loose pieces being considered.
-pub(super) fn log_loose_piece(model: &str, drawn: bool, origin: [f32; 3]) {
+pub(super) fn log_loose_piece(mdl: &str, drawn: bool, origin_in: [f32; 3]) {
     if std::env::var_os("BO2MP_T6_HITLOG").is_none() {
         return;
     }
@@ -99,8 +101,8 @@ pub(super) fn log_loose_piece(model: &str, drawn: bool, origin: [f32; 3]) {
     if n % 30 == 0 && n < 600 {
         diag::info!(
             World,
-            "loose piece {} {} at {origin:?}",
-            model,
+            "loose piece {} {} at {origin_in:?}",
+            mdl,
             if drawn {
                 "draws"
             } else {

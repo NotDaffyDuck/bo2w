@@ -4,6 +4,8 @@
 //! the low half), then the normal and the tangent as signed 10:10:10 words; a
 //! world vertex adds its lightmap coordinate (two u16 over 65535).
 
+use std::cmp::Ordering;
+
 pub const T6_PACKED_VERTEX: usize = 32;
 
 pub const T6_WORLD_VERTEX: usize = 36;
@@ -11,13 +13,12 @@ pub const T6_WORLD_VERTEX: usize = 36;
 /// BO2's packed unit vector: three signed 10-bit components (two's complement)
 /// over 511, x in the low bits. The top two bits are not read.
 #[must_use]
-pub fn unpack_unit_vec(packed: u32) -> [f32; 3] {
-    let c = |v: u32| {
-        let v = (v & 0x3ff) as i32;
-        let v = if v >= 512 { v - 1024 } else { v };
-        v as f32 / 511.0
+pub fn decode_unit_normal(bits: u32) -> [f32; 3] {
+    let widen = |field: u32| {
+        let raw = (field & 0x3ff) as i32;
+        ((raw << 22) >> 22) as f32 / 511.0
     };
-    [c(packed), c(packed >> 10), c(packed >> 20)]
+    [widen(bits), widen(bits >> 10), widen(bits >> 20)]
 }
 
 /// Packs a unit vector the way BO2's skinning stores one: each component clamped to
@@ -26,32 +27,34 @@ pub fn unpack_unit_vec(packed: u32) -> [f32; 3] {
 /// x channel round toward zero and the y and z channels round down. The top two
 /// bits are 0.
 #[must_use]
-pub fn pack_unit_vec(v: [f32; 3]) -> u32 {
-    let c = |v: f32, mul: f32, mask: u32| ((v.clamp(-1.0, 1.0) * mul) as i32 as u32) & mask;
-    c(v[0], 511.0, 0x3ff) | c(v[1], 523_264.0, 0xf_fc00) | c(v[2], 535_822_336.0, 0x3ff0_0000)
+pub fn pack_unit_vec(axes: [f32; 3]) -> u32 {
+    let channel = |axis: f32, step: f32, mask: u32| {
+        let scaled = axis.clamp(-1.0, 1.0) * step;
+        (scaled as i32 as u32) & mask
+    };
+    let [x, y, z] = axes;
+    channel(x, 511.0, 0x3ff) | channel(y, 523_264.0, 0xf_fc00) | channel(z, 535_822_336.0, 0x3ff0_0000)
 }
 
 /// An IEEE half as an f32.
 #[must_use]
-pub fn half_to_f32(bits: u16) -> f32 {
-    let sign = u32::from(bits & 0x8000) << 16;
-    let exponent = (bits >> 10) & 0x1f;
-    let mantissa = u32::from(bits & 0x03ff);
-    let value = match exponent {
-        0 if mantissa == 0 => sign,
-        0 => {
-            let mut mantissa = mantissa;
-            let mut exponent = -14i32;
-            while mantissa & 0x0400 == 0 {
-                mantissa <<= 1;
-                exponent -= 1;
-            }
-            sign | (((exponent + 127) as u32) << 23) | ((mantissa & 0x03ff) << 13)
-        }
-        0x1f => sign | 0x7f80_0000 | (mantissa << 13),
-        _ => sign | ((u32::from(exponent) + 112) << 23) | (mantissa << 13),
+pub fn short_float_to_full(bits: u16) -> f32 {
+    let sign_bit = u32::from(bits >> 15) << 31;
+    let biased = u32::from((bits >> 10) & 0x1f);
+    let frac = u32::from(bits) & 0x3ff;
+    let pattern = if biased == 0x1f {
+        sign_bit | 0x7f80_0000 | (frac << 13)
+    } else if biased != 0 {
+        sign_bit | ((biased + 112) << 23) | (frac << 13)
+    } else if frac == 0 {
+        sign_bit
+    } else {
+        // Subnormal: normalise so the leading one lands on the hidden bit.
+        let lead = frac.leading_zeros();
+        let steps = lead - 21;
+        sign_bit | ((134 - lead) << 23) | (((frac << steps) & 0x3ff) << 13)
     };
-    f32::from_bits(value)
+    f32::from_bits(pattern)
 }
 
 /// An f32 as an IEEE half, rounded to the nearest (ties to even); too large
@@ -60,43 +63,45 @@ pub fn half_to_f32(bits: u16) -> f32 {
 // (mark and code-mesh vertices); QUESTIONS.md 10-21 Clean1.
 #[must_use]
 pub fn f32_to_half(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x007f_ffff;
-    if exponent == 0xff {
-        let nan = if mantissa == 0 { 0 } else { 0x0200 };
-        return sign | 0x7c00 | nan;
+    let raw = value.to_bits();
+    let sign_half = ((raw >> 16) & 0x8000) as u16;
+    let biased = ((raw >> 23) & 0xff) as i32;
+    let frac = raw & 0x007f_ffff;
+    if biased == 0xff {
+        return sign_half | 0x7c00 | if frac == 0 { 0 } else { 0x0200 };
     }
-    let half_exponent = exponent - 112;
-    if half_exponent >= 0x1f {
-        return sign | 0x7c00;
+    let rebased = biased - 112;
+    if rebased >= 0x1f {
+        return sign_half | 0x7c00;
     }
-    // Shift the 24-bit mantissa (with its hidden bit) down to the half's 10 bits,
+    // Shift the 24-bit significand (with its hidden bit) down to the half's 10 bits,
     // further for a subnormal, then round to nearest even.
-    let (base, shift) = if half_exponent <= 0 {
-        if half_exponent < -10 {
-            return sign;
-        }
-        (0u32, (14 - half_exponent) as u32)
+    let (high_bits, drop, significand) = if rebased > 0 {
+        ((rebased as u32) << 10, 13u32, frac)
+    } else if rebased < -10 {
+        return sign_half;
     } else {
-        ((half_exponent as u32) << 10, 13)
+        let hidden = if biased == 0 { 0 } else { 0x0080_0000 };
+        (0u32, (14 - rebased) as u32, frac | hidden)
     };
-    let full = mantissa | if exponent == 0 { 0 } else { 0x0080_0000 };
-    let kept = if half_exponent <= 0 { full >> shift } else { mantissa >> shift };
-    let rest = if half_exponent <= 0 { full } else { mantissa } & ((1 << shift) - 1);
-    let halfway = 1 << (shift - 1);
-    let round = u32::from(rest > halfway || (rest == halfway && kept & 1 == 1));
+    let kept = significand >> drop;
+    let remainder = significand & ((1u32 << drop) - 1);
+    let half_way = 1u32 << (drop - 1);
+    let bump = match remainder.cmp(&half_way) {
+        Ordering::Greater => 1,
+        Ordering::Less => 0,
+        Ordering::Equal => kept & 1,
+    };
     // A carry out of the mantissa steps the exponent, which is the right result.
-    sign | (base + kept + round) as u16
+    sign_half | (high_bits + kept + bump) as u16
 }
 
-fn rd_u32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+fn rd_u32(bytes: &[u8], offset: usize) -> u32 {
+    bytes[offset..offset + 4].try_into().map(u32::from_le_bytes).unwrap()
 }
 
-fn rd_f32(b: &[u8], at: usize) -> f32 {
-    f32::from_bits(rd_u32(b, at))
+fn rd_f32(bytes: &[u8], offset: usize) -> f32 {
+    f32::from_bits(rd_u32(bytes, offset))
 }
 
 /// One BO2 model vertex, fields as stored.
@@ -129,9 +134,9 @@ impl T6PackedVertex {
 
     #[must_use]
     pub fn to_bytes(&self) -> [u8; T6_PACKED_VERTEX] {
-        let mut row = [0u8; T6_PACKED_VERTEX];
-        for (i, p) in self.position.iter().enumerate() {
-            row[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
+        let mut row = [0_u8; T6_PACKED_VERTEX];
+        for (axis, coord) in self.position.iter().enumerate() {
+            row[axis * 4..axis * 4 + 4].copy_from_slice(&coord.to_le_bytes());
         }
         row[12..16].copy_from_slice(&self.binormal_sign.to_le_bytes());
         row[16..20].copy_from_slice(&self.color);
@@ -144,19 +149,19 @@ impl T6PackedVertex {
     #[must_use]
     pub fn uv(&self) -> [f32; 2] {
         [
-            half_to_f32(self.tex_coord as u16),
-            half_to_f32((self.tex_coord >> 16) as u16),
+            short_float_to_full(self.tex_coord as u16),
+            short_float_to_full((self.tex_coord >> 16) as u16),
         ]
     }
 
     #[must_use]
     pub fn unpacked_normal(&self) -> [f32; 3] {
-        unpack_unit_vec(self.normal)
+        decode_unit_normal(self.normal)
     }
 
     #[must_use]
     pub fn unpacked_tangent(&self) -> [f32; 3] {
-        unpack_unit_vec(self.tangent)
+        decode_unit_normal(self.tangent)
     }
 
     /// The colour as R, G, B, A over 255.
@@ -171,7 +176,7 @@ impl T6PackedVertex {
 pub struct T6WorldVertex {
     pub base: T6PackedVertex,
     /// Two u16, u in the low 16 bits.
-    pub lmap_coord: u32,
+    pub baked_light_uv: u32,
 }
 
 impl T6WorldVertex {
@@ -181,23 +186,23 @@ impl T6WorldVertex {
         let row = row.get(..T6_WORLD_VERTEX)?;
         Some(Self {
             base: T6PackedVertex::read(row)?,
-            lmap_coord: rd_u32(row, 32),
+            baked_light_uv: rd_u32(row, 32),
         })
     }
 
     #[must_use]
     pub fn to_bytes(&self) -> [u8; T6_WORLD_VERTEX] {
-        let mut row = [0u8; T6_WORLD_VERTEX];
+        let mut row = [0_u8; T6_WORLD_VERTEX];
         row[..T6_PACKED_VERTEX].copy_from_slice(&self.base.to_bytes());
-        row[32..36].copy_from_slice(&self.lmap_coord.to_le_bytes());
+        row[32..36].copy_from_slice(&self.baked_light_uv.to_le_bytes());
         row
     }
 
     #[must_use]
     pub fn lightmap_uv(&self) -> [f32; 2] {
         [
-            f32::from(self.lmap_coord as u16) / 65535.0,
-            f32::from((self.lmap_coord >> 16) as u16) / 65535.0,
+            f32::from(self.baked_light_uv as u16) / 65535.0,
+            f32::from((self.baked_light_uv >> 16) as u16) / 65535.0,
         ]
     }
 }
@@ -208,11 +213,11 @@ mod tests {
 
     #[test]
     fn unit_vectors_are_signed_ten_bit() {
-        assert_eq!(unpack_unit_vec(0x1ff | 0x201 << 10), [1.0, -1.0, 0.0]);
-        assert_eq!(unpack_unit_vec(0x3ff << 20)[2], -1.0 / 511.0);
-        assert_eq!(unpack_unit_vec(0xc000_0000), [0.0; 3]);
+        assert_eq!(decode_unit_normal(0x1ff | 0x201 << 10), [1.0, -1.0, 0.0]);
+        assert_eq!(decode_unit_normal(0x3ff << 20)[2], -1.0 / 511.0);
+        assert_eq!(decode_unit_normal(0xc000_0000), [0.0; 3]);
         for v in [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.6, -0.8, 0.0], [-0.3, 0.2, 0.9]] {
-            let back = unpack_unit_vec(pack_unit_vec(v));
+            let back = decode_unit_normal(pack_unit_vec(v));
             for (a, b) in v.iter().zip(back) {
                 assert!((a - b).abs() <= 1.0 / 511.0 + 1e-6, "{v:?} -> {back:?}");
             }
@@ -220,27 +225,27 @@ mod tests {
         assert_eq!(pack_unit_vec([2.0, -2.0, 0.0]), 0x1ff | 0x201 << 10);
         // x truncates toward zero; y and z round down.
         let tiny = -0.5 / 511.0;
-        assert_eq!(unpack_unit_vec(pack_unit_vec([tiny, tiny, tiny])), [0.0, -1.0 / 511.0, -1.0 / 511.0]);
+        assert_eq!(decode_unit_normal(pack_unit_vec([tiny, tiny, tiny])), [0.0, -1.0 / 511.0, -1.0 / 511.0]);
     }
 
     #[test]
     fn halves_decode() {
-        assert_eq!(half_to_f32(0x3c00), 1.0);
-        assert_eq!(half_to_f32(0xc000), -2.0);
-        assert_eq!(half_to_f32(0x3800), 0.5);
-        assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
-        assert!(half_to_f32(0x7c00).is_infinite());
+        assert_eq!(short_float_to_full(0x3c00), 1.0);
+        assert_eq!(short_float_to_full(0xc000), -2.0);
+        assert_eq!(short_float_to_full(0x3800), 0.5);
+        assert_eq!(short_float_to_full(0x0001), 2f32.powi(-24));
+        assert!(short_float_to_full(0x7c00).is_infinite());
     }
 
     #[test]
     fn halves_encode() {
         for bits in [0x3c00u16, 0xc000, 0x3800, 0x0001, 0x03ff, 0x0400, 0x7bff, 0x8000, 0x3555] {
-            assert_eq!(f32_to_half(half_to_f32(bits)), bits, "{bits:#06x}");
+            assert_eq!(f32_to_half(short_float_to_full(bits)), bits, "{bits:#06x}");
         }
         assert_eq!(f32_to_half(0.0), 0);
         assert_eq!(f32_to_half(1.0e6), 0x7c00);
         assert_eq!(f32_to_half(1.0e-9), 0);
-        assert!(half_to_f32(f32_to_half(f32::NAN)).is_nan());
+        assert!(short_float_to_full(f32_to_half(f32::NAN)).is_nan());
         // 1 + 2^-11 is halfway between 1 and the next half: ties go to even (1).
         assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
         assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
@@ -249,7 +254,7 @@ mod tests {
     }
 
     fn sample_world_row() -> [u8; T6_WORLD_VERTEX] {
-        let mut row = [0u8; T6_WORLD_VERTEX];
+        let mut row = [0_u8; T6_WORLD_VERTEX];
         row[0..4].copy_from_slice(&1.5f32.to_le_bytes());
         row[4..8].copy_from_slice(&(-2.0f32).to_le_bytes());
         row[8..12].copy_from_slice(&64.0f32.to_le_bytes());
@@ -306,7 +311,7 @@ mod tests {
     ];
 
     fn real_row(hex: &str) -> [u8; T6_PACKED_VERTEX] {
-        let mut row = [0u8; T6_PACKED_VERTEX];
+        let mut row = [0_u8; T6_PACKED_VERTEX];
         for (i, b) in row.iter_mut().enumerate() {
             *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
         }
@@ -334,7 +339,7 @@ mod tests {
             for word in [v.normal, v.tangent] {
                 // Rule 6: bits 30..31 are 0 and the length over 511 is 1 within 0.002.
                 assert_eq!(word >> 30, 0, "{hex}");
-                let unit = unpack_unit_vec(word);
+                let unit = decode_unit_normal(word);
                 assert!((len(unit) - 1.0).abs() <= 0.002, "{hex}: {unit:?}");
                 // Rule 7: the packer gives back the stored word.
                 assert_eq!(pack_unit_vec(unit), word, "{hex}");

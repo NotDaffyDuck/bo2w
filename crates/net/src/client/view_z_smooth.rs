@@ -17,7 +17,7 @@ pub struct ViewZSmoothing {
     offset: f32,
 
     /// When that step was taken (command time, ms).
-    time_ms: i32,
+    clock_stamp_ms: i32,
 
     /// Steps taken by moves predicted since the last `settle`.
     pending: f32,
@@ -27,41 +27,41 @@ pub struct ViewZSmoothing {
 
 impl ViewZSmoothing {
     /// A newly predicted move stepped `rise` units at `command_time`.
-    pub fn note_step(&mut self, rise: f32, command_time: i32) {
+    pub fn record_rise(&mut self, rise: f32, command_time: i32) {
         if rise != 0.0 {
             self.pending += rise;
             self.pending_time_ms = command_time;
         }
     }
 
-    /// After a frame's prediction at `now_ms`: ease over the new steps. Only
-    /// a normal, noclip or ufo player (pm_type 0, 2 or 3) is eased; a new
+    /// After a frame's prediction at `clock_millis`: ease over the new steps. Only
+    /// a normal, noclip or ufo player (movement_mode 0, 2 or 3) is eased; a new
     /// step adds what is left of the last one.
-    pub fn settle(&mut self, now_ms: i32, pm_type: i32) {
+    pub fn settle(&mut self, clock_millis: i32, movement_mode: i32) {
         let change = core::mem::take(&mut self.pending);
-        let since_last = now_ms.wrapping_sub(self.time_ms);
+        let since_last = clock_millis.wrapping_sub(self.clock_stamp_ms);
         if change != 0.0
-            && self.pending_time_ms != self.time_ms
-            && matches!(pm_type, 0 | 2 | 3)
+            && self.pending_time_ms != self.clock_stamp_ms
+            && matches!(movement_mode, 0 | 2 | 3)
             && change.abs() >= SMOOTH_MIN
         {
             let mut left = 0.0;
             if since_last < SMOOTH_MS {
-                let gap = self.pending_time_ms.wrapping_sub(self.time_ms);
+                let gap = self.pending_time_ms.wrapping_sub(self.clock_stamp_ms);
                 if (0..SMOOTH_MS).contains(&gap) {
                     left = (1.0 - gap as f32 / SMOOTH_MS as f32) * self.offset;
                 }
             }
             self.offset = (left + change).clamp(-SMOOTH_MAX, SMOOTH_MAX);
-            self.time_ms = self.pending_time_ms;
+            self.clock_stamp_ms = self.pending_time_ms;
         } else if since_last > SMOOTH_MS {
             self.offset = 0.0;
         }
     }
 
-    /// How far below the player's real eye the camera sits at `now_ms`.
-    pub fn camera_drop(&self, now_ms: i32) -> f32 {
-        let elapsed = now_ms.wrapping_sub(self.time_ms);
+    /// How far below the player's real eye the camera sits at `clock_millis`.
+    pub fn camera_drop(&self, clock_millis: i32) -> f32 {
+        let elapsed = clock_millis.wrapping_sub(self.clock_stamp_ms);
         if self.offset == 0.0 || elapsed < 0 {
             return 0.0;
         }
@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn a_step_up_eases_over_a_tenth_of_a_second() {
         let mut z = ViewZSmoothing::default();
-        z.note_step(12.0, 1000);
+        z.record_rise(12.0, 1000);
         z.settle(1000, 0);
         assert_eq!(z.camera_drop(1000), 12.0);
         assert!((z.camera_drop(1050) - 6.0).abs() < 1e-5);
@@ -91,24 +91,24 @@ mod tests {
     #[test]
     fn small_steps_and_dead_players_snap() {
         let mut z = ViewZSmoothing::default();
-        z.note_step(0.75, 1000);
+        z.record_rise(0.75, 1000);
         z.settle(1000, 0);
         assert_eq!(z.camera_drop(1000), 0.0);
-        z.note_step(12.0, 1016);
-        z.settle(1016, playerstate_t6::game::PM_TYPE_DEAD);
+        z.record_rise(12.0, 1016);
+        z.settle(1016, playerstate_t6::game::MOVE_KIND_DEAD);
         assert_eq!(z.camera_drop(1016), 0.0);
     }
 
     #[test]
     fn stairs_add_up_to_sixteen_at_most() {
         let mut z = ViewZSmoothing::default();
-        z.note_step(12.0, 1000);
+        z.record_rise(12.0, 1000);
         z.settle(1000, 0);
         // Half way through the first step: 6 left + 12 = 18, held to 16.
-        z.note_step(12.0, 1050);
+        z.record_rise(12.0, 1050);
         z.settle(1050, 0);
         assert_eq!(z.camera_drop(1050), SMOOTH_MAX);
-        z.note_step(-12.0, 1300);
+        z.record_rise(-12.0, 1300);
         z.settle(1300, 0);
         assert_eq!(z.camera_drop(1300), -12.0);
     }

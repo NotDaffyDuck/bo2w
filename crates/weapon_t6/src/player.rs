@@ -1,7 +1,7 @@
 //! BO2's weapon part of the player state, with BO2's field names (snake case).
 //!
 //! Everything the weapon brain reads or writes between ticks lives here, so it can ride the
-//! network as one blob and a trace can print it. Movement-owned values (pm_type, pm_flags,
+//! network as one blob and a trace can print it. Movement-owned values (movement_mode, movement_state_bits,
 //! water level, ...) come in per tick through [`crate::env::T6Env`] instead.
 
 use crate::facts::FactsTable;
@@ -15,7 +15,7 @@ pub mod wf {
     /// Holding breath (scoped).
     pub const HOLDING_BREATH: u64 = 0x4;
     /// Script AllowADS(false).
-    pub const NO_ADS: u64 = 0x20;
+    pub const AIM_DISABLED_BIT: u64 = 0x20;
     /// Seen in BO2 only as a reader: with it set, running dry does not switch away and the
     /// alt-mode memory is kept (treated like `unlimitedAmmo`). Nothing in MP script sets it.
     pub const NO_AMMO_SWITCH: u64 = 0x200;
@@ -78,7 +78,7 @@ pub struct HeldWeapon {
 /// Reserve ammo for one ammo type (BO2 `AmmoPool`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AmmoPool {
-    pub weapon: u32,
+    pub gun_id: u32,
     pub count: i32,
 }
 
@@ -86,7 +86,7 @@ pub struct AmmoPool {
 /// dual-wield left hand has its own entry (an alt mode that shares its gun's magazine has none).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AmmoClip {
-    pub weapon: u32,
+    pub gun_id: u32,
     pub count: i32,
 }
 
@@ -94,24 +94,24 @@ pub struct AmmoClip {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct T6WeaponPs {
     pub weapon: u32,
-    pub weaponstate: i32,
+    pub gun_phase: i32,
     pub weaponstate_left: i32,
-    pub weapon_time: i32,
-    pub weapon_delay: i32,
+    pub gun_timer_ms: i32,
+    pub weapon_ready_wait: i32,
     pub weapon_time_left: i32,
     pub weapon_delay_left: i32,
     pub weapon_idle_time: i32,
-    pub weapon_restrict_kick_time: i32,
-    pub weap_anim: i32,
+    pub gun_lockout_kick_stamp: i32,
+    pub gun_clip: i32,
     pub weap_anim_left: i32,
     pub weapon_shot_count: u32,
     pub weapon_shot_count_left: u32,
     pub b_run_left_gun: bool,
-    pub weap_flags: u64,
-    pub grenade_time_left: i32,
+    pub weapon_state_bits: u64,
+    pub cook_remaining: i32,
     pub off_hand_weapon: u32,
-    pub offhand_primary: u32,
-    pub offhand_secondary: u32,
+    pub secondary_gear_main: u32,
+    pub secondary_gear_alt: u32,
     pub last_weapon_alt_mode_switch: u32,
     pub stowed_weapon: u32,
     pub melee_weapon: u32,
@@ -120,9 +120,9 @@ pub struct T6WeaponPs {
     pub inventory_weapon: u32,
     pub ads_zoom_select: i32,
     pub ads_zoom_latch_time: i32,
-    pub aim_spread_scale: f32,
-    pub f_weapon_pos_frac: f32,
-    pub ads_delay_time: i32,
+    pub sight_spread_factor: f32,
+    pub weapon_raise_fraction: f32,
+    pub scope_in_wait: i32,
     pub weapon_spin_lerp: f32,
     pub charge_shot_timer: i32,
     pub charge_shot_level: i32,
@@ -135,7 +135,7 @@ pub struct T6WeaponPs {
     /// Entity of the use prompt under the crosshair (`None` = BO2's 0x3ff, no prompt).
     pub cursor_hint_ent_index: Option<u16>,
     /// Hold-breath sway scale (1.0 = no breath held).
-    pub hold_breath_scale: f32,
+    pub steady_aim_factor: f32,
     pub hold_breath_timer: i32,
     /// Quickscope scale (1.0 = settled).
     pub quick_scope_scale: f32,
@@ -145,8 +145,8 @@ pub struct T6WeaponPs {
     pub ads_prev_zoom_select_time: i32,
     /// Melee lunge target (`None` = BO2's 0x3ff).
     pub melee_charge_ent: Option<u16>,
-    pub melee_charge_dist: u32,
-    pub melee_charge_time: i32,
+    pub lunge_reach: u32,
+    pub lunge_clock: i32,
     pub held: [HeldWeapon; MAX_HELD],
     pub ammo_not_in_clip: [AmmoPool; MAX_HELD],
     pub ammo_in_clip: [AmmoClip; MAX_HELD],
@@ -157,24 +157,24 @@ impl Default for T6WeaponPs {
     fn default() -> Self {
         Self {
             weapon: Default::default(),
-            weaponstate: Default::default(),
+            gun_phase: Default::default(),
             weaponstate_left: Default::default(),
-            weapon_time: Default::default(),
-            weapon_delay: Default::default(),
+            gun_timer_ms: Default::default(),
+            weapon_ready_wait: Default::default(),
             weapon_time_left: Default::default(),
             weapon_delay_left: Default::default(),
             weapon_idle_time: Default::default(),
-            weapon_restrict_kick_time: Default::default(),
-            weap_anim: Default::default(),
+            gun_lockout_kick_stamp: Default::default(),
+            gun_clip: Default::default(),
             weap_anim_left: Default::default(),
             weapon_shot_count: Default::default(),
             weapon_shot_count_left: Default::default(),
             b_run_left_gun: Default::default(),
-            weap_flags: Default::default(),
-            grenade_time_left: Default::default(),
+            weapon_state_bits: Default::default(),
+            cook_remaining: Default::default(),
             off_hand_weapon: Default::default(),
-            offhand_primary: Default::default(),
-            offhand_secondary: Default::default(),
+            secondary_gear_main: Default::default(),
+            secondary_gear_alt: Default::default(),
             last_weapon_alt_mode_switch: Default::default(),
             stowed_weapon: Default::default(),
             melee_weapon: Default::default(),
@@ -182,9 +182,9 @@ impl Default for T6WeaponPs {
             inventory_weapon: 0,
             ads_zoom_select: Default::default(),
             ads_zoom_latch_time: Default::default(),
-            aim_spread_scale: Default::default(),
-            f_weapon_pos_frac: Default::default(),
-            ads_delay_time: Default::default(),
+            sight_spread_factor: Default::default(),
+            weapon_raise_fraction: Default::default(),
+            scope_in_wait: Default::default(),
             weapon_spin_lerp: Default::default(),
             charge_shot_timer: Default::default(),
             charge_shot_level: Default::default(),
@@ -193,7 +193,7 @@ impl Default for T6WeaponPs {
             throw_back_grenade_owner: Default::default(),
             throw_back_grenade_time_left: Default::default(),
             cursor_hint_ent_index: Default::default(),
-            hold_breath_scale: 1.0,
+            steady_aim_factor: 1.0,
             hold_breath_timer: 0,
             quick_scope_scale: 1.0,
             quick_scope_timer: 0,
@@ -201,8 +201,8 @@ impl Default for T6WeaponPs {
             ads_prev_zoom_select: 0,
             ads_prev_zoom_select_time: 0,
             melee_charge_ent: None,
-            melee_charge_dist: 0,
-            melee_charge_time: 0,
+            lunge_reach: 0,
+            lunge_clock: 0,
             held: Default::default(),
             ammo_not_in_clip: Default::default(),
             ammo_in_clip: Default::default(),
@@ -213,23 +213,23 @@ impl Default for T6WeaponPs {
 /// One hand's copy of the per-hand fields, for code that runs either hand.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Hand {
-    pub state: i32,
+    pub phase: i32,
     pub time: i32,
     pub delay: i32,
-    pub shot_count: u32,
+    pub rounds_fired: u32,
 }
 
 impl T6WeaponPs {
     /// Slot of `weapon` in `held` (BG_GetHeldWeapon); weapon 0 is never held.
-    pub fn held_slot(&self, weapon: u32) -> Option<usize> {
-        if weapon == 0 {
+    pub fn held_slot(&self, gun: u32) -> Option<usize> {
+        if gun == 0 {
             return None;
         }
-        self.held.iter().position(|h| h.weapon == weapon)
+        self.held.iter().position(|h| h.weapon == gun)
     }
 
-    pub fn held(&self, weapon: u32) -> Option<&HeldWeapon> {
-        self.held_slot(weapon).map(|i| &self.held[i])
+    pub fn held(&self, gun: u32) -> Option<&HeldWeapon> {
+        self.held_slot(gun).map(|i| &self.held[i])
     }
 
     pub fn held_mut(&mut self, weapon: u32) -> Option<&mut HeldWeapon> {
@@ -237,45 +237,45 @@ impl T6WeaponPs {
     }
 
     /// BG_PlayerHasWeapon.
-    pub fn has_weapon(&self, weapon: u32) -> bool {
-        self.held_slot(weapon).is_some()
+    pub fn has_weapon(&self, gun: u32) -> bool {
+        self.held_slot(gun).is_some()
     }
 
     /// BG_IsWeaponValid: a weapon in the table (of `num_weapons`) that he holds.
-    pub fn is_weapon_valid(&self, weapon: u32, num_weapons: usize) -> bool {
-        (weapon as usize) < num_weapons && self.has_weapon(weapon)
+    pub fn is_weapon_valid(&self, gun: u32, num_weapons: usize) -> bool {
+        (gun as usize) < num_weapons && self.has_weapon(gun)
     }
 
     /// BG_PlayerEverHadWeapon: the held weapon has been raised before.
-    pub fn ever_had_weapon(&self, weapon: u32) -> bool {
-        self.held(weapon).is_some_and(|h| h.held_before)
+    pub fn ever_had_weapon(&self, gun: u32) -> bool {
+        self.held(gun).is_some_and(|h| h.held_before)
     }
 
     /// BG_SetEverHadAllPlayerHeldWeapons.
-    pub fn set_ever_had_all(&mut self, value: bool) {
+    pub fn mark_all_owned(&mut self, on: bool) {
         for h in &mut self.held {
             if h.weapon != 0 {
-                h.held_before = value;
+                h.held_before = on;
             }
         }
     }
 
     /// Set one held weapon's "raised before" flag (the script's initial-raise switch clears it).
-    pub fn set_ever_had(&mut self, weapon: u32, value: bool) {
-        if let Some(h) = self.held_mut(weapon) {
-            h.held_before = value;
+    pub fn set_ever_had(&mut self, gun: u32, on: bool) {
+        if let Some(h) = self.held_mut(gun) {
+            h.held_before = on;
         }
     }
 
     /// Put `weapon` in a free held slot (no-op if already held). False when all slots are full.
-    pub fn give(&mut self, weapon: u32) -> bool {
-        if weapon == 0 || self.has_weapon(weapon) {
-            return weapon != 0;
+    pub fn give(&mut self, gun: u32) -> bool {
+        if gun == 0 || self.has_weapon(gun) {
+            return gun != 0;
         }
         match self.held.iter_mut().find(|h| h.weapon == 0) {
             Some(h) => {
                 *h = HeldWeapon {
-                    weapon,
+                    weapon: gun,
                     ..HeldWeapon::default()
                 };
                 true
@@ -285,8 +285,8 @@ impl T6WeaponPs {
     }
 
     /// Remove `weapon` from the held slots.
-    pub fn take(&mut self, weapon: u32) {
-        if let Some(h) = self.held_mut(weapon) {
+    pub fn take(&mut self, gun: u32) {
+        if let Some(h) = self.held_mut(gun) {
             *h = HeldWeapon::default();
         }
     }
@@ -294,100 +294,100 @@ impl T6WeaponPs {
     /// BG_GetAmmoInClip: the rounds in the magazine `weapon` fires from
     /// ([`FactsTable::ammo_clip_weapon`]: Select Fire and the Hybrid's other optic share the
     /// gun's).
-    pub fn ammo_in_clip(&self, facts: &FactsTable, weapon: u32) -> i32 {
-        self.clip_slot(facts.ammo_clip_weapon(weapon))
+    pub fn ammo_in_clip(&self, facts: &FactsTable, gun: u32) -> i32 {
+        self.clip_slot(facts.ammo_clip_weapon(gun))
     }
 
     /// BG_SetAmmoInClip (never below 0).
-    pub fn set_ammo_in_clip(&mut self, facts: &FactsTable, weapon: u32, count: i32) {
-        self.set_clip_slot(facts.ammo_clip_weapon(weapon), count.max(0));
+    pub fn set_ammo_in_clip(&mut self, facts: &FactsTable, gun: u32, n: i32) {
+        self.set_clip_slot(facts.ammo_clip_weapon(gun), n.max(0));
     }
 
     /// BG_GetAmmoNotInClip: the reserve `weapon` draws from
     /// ([`FactsTable::ammo_pool_weapon`]).
-    pub fn ammo_not_in_clip(&self, facts: &FactsTable, weapon: u32) -> i32 {
-        self.pool_slot(facts.ammo_pool_weapon(weapon))
+    pub fn ammo_not_in_clip(&self, facts: &FactsTable, gun: u32) -> i32 {
+        self.reserve_index(facts.ammo_pool_weapon(gun))
     }
 
     /// BG_SetAmmoInPool (never below 0).
-    pub fn set_ammo_not_in_clip(&mut self, facts: &FactsTable, weapon: u32, count: i32) {
-        self.set_pool_slot(facts.ammo_pool_weapon(weapon), count.max(0));
+    pub fn set_ammo_not_in_clip(&mut self, facts: &FactsTable, gun: u32, n: i32) {
+        self.set_pool_slot(facts.ammo_pool_weapon(gun), n.max(0));
     }
 
     /// The clip stored under `weapon` itself, with no remap (the game's ammo sync; BO2 code
     /// goes through [`Self::ammo_in_clip`]).
-    pub fn clip_slot(&self, weapon: u32) -> i32 {
+    pub fn clip_slot(&self, gun: u32) -> i32 {
         self.ammo_in_clip
             .iter()
-            .find(|c| weapon != 0 && c.weapon == weapon)
+            .find(|c| gun != 0 && c.gun_id == gun)
             .map_or(0, |c| c.count)
     }
 
     /// Set the clip stored under `weapon`, taking a free slot if it has none yet.
-    pub fn set_clip_slot(&mut self, weapon: u32, count: i32) {
-        if weapon == 0 {
+    pub fn set_clip_slot(&mut self, gun: u32, n: i32) {
+        if gun == 0 {
             return;
         }
-        if let Some(c) = self.ammo_in_clip.iter_mut().find(|c| c.weapon == weapon) {
-            c.count = count;
-        } else if let Some(c) = self.ammo_in_clip.iter_mut().find(|c| c.weapon == 0) {
-            *c = AmmoClip { weapon, count };
+        if let Some(c) = self.ammo_in_clip.iter_mut().find(|c| c.gun_id == gun) {
+            c.count = n;
+        } else if let Some(c) = self.ammo_in_clip.iter_mut().find(|c| c.gun_id == 0) {
+            *c = AmmoClip { gun_id: gun, count: n };
         }
     }
 
     /// The reserve stored under `weapon` itself, with no remap.
-    pub fn pool_slot(&self, weapon: u32) -> i32 {
+    pub fn reserve_index(&self, gun: u32) -> i32 {
         self.ammo_not_in_clip
             .iter()
-            .find(|p| weapon != 0 && p.weapon == weapon)
+            .find(|p| gun != 0 && p.gun_id == gun)
             .map_or(0, |p| p.count)
     }
 
     /// Set the reserve stored under `weapon`, taking a free slot if it has none yet.
-    pub fn set_pool_slot(&mut self, weapon: u32, count: i32) {
-        if weapon == 0 {
+    pub fn set_pool_slot(&mut self, gun: u32, n: i32) {
+        if gun == 0 {
             return;
         }
         if let Some(p) = self
             .ammo_not_in_clip
             .iter_mut()
-            .find(|p| p.weapon == weapon)
+            .find(|p| p.gun_id == gun)
         {
-            p.count = count;
-        } else if let Some(p) = self.ammo_not_in_clip.iter_mut().find(|p| p.weapon == 0) {
-            *p = AmmoPool { weapon, count };
+            p.count = n;
+        } else if let Some(p) = self.ammo_not_in_clip.iter_mut().find(|p| p.gun_id == 0) {
+            *p = AmmoPool { gun_id: gun, count: n };
         }
     }
 
     pub fn hand(&self, left: bool) -> Hand {
         if left {
             Hand {
-                state: self.weaponstate_left,
+                phase: self.weaponstate_left,
                 time: self.weapon_time_left,
                 delay: self.weapon_delay_left,
-                shot_count: self.weapon_shot_count_left,
+                rounds_fired: self.weapon_shot_count_left,
             }
         } else {
             Hand {
-                state: self.weaponstate,
-                time: self.weapon_time,
-                delay: self.weapon_delay,
-                shot_count: self.weapon_shot_count,
+                phase: self.gun_phase,
+                time: self.gun_timer_ms,
+                delay: self.weapon_ready_wait,
+                rounds_fired: self.weapon_shot_count,
             }
         }
     }
 
     pub fn set_hand(&mut self, left: bool, h: Hand) {
         if left {
-            self.weaponstate_left = h.state;
+            self.weaponstate_left = h.phase;
             self.weapon_time_left = h.time;
             self.weapon_delay_left = h.delay;
-            self.weapon_shot_count_left = h.shot_count;
+            self.weapon_shot_count_left = h.rounds_fired;
         } else {
-            self.weaponstate = h.state;
-            self.weapon_time = h.time;
-            self.weapon_delay = h.delay;
-            self.weapon_shot_count = h.shot_count;
+            self.gun_phase = h.phase;
+            self.gun_timer_ms = h.time;
+            self.weapon_ready_wait = h.delay;
+            self.weapon_shot_count = h.rounds_fired;
         }
     }
 
@@ -396,25 +396,25 @@ impl T6WeaponPs {
         if self.b_run_left_gun {
             (self.weapon_time_left, self.weapon_delay_left)
         } else {
-            (self.weapon_time, self.weapon_delay)
+            (self.gun_timer_ms, self.weapon_ready_wait)
         }
     }
 
     /// Serialise for the network (little endian, fixed layout, version byte first).
-    pub fn to_wire(&self) -> Vec<u8> {
+    pub fn encode_for_net(&self) -> Vec<u8> {
         let mut w = Wire(Vec::with_capacity(WIRE_LEN));
         w.u8(WIRE_VERSION);
         w.u32(self.weapon);
         for v in [
-            self.weaponstate,
+            self.gun_phase,
             self.weaponstate_left,
-            self.weapon_time,
-            self.weapon_delay,
+            self.gun_timer_ms,
+            self.weapon_ready_wait,
             self.weapon_time_left,
             self.weapon_delay_left,
             self.weapon_idle_time,
-            self.weapon_restrict_kick_time,
-            self.weap_anim,
+            self.gun_lockout_kick_stamp,
+            self.gun_clip,
             self.weap_anim_left,
         ] {
             w.i32(v);
@@ -422,12 +422,12 @@ impl T6WeaponPs {
         w.u32(self.weapon_shot_count);
         w.u32(self.weapon_shot_count_left);
         w.u8(u8::from(self.b_run_left_gun));
-        w.u64(self.weap_flags);
-        w.i32(self.grenade_time_left);
+        w.u64(self.weapon_state_bits);
+        w.i32(self.cook_remaining);
         for v in [
             self.off_hand_weapon,
-            self.offhand_primary,
-            self.offhand_secondary,
+            self.secondary_gear_main,
+            self.secondary_gear_alt,
             self.last_weapon_alt_mode_switch,
             self.stowed_weapon,
             self.melee_weapon,
@@ -438,9 +438,9 @@ impl T6WeaponPs {
         }
         w.i32(self.ads_zoom_select);
         w.i32(self.ads_zoom_latch_time);
-        w.f32(self.aim_spread_scale);
-        w.f32(self.f_weapon_pos_frac);
-        w.i32(self.ads_delay_time);
+        w.f32(self.sight_spread_factor);
+        w.f32(self.weapon_raise_fraction);
+        w.i32(self.scope_in_wait);
         w.f32(self.weapon_spin_lerp);
         w.i32(self.charge_shot_timer);
         w.i32(self.charge_shot_level);
@@ -449,7 +449,7 @@ impl T6WeaponPs {
         w.u16(ent_to_wire(self.throw_back_grenade_owner));
         w.i32(self.throw_back_grenade_time_left);
         w.u16(ent_to_wire(self.cursor_hint_ent_index));
-        w.f32(self.hold_breath_scale);
+        w.f32(self.steady_aim_factor);
         w.i32(self.hold_breath_timer);
         w.f32(self.quick_scope_scale);
         w.i32(self.quick_scope_timer);
@@ -457,8 +457,8 @@ impl T6WeaponPs {
         w.i32(self.ads_prev_zoom_select);
         w.i32(self.ads_prev_zoom_select_time);
         w.u16(ent_to_wire(self.melee_charge_ent));
-        w.u32(self.melee_charge_dist);
-        w.i32(self.melee_charge_time);
+        w.u32(self.lunge_reach);
+        w.i32(self.lunge_clock);
         for h in &self.held {
             w.u32(h.weapon);
             w.f32(h.heat_percent);
@@ -473,43 +473,43 @@ impl T6WeaponPs {
             w.u8(h.model);
         }
         for p in &self.ammo_not_in_clip {
-            w.u32(p.weapon);
+            w.u32(p.gun_id);
             w.i32(p.count);
         }
         for c in &self.ammo_in_clip {
-            w.u32(c.weapon);
+            w.u32(c.gun_id);
             w.i32(c.count);
         }
         debug_assert_eq!(w.0.len(), WIRE_LEN);
         w.0
     }
 
-    /// Inverse of [`Self::to_wire`]; `None` on a wrong length or version.
-    pub fn from_wire(bytes: &[u8]) -> Option<Self> {
+    /// Inverse of [`Self::encode_for_net`]; `None` on a wrong length or version.
+    pub fn decode_net(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != WIRE_LEN || bytes[0] != WIRE_VERSION {
             return None;
         }
         let mut r = Read(&bytes[1..]);
         let mut ps = Self {
             weapon: r.u32(),
-            weaponstate: r.i32(),
+            gun_phase: r.i32(),
             weaponstate_left: r.i32(),
-            weapon_time: r.i32(),
-            weapon_delay: r.i32(),
+            gun_timer_ms: r.i32(),
+            weapon_ready_wait: r.i32(),
             weapon_time_left: r.i32(),
             weapon_delay_left: r.i32(),
             weapon_idle_time: r.i32(),
-            weapon_restrict_kick_time: r.i32(),
-            weap_anim: r.i32(),
+            gun_lockout_kick_stamp: r.i32(),
+            gun_clip: r.i32(),
             weap_anim_left: r.i32(),
             weapon_shot_count: r.u32(),
             weapon_shot_count_left: r.u32(),
             b_run_left_gun: r.u8() != 0,
-            weap_flags: r.u64(),
-            grenade_time_left: r.i32(),
+            weapon_state_bits: r.u64(),
+            cook_remaining: r.i32(),
             off_hand_weapon: r.u32(),
-            offhand_primary: r.u32(),
-            offhand_secondary: r.u32(),
+            secondary_gear_main: r.u32(),
+            secondary_gear_alt: r.u32(),
             last_weapon_alt_mode_switch: r.u32(),
             stowed_weapon: r.u32(),
             melee_weapon: r.u32(),
@@ -517,9 +517,9 @@ impl T6WeaponPs {
             inventory_weapon: r.u32(),
             ads_zoom_select: r.i32(),
             ads_zoom_latch_time: r.i32(),
-            aim_spread_scale: r.f32(),
-            f_weapon_pos_frac: r.f32(),
-            ads_delay_time: r.i32(),
+            sight_spread_factor: r.f32(),
+            weapon_raise_fraction: r.f32(),
+            scope_in_wait: r.i32(),
             weapon_spin_lerp: r.f32(),
             charge_shot_timer: r.i32(),
             charge_shot_level: r.i32(),
@@ -528,7 +528,7 @@ impl T6WeaponPs {
             throw_back_grenade_owner: ent_from_wire(r.u16()),
             throw_back_grenade_time_left: r.i32(),
             cursor_hint_ent_index: ent_from_wire(r.u16()),
-            hold_breath_scale: r.f32(),
+            steady_aim_factor: r.f32(),
             hold_breath_timer: r.i32(),
             quick_scope_scale: r.f32(),
             quick_scope_timer: r.i32(),
@@ -536,8 +536,8 @@ impl T6WeaponPs {
             ads_prev_zoom_select: r.i32(),
             ads_prev_zoom_select_time: r.i32(),
             melee_charge_ent: ent_from_wire(r.u16()),
-            melee_charge_dist: r.u32(),
-            melee_charge_time: r.i32(),
+            lunge_reach: r.u32(),
+            lunge_clock: r.i32(),
             ..Self::default()
         };
         for h in &mut ps.held {
@@ -554,11 +554,11 @@ impl T6WeaponPs {
             h.model = r.u8();
         }
         for p in &mut ps.ammo_not_in_clip {
-            p.weapon = r.u32();
+            p.gun_id = r.u32();
             p.count = r.i32();
         }
         for c in &mut ps.ammo_in_clip {
-            c.weapon = r.u32();
+            c.gun_id = r.u32();
             c.count = r.i32();
         }
         Some(ps)
@@ -639,11 +639,11 @@ mod tests {
     fn wire_round_trip() {
         let mut ps = T6WeaponPs {
             weapon: 7,
-            weaponstate: crate::state::RAISING,
-            weap_anim: 0x40f,
+            gun_phase: crate::state::RAISING,
+            gun_clip: 0x40f,
             weap_anim_left: crate::anim::LEFT_NONE,
-            weap_flags: wf::RIOTSHIELD_SWITCH | (1 << 40),
-            aim_spread_scale: 255.0,
+            weapon_state_bits: wf::RIOTSHIELD_SWITCH | (1 << 40),
+            sight_spread_factor: 255.0,
             b_run_left_gun: true,
             ..T6WeaponPs::default()
         };
@@ -652,10 +652,10 @@ mod tests {
         ps.held[14].quick_reload = true;
         ps.set_clip_slot(7, 30);
         ps.set_pool_slot(7, 120);
-        let bytes = ps.to_wire();
+        let bytes = ps.encode_for_net();
         assert_eq!(bytes.len(), WIRE_LEN);
-        assert_eq!(T6WeaponPs::from_wire(&bytes), Some(ps));
-        assert_eq!(T6WeaponPs::from_wire(&bytes[1..]), None);
+        assert_eq!(T6WeaponPs::decode_net(&bytes), Some(ps));
+        assert_eq!(T6WeaponPs::decode_net(&bytes[1..]), None);
     }
 
     #[test]

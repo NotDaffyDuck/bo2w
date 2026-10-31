@@ -2,18 +2,18 @@
 //! and swims, plus night vision (BO2 MP has none: its check stays a no-op).
 //!
 //! Movement itself (speeds, when a dive or slide starts) is the movement code's; it reports
-//! here through `pm_flags`, `jump_time`, `slide_time` and `last_dtp_end` in [`crate::env`].
+//! here through `movement_state_bits`, `hop_start_ms`, `slide_time` and `last_dtp_end` in [`crate::env`].
 //! Timing spec and per-weapon numbers: `docs/gun/SPRINT.md`.
 
-use super::{Pm, fire};
+use crate::pm::{Pm, fire};
 use crate::anim;
 use crate::base;
 use crate::cmd::button;
-use crate::env::{perk, pm_type, pmf};
-use crate::events::{self, AnimScript};
+use crate::env::{perk, movement_mode, pmf};
+use crate::events::{AnimScript, EV_PUTAWAY_WEAPON, EV_RAISE_WEAPON};
 use crate::facts::{fire_type, offhand_slot};
 use crate::state;
-use fastfile_t6::layout::WeaponDef as D;
+use fastfile_t6::layout::WeaponDef;
 
 /// Per-weapon times (ms) for the movement states.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -32,7 +32,7 @@ pub struct MoveFacts {
     pub crawl_out_fire: i32,
     pub crawl_out: i32,
     pub slide_in: i32,
-    pub sprint_duration_scale: f32,
+    pub run_time_multiplier: f32,
     pub blocks_prone: bool,
 }
 
@@ -46,22 +46,22 @@ impl MoveFacts {
     pub fn read(variant: &[u8], def: &[u8]) -> Self {
         let _ = variant;
         Self {
-            sprint_in: rd_i32(def, D::sprintInTime),
-            sprint_loop: rd_i32(def, D::sprintLoopTime),
-            sprint_out: rd_i32(def, D::sprintOutTime),
-            dtp_in: rd_i32(def, D::dtpInTime),
-            dtp_loop: rd_i32(def, D::dtpLoopTime),
-            dtp_out: rd_i32(def, D::dtpOutTime),
-            crawl_in: rd_i32(def, D::crawlInTime),
-            crawl_forward: rd_i32(def, D::crawlForwardTime),
-            crawl_back: rd_i32(def, D::crawlBackTime),
-            crawl_right: rd_i32(def, D::crawlRightTime),
-            crawl_left: rd_i32(def, D::crawlLeftTime),
-            crawl_out_fire: rd_i32(def, D::crawlOutFireTime),
-            crawl_out: rd_i32(def, D::crawlOutTime),
-            slide_in: rd_i32(def, D::slideInTime),
-            sprint_duration_scale: f32::from_bits(rd_i32(def, D::sprintDurationScale) as u32),
-            blocks_prone: def.get(D::blocksProne).is_some_and(|&b| b != 0),
+            sprint_in: rd_i32(def, WeaponDef::sprintInTime),
+            sprint_loop: rd_i32(def, WeaponDef::sprintLoopTime),
+            sprint_out: rd_i32(def, WeaponDef::sprintOutTime),
+            dtp_in: rd_i32(def, WeaponDef::dtpInTime),
+            dtp_loop: rd_i32(def, WeaponDef::dtpLoopTime),
+            dtp_out: rd_i32(def, WeaponDef::dtpOutTime),
+            crawl_in: rd_i32(def, WeaponDef::crawlInTime),
+            crawl_forward: rd_i32(def, WeaponDef::crawlForwardTime),
+            crawl_back: rd_i32(def, WeaponDef::crawlBackTime),
+            crawl_right: rd_i32(def, WeaponDef::crawlRightTime),
+            crawl_left: rd_i32(def, WeaponDef::crawlLeftTime),
+            crawl_out_fire: rd_i32(def, WeaponDef::crawlOutFireTime),
+            crawl_out: rd_i32(def, WeaponDef::crawlOutTime),
+            slide_in: rd_i32(def, WeaponDef::slideInTime),
+            run_time_multiplier: f32::from_bits(rd_i32(def, WeaponDef::sprintDurationScale) as u32),
+            blocks_prone: def.get(WeaponDef::blocksProne).is_some_and(|&b| b != 0),
         }
     }
 }
@@ -130,18 +130,18 @@ fn current_anim(pm: &Pm) -> i32 {
     if pm.left() {
         pm.ps.weap_anim_left
     } else {
-        pm.ps.weap_anim
+        pm.ps.gun_clip
     }
 }
 
 /// Start `a` on the right hand unless the hand being run already plays it; with `left_too`,
 /// then the same for the left hand (tested again after the first write, as BO2 does).
 fn continue_on(pm: &mut Pm, a: i32, left_too: bool) {
-    if pm.env.pm_type >= pm_type::DEAD {
+    if pm.env.movement_mode >= movement_mode::DEAD {
         return;
     }
     if anim::number(current_anim(pm)) != a {
-        pm.ps.weap_anim = anim::start(pm.ps.weap_anim, a);
+        pm.ps.gun_clip = anim::start(pm.ps.gun_clip, a);
     }
     if left_too && anim::number(current_anim(pm)) != a {
         pm.ps.weap_anim_left = anim::start(pm.ps.weap_anim_left, a);
@@ -150,9 +150,9 @@ fn continue_on(pm: &mut Pm, a: i32, left_too: bool) {
 
 /// Right-hand state, timer and delay.
 fn set_right(pm: &mut Pm, st: i32, time: i32) {
-    pm.ps.weaponstate = st;
-    pm.ps.weapon_time = time;
-    pm.ps.weapon_delay = 0;
+    pm.ps.gun_phase = st;
+    pm.ps.gun_timer_ms = time;
+    pm.ps.weapon_ready_wait = 0;
 }
 
 /// The same state and timer on both hands (the dive moves both guns together).
@@ -166,9 +166,9 @@ fn set_both(pm: &mut Pm, st: i32, time: i32) {
 /// The hand being run has fired every shot its trigger pull allows.
 fn shot_limit_reached(pm: &Pm) -> bool {
     let core = pm.weapon_facts().core;
-    let count = pm.hand().shot_count as i64;
+    let count = pm.hand().rounds_fired as i64;
     match core.fire_type {
-        fire_type::STACKED => i64::from(core.clip_size) <= count,
+        fire_type::STACKED => i64::from(core.magazine_capacity) <= count,
         fire_type::CHARGESHOT => i64::from(pm.ps.charge_shot_level) <= count,
         fire_type::SINGLESHOT => count > 0,
         fire_type::BURSTFIRE2 => count > 1,
@@ -206,9 +206,9 @@ pub fn finish_night_vision_remove(pm: &mut Pm) {
 }
 
 fn finish_night_vision(pm: &mut Pm, st: i32) {
-    if pm.ps.weaponstate == st && pm.ps.weapon_time == 0 {
-        pm.ps.weaponstate = state::READY;
-        base::start_anim(pm, anim::IDLE, false);
+    if pm.ps.gun_phase == st && pm.ps.gun_timer_ms == 0 {
+        pm.ps.gun_phase = state::READY;
+        base::start_anim(pm, anim::REST, false);
     }
 }
 
@@ -222,17 +222,17 @@ pub fn check_for_sprint(pm: &mut Pm) {
     if no_gun(pm) {
         return;
     }
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     if attacking(s) || attacking(pm.ps.weaponstate_left) {
         return;
     }
     if switching(s) || offhand(s) || diving(s) || shield(s) || s == state::DETONATING {
         return;
     }
-    if pm.env.pm_flags & pmf::DTP_AIR != 0 {
+    if pm.env.movement_state_bits & pmf::DTP_AIR != 0 {
         return;
     }
-    let sprinting = pm.env.pm_flags & pmf::SPRINT != 0;
+    let sprinting = pm.env.movement_state_bits & pmf::SPRINT != 0;
     if sprinting && !(state::SPRINT_RAISE..=state::SPRINT_DROP).contains(&s) {
         sprint_raise(pm);
     } else if !sprinting && matches!(s, state::SPRINT_RAISE | state::SPRINT_LOOP) {
@@ -243,14 +243,14 @@ pub fn check_for_sprint(pm: &mut Pm) {
 fn sprint_raise(pm: &mut Pm) {
     let t = pm.weapon_facts().moves.sprint_in;
     set_right(pm, state::SPRINT_RAISE, t);
-    let a = pick(pm, anim::SPRINT_IN, anim::SPRINT_EMPTY_IN);
+    let a = pick(pm, anim::SPRINT_ENTER, anim::SPRINT_EMPTY_IN);
     start_both(pm, a);
 }
 
 /// Sprint_State_Loop (state SPRINT_RAISE ran out): hold the sprint pose.
 pub fn sprint_loop(pm: &mut Pm) {
     set_right(pm, state::SPRINT_LOOP, 0);
-    let a = pick(pm, anim::SPRINT_LOOP, anim::SPRINT_EMPTY_LOOP);
+    let a = pick(pm, anim::SPRINT_HOLD, anim::SPRINT_EMPTY_LOOP);
     start_both(pm, a);
 }
 
@@ -262,7 +262,7 @@ fn sprint_drop(pm: &mut Pm) {
         t = (t as f32 * pm.env.dvars.perk_sprint_recovery_multiplier) as i32;
     }
     set_right(pm, state::SPRINT_DROP, t);
-    let a = pick(pm, anim::SPRINT_OUT, anim::SPRINT_EMPTY_OUT);
+    let a = pick(pm, anim::SPRINT_EXIT, anim::SPRINT_EMPTY_OUT);
     start_both(pm, a);
 }
 
@@ -276,11 +276,11 @@ pub fn check_for_dtp(pm: &mut Pm) {
     if no_gun(pm) {
         return;
     }
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     if attacking(s) || switching(s) || offhand(s) || shield(s) || diving(s) {
         return;
     }
-    if pm.env.pm_flags & pmf::DTP_AIR == 0 {
+    if pm.env.movement_state_bits & pmf::DTP_AIR == 0 {
         return;
     }
     if !dtp_is_sliding(pm) {
@@ -304,7 +304,7 @@ pub fn dtp_loop(pm: &mut Pm) {
 
 /// Dtp_IsSliding: the dive has landed and is sliding along the ground.
 pub fn dtp_is_sliding(pm: &Pm) -> bool {
-    pm.env.dvars.dtp && pm.env.pm_flags & pmf::DTP_AIR != 0 && pm.env.jump_time < 0
+    pm.env.dvars.dtp && pm.env.movement_state_bits & pmf::DTP_AIR != 0 && pm.env.hop_start_ms < 0
 }
 
 /// Dtp_State_Out (state DTP_LOOP, once the dive lands): the guns come back up.
@@ -318,8 +318,8 @@ pub fn dtp_out(pm: &mut Pm) {
 /// Dtp_CanMove: just after a dive ends the player stays put for `dtp_post_move_pause` ms.
 fn dtp_can_move(pm: &Pm) -> bool {
     let env = &pm.env;
-    if env.dvars.dtp && env.pm_flags & pmf::DTP_AIR == 0 && env.last_dtp_end != 0 {
-        let since = (pm.cmd.server_time - env.last_dtp_end) as f32;
+    if env.dvars.dtp && env.movement_state_bits & pmf::DTP_AIR == 0 && env.last_dtp_end != 0 {
+        let since = (pm.cmd.authority_clock_ms - env.last_dtp_end) as f32;
         if since < env.dvars.dtp_post_move_pause {
             return false;
         }
@@ -336,12 +336,12 @@ pub fn check_for_slide(pm: &mut Pm) {
     if no_gun(pm) {
         return;
     }
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     if attacking(s) || switching(s) || offhand(s) || shield(s) || diving(s) || s == state::SLIDE_IN
     {
         return;
     }
-    if pm.env.pm_flags & pmf::SLIDE == 0 || pm.env.slide_time != pm.cmd.server_time {
+    if pm.env.movement_state_bits & pmf::SLIDE == 0 || pm.env.slide_time != pm.cmd.authority_clock_ms {
         return;
     }
     let t = pm.weapon_facts().moves.slide_in;
@@ -357,11 +357,11 @@ pub fn check_for_slide(pm: &mut Pm) {
 /// over, a gun still in MANTLE goes back to idle.
 pub fn check_for_mantle(pm: &mut Pm) {
     if pm.env.mantle_weapon_equipped {
-        if pm.ps.weaponstate == state::SPRINT_DROP {
-            pm.ps.weapon_time = 0;
+        if pm.ps.gun_phase == state::SPRINT_DROP {
+            pm.ps.gun_timer_ms = 0;
         }
         continue_on(pm, anim::MANTLE, false);
-    } else if pm.env.pm_flags & pmf::MANTLE == 0 && anim::number(pm.ps.weap_anim) == anim::MANTLE {
+    } else if pm.env.movement_state_bits & pmf::MANTLE == 0 && anim::number(pm.ps.gun_clip) == anim::MANTLE {
         base::idle(pm);
     }
 }
@@ -372,19 +372,19 @@ pub fn check_for_mantle(pm: &mut Pm) {
 
 /// PM_WeaponSwimIn (state SWIM_IN ran out): the gun is put away.
 pub fn swim_in(pm: &mut Pm) {
-    pm.add_event(events::EV_PUTAWAY_WEAPON);
-    if pm.ps.weap_flags & crate::player::wf::SWIM_LOWERED == 0 {
-        continue_on(pm, anim::DROP, false);
+    pm.add_event(EV_PUTAWAY_WEAPON);
+    if pm.ps.weapon_state_bits & crate::player::wf::SWIM_LOWERED == 0 {
+        continue_on(pm, anim::PUT_AWAY, false);
     } else {
-        base::start_anim(pm, anim::DROP, false);
+        base::start_anim(pm, anim::PUT_AWAY, false);
     }
 }
 
 /// PM_WeaponSwimOut (state SWIM_OUT ran out): the gun comes back up. No raise time is set, so
 /// RAISING finishes on the next tick.
 pub fn swim_out(pm: &mut Pm) {
-    pm.ps.weaponstate = state::RAISING;
-    pm.add_event(events::EV_RAISE_WEAPON);
+    pm.ps.gun_phase = state::RAISING;
+    pm.add_event(EV_RAISE_WEAPON);
     base::start_anim(pm, anim::RAISE, false);
 }
 
@@ -398,7 +398,7 @@ pub fn check_for_prone(pm: &mut Pm) {
     if pm.left() || no_gun(pm) {
         return;
     }
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     if attacking(s) || attacking(pm.ps.weaponstate_left) {
         return;
     }
@@ -412,7 +412,7 @@ pub fn check_for_prone(pm: &mut Pm) {
     {
         return;
     }
-    if pm.env.pm_flags & pmf::DTP_AIR != 0 {
+    if pm.env.movement_state_bits & pmf::DTP_AIR != 0 {
         return;
     }
 
@@ -427,23 +427,23 @@ pub fn check_for_prone(pm: &mut Pm) {
         pm.ps.b_run_left_gun = false;
     }
 
-    if ((fire_r && !limit_r) || (fire_l && !limit_l)) && crawling(pm.ps.weaponstate) {
+    if ((fire_r && !limit_r) || (fire_l && !limit_l)) && crawling(pm.ps.gun_phase) {
         crawl_out(pm, true);
     }
-    let prone = pm.env.pm_flags & pmf::PRONE != 0;
-    if !prone && (state::CRAWL_FORWARD..=state::CRAWL_LEFT).contains(&pm.ps.weaponstate) {
+    let prone = pm.env.movement_state_bits & pmf::LYING_FLAT != 0;
+    if !prone && (state::CRAWL_FORWARD..=state::CRAWL_LEFT).contains(&pm.ps.gun_phase) {
         crawl_out(pm, false);
     }
-    if fire_r && (!limit_r || crawl_or_out(pm.ps.weaponstate)) {
+    if fire_r && (!limit_r || crawl_or_out(pm.ps.gun_phase)) {
         return;
     }
-    if dual && fire_l && (!limit_l || crawl_or_out(pm.ps.weaponstate)) {
+    if dual && fire_l && (!limit_l || crawl_or_out(pm.ps.gun_phase)) {
         return;
     }
     if prone {
-        let moving = pm.cmd.forwardmove != 0 || pm.cmd.rightmove != 0;
+        let moving = pm.cmd.thrust_ahead != 0 || pm.cmd.thrust_lateral != 0;
         if moving {
-            if !crawl_or_out(pm.ps.weaponstate) {
+            if !crawl_or_out(pm.ps.gun_phase) {
                 crawl_in(pm);
             }
             return;
@@ -452,7 +452,7 @@ pub fn check_for_prone(pm: &mut Pm) {
             return;
         }
     }
-    if crawling(pm.ps.weaponstate) {
+    if crawling(pm.ps.gun_phase) {
         crawl_out(pm, false);
     }
 }
@@ -481,8 +481,8 @@ pub fn crawl_set_direction(pm: &mut Pm) {
     if wants_shot(pm) {
         return crawl_out(pm, true);
     }
-    let f = i32::from(pm.cmd.forwardmove);
-    let r = i32::from(pm.cmd.rightmove);
+    let f = i32::from(pm.cmd.thrust_ahead);
+    let r = i32::from(pm.cmd.thrust_lateral);
     let (st, a) = if 4 * f * f <= r * r {
         if r < 1 {
             (state::CRAWL_LEFT, anim::CRAWL_LEFT)
@@ -499,7 +499,7 @@ pub fn crawl_set_direction(pm: &mut Pm) {
     } else {
         a
     };
-    if pm.ps.weaponstate != st {
+    if pm.ps.gun_phase != st {
         set_right(pm, st, 0);
         start_both(pm, a);
     }
@@ -529,37 +529,37 @@ pub fn dtp_takeoff(pm: &mut Pm) {
     pm.out.scripts.push(AnimScript::DtpTakeoff);
 }
 
-/// The dive update on the ground: fires once, while DTP_AIR is still set and `jump_time` is
+/// The dive update on the ground: fires once, while DTP_AIR is still set and `hop_start_ms` is
 /// above 0. Returns true when it fired; the movement code then raises EV_DTP_LAND and sets
-/// `jump_time` below 0 (the landed slide).
+/// `hop_start_ms` below 0 (the landed slide).
 pub fn dtp_land(pm: &mut Pm) -> bool {
     let e = &pm.env;
-    if !(e.dvars.dtp && e.pm_flags & pmf::DTP_AIR != 0 && e.jump_time > 0) {
+    if !(e.dvars.dtp && e.movement_state_bits & pmf::DTP_AIR != 0 && e.hop_start_ms > 0) {
         return false;
     }
     pm.out.scripts.push(AnimScript::DtpLand);
     true
 }
 
-/// Footsteps: moving at run speed with the stick let go. `xyspeed` = horizontal speed.
-pub fn run_to_idle(pm: &mut Pm, xyspeed: f32) -> bool {
+/// Footsteps: moving at run speed with the stick let go. `ground_velocity` = horizontal speed.
+pub fn run_to_idle(pm: &mut Pm, ground_velocity: f32) -> bool {
     let e = &pm.env;
-    let f = e.pm_flags;
-    let in_air = !e.on_ground
+    let f = e.movement_state_bits;
+    let in_air = !e.grounded_now
         && e.waterlevel == 0
         && f & (pmf::DTP_AIR | pmf::SLIDE) == 0
         && f & pmf::MANTLE == 0;
-    let moving = (xyspeed >= MOVE_THRESHOLD && e.pm_type != pm_type::NORMAL_LINKED)
+    let moving = (ground_velocity >= MOVE_THRESHOLD && e.movement_mode != movement_mode::NORMAL_LINKED)
         || f & (pmf::SLIDE | pmf::MANTLE) != 0;
-    let fires = e.pm_type < pm_type::DEAD
+    let fires = e.movement_mode < movement_mode::DEAD
         // eFlags 0x300: BO2 holds the legs idle and skips footsteps.
-        && e.e_flags & 0x300 == 0
+        && e.ent_bits & 0x300 == 0
         && !in_air
         && moving
-        && pm.cmd.forwardmove == 0
-        && pm.cmd.rightmove == 0
+        && pm.cmd.thrust_ahead == 0
+        && pm.cmd.thrust_lateral == 0
         && f & (pmf::SLIDE | pmf::DTP_AIR) == 0
-        && xyspeed >= RUN_THRESHOLD;
+        && ground_velocity >= RUN_THRESHOLD;
     if fires {
         pm.out.scripts.push(AnimScript::RunToIdle);
     }
@@ -567,30 +567,30 @@ pub fn run_to_idle(pm: &mut Pm, xyspeed: f32) -> bool {
 }
 
 // Sprint button rules. The movement code asks these before it starts or keeps a sprint; the
-// weapon only answers. Buttons are read as BO2 sends them: CROUCH / PRONE carry the stance the
+// weapon only answers. Buttons are read as BO2 sends them: DUCK_BUTTON_BIT / LYING_FLAT carry the stance the
 // player wants (BO2 adds the current stance to every command), not only the key.
 
 /// `player_sprintForwardMinimum` (BO2 default): the stick must push forward past this.
 const SPRINT_FORWARD_MINIMUM: i32 = 105;
-/// pm_flags bits these rules test whose meaning is not identified yet.
+/// movement_state_bits bits these rules test whose meaning is not identified yet.
 const PMF_GATE_4000: u32 = 0x4000;
 const PMF_GATE_10000: u32 = 0x1_0000;
 const PMF_GATE_40000: u32 = 0x4_0000;
 
 /// Buttons that stop a sprint from starting or going on, in BO2 MP: jump, reload, melee,
 /// attack, use-reload, lethal, tactical.
-const SPRINT_BREAKERS: u32 = button::JUMP
-    | button::RELOAD
-    | button::MELEE
-    | button::ATTACK
-    | button::USE_RELOAD
-    | button::FRAG
-    | button::SMOKE;
+const SPRINT_BREAKERS: u32 = button::LEAP
+    | button::REFILL_BIT
+    | button::CLOSE_COMBAT
+    | button::FIRE_BIT
+    | button::INTERACT_RELOAD_KEY
+    | button::SAMPLE_FRAG_ASSET
+    | button::OBSCURANT;
 
 /// Zombies keeps only melee, attack and ads-throw as breakers (BO2 tests this with the default
 /// forward minimum, which is above 0).
 fn zombies_breaks(buttons: u32) -> bool {
-    buttons & (button::MELEE | button::ATTACK | button::TOGGLE_ADS) != 0
+    buttons & (button::CLOSE_COMBAT | button::FIRE_BIT | button::TOGGLE_ADS) != 0
 }
 
 /// ADS-throw pressed with a held weapon that is not equipment.
@@ -614,48 +614,48 @@ fn melee_offhand_or_shield(s: i32) -> bool {
 /// next sprint.
 pub fn update_sprint_flag(pm: &mut Pm, up_required: &mut bool, pm_time: i32) {
     let held = pm.cmd.held(button::SPRINT);
-    if *up_required && !held && pm.env.pm_flags & pmf::NO_FIRE == 0 {
+    if *up_required && !held && pm.env.movement_state_bits & pmf::NO_FIRE == 0 {
         *up_required = false;
     }
-    let sprinting = pm.env.pm_flags & pmf::SPRINT != 0;
-    let alive = matches!(pm.env.pm_type, pm_type::NORMAL | pm_type::NORMAL_LINKED);
-    let low_ready = (state::LOWREADY_RAISE..=state::LOWREADY_DROP).contains(&pm.ps.weaponstate);
+    let is_sprinting = pm.env.movement_state_bits & pmf::SPRINT != 0;
+    let alive = matches!(pm.env.movement_mode, movement_mode::NORMAL | movement_mode::NORMAL_LINKED);
+    let low_ready = (state::LOWREADY_RAISE..=state::LOWREADY_DROP).contains(&pm.ps.gun_phase);
     let end = if !alive || low_ready {
-        sprinting
-    } else if sprinting {
+        is_sprinting
+    } else if is_sprinting {
         sprint_ending_buttons(pm, 0.0)
     } else {
         if held
             && !*up_required
-            && pm.env.pm_flags & PMF_GATE_40000 == 0
+            && pm.env.movement_state_bits & PMF_GATE_40000 == 0
             && !sprint_start_interfering_buttons(
                 pm,
-                pm.cmd.forwardmove,
+                pm.cmd.thrust_ahead,
                 pm.cmd.buttons,
                 0.0,
                 pm_time,
             )
         {
-            pm.env.pm_flags |= pmf::SPRINT;
+            pm.env.movement_state_bits |= pmf::SPRINT;
         }
         false
     };
     if end {
-        pm.env.pm_flags &= !pmf::SPRINT;
+        pm.env.movement_state_bits &= !pmf::SPRINT;
         if held {
             *up_required = true;
         }
     }
 }
 
-/// PM_SprintEndingButtons: true = this command ends the running sprint. `leanf` is the lean
+/// PM_SprintEndingButtons: true = this command ends the running sprint. `tilt_sideways` is the lean
 /// fraction (BO2 MP has no lean key, so it stays 0).
-pub fn sprint_ending_buttons(pm: &Pm, leanf: f32) -> bool {
+pub fn sprint_ending_buttons(pm: &Pm, tilt_sideways: f32) -> bool {
     let e = &pm.env;
-    if e.waterlevel > 1 || e.pm_flags & (PMF_GATE_10000 | pmf::LADDER | pmf::ADS) != 0 {
+    if e.waterlevel > 1 || e.movement_state_bits & (PMF_GATE_10000 | pmf::LADDER | pmf::ADS) != 0 {
         return true;
     }
-    if i32::from(pm.cmd.forwardmove) <= SPRINT_FORWARD_MINIMUM {
+    if i32::from(pm.cmd.thrust_ahead) <= SPRINT_FORWARD_MINIMUM {
         return true;
     }
     let b = pm.cmd.buttons;
@@ -665,50 +665,50 @@ pub fn sprint_ending_buttons(pm: &Pm, leanf: f32) -> bool {
     if b & SPRINT_BREAKERS != 0 {
         return true;
     }
-    if b & button::PRONE != 0 && !pm.weapon_facts().moves.blocks_prone {
+    if b & button::LYING_FLAT != 0 && !pm.weapon_facts().moves.blocks_prone {
         return true;
     }
-    if b & button::CROUCH != 0 || leanf != 0.0 || ads_throw_breaks(pm, b) {
+    if b & button::DUCK_BUTTON_BIT != 0 || tilt_sideways != 0.0 || ads_throw_breaks(pm, b) {
         return true;
     }
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     if melee_offhand_or_shield(s)
         || matches!(s, state::NIGHTVISION_WEAR | state::NIGHTVISION_REMOVE)
     {
         return true;
     }
-    e.pm_flags & pmf::SLIDE != 0 || e.pm_flags & PMF_GATE_40000 != 0
+    e.movement_state_bits & pmf::SLIDE != 0 || e.movement_state_bits & PMF_GATE_40000 != 0
 }
 
 /// PM_SprintStartInterferingButtons: true = a sprint may not start with this command.
 /// `pm_time` is the movement timer (BO2 `pm_time`).
 pub fn sprint_start_interfering_buttons(
     pm: &Pm,
-    forwardmove: i8,
-    buttons: u32,
-    leanf: f32,
+    thrust_ahead: i8,
+    held_buttons: u32,
+    tilt_sideways: f32,
     pm_time: i32,
 ) -> bool {
     let e = &pm.env;
-    if e.pm_flags & pmf::LADDER != 0 || e.waterlevel > 1 {
+    if e.movement_state_bits & pmf::LADDER != 0 || e.waterlevel > 1 {
         return true;
     }
-    if i32::from(forwardmove) <= SPRINT_FORWARD_MINIMUM {
+    if i32::from(thrust_ahead) <= SPRINT_FORWARD_MINIMUM {
         return true;
     }
     if e.zombies {
-        return zombies_breaks(buttons);
+        return zombies_breaks(held_buttons);
     }
-    if buttons & SPRINT_BREAKERS != 0 || ads_throw_breaks(pm, buttons) {
+    if held_buttons & SPRINT_BREAKERS != 0 || ads_throw_breaks(pm, held_buttons) {
         return true;
     }
-    if leanf != 0.0 || e.pm_flags & (PMF_GATE_10000 | pmf::ADS | pmf::LADDER | pmf::MANTLE) != 0 {
+    if tilt_sideways != 0.0 || e.movement_state_bits & (PMF_GATE_10000 | pmf::ADS | pmf::LADDER | pmf::MANTLE) != 0 {
         return true;
     }
-    if e.pm_flags & PMF_GATE_4000 != 0 && pm_time == 0 {
+    if e.movement_state_bits & PMF_GATE_4000 != 0 && pm_time == 0 {
         return false;
     }
-    let s = pm.ps.weaponstate;
+    let s = pm.ps.gun_phase;
     if melee_offhand_or_shield(s) {
         return true;
     }
@@ -721,7 +721,7 @@ pub fn sprint_start_interfering_buttons(
     {
         return true;
     }
-    e.pm_flags & pmf::SLIDE != 0 || e.pm_flags & pmf::DTP_AIR != 0
+    e.movement_state_bits & pmf::SLIDE != 0 || e.movement_state_bits & pmf::DTP_AIR != 0
 }
 
 #[cfg(test)]
@@ -732,8 +732,8 @@ mod tests {
     use crate::facts::{FactsTable, T6WeaponFacts};
     use crate::player::T6WeaponPs;
     use crate::pm::FrameOut;
-    use crate::trace::Runner;
-    use crate::{anim, events, state, tick};
+    use crate::trace::ScenarioDriver;
+    use {crate::anim, crate::events, crate::state, crate::tick};
 
     /// The AN-94 and Kard with their patch-zone numbers (SPRINT.md section 10); 50 ms ticks.
     fn facts() -> FactsTable {
@@ -753,7 +753,7 @@ mod tests {
             crawl_out_fire: 48,
             crawl_out: 100,
             slide_in: 500,
-            sprint_duration_scale: 1.0,
+            run_time_multiplier: 1.0,
             blocks_prone: false,
         };
         let kard = MoveFacts {
@@ -767,7 +767,7 @@ mod tests {
         };
         for (i, name, m) in [(1u32, "an94_mp", an94), (2, "kard_mp", kard)] {
             let mut f = T6WeaponFacts::default();
-            f.core.clip_size = 30;
+            f.core.magazine_capacity = 30;
             f.switch.raise = 500;
             f.switch.drop = 400;
             f.moves = m;
@@ -778,8 +778,8 @@ mod tests {
 
     fn run(script: &str) -> String {
         let facts = facts();
-        let r = Runner::new(&facts).run_script(script).expect("script runs");
-        let text = r.lines.join("\n");
+        let r = ScenarioDriver::new(&facts).run_script(script).expect("script runs");
+        let text = r.log_rows.join("\n");
         assert_eq!(r.failures, 0, "{text}");
         text
     }
@@ -807,7 +807,7 @@ mod tests {
                     ..T6Env::default()
                 },
                 cmd: T6Cmd {
-                    msec: 50,
+                    frame_ms: 50,
                     weapon: 1,
                     ..T6Cmd::default()
                 },
@@ -815,7 +815,7 @@ mod tests {
         }
 
         fn step(&mut self) -> FrameOut {
-            self.cmd.server_time += self.cmd.msec;
+            self.cmd.authority_clock_ms += self.cmd.frame_ms;
             tick::run(&mut self.ps, &self.cmd, &mut self.env, &self.facts)
         }
 
@@ -1042,24 +1042,24 @@ mod tests {
     #[test]
     fn mantle_cuts_the_sprint_drop_and_holds_mantle() {
         let mut b = Bench::new();
-        b.env.pm_flags = pmf::SPRINT;
+        b.env.movement_state_bits = pmf::SPRINT;
         b.steps(6);
-        b.env.pm_flags = 0;
+        b.env.movement_state_bits = 0;
         b.step();
-        assert_eq!(b.ps.weaponstate, state::SPRINT_DROP);
+        assert_eq!(b.ps.gun_phase, state::SPRINT_DROP);
         b.env.mantle_weapon_equipped = true;
-        b.env.pm_flags = pmf::MANTLE;
+        b.env.movement_state_bits = pmf::MANTLE;
         b.step();
-        assert_eq!(b.ps.weaponstate, state::READY, "the drop is cut short");
+        assert_eq!(b.ps.gun_phase, state::READY, "the drop is cut short");
         b.step();
-        assert_eq!(anim::number(b.ps.weap_anim), anim::MANTLE);
-        let held = b.ps.weap_anim;
+        assert_eq!(anim::number(b.ps.gun_clip), anim::MANTLE);
+        let held = b.ps.gun_clip;
         b.step();
-        assert_eq!(b.ps.weap_anim, held, "held, not restarted");
+        assert_eq!(b.ps.gun_clip, held, "held, not restarted");
         b.env.mantle_weapon_equipped = false;
-        b.env.pm_flags = 0;
+        b.env.movement_state_bits = 0;
         b.step();
-        assert_eq!(anim::number(b.ps.weap_anim), anim::IDLE);
+        assert_eq!(anim::number(b.ps.gun_clip), anim::REST);
     }
 
     #[test]
@@ -1069,14 +1069,14 @@ mod tests {
         b.env.dvars.player_disable_weapons_in_water = true;
         b.env.waterlevel = 4;
         let out = b.step();
-        assert_eq!(b.ps.weaponstate, state::SWIM_IN);
-        assert_eq!(anim::number(b.ps.weap_anim), anim::DROP);
+        assert_eq!(b.ps.gun_phase, state::SWIM_IN);
+        assert_eq!(anim::number(b.ps.gun_clip), anim::PUT_AWAY);
         assert!(out.events.iter().any(|e| e.id == events::EV_PUTAWAY_WEAPON));
         b.steps(5);
-        assert_eq!(b.ps.weaponstate, state::SWIM_IN);
+        assert_eq!(b.ps.gun_phase, state::SWIM_IN);
         b.env.waterlevel = 0;
         b.step();
-        assert_eq!(b.ps.weaponstate, state::SWIM_OUT);
+        assert_eq!(b.ps.gun_phase, state::SWIM_OUT);
         let mut ticks = 0;
         loop {
             ticks += 1;
@@ -1088,10 +1088,10 @@ mod tests {
         }
         // The water block sets 1000 ms before the timer step of the same tick: 1 + 19 ticks.
         assert_eq!(ticks, 19, "SWIM_OUT runs 1000 ms");
-        assert_eq!(b.ps.weaponstate, state::RAISING);
-        assert_eq!(anim::number(b.ps.weap_anim), anim::RAISE);
+        assert_eq!(b.ps.gun_phase, state::RAISING);
+        assert_eq!(anim::number(b.ps.gun_clip), anim::RAISE);
         b.step();
-        assert_eq!(b.ps.weaponstate, state::READY, "no extra raise time");
+        assert_eq!(b.ps.gun_phase, state::READY, "no extra raise time");
     }
 
     #[test]
@@ -1114,23 +1114,23 @@ mod tests {
             super::dtp_takeoff(pm);
             true
         });
-        b.env.pm_flags = pmf::DTP_AIR;
-        b.env.jump_time = 0;
+        b.env.movement_state_bits = pmf::DTP_AIR;
+        b.env.hop_start_ms = 0;
         assert!(!hook(&mut b, &|pm| super::dtp_land(pm)));
-        b.env.jump_time = 1000;
+        b.env.hop_start_ms = 1000;
         assert!(hook(&mut b, &|pm| super::dtp_land(pm)));
         // Run-to-idle: on the ground, stick let go, at run speed (110) or faster.
-        b.env.pm_flags = 0;
-        b.env.on_ground = true;
+        b.env.movement_state_bits = 0;
+        b.env.grounded_now = true;
         assert!(!hook(&mut b, &|pm| super::run_to_idle(pm, 109.0)));
         assert!(hook(&mut b, &|pm| super::run_to_idle(pm, 190.0)));
-        b.cmd.forwardmove = 127;
+        b.cmd.thrust_ahead = 127;
         assert!(!hook(&mut b, &|pm| super::run_to_idle(pm, 190.0)));
-        b.cmd.forwardmove = 0;
-        b.env.on_ground = false;
+        b.cmd.thrust_ahead = 0;
+        b.env.grounded_now = false;
         assert!(!hook(&mut b, &|pm| super::run_to_idle(pm, 190.0)));
-        use events::AnimScript as A;
-        assert_eq!(out.scripts, vec![A::DtpTakeoff, A::DtpLand, A::RunToIdle]);
+        use events::AnimScript;
+        assert_eq!(out.scripts, vec![AnimScript::DtpTakeoff, AnimScript::DtpLand, AnimScript::RunToIdle]);
     }
 
     #[test]
@@ -1149,73 +1149,73 @@ mod tests {
             f(&pm)
         };
         let ends = |pm: &crate::pm::Pm| super::sprint_ending_buttons(pm, 0.0);
-        b.ps.weaponstate = state::READY;
-        b.cmd.forwardmove = 127;
+        b.ps.gun_phase = state::READY;
+        b.cmd.thrust_ahead = 127;
         assert!(
             !ask(&mut b, &ends),
             "full stick, no buttons: sprint goes on"
         );
-        b.cmd.forwardmove = 105;
+        b.cmd.thrust_ahead = 105;
         assert!(ask(&mut b, &ends), "105 is not past the forward minimum");
-        b.cmd.forwardmove = 127;
+        b.cmd.thrust_ahead = 127;
         for bit in [
-            button::ATTACK,
-            button::MELEE,
-            button::RELOAD,
-            button::USE_RELOAD,
-            button::JUMP,
-            button::FRAG,
-            button::SMOKE,
-            button::CROUCH,
-            button::PRONE,
+            button::FIRE_BIT,
+            button::CLOSE_COMBAT,
+            button::REFILL_BIT,
+            button::INTERACT_RELOAD_KEY,
+            button::LEAP,
+            button::SAMPLE_FRAG_ASSET,
+            button::OBSCURANT,
+            button::DUCK_BUTTON_BIT,
+            button::LYING_FLAT,
             button::TOGGLE_ADS,
         ] {
             b.cmd.buttons = bit;
             assert!(ask(&mut b, &ends), "button {bit:#x} ends the sprint");
         }
-        b.cmd.buttons = button::USE;
+        b.cmd.buttons = button::INTERACT_KEY;
         assert!(!ask(&mut b, &ends), "use does not");
         b.cmd.buttons = 0;
-        b.env.pm_flags = pmf::ADS;
+        b.env.movement_state_bits = pmf::ADS;
         assert!(ask(&mut b, &ends));
-        b.env.pm_flags = pmf::SLIDE;
+        b.env.movement_state_bits = pmf::SLIDE;
         assert!(ask(&mut b, &ends));
-        b.env.pm_flags = 0;
-        b.ps.weaponstate = state::MELEE_INIT;
+        b.env.movement_state_bits = 0;
+        b.ps.gun_phase = state::MELEE_INIT;
         assert!(ask(&mut b, &ends));
-        b.ps.weaponstate = state::RELOADING;
+        b.ps.gun_phase = state::RELOADING;
         assert!(!ask(&mut b, &ends), "a reload in progress does not end it");
         // Zombies: only melee, attack and ads-throw.
         b.env.zombies = true;
-        b.cmd.buttons = button::RELOAD;
+        b.cmd.buttons = button::REFILL_BIT;
         assert!(!ask(&mut b, &ends));
-        b.cmd.buttons = button::ATTACK;
+        b.cmd.buttons = button::FIRE_BIT;
         assert!(ask(&mut b, &ends));
         b.env.zombies = false;
         b.cmd.buttons = 0;
 
-        let starts_blocked = |fwd: i8, buttons: u32, pm_time: i32| {
+        let starts_blocked = |fwd: i8, held: u32, pm_time: i32| {
             move |pm: &crate::pm::Pm| {
-                super::sprint_start_interfering_buttons(pm, fwd, buttons, 0.0, pm_time)
+                super::sprint_start_interfering_buttons(pm, fwd, held, 0.0, pm_time)
             }
         };
-        b.ps.weaponstate = state::READY;
+        b.ps.gun_phase = state::READY;
         assert!(!ask(&mut b, &starts_blocked(127, 0, 0)));
         assert!(ask(&mut b, &starts_blocked(100, 0, 0)));
-        assert!(ask(&mut b, &starts_blocked(127, button::ATTACK, 0)));
+        assert!(ask(&mut b, &starts_blocked(127, button::FIRE_BIT, 0)));
         assert!(
-            !ask(&mut b, &starts_blocked(127, button::CROUCH, 0)),
+            !ask(&mut b, &starts_blocked(127, button::DUCK_BUTTON_BIT, 0)),
             "crouch held may start"
         );
-        b.ps.weaponstate = state::FIRING;
+        b.ps.gun_phase = state::FIRING;
         assert!(
             !ask(&mut b, &starts_blocked(127, 0, 0)),
             "a gun mid-shot may start a sprint"
         );
-        b.env.pm_flags = pmf::DTP_AIR;
-        b.ps.weaponstate = state::READY;
+        b.env.movement_state_bits = pmf::DTP_AIR;
+        b.ps.gun_phase = state::READY;
         assert!(ask(&mut b, &starts_blocked(127, 0, 0)));
-        b.env.pm_flags = super::PMF_GATE_4000 | pmf::DTP_AIR;
+        b.env.movement_state_bits = super::PMF_GATE_4000 | pmf::DTP_AIR;
         assert!(
             !ask(&mut b, &starts_blocked(127, 0, 0)),
             "0x4000 with pm_time 0 allows it"
@@ -1230,20 +1230,20 @@ mod tests {
         b.ps.give(2);
         b.ps.set_clip_slot(2, 30);
         b.step();
-        b.env.pm_flags = pmf::PRONE;
+        b.env.movement_state_bits = pmf::LYING_FLAT;
         b.cmd.weapon = 2;
         b.step();
-        assert!(state::is_dropping(b.ps.weaponstate));
-        assert_ne!(b.env.pm_flags & pmf::PRONE_MOVE_OVERRIDE, 0, "set at the drop");
-        b.env.pm_flags = pmf::PRONE;
+        assert!(state::is_dropping(b.ps.gun_phase));
+        assert_ne!(b.env.movement_state_bits & pmf::PRONE_MOVE_OVERRIDE, 0, "set at the drop");
+        b.env.movement_state_bits = pmf::LYING_FLAT;
         for _ in 0..20 {
             b.step();
-            if state::is_raising(b.ps.weaponstate) {
+            if state::is_raising(b.ps.gun_phase) {
                 break;
             }
         }
-        assert!(state::is_raising(b.ps.weaponstate));
-        assert_ne!(b.env.pm_flags & pmf::PRONE_MOVE_OVERRIDE, 0, "set again at the raise");
+        assert!(state::is_raising(b.ps.gun_phase));
+        assert_ne!(b.env.movement_state_bits & pmf::PRONE_MOVE_OVERRIDE, 0, "set again at the raise");
 
         // Standing: the same switch leaves the flag alone.
         let mut b = Bench::new();
@@ -1251,7 +1251,7 @@ mod tests {
         b.step();
         b.cmd.weapon = 2;
         b.step();
-        assert!(state::is_dropping(b.ps.weaponstate));
-        assert_eq!(b.env.pm_flags & pmf::PRONE_MOVE_OVERRIDE, 0);
+        assert!(state::is_dropping(b.ps.gun_phase));
+        assert_eq!(b.env.movement_state_bits & pmf::PRONE_MOVE_OVERRIDE, 0);
     }
 }

@@ -10,8 +10,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::value::{Closure, Native, Table, TableRef, UpVal, Value, format_number};
-use crate::{Const, Proto, decode};
+use crate::value::{Closure, Native, LuaTable, UpVal, Value, format_number};
+use crate::{Proto, Const, decode};
 
 #[derive(Clone, Debug)]
 pub struct LuaError {
@@ -23,8 +23,8 @@ pub struct LuaError {
 }
 
 impl LuaError {
-    pub fn new(msg: impl Into<String>) -> Self {
-        let msg = msg.into();
+    pub fn new(why: impl Into<String>) -> Self {
+        let msg = why.into();
         LuaError {
             value: Value::str(&msg),
             msg,
@@ -43,21 +43,19 @@ impl std::fmt::Display for LuaError {
     }
 }
 
-type Res<T> = Result<T, LuaError>;
-
 /// Fields per SETLIST flush (Lua 5.1's LFIELDS_PER_FLUSH).
 const FIELDS_PER_FLUSH: usize = 50;
 const MAX_DEPTH: usize = 220;
 
 pub struct Vm {
-    pub globals: TableRef,
+    pub globals: Rc<RefCell<LuaTable>>,
     pub stack: Vec<Value>,
     open: Vec<(usize, Rc<RefCell<UpVal>>)>,
     /// Constants as values, per function (the function kept alive with
     /// them: its address is the key).
     consts: HashMap<*const Proto, (Rc<Proto>, Rc<[Value]>)>,
-    pub string_meta: Option<TableRef>,
-    depth: usize,
+    pub string_meta: Option<Rc<RefCell<LuaTable>>>,
+    call_depth: usize,
     /// Instructions run (a guard against runaway loops in tests).
     pub steps: u64,
     pub step_limit: u64,
@@ -72,12 +70,12 @@ impl Default for Vm {
 impl Vm {
     pub fn new() -> Self {
         Vm {
-            globals: Table::new_ref(),
+            globals: LuaTable::new_ref(),
             stack: Vec::with_capacity(1024),
             open: Vec::new(),
             consts: HashMap::new(),
             string_meta: None,
-            depth: 0,
+            call_depth: 0,
             steps: 0,
             step_limit: u64::MAX,
         }
@@ -86,7 +84,7 @@ impl Vm {
     pub fn native(
         &self,
         name: &'static str,
-        f: impl Fn(&mut Vm, Vec<Value>) -> Res<Vec<Value>> + 'static,
+        f: impl Fn(&mut Vm, Vec<Value>) -> Result<Vec<Value>, LuaError> + 'static,
     ) -> Value {
         Value::Native(Rc::new(Native {
             name,
@@ -112,7 +110,7 @@ impl Vm {
 
     fn konst(&mut self, p: &Rc<Proto>) -> Rc<[Value]> {
         let key = Rc::as_ptr(p);
-        if let Some((_, k)) = self.consts.get(&key) {
+        if let Some((_owner, k)) = self.consts.get(&key) {
             return k.clone();
         }
         let k: Rc<[Value]> = p
@@ -120,7 +118,7 @@ impl Vm {
             .iter()
             .map(|c| match c {
                 Const::Nil => Value::Nil,
-                Const::Bool(b) => Value::Bool(*b),
+                Const::Boolean(b) => Value::Boolean(*b),
                 Const::Number(n) => Value::Num(*n),
                 Const::String(s) => Value::Str(Rc::from(String::from_utf8_lossy(s).as_ref())),
             })
@@ -131,7 +129,7 @@ impl Vm {
 
     // ---- metatables -----------------------------------------------------
 
-    pub fn metatable(&self, v: &Value) -> Option<TableRef> {
+    pub fn metatable(&self, v: &Value) -> Option<Rc<RefCell<LuaTable>>> {
         match v {
             Value::Table(t) => t.borrow().meta.clone(),
             Value::Str(_) => self.string_meta.clone(),
@@ -146,12 +144,12 @@ impl Vm {
     }
 
     /// `t[k]` with `__index`.
-    pub fn index(&mut self, t: &Value, k: &Value) -> Res<Value> {
+    pub fn lookup_index(&mut self, t: &Value, k: &Value) -> Result<Value, LuaError> {
         let mut t = t.clone();
         for _ in 0..100 {
             let handler = match &t {
                 Value::Table(tab) => {
-                    let v = tab.borrow().get(k);
+                    let v = tab.borrow().read_key(k);
                     if !matches!(v, Value::Nil) {
                         return Ok(v);
                     }
@@ -184,12 +182,12 @@ impl Vm {
     }
 
     /// `t[k] = v` with `__newindex`.
-    pub fn set_index(&mut self, t: &Value, k: Value, v: Value) -> Res<()> {
+    pub fn set_index(&mut self, t: &Value, k: Value, v: Value) -> Result<(), LuaError> {
         let mut t = t.clone();
         for _ in 0..100 {
             let handler = match &t {
                 Value::Table(tab) => {
-                    let present = !matches!(tab.borrow().get(&k), Value::Nil);
+                    let present = !matches!(tab.borrow().read_key(&k), Value::Nil);
                     let h = if present {
                         Value::Nil
                     } else {
@@ -199,7 +197,7 @@ impl Vm {
                         if matches!(k, Value::Nil) {
                             return Err(LuaError::new("table index is nil"));
                         }
-                        tab.borrow_mut().set(k, v);
+                        tab.borrow_mut().store(k, v);
                         return Ok(());
                     }
                     h
@@ -226,7 +224,7 @@ impl Vm {
         Err(LuaError::new("'__newindex' chain too long"))
     }
 
-    fn arith(&mut self, op: u8, a: &Value, b: &Value) -> Res<Value> {
+    fn arith(&mut self, op: u8, a: &Value, b: &Value) -> Result<Value, LuaError> {
         if let (Some(x), Some(y)) = (a.as_num(), b.as_num()) {
             return Ok(Value::Num(match op {
                 b'+' => x + y,
@@ -265,7 +263,7 @@ impl Vm {
             .unwrap_or(Value::Nil))
     }
 
-    pub fn equals(&mut self, a: &Value, b: &Value) -> Res<bool> {
+    pub fn equals(&mut self, a: &Value, b: &Value) -> Result<bool, LuaError> {
         if a.raw_eq(b) {
             return Ok(true);
         }
@@ -286,7 +284,7 @@ impl Vm {
             .is_some_and(Value::truthy))
     }
 
-    fn less(&mut self, a: &Value, b: &Value, or_equal: bool) -> Res<bool> {
+    fn less(&mut self, a: &Value, b: &Value, or_equal: bool) -> Result<bool, LuaError> {
         match (a, b) {
             (Value::Num(x), Value::Num(y)) => Ok(if or_equal { x <= y } else { x < y }),
             (Value::Str(x), Value::Str(y)) => Ok(if or_equal { x <= y } else { x < y }),
@@ -308,7 +306,7 @@ impl Vm {
         }
     }
 
-    pub fn tostring(&mut self, v: &Value) -> Res<String> {
+    pub fn tostring(&mut self, v: &Value) -> Result<String, LuaError> {
         let h = self.metamethod(v, "__tostring");
         if !matches!(h, Value::Nil) {
             let r = self.call(h, vec![v.clone()])?;
@@ -317,7 +315,7 @@ impl Vm {
         Ok(v.to_string())
     }
 
-    fn concat(&mut self, a: &Value, b: &Value) -> Res<Value> {
+    fn concat(&mut self, a: &Value, b: &Value) -> Result<Value, LuaError> {
         let piece = |v: &Value| match v {
             Value::Str(s) => Some(s.to_string()),
             Value::Num(n) => Some(format_number(*n)),
@@ -344,7 +342,7 @@ impl Vm {
             .unwrap_or(Value::Nil))
     }
 
-    fn length(&mut self, v: &Value) -> Res<Value> {
+    fn length(&mut self, v: &Value) -> Result<Value, LuaError> {
         match v {
             Value::Str(s) => Ok(Value::Num(s.len() as f32)),
             Value::Table(t) => Ok(Value::Num(t.borrow().len() as f32)),
@@ -368,10 +366,10 @@ impl Vm {
     // ---- calls -------------------------------------------------------------
 
     /// Call any callable with arguments; all results.
-    pub fn call(&mut self, f: Value, args: Vec<Value>) -> Res<Vec<Value>> {
+    pub fn call(&mut self, f: Value, args: Vec<Value>) -> Result<Vec<Value>, LuaError> {
         match f {
             Value::Native(n) => (n.f)(self, args),
-            Value::Func(c) => self.run(c, args),
+            Value::Func(c) => self.run_closure(c, args),
             other => {
                 let h = self.metamethod(&other, "__call");
                 if matches!(h, Value::Nil) {
@@ -400,7 +398,7 @@ impl Vm {
     }
 
     fn find_upval(&mut self, at: usize) -> Rc<RefCell<UpVal>> {
-        if let Some((_, uv)) = self.open.iter().rev().find(|(i, _)| *i == at) {
+        if let Some((_slot, uv)) = self.open.iter().rev().find(|(i, _)| *i == at) {
             return uv.clone();
         }
         let uv = Rc::new(RefCell::new(UpVal::Open(at)));
@@ -410,32 +408,32 @@ impl Vm {
         uv
     }
 
-    fn run(&mut self, closure: Rc<Closure>, args: Vec<Value>) -> Res<Vec<Value>> {
-        if self.depth >= MAX_DEPTH {
+    fn run_closure(&mut self, closure: Rc<Closure>, args: Vec<Value>) -> Result<Vec<Value>, LuaError> {
+        if self.call_depth >= MAX_DEPTH {
             return Err(LuaError::new("stack overflow"));
         }
-        self.depth += 1;
+        self.call_depth += 1;
         let base = self.stack.len();
-        let r = self.execute(closure, args, base);
+        let r = self.run_frames(closure, args, base);
         self.close_upvals(base);
         self.stack.truncate(base);
-        self.depth -= 1;
+        self.call_depth -= 1;
         r
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn execute(
+    #[allow(clippy::too_many_lines, reason = "the whole opcode switch")]
+    fn run_frames(
         &mut self,
         mut cl: Rc<Closure>,
         mut args: Vec<Value>,
-        base: usize,
-    ) -> Res<Vec<Value>> {
+        frame_base: usize,
+    ) -> Result<Vec<Value>, LuaError> {
         'call: loop {
             let p = cl.proto.clone();
             // T6LUA_CALLS=<hash>/<index>,...: say when those functions run
             // (debugging aid).
             if let Some(want) = traced_functions()
-                && (want.contains(&(p.name_hash, p.index)) || want.contains(&(0, 0)))
+                && (want.contains(&(p.label_digest, p.index)) || want.contains(&(0, 0)))
             {
                 let a: Vec<String> = args
                     .iter()
@@ -445,7 +443,7 @@ impl Vm {
                         None => format!("{v:?}"),
                     })
                     .collect();
-                println!("  enter {:08x}/{} ({})", p.name_hash, p.index, a.join(", "));
+                println!("  enter {:08x}/{} ({})", p.label_digest, p.index, a.join(", "));
             }
             let k = self.konst(&p);
             let nparams = p.params as usize;
@@ -454,17 +452,17 @@ impl Vm {
             } else {
                 Vec::new()
             };
-            self.stack.truncate(base);
+            self.stack.truncate(frame_base);
             self.stack
-                .resize(base + (p.stack as usize).max(nparams) + 1, Value::Nil);
+                .resize(frame_base + (p.stack as usize).max(nparams) + 1, Value::Nil);
             for (i, a) in args.drain(..).enumerate() {
-                self.stack[base + i] = a;
+                self.stack[frame_base + i] = a;
             }
             let mut pc = 0usize;
-            let mut top = base;
+            let mut top = frame_base;
             macro_rules! r {
                 ($i:expr) => {
-                    self.stack[base + $i as usize]
+                    self.stack[frame_base + $i as usize]
                 };
             }
             macro_rules! rk {
@@ -473,7 +471,7 @@ impl Vm {
                     if i >= 256 {
                         kk!(i - 256)
                     } else {
-                        self.stack[base + i].clone()
+                        self.stack[frame_base + i].clone()
                     }
                 }};
             }
@@ -487,7 +485,7 @@ impl Vm {
                         e.msg = format!("{} ({name})", e.msg);
                     }
                     e.trace
-                        .push(format!("{:08x}/{}:{}", p.name_hash, p.index, pc.saturating_sub(1)));
+                        .push(format!("{:08x}/{}:{}", p.label_digest, p.index, pc.saturating_sub(1)));
                     return Err(e);
                 }};
             }
@@ -528,7 +526,7 @@ impl Vm {
                     0 | 73 => {
                         let t = r!(b).clone();
                         let key = kk!(c);
-                        let v = tryv!(self.index(&t, &key));
+                        let v = tryv!(self.lookup_index(&t, &key));
                         r!(a) = v;
                         pc += 2;
                     }
@@ -541,17 +539,17 @@ impl Vm {
                     // CALL_I, CALL_C, CALL_M, CALL, CALL_I_R1
                     2 | 3 | 29 | 30 | 69 => {
                         let f = r!(a).clone();
-                        let nargs = if b == 0 { top - (base + a + 1) } else { b - 1 };
+                        let nargs = if b == 0 { top - (frame_base + a + 1) } else { b - 1 };
                         let argv: Vec<Value> =
-                            self.stack[base + a + 1..base + a + 1 + nargs].to_vec();
+                            self.stack[frame_base + a + 1..frame_base + a + 1 + nargs].to_vec();
                         let res = tryv!(self.call(f, argv));
                         if c == 0 {
-                            let end = base + a + res.len();
+                            let end = frame_base + a + res.len();
                             if self.stack.len() < end + 1 {
                                 self.stack.resize(end + 1, Value::Nil);
                             }
                             for (i, v) in res.into_iter().enumerate() {
-                                self.stack[base + a + i] = v;
+                                self.stack[frame_base + a + i] = v;
                             }
                             top = end;
                         } else {
@@ -574,7 +572,7 @@ impl Vm {
                     6 => {
                         let key = kk!(d.bx as usize);
                         let g = Value::Table(self.globals.clone());
-                        let v = tryv!(self.index(&g, &key));
+                        let v = tryv!(self.lookup_index(&g, &key));
                         r!(a) = v;
                     }
                     // MOVE
@@ -586,20 +584,20 @@ impl Vm {
                     8 => {
                         let obj = r!(b).clone();
                         let key = rk!(c);
-                        let m = tryv!(self.index(&obj, &key));
+                        let m = tryv!(self.lookup_index(&obj, &key));
                         r!(a + 1) = obj;
                         r!(a) = m;
                     }
                     // RETURN
                     9 => {
-                        let n = if b == 0 { top - (base + a) } else { b - 1 };
-                        return Ok(self.stack[base + a..base + a + n].to_vec());
+                        let n = if b == 0 { top - (frame_base + a) } else { b - 1 };
+                        return Ok(self.stack[frame_base + a..frame_base + a + n].to_vec());
                     }
                     // GETTABLE_S, GETTABLE_N, GETTABLE: R(A) := R(B)[RK(C)]
                     10..=12 => {
                         let t = r!(b).clone();
                         let key = rk!(c);
-                        let v = tryv!(self.index(&t, &key));
+                        let v = tryv!(self.lookup_index(&t, &key));
                         r!(a) = v;
                         if d.op == 10 {
                             pc += 2;
@@ -607,7 +605,7 @@ impl Vm {
                     }
                     // LOADBOOL
                     13 => {
-                        r!(a) = Value::Bool(b != 0);
+                        r!(a) = Value::Boolean(b != 0);
                         if c != 0 {
                             pc += 1;
                         }
@@ -649,10 +647,10 @@ impl Vm {
                     // TAILCALL_I, _C, _M, TAILCALL, TAILCALL_I_R1
                     22..=24 | 37 | 68 => {
                         let f = r!(a).clone();
-                        let nargs = if b == 0 { top - (base + a + 1) } else { b - 1 };
+                        let nargs = if b == 0 { top - (frame_base + a + 1) } else { b - 1 };
                         let argv: Vec<Value> =
-                            self.stack[base + a + 1..base + a + 1 + nargs].to_vec();
-                        self.close_upvals(base);
+                            self.stack[frame_base + a + 1..frame_base + a + 1 + nargs].to_vec();
+                        self.close_upvals(frame_base);
                         match f {
                             Value::Func(next) => {
                                 cl = next;
@@ -714,7 +712,7 @@ impl Vm {
                     }
                     // NEWTABLE
                     52 => {
-                        r!(a) = Value::Table(Table::new_ref());
+                        r!(a) = Value::Table(LuaTable::new_ref());
                     }
                     // UNM
                     53 => {
@@ -725,7 +723,7 @@ impl Vm {
                     // NOT, NOT_R1
                     54 | 72 => {
                         let v = !r!(b).truthy();
-                        r!(a) = Value::Bool(v);
+                        r!(a) = Value::Boolean(v);
                     }
                     // LEN
                     55 => {
@@ -789,7 +787,7 @@ impl Vm {
                     }
                     // SETLIST: R(A)[(C-1)*50 + i] := R(A+i), 1 <= i <= B
                     64 => {
-                        let n = if b == 0 { top - (base + a) - 1 } else { b };
+                        let n = if b == 0 { top - (frame_base + a) - 1 } else { b };
                         let block = if c == 0 {
                             let w = p.code.get(pc).copied().unwrap_or(0) as usize;
                             pc += 1;
@@ -802,13 +800,13 @@ impl Vm {
                         };
                         let mut t = t.borrow_mut();
                         for i in 1..=n {
-                            let v = self.stack[base + a + i].clone();
-                            t.set(Value::Num(((block - 1) * FIELDS_PER_FLUSH + i) as f32), v);
+                            let v = self.stack[frame_base + a + i].clone();
+                            t.store(Value::Num(((block - 1) * FIELDS_PER_FLUSH + i) as f32), v);
                         }
                     }
                     // CLOSE
                     65 => {
-                        self.close_upvals(base + a);
+                        self.close_upvals(frame_base + a);
                     }
                     // CLOSURE (+ one DATA word per upvalue)
                     66 => {
@@ -818,7 +816,7 @@ impl Vm {
                             let dw = decode(p.code.get(pc).copied().unwrap_or(0));
                             pc += 1;
                             if dw.a == 1 {
-                                upvals.push(self.find_upval(base + dw.c as usize));
+                                upvals.push(self.find_upval(frame_base + dw.c as usize));
                             } else {
                                 upvals.push(cl.upvals[dw.c as usize].clone());
                             }
@@ -831,12 +829,12 @@ impl Vm {
                     // VARARG: R(A), R(A+1), ..., R(A+B-1) = vararg
                     67 => {
                         if b == 0 {
-                            let end = base + a + varargs.len();
+                            let end = frame_base + a + varargs.len();
                             if self.stack.len() < end + 1 {
                                 self.stack.resize(end + 1, Value::Nil);
                             }
                             for (i, v) in varargs.iter().enumerate() {
-                                self.stack[base + a + i] = v.clone();
+                                self.stack[frame_base + a + i] = v.clone();
                             }
                             top = end;
                         } else {
@@ -860,11 +858,11 @@ impl Vm {
 
 /// What the call at `pc` calls, read back from the instruction that loaded
 /// its register (`method 'x'`, `field 'x'`, `global 'x'`).
-fn callee_name(p: &crate::Proto, k: &[Value], pc: usize) -> Option<String> {
-    let call = crate::decode(*p.code.get(pc)?);
+fn callee_name(p: &Proto, k: &[Value], pc: usize) -> Option<String> {
+    let call = decode(*p.code.get(pc)?);
     let name = |i: usize| k.get(i).map(ToString::to_string);
     for at in (pc.saturating_sub(16)..pc).rev() {
-        let d = crate::decode(p.code[at]);
+        let d = decode(p.code[at]);
         if d.a != call.a {
             continue;
         }

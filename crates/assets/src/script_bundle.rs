@@ -11,7 +11,7 @@ use crate::script_set::T6ScriptSet;
 pub struct ScriptSources {
     /// What a Black Ops II map adds. Not set for any other kind of map.
     pub t6: Option<T6ScriptSet>,
-    modules: BTreeMap<String, Vec<u8>>,
+    module_list: BTreeMap<String, Vec<u8>>,
     entities: Option<String>,
 }
 
@@ -35,18 +35,18 @@ impl ScriptSources {
     /// The compiled or source bytes of `module`, which must already be in
     /// stored form (forward slashes, lower case).
     pub fn read(&self, module: &str) -> Result<Vec<u8>, String> {
-        self.modules
+        self.module_list
             .get(module)
             .cloned()
             .ok_or_else(|| format!("missing script asset {module}.gsc"))
     }
 
     pub fn len(&self) -> usize {
-        self.modules.len()
+        self.module_list.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.modules.is_empty()
+        self.module_list.is_empty()
     }
 
     /// The map's entity text, when it has any.
@@ -75,18 +75,16 @@ impl ScriptSources {
     /// Every name the scripts and the entity text put in quotes, which is
     /// where a script says what it loads.
     pub(crate) fn asset_names(&self) -> BTreeSet<String> {
-        let mut names = BTreeSet::new();
-        for module in self.modules.values() {
-            collect_quoted(module, &mut names);
-        }
-        if let Some(entities) = &self.entities {
-            collect_quoted(entities.as_bytes(), &mut names);
-        }
-        names
+        let entity_text = self.entities.as_deref().map(str::as_bytes);
+        let texts = self.module_list.values().map(Vec::as_slice).chain(entity_text);
+        texts.fold(BTreeSet::new(), |mut found, text| {
+            collect_quoted(text, &mut found);
+            found
+        })
     }
 
     pub(crate) fn insert_source(&mut self, module: &str, source: String) {
-        self.modules.insert(module_key(module), source.into_bytes());
+        self.module_list.insert(module_key(module), source.into_bytes());
     }
 
     pub(crate) fn set_entities(&mut self, entities: String) {
@@ -95,11 +93,11 @@ impl ScriptSources {
 
     /// Lays `other` over this set: its modules replace same-named ones, and
     /// its entity text and Black Ops II extras replace ours when it has any.
-    pub(crate) fn overlay(&mut self, other: Self) {
-        self.modules.extend(other.modules);
-        self.entities = other.entities.or(self.entities.take());
-        if other.t6.is_some() {
-            self.t6 = other.t6;
+    pub(crate) fn overlay(&mut self, rhs: Self) {
+        self.module_list.extend(rhs.module_list);
+        self.entities = rhs.entities.or(self.entities.take());
+        if rhs.t6.is_some() {
+            self.t6 = rhs.t6;
         }
     }
 }

@@ -1,9 +1,9 @@
 [package]
-name = "d3d9_state"
+name = "d3d9_state" # crate name other crates depend on
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
-description = "D3D9 render-state numbers: compare functions, blend factors, alpha test and the state ids the engine sets."
+publish.workspace = true
+description = "Named fixed-function numbers from materials: depth and alpha comparisons, blend weights, the alpha cutoff, render-state slots."
 
 [lints]
 workspace = true

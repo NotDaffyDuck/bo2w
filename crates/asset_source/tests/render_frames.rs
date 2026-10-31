@@ -23,21 +23,21 @@ fn sample(tex: &vtf::Rgba, uv: Vec2) -> [f32; 4] {
 }
 
 /// `glow`: the texture's alpha is its self-lit mask (the stand-in's).
-fn draw(model: &mdl::Model, textures: &[Option<vtf::Rgba>], skin: &[Mat4], proj: Mat4, canvas: &mut Canvas, glow: bool) {
+fn draw(model: &mdl::Model, textures: &[Option<vtf::Rgba>], palette: &[Mat4], proj: Mat4, canvas: &mut Canvas, glow: bool) {
     let light = Vec3::new(-0.4, 0.5, 0.8).normalize();
     for mesh in &model.meshes {
         let tex = textures.get(mesh.texture).and_then(Option::as_ref);
-        let verts: Vec<(Vec4, Vec3, Vec2)> = mesh
+        let vertex_points: Vec<(Vec4, Vec3, Vec2)> = mesh
             .vertices
             .iter()
             .map(|v| {
                 let mut p = Vec3::ZERO;
                 let mut n = Vec3::ZERO;
                 for k in 0..3 {
-                    if v.weights[k] > 0.0 {
-                        let m = skin[v.bones[k] as usize];
-                        p += m.transform_point3(v.pos) * v.weights[k];
-                        n += m.transform_vector3(v.normal) * v.weights[k];
+                    if v.blend[k] > 0.0 {
+                        let m = palette[v.bones[k] as usize];
+                        p += m.transform_point3(v.pos) * v.blend[k];
+                        n += m.transform_vector3(v.normal) * v.blend[k];
                     }
                 }
                 // Source view: x forward, y left, z up -> right, up, back.
@@ -46,8 +46,8 @@ fn draw(model: &mdl::Model, textures: &[Option<vtf::Rgba>], skin: &[Mat4], proj:
                 (proj * view.extend(1.0), nv, v.uv)
             })
             .collect();
-        for tri in mesh.indices.chunks_exact(3) {
-            let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize].map(|i| verts[i]);
+        for tri in mesh.tri_list.chunks_exact(3) {
+            let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize].map(|i| vertex_points[i]);
             if a.0.w <= 0.01 || b.0.w <= 0.01 || c.0.w <= 0.01 {
                 continue;
             }
@@ -146,7 +146,7 @@ fn render_frames() {
                     save(&canvas, &out.join(format!("{name}_claws_{tag}.png")));
                 }
             }
-            eprintln!("{name} {} flags {:#x} layers {:?} fps {} frames {} len {len:.2}s act {}", seq.name, seq.flags, seq.layers.iter().map(|l| (l.sequence, l.pose, l.flags, l.start, l.end)).collect::<Vec<_>>(), model.animations[seq.anims[0]].fps, model.animations[seq.anims[0]].frames.len(), seq.activity);
+            eprintln!("{name} {} flags {:#x} layers {:?} fps {} frames {} len {len:.2}s act {}", seq.name, seq.studio_bits, seq.layers.iter().map(|l| (l.sequence, l.pose, l.layer_bits, l.start, l.end)).collect::<Vec<_>>(), model.animations[seq.anims[0]].fps, model.animations[seq.anims[0]].frames.len(), seq.activity);
         }
     }
 }
@@ -186,7 +186,8 @@ fn render_standin() {
                     let skin = model.skin(&model.pose(si, t, &[open], t));
                     let mut canvas = Canvas { rgb: vec![[40, 44, 52]; W * H], depth: vec![f32::INFINITY; W * H] };
                     draw(&model, &textures, &skin, proj, &mut canvas, true);
-                    save(&canvas, &out.join(format!("{}_{}_{k}_{tag}.png", model.name, seq.name)));
+                    let (model_name, seq_name) = (&model.name, &seq.name);
+                    save(&canvas, &out.join(format!("{model_name}_{seq_name}_{k}_{tag}.png")));
                 }
             }
         }

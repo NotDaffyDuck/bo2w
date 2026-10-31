@@ -10,8 +10,8 @@
 //! striking the riot shield he bears starts one at his view.
 
 use bevy::prelude::*;
-use entity_t6::event as ev;
-use net::{FrameClock, LocalPresentClient, PresentedSnapshot};
+use entity_t6::event;
+use net::{FrameClock, HostViewClient, ShownWorldFrame};
 
 const SLOTS: usize = 4;
 /// BO2's boost shake: 0.3 for a second.
@@ -23,7 +23,7 @@ struct Shake {
     time: i32,
     scale: f32,
     length: i32,
-    radius: f32,
+    rad: f32,
     src: [f32; 3],
     size: f32,
     rumble_scale: f32,
@@ -33,14 +33,14 @@ impl Shake {
     /// Whether it still shakes at `now` from `view`; if so, how hard
     /// (`size`, negative once the view is past its radius) and its faded
     /// strength (`rumble_scale`).
-    fn update(&mut self, now: i32, view: [f32; 3]) -> bool {
+    fn refresh(&mut self, now: i32, view: [f32; 3]) -> bool {
         let elapsed = now.wrapping_sub(self.time);
         if elapsed < 0 || elapsed >= self.length {
             return false;
         }
-        let spatial = if self.radius > 0.0 {
+        let spatial = if self.rad > 0.0 {
             let d = [view[0] - self.src[0], view[1] - self.src[1], view[2] - self.src[2]];
-            1.0 - game_math::vec3_length(d) / self.radius
+            1.0 - game_math::vec3_norm(d) / self.rad
         } else {
             1.0
         };
@@ -96,34 +96,34 @@ impl CameraShakes {
     pub(crate) fn start(
         &mut self,
         scale: f32,
-        duration_ms: i32,
+        duration_ms_in: i32,
         src: [f32; 3],
-        radius: f32,
+        reach: f32,
         now: i32,
         view: [f32; 3],
     ) {
-        if scale <= 0.0 || duration_ms < 1 {
+        if scale <= 0.0 || duration_ms_in < 1 {
             return;
         }
         for shake in &mut self.shakes {
-            shake.update(now, view);
+            shake.refresh(now, view);
         }
-        let slot = self.shakes.iter().position(|s| s.free(now)).or_else(|| {
+        let bay = self.shakes.iter().position(|s| s.free(now)).or_else(|| {
             self.shakes
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.size < 0.0)
-                .min_by(|a, b| a.1.size.total_cmp(&b.1.size))
+                .filter(|(_k, s)| s.size < 0.0)
+                .min_by(|lhs, rhs| lhs.1.size.total_cmp(&rhs.1.size))
                 .map(|(i, _)| i)
         });
-        let Some(slot) = slot else {
+        let Some(bay) = bay else {
             return;
         };
-        self.shakes[slot] = Shake {
+        self.shakes[bay] = Shake {
             time: now,
             scale,
-            length: duration_ms,
-            radius,
+            length: duration_ms_in,
+            rad: reach,
             src,
             ..Shake::default()
         };
@@ -131,12 +131,12 @@ impl CameraShakes {
 
     /// The view's angles turned by the strongest shake at `now` from `view`.
     /// While nothing shakes the waves' phase is picked anew.
-    pub(crate) fn apply(&mut self, angles: &mut [f32; 3], now: i32, view: [f32; 3]) {
+    pub(crate) fn apply(&mut self, angs: &mut [f32; 3], now: i32, view: [f32; 3]) {
         self.view = view;
         let mut best = 0.0f32;
         let mut amp = 0.0f32;
         for shake in &mut self.shakes {
-            if shake.update(now, view) && shake.size > best {
+            if shake.refresh(now, view) && shake.size > best {
                 best = shake.size;
                 amp = shake.rumble_scale;
             }
@@ -147,9 +147,9 @@ impl CameraShakes {
         }
         let best = best.min(1.0);
         let t = now as f32 * 0.001_666_666_7;
-        angles[0] += (t * 25.132_742 + self.phase).sin() * amp * 18.0 * best;
-        angles[1] += (t * 47.123_89 + self.phase).sin() * amp * 16.0 * best;
-        angles[2] += (t * 37.699_112 + self.phase).sin() * amp * 10.0 * best;
+        angs[0] += (t * 25.132_742 + self.phase).sin() * amp * 18.0 * best;
+        angs[1] += (t * 47.123_89 + self.phase).sin() * amp * 16.0 * best;
+        angs[2] += (t * 37.699_112 + self.phase).sin() * amp * 10.0 * best;
     }
 }
 
@@ -158,14 +158,14 @@ impl CameraShakes {
 /// rides, from his view, as hard everywhere).
 pub(crate) fn remote_missile_boost(
     _boost: On<net::EntityRemoteMissileBoost>,
-    presented: Res<PresentedSnapshot>,
-    local: Res<LocalPresentClient>,
+    presented: Res<ShownWorldFrame>,
+    local: Res<HostViewClient>,
     clock: Res<FrameClock>,
     mut shakes: ResMut<CameraShakes>,
 ) {
     let now = clock.time();
-    if let Some(pose) = super::third_person::remote_missile_camera(&presented, local.0, now) {
-        shakes.start(BOOST_SCALE, BOOST_MS, pose.origin, 0.0, now, pose.origin);
+    if let Some(posture) = super::other_view::remote_missile_camera(&presented, local.0, now) {
+        shakes.start(BOOST_SCALE, BOOST_MS, posture.origin, 0.0, now, posture.origin);
     }
 }
 
@@ -173,48 +173,48 @@ pub(crate) fn remote_missile_boost(
 /// it went off, weaker out to its radius, started from the last view.
 pub(crate) fn earthquake(
     quake: On<net::EntityEarthquake>,
-    clock: Res<FrameClock>,
+    clk: Res<FrameClock>,
     mut shakes: ResMut<CameraShakes>,
 ) {
     let p = quake.event.payload;
-    shakes.start_earthquake(p.origin, p.origin2, p.event_parm, clock.time());
+    shakes.start_earthquake(p.origin, p.origin2, p.event_parm, clk.time());
 }
 
 /// A projectile went off (BO2's CG_ProjectileExplosionEvent): its weapon's
 /// explosion shake from the blast. A flashbang's own event starts none.
 pub(crate) fn explosion(
-    boom: On<net::EntityExplosion>,
-    prediction: Option<Res<net::ClientPredictionState>>,
-    clock: Res<FrameClock>,
+    boom: On<net::BlastAt>,
+    prediction: Option<Res<net::ClientGuessState>>,
+    clock_val: Res<FrameClock>,
     mut shakes: ResMut<CameraShakes>,
 ) {
     let e = boom.event;
-    if e.event.0 == i32::from(ev::FLASHBANG_EXPLODE) {
+    if e.event.0 == i32::from(event::FLASHBANG_EXPLODE) {
         return;
     }
     let Some(prediction) = prediction else {
         return;
     };
     let shake = prediction.0.world().gun_facts().get(e.payload.weapon).shake;
-    shakes.start_weapon(shake.explosion, e.payload.origin, clock.time());
+    shakes.start_weapon(shake.explosion, e.payload.origin, clock_val.time());
 }
 
 /// A gun fired (BO2's CG_FireWeapon): its fire shake from the shooter. A
 /// vehicle gunner's adds BO2's own small one from where the vehicle stands.
 pub(crate) fn weapon_fire(
-    fire: On<net::EntityWeaponFire>,
-    prediction: Option<Res<net::ClientPredictionState>>,
-    clock: Res<FrameClock>,
+    fire_in: On<net::GunFiredAt>,
+    prediction: Option<Res<net::ClientGuessState>>,
+    clock_here: Res<FrameClock>,
     mut shakes: ResMut<CameraShakes>,
 ) {
     let Some(prediction) = prediction else {
         return;
     };
-    let p = fire.event.payload;
+    let p = fire_in.event.payload;
     let shake = prediction.0.world().gun_facts().get(p.weapon).shake;
-    shakes.start_weapon(shake.fire, p.origin, clock.time());
-    if u8::try_from(fire.event.event.0).is_ok_and(|e| ev::gunner_of_fire_event(e).is_some()) {
-        shakes.start_gunner(p.origin2, clock.time());
+    shakes.start_weapon(shake.fire, p.origin, clock_here.time());
+    if u8::try_from(fire_in.event.event.0).is_ok_and(|e| event::gunner_of_fire_event(e).is_some()) {
+        shakes.start_gunner(p.origin2, clock_here.time());
     }
 }
 
@@ -228,20 +228,20 @@ const GUNNER_RADIUS: f32 = 100.0;
 /// CG_BulletHitClientShieldEvent; the event comes to him alone): a shake
 /// from his view, and the riotshield_impact rumble.
 pub(crate) fn shield_hit(
-    hit: On<net::EntityBulletHit>,
-    local: Res<LocalPresentClient>,
-    clock: Res<FrameClock>,
+    hit_in: On<net::BulletStrike>,
+    local: Res<HostViewClient>,
+    clock_in: Res<FrameClock>,
     mut shakes: ResMut<CameraShakes>,
     mut rumbles: MessageWriter<audio::CodeRumbleT6>,
 ) {
-    let e = hit.event;
-    if shakes.start_shield(e.event.0, e.payload.event_parm, false, clock.time()) {
+    let e = hit_in.event;
+    if shakes.start_shield(e.event.0, e.payload.event_parm, false, clock_in.time()) {
         shield_rumble(&local, &mut rumbles);
     }
 }
 
 /// BO2 rumbles his pad (riotshield_impact) as each shield shake starts.
-fn shield_rumble(local: &LocalPresentClient, rumbles: &mut MessageWriter<audio::CodeRumbleT6>) {
+fn shield_rumble(local: &HostViewClient, rumbles: &mut MessageWriter<audio::CodeRumbleT6>) {
     if let Ok(number) = u16::try_from(local.0.0) {
         rumbles.write(audio::CodeRumbleT6 { name: "riotshield_impact", number });
     }
@@ -252,14 +252,14 @@ fn shield_rumble(local: &LocalPresentClient, rumbles: &mut MessageWriter<audio::
 /// the event goes to all, and shakes only the bearer it names.
 pub(crate) fn shield_blast(
     blast: On<net::EntityShieldBlast>,
-    local: Res<LocalPresentClient>,
-    clock: Res<FrameClock>,
+    local: Res<HostViewClient>,
+    clock_v: Res<FrameClock>,
     mut shakes: ResMut<CameraShakes>,
     mut rumbles: MessageWriter<audio::CodeRumbleT6>,
 ) {
     let e = blast.event;
     let his = e.payload.number == local.0.0 as i32;
-    if shakes.start_shield(e.event.0, e.payload.event_parm, his, clock.time()) {
+    if shakes.start_shield(e.event.0, e.payload.event_parm, his, clock_v.time()) {
         shield_rumble(&local, &mut rumbles);
     }
 }
@@ -276,10 +276,10 @@ const SHIELD_BLAST_THRESHOLD: i32 = 85;
 /// unshielded). `his`: the event names him.
 fn shield_shake(event: i32, parm: i32, his: bool) -> Option<(f32, i32)> {
     match u8::try_from(event).ok()? {
-        ev::BULLET_HIT_CLIENT_SHIELD => Some((0.25, 500)),
-        ev::EXPLOSIVE_IMPACT_ON_SHIELD if his => Some((0.5, 1_500)),
-        ev::EXPLOSIVE_SPLASH_ON_SHIELD if his && parm > SHIELD_BLAST_THRESHOLD => Some((0.5, 1_250)),
-        ev::EXPLOSIVE_SPLASH_ON_SHIELD if his => Some((0.4, 800)),
+        event::BULLET_HIT_CLIENT_SHIELD => Some((0.25, 500)),
+        event::EXPLOSIVE_IMPACT_ON_SHIELD if his => Some((0.5, 1_500)),
+        event::EXPLOSIVE_SPLASH_ON_SHIELD if his && parm > SHIELD_BLAST_THRESHOLD => Some((0.5, 1_250)),
+        event::EXPLOSIVE_SPLASH_ON_SHIELD if his => Some((0.4, 800)),
         _ => None,
     }
 }
@@ -289,7 +289,7 @@ impl CameraShakes {
     fn start_shield(&mut self, event: i32, parm: i32, his: bool, now: i32) -> bool {
         let shake = shield_shake(event, parm, his);
         if std::env::var_os("BO2MP_SHIELDLOG").is_some() {
-            diag::info!(Fpv, "bo2mp shield: event {event:?} parm {parm} his {his}: shake {shake:?}");
+            diag::info!(ViewModelPerspective, "bo2mp shield: event {event:?} parm {parm} his {his}: shake {shake:?}");
         }
         if let Some((scale, ms)) = shake {
             let view = self.view;
@@ -300,9 +300,9 @@ impl CameraShakes {
 
     /// The earthquake event's fields: the scale and the radius ride in
     /// origin2, the length in milliseconds in event_parm.
-    fn start_earthquake(&mut self, origin: [f32; 3], origin2: [f32; 3], duration_ms: i32, now: i32) {
+    fn start_earthquake(&mut self, pos: [f32; 3], origin2: [f32; 3], span_ms: i32, now: i32) {
         let view = self.view;
-        self.start(origin2[0], duration_ms, origin, origin2[1], now, view);
+        self.start(origin2[0], span_ms, pos, origin2[1], now, view);
     }
 
     /// A vehicle gunner's shot: its shake from where the vehicle stands.
@@ -318,12 +318,12 @@ impl CameraShakes {
             return;
         }
         let view = self.view;
-        self.start(shake.scale, shake.duration_ms, src, shake.radius as f32, now, view);
+        self.start(shake.scale, shake.span_ms, src, shake.radius as f32, now, view);
     }
 }
 
-#[cfg(test)]
 mod tests {
+    #![cfg(test)]
     use super::*;
 
     const AT: [f32; 3] = [0.0; 3];
@@ -337,22 +337,22 @@ mod tests {
     #[test]
     fn a_shake_fades_out_over_its_length() {
         let mut slot = Shake { time: 1_000, scale: 0.3, length: 1_000, ..Shake::default() };
-        assert!(slot.update(1_000, AT));
+        assert!(slot.refresh(1_000, AT));
         assert_eq!(slot.rumble_scale, 0.3);
-        assert!(slot.update(1_500, AT));
+        assert!(slot.refresh(1_500, AT));
         assert!((slot.rumble_scale - 0.15).abs() < 1e-6);
         assert!((slot.size - 0.15).abs() < 1e-6);
-        assert!(!slot.update(2_000, AT));
-        assert!(!slot.update(999, AT));
+        assert!(!slot.refresh(2_000, AT));
+        assert!(!slot.refresh(999, AT));
     }
 
     #[test]
     fn a_radius_weakens_it_with_distance() {
-        let mut slot = Shake { time: 0, scale: 1.0, length: 1_000, radius: 100.0, ..Shake::default() };
-        assert!(slot.update(0, [50.0, 0.0, 0.0]));
+        let mut slot = Shake { time: 0, scale: 1.0, length: 1_000, rad: 100.0, ..Shake::default() };
+        assert!(slot.refresh(0, [50.0, 0.0, 0.0]));
         assert!((slot.size - 0.5).abs() < 1e-6);
         // Past its radius it still counts, but below nothing.
-        assert!(slot.update(500, [150.0, 0.0, 0.0]));
+        assert!(slot.refresh(500, [150.0, 0.0, 0.0]));
         assert!((slot.size - -1.0).abs() < 1e-6);
     }
 
@@ -381,8 +381,8 @@ mod tests {
         shakes.start(0.7, 1_000, AT, 0.0, 10, AT);
         assert!(shakes.shakes.iter().all(|s| s.scale == 1.0));
         // Two out of range: the one farther out goes.
-        shakes.shakes[1].radius = 10.0;
-        shakes.shakes[3].radius = 10.0;
+        shakes.shakes[1].rad = 10.0;
+        shakes.shakes[3].rad = 10.0;
         shakes.shakes[3].src = [100.0, 0.0, 0.0];
         shakes.start(0.7, 1_000, AT, 0.0, 10, [30.0, 0.0, 0.0]);
         assert_eq!(shakes.shakes[3].scale, 0.7);
@@ -421,7 +421,7 @@ mod tests {
         shaken(&mut shakes, 900, [50.0, 0.0, 0.0]);
         shakes.start_earthquake([0.0; 3], [0.2, 200.0, 0.0], 200, 1_000);
         assert_eq!(shakes.shakes[0].length, 200);
-        assert_eq!(shakes.shakes[0].radius, 200.0);
+        assert_eq!(shakes.shakes[0].rad, 200.0);
         let phase = shakes.phase;
         let angles = shaken(&mut shakes, 1_100, [50.0, 0.0, 0.0]);
         // Half way through, three quarters in: 0.1 faded, 0.075 strong.
@@ -438,15 +438,15 @@ mod tests {
         let mut shakes = CameraShakes::default();
         shaken(&mut shakes, 900, [100.0, 0.0, 0.0]);
         // A frag going off 100 out: 0.5 for 500 ms out to 800.
-        let frag = CameraShake { scale: 0.5, duration_ms: 500, radius: 800 };
+        let frag = CameraShake { scale: 0.5, span_ms: 500, radius: 800 };
         shakes.start_weapon(frag, AT, 1_000);
-        assert_eq!(shakes.shakes[0].radius, 800.0);
+        assert_eq!(shakes.shakes[0].rad, 800.0);
         assert_eq!(shakes.shakes[0].length, 500);
         assert_ne!(shaken(&mut shakes, 1_100, [100.0, 0.0, 0.0]), [0.0; 3]);
         // A player's gun: no length, no radius, no shake.
         let mut calm = CameraShakes::default();
-        calm.start_weapon(CameraShake { scale: 0.5, duration_ms: 500, radius: 0 }, AT, 0);
-        calm.start_weapon(CameraShake { scale: 0.5, duration_ms: 0, radius: 512 }, AT, 0);
+        calm.start_weapon(CameraShake { scale: 0.5, span_ms: 500, radius: 0 }, AT, 0);
+        calm.start_weapon(CameraShake { scale: 0.5, span_ms: 0, radius: 512 }, AT, 0);
         assert_eq!(calm.shakes, [Shake::default(); SLOTS]);
     }
 
@@ -465,22 +465,22 @@ mod tests {
     #[test]
     fn a_hit_on_his_shield_shakes_his_view() {
         // A bullet's comes to him alone: it always shakes.
-        assert_eq!(shield_shake(i32::from(ev::BULLET_HIT_CLIENT_SHIELD), 0, false), Some((0.25, 500)));
+        assert_eq!(shield_shake(i32::from(event::BULLET_HIT_CLIENT_SHIELD), 0, false), Some((0.25, 500)));
         // A missile's and a blast's only shake the one they name.
-        assert_eq!(shield_shake(i32::from(ev::EXPLOSIVE_IMPACT_ON_SHIELD), 0, true), Some((0.5, 1_500)));
-        assert_eq!(shield_shake(i32::from(ev::EXPLOSIVE_IMPACT_ON_SHIELD), 0, false), None);
-        assert_eq!(shield_shake(i32::from(ev::EXPLOSIVE_SPLASH_ON_SHIELD), 86, true), Some((0.5, 1_250)));
-        assert_eq!(shield_shake(i32::from(ev::EXPLOSIVE_SPLASH_ON_SHIELD), 85, true), Some((0.4, 800)));
-        assert_eq!(shield_shake(i32::from(ev::EXPLOSIVE_SPLASH_ON_SHIELD), 200, false), None);
-        assert_eq!(shield_shake(i32::from(ev::BULLET_HIT_CLIENT_SMALL), 0, true), None);
+        assert_eq!(shield_shake(i32::from(event::EXPLOSIVE_IMPACT_ON_SHIELD), 0, true), Some((0.5, 1_500)));
+        assert_eq!(shield_shake(i32::from(event::EXPLOSIVE_IMPACT_ON_SHIELD), 0, false), None);
+        assert_eq!(shield_shake(i32::from(event::EXPLOSIVE_SPLASH_ON_SHIELD), 86, true), Some((0.5, 1_250)));
+        assert_eq!(shield_shake(i32::from(event::EXPLOSIVE_SPLASH_ON_SHIELD), 85, true), Some((0.4, 800)));
+        assert_eq!(shield_shake(i32::from(event::EXPLOSIVE_SPLASH_ON_SHIELD), 200, false), None);
+        assert_eq!(shield_shake(i32::from(event::ROUND_HIT_BODY_SMALL), 0, true), None);
         // It starts where the view last was, and fades out 100 from it.
         let mut shakes = CameraShakes::default();
         shaken(&mut shakes, 900, [40.0, 0.0, 0.0]);
         // A shake that starts also rumbles his pad; a blast on another's shield neither.
-        assert!(!shakes.start_shield(i32::from(ev::EXPLOSIVE_IMPACT_ON_SHIELD), 0, false, 1_000));
-        assert!(shakes.start_shield(i32::from(ev::BULLET_HIT_CLIENT_SHIELD), 0, false, 1_000));
+        assert!(!shakes.start_shield(i32::from(event::EXPLOSIVE_IMPACT_ON_SHIELD), 0, false, 1_000));
+        assert!(shakes.start_shield(i32::from(event::BULLET_HIT_CLIENT_SHIELD), 0, false, 1_000));
         assert_eq!(shakes.shakes[0].src, [40.0, 0.0, 0.0]);
-        assert_eq!(shakes.shakes[0].radius, 100.0);
+        assert_eq!(shakes.shakes[0].rad, 100.0);
         assert_ne!(shaken(&mut shakes, 1_100, [40.0, 0.0, 0.0]), [0.0; 3]);
         assert_eq!(shaken(&mut shakes, 1_200, [160.0, 0.0, 0.0]), [0.0; 3]);
     }

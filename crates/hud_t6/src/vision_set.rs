@@ -22,23 +22,26 @@ pub enum VisionSetLerpStyle {
 impl VisionSetLerpStyle {
     #[must_use]
     pub fn is_backforth(self) -> bool {
-        matches!(self, Self::BackforthLinear | Self::BackforthSmooth)
+        match self {
+            Self::BackforthLinear | Self::BackforthSmooth => true,
+            _ => false,
+        }
     }
 }
 
 /// `visionSetLerpData_t` (vision-set-t6.md 1): times in milliseconds of cg time.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct VisionSetLerpData {
-    pub time_start: i32,
-    pub time_duration: i32,
+pub struct ColorGradeBlend {
+    pub began_at_ms: i32,
+    pub span_length_ms: i32,
     pub lerp_fraction: f32,
     pub style: VisionSetLerpStyle,
 }
 
 /// LerpBool (vision-set-t6.md 2). Back-and-forth styles give `from` from the halfway point on; every other style gives `to`.
 #[must_use]
-pub fn lerp_bool(from: bool, to: bool, fraction: f32, style: VisionSetLerpStyle) -> bool {
-    if style.is_backforth() && fraction >= 0.5 {
+pub fn lerp_bool(from: bool, to: bool, along: f32, style: VisionSetLerpStyle) -> bool {
+    if style.is_backforth() && along >= 0.5 {
         from
     } else {
         to
@@ -46,21 +49,21 @@ pub fn lerp_bool(from: bool, to: bool, fraction: f32, style: VisionSetLerpStyle)
 }
 
 /// LerpFloat (vision-set-t6.md 2). TO styles run from -> to; back-and-forth styles reach `to` at half and return to
-/// `from`. Smooth styles first ease the fraction by sin(f * pi / 2). CUSTOM_VALUE is linear.
+/// `from`. Smooth styles first ease the along by sin(f * pi / 2). CUSTOM_VALUE is linear.
 #[must_use]
-pub fn lerp_float(from: f32, to: f32, fraction: f32, style: VisionSetLerpStyle) -> f32 {
-    use VisionSetLerpStyle as S;
-    let fraction = match style {
-        S::ToSmooth | S::BackforthSmooth => libm::sinf(fraction * core::f32::consts::PI * 0.5),
-        _ => fraction,
+pub fn lerp_float(from: f32, to: f32, along: f32, style: VisionSetLerpStyle) -> f32 {
+    let along = match style {
+        VisionSetLerpStyle::ToSmooth | VisionSetLerpStyle::BackforthSmooth => libm::sinf(along * core::f32::consts::PI * 0.5),
+        _ => along,
     };
     if !style.is_backforth() {
-        return from + fraction * (to - from);
+        let gap = to - from;
+        return from + gap * along;
     }
-    if fraction < 0.5 {
-        from + 2.0 * fraction * (to - from)
+    if along < 0.5 {
+        from + 2.0 * along * (to - from)
     } else {
-        to + 2.0 * (fraction - 0.5) * (from - to)
+        to + 2.0 * (along - 0.5) * (from - to)
     }
 }
 
@@ -68,23 +71,23 @@ pub fn lerp_float(from: f32, to: f32, fraction: f32, style: VisionSetLerpStyle) 
 pub fn lerp_vec3(
     from: [f32; 3],
     to: [f32; 3],
-    fraction: f32,
+    along: f32,
     style: VisionSetLerpStyle,
 ) -> [f32; 3] {
-    core::array::from_fn(|i| lerp_float(from[i], to[i], fraction, style))
+    core::array::from_fn(|i| lerp_float(from[i], to[i], along, style))
 }
 
 #[must_use]
 pub fn lerp_vec4(
     from: [f32; 4],
     to: [f32; 4],
-    fraction: f32,
+    along: f32,
     style: VisionSetLerpStyle,
 ) -> [f32; 4] {
-    core::array::from_fn(|i| lerp_float(from[i], to[i], fraction, style))
+    core::array::from_fn(|i| lerp_float(from[i], to[i], along, style))
 }
 
-/// BO2's lerp-fraction clamp (vision-set-t6.md 3): a fraction that is not a number counts as 1.
+/// BO2's lerp-along clamp (vision-set-t6.md 3): a along that is not a number counts as 1.
 #[must_use]
 fn clamp_fraction(f: f32) -> f32 {
     let mut out = 1.0;
@@ -99,32 +102,32 @@ fn clamp_fraction(f: f32) -> f32 {
 
 /// `UpdateVarsLerp` (vision-set-t6.md 3). No change while the style is UNDEFINED or NONE. Once the lerp has
 /// run past its end the result becomes `to` (TO styles) or `from` (back-and-forth) and
-/// the style becomes NONE; before that every field is lerped at the clamped fraction.
+/// the style becomes NONE; before that every field is lerped at the clamped along.
 pub fn update_vars_lerp<T: Copy>(
     now: i32,
     from: T,
     to: T,
-    lerp: &mut VisionSetLerpData,
+    blend: &mut ColorGradeBlend,
     result: &mut T,
     lerp_vars: impl Fn(T, T, f32, VisionSetLerpStyle) -> T,
 ) {
     if matches!(
-        lerp.style,
+        blend.style,
         VisionSetLerpStyle::Undefined | VisionSetLerpStyle::None
     ) {
         return;
     }
-    if lerp.time_start.wrapping_add(lerp.time_duration) < now {
-        *result = match lerp.style {
+    if blend.began_at_ms.wrapping_add(blend.span_length_ms) < now {
+        *result = match blend.style {
             VisionSetLerpStyle::ToLinear | VisionSetLerpStyle::ToSmooth => to,
             _ => from,
         };
-        lerp.style = VisionSetLerpStyle::None;
+        blend.style = VisionSetLerpStyle::None;
         return;
     }
-    let fraction =
-        clamp_fraction(now.wrapping_sub(lerp.time_start) as f32 / lerp.time_duration as f32);
-    *result = lerp_vars(from, to, fraction, lerp.style);
+    let elapsed = now.wrapping_sub(blend.began_at_ms) as f32;
+    let along = clamp_fraction(elapsed / blend.span_length_ms as f32);
+    *result = lerp_vars(from, to, along, blend.style);
 }
 
 /// One `visionSetMode_t` slot of cg: `visionSetFrom`, `visionSetTo`, `visionSetCurrent`
@@ -134,7 +137,7 @@ pub struct VisionSetMode<T> {
     pub from: T,
     pub to: T,
     pub current: T,
-    pub lerp: VisionSetLerpData,
+    pub lerp: ColorGradeBlend,
 }
 
 impl<T: Copy> VisionSetMode<T> {
@@ -145,9 +148,9 @@ impl<T: Copy> VisionSetMode<T> {
         if duration_ms > 0 && self.lerp.style != VisionSetLerpStyle::Undefined {
             self.from = self.current;
             self.to = set;
-            self.lerp = VisionSetLerpData {
-                time_start: now,
-                time_duration: duration_ms,
+            self.lerp = ColorGradeBlend {
+                began_at_ms: now,
+                span_length_ms: duration_ms,
                 lerp_fraction: 0.0,
                 style,
             };
@@ -158,7 +161,7 @@ impl<T: Copy> VisionSetMode<T> {
     }
 
     /// Advance this mode's lerp to `now` (`UpdateVarsLerp` on its sets).
-    pub fn update(&mut self, now: i32, lerp_vars: impl Fn(T, T, f32, VisionSetLerpStyle) -> T) {
+    pub fn catch_up(&mut self, now: i32, lerp_vars: impl Fn(T, T, f32, VisionSetLerpStyle) -> T) {
         update_vars_lerp(
             now,
             self.from,
@@ -168,66 +171,66 @@ impl<T: Copy> VisionSetMode<T> {
             lerp_vars,
         );
     }
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use VisionSetLerpStyle as S;
 
     #[test]
     fn style_values_match_bo2() {
-        assert_eq!(S::Undefined as i32, 0);
-        assert_eq!(S::None as i32, 1);
-        assert_eq!(S::ToLinear as i32, 2);
-        assert_eq!(S::ToSmooth as i32, 3);
-        assert_eq!(S::BackforthLinear as i32, 4);
-        assert_eq!(S::BackforthSmooth as i32, 5);
-        assert_eq!(S::CustomValue as i32, 6);
+        assert_eq!(VisionSetLerpStyle::Undefined as i32, 0);
+        assert_eq!(VisionSetLerpStyle::None as i32, 1);
+        assert_eq!(VisionSetLerpStyle::ToLinear as i32, 2);
+        assert_eq!(VisionSetLerpStyle::ToSmooth as i32, 3);
+        assert_eq!(VisionSetLerpStyle::BackforthLinear as i32, 4);
+        assert_eq!(VisionSetLerpStyle::BackforthSmooth as i32, 5);
+        assert_eq!(VisionSetLerpStyle::CustomValue as i32, 6);
     }
 
     #[test]
     fn float_styles() {
-        assert_eq!(lerp_float(0.0, 10.0, 0.25, S::ToLinear), 2.5);
-        assert_eq!(lerp_float(0.0, 10.0, 0.25, S::CustomValue), 2.5);
-        let smooth = lerp_float(0.0, 10.0, 0.5, S::ToSmooth);
+        assert_eq!(lerp_float(0.0, 10.0, 0.25, VisionSetLerpStyle::ToLinear), 2.5);
+        assert_eq!(lerp_float(0.0, 10.0, 0.25, VisionSetLerpStyle::CustomValue), 2.5);
+        let smooth = lerp_float(0.0, 10.0, 0.5, VisionSetLerpStyle::ToSmooth);
         assert!((smooth - 10.0 * libm::sinf(core::f32::consts::PI * 0.25)).abs() < 1e-5);
-        assert_eq!(lerp_float(0.0, 10.0, 0.25, S::BackforthLinear), 5.0);
-        assert_eq!(lerp_float(0.0, 10.0, 0.5, S::BackforthLinear), 10.0);
-        assert_eq!(lerp_float(0.0, 10.0, 1.0, S::BackforthLinear), 0.0);
-        assert!(lerp_float(0.0, 10.0, 1.0, S::BackforthSmooth).abs() < 1e-5);
+        assert_eq!(lerp_float(0.0, 10.0, 0.25, VisionSetLerpStyle::BackforthLinear), 5.0);
+        assert_eq!(lerp_float(0.0, 10.0, 0.5, VisionSetLerpStyle::BackforthLinear), 10.0);
+        assert_eq!(lerp_float(0.0, 10.0, 1.0, VisionSetLerpStyle::BackforthLinear), 0.0);
+        assert!(lerp_float(0.0, 10.0, 1.0, VisionSetLerpStyle::BackforthSmooth).abs() < 1e-5);
     }
 
     #[test]
     fn bool_styles() {
-        assert!(lerp_bool(false, true, 0.0, S::ToLinear));
-        assert!(lerp_bool(false, true, 0.9, S::ToSmooth));
-        assert!(lerp_bool(false, true, 0.4, S::BackforthLinear));
-        assert!(!lerp_bool(false, true, 0.5, S::BackforthLinear));
-        assert!(!lerp_bool(false, true, 0.9, S::BackforthSmooth));
+        assert!(lerp_bool(false, true, 0.0, VisionSetLerpStyle::ToLinear));
+        assert!(lerp_bool(false, true, 0.9, VisionSetLerpStyle::ToSmooth));
+        assert!(lerp_bool(false, true, 0.4, VisionSetLerpStyle::BackforthLinear));
+        assert!(!lerp_bool(false, true, 0.5, VisionSetLerpStyle::BackforthLinear));
+        assert!(!lerp_bool(false, true, 0.9, VisionSetLerpStyle::BackforthSmooth));
     }
 
     #[test]
     fn first_start_snaps_then_lerps_then_ends_on_to() {
         let mut mode = VisionSetMode::<f32>::default();
-        mode.start_lerp_to(100, S::ToLinear, 4.0, 1000);
+        mode.start_lerp_to(100, VisionSetLerpStyle::ToLinear, 4.0, 1000);
         assert_eq!(mode.current, 4.0);
-        assert_eq!(mode.lerp.style, S::None);
+        assert_eq!(mode.lerp.style, VisionSetLerpStyle::None);
 
-        mode.start_lerp_to(1000, S::ToLinear, 8.0, 1000);
+        mode.start_lerp_to(1000, VisionSetLerpStyle::ToLinear, 8.0, 1000);
         assert_eq!(
             (mode.from, mode.to, mode.lerp.style),
-            (4.0, 8.0, S::ToLinear)
+            (4.0, 8.0, VisionSetLerpStyle::ToLinear)
         );
-        mode.update(1500, lerp_float);
+        mode.catch_up(1500, lerp_float);
         assert_eq!(mode.current, 6.0);
-        mode.update(2000, lerp_float);
+        mode.catch_up(2000, lerp_float);
         assert_eq!(mode.current, 8.0);
-        assert_eq!(mode.lerp.style, S::ToLinear);
-        mode.update(2001, lerp_float);
+        assert_eq!(mode.lerp.style, VisionSetLerpStyle::ToLinear);
+        mode.catch_up(2001, lerp_float);
         assert_eq!(mode.current, 8.0);
-        assert_eq!(mode.lerp.style, S::None);
-        mode.update(5000, lerp_float);
+        assert_eq!(mode.lerp.style, VisionSetLerpStyle::None);
+        mode.catch_up(5000, lerp_float);
         assert_eq!(mode.current, 8.0);
     }
 
@@ -235,33 +238,33 @@ mod tests {
     fn backforth_ends_on_from() {
         let mut mode = VisionSetMode::<f32> {
             current: 1.0,
-            lerp: VisionSetLerpData {
-                style: S::None,
+            lerp: ColorGradeBlend {
+                style: VisionSetLerpStyle::None,
                 ..Default::default()
             },
             ..Default::default()
         };
-        mode.start_lerp_to(0, S::BackforthLinear, 3.0, 100);
-        mode.update(50, lerp_float);
+        mode.start_lerp_to(0, VisionSetLerpStyle::BackforthLinear, 3.0, 100);
+        mode.catch_up(50, lerp_float);
         assert_eq!(mode.current, 3.0);
-        mode.update(101, lerp_float);
+        mode.catch_up(101, lerp_float);
         assert_eq!(mode.current, 1.0);
-        assert_eq!(mode.lerp.style, S::None);
+        assert_eq!(mode.lerp.style, VisionSetLerpStyle::None);
     }
 
     #[test]
     fn zero_duration_snaps() {
         let mut mode = VisionSetMode::<f32> {
             current: 1.0,
-            lerp: VisionSetLerpData {
-                style: S::None,
+            lerp: ColorGradeBlend {
+                style: VisionSetLerpStyle::None,
                 ..Default::default()
             },
             ..Default::default()
         };
-        mode.start_lerp_to(0, S::ToSmooth, 7.0, 0);
+        mode.start_lerp_to(0, VisionSetLerpStyle::ToSmooth, 7.0, 0);
         assert_eq!(mode.current, 7.0);
-        assert_eq!(mode.lerp.style, S::None);
+        assert_eq!(mode.lerp.style, VisionSetLerpStyle::None);
     }
 
     #[test]

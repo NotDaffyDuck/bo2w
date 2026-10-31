@@ -1,6 +1,6 @@
 //! A map load as a thing of its own, separate from any screen drawn over it.
 //!
-//! Each request gets one process and its own [`LoadProgress`]. Surfaces read
+//! Each request gets one process and its own [`LoadCompletion`]. Surfaces read
 //! it; one going away, or never being there, changes nothing about what the
 //! load waits for or reports. A task still finishing the previous map writes
 //! into a progress record nobody reads any more, not into the new map's rows.
@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use bevy::prelude::Resource;
 
-use asset_transport::progress::{LoadProgress, StageHandle, StageId};
+use asset_transport::progress::{LoadCompletion, StageHandle, StageId};
 
 /// Where the load is in the hand-off to the session.
 enum Wait {
@@ -24,24 +24,24 @@ enum Wait {
 
 #[derive(Resource)]
 pub struct MapLoadProcess {
-    pub request_id: u64,
-    pub load_key: frame::LocalLoadKey,
+    pub load_req_id: u64,
+    pub decrypt_secret: frame::OwnLevelLoadTicket,
     pub zone: String,
-    pub progress: LoadProgress,
+    pub progress: LoadCompletion,
     requested_at: Instant,
     wait: Wait,
 }
 
 impl MapLoadProcess {
     pub fn new(
-        request_id: u64,
-        load_key: frame::LocalLoadKey,
+        load_req_id: u64,
+        decrypt_secret: frame::OwnLevelLoadTicket,
         zone: impl Into<String>,
-        progress: LoadProgress,
+        progress: LoadCompletion,
     ) -> Self {
         Self {
-            request_id,
-            load_key,
+            load_req_id,
+            decrypt_secret,
             zone: zone.into(),
             requested_at: progress.requested_at(),
             progress,
@@ -53,7 +53,7 @@ impl MapLoadProcess {
         self.requested_at
     }
 
-    pub fn is_complete(&self) -> bool {
+    pub fn is_done(&self) -> bool {
         matches!(self.wait, Wait::Over)
     }
 
@@ -74,15 +74,14 @@ impl MapLoadProcess {
             Wait::Admission(stage) => stage.done(),
             Wait::Preparing => self.progress.record_skipped(StageId::Admission),
         }
-        let installed_ms = self.requested_at.elapsed().as_secs_f32() * 1000.0;
-        let trim_ms = diag::release_freed_heap().as_secs_f32() * 1000.0;
-        let trimmed_ms = self.requested_at.elapsed().as_secs_f32() * 1000.0;
-        let rss = asset_transport::process_resident_bytes()
-            .map(|bytes| format!(" rss_mib={}", bytes >> 20))
-            .unwrap_or_default();
-        let heap = diag::process_live_heap_bytes()
-            .map(|bytes| format!(" heap_mib={}", bytes >> 20))
-            .unwrap_or_default();
+        let millis = |span: std::time::Duration| span.as_secs_f32() * 1000.0;
+        let installed_ms = millis(self.requested_at.elapsed());
+        let trim_ms = millis(diag::return_spare_heap());
+        let trimmed_ms = millis(self.requested_at.elapsed());
+        // Memory figures in whole MiB, left out where the platform has none.
+        let mib = |label: &str, bytes: Option<u64>| bytes.map_or_else(String::new, |b| format!(" {label}={}", b >> 20));
+        let rss = mib("rss_mib", asset_transport::working_set_size());
+        let heap = mib("heap_mib", diag::heap_bytes_in_use());
         diag::info!(
             World,
             "load complete: {installed_ms:.0}ms from overlay to installed world ({trimmed_ms:.0}ms with trim) for `{}`{rss}{heap} trim={trim_ms:.1}ms",

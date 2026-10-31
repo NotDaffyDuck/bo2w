@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 
 const SIGNATURE: u32 = 0x55aa_1234;
@@ -20,8 +20,8 @@ struct Entry {
 
 /// One opened VPK: its tree, read once.
 #[derive(Debug)]
-pub struct Vpk {
-    dir: PathBuf,
+pub struct PackFile {
+    folder: PathBuf,
     /// Where archive 0x7fff's bytes start in the directory file.
     data_start: u64,
     entries: HashMap<String, Entry>,
@@ -43,11 +43,16 @@ fn u32_at(data: &[u8], at: usize) -> Option<u32> {
 }
 
 /// The lower-case, forward-slash name a file is looked up by.
-pub fn key(path: &str) -> String {
+/// `text` with `\` turned into `/` and in lower case.
+pub(crate) fn folded(text: &str) -> String {
+    text.chars().map(|c| if c == '\\' { '/' } else { c.to_ascii_lowercase() }).collect()
+}
+
+pub fn pack_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase()
 }
 
-impl Vpk {
+impl PackFile {
     /// Opens a `*_dir.vpk`.
     pub fn open(dir: &Path) -> Option<Self> {
         let data = std::fs::read(dir).ok()?;
@@ -55,7 +60,7 @@ impl Vpk {
             return None;
         }
         let version = u32_at(&data, 4)?;
-        let tree_size = u32_at(&data, 8)? as usize;
+        let tree_size = u32_at(&data, 8).map(|n| n as usize)?;
         let header = match version {
             1 => 12,
             2 => 28,
@@ -96,42 +101,42 @@ impl Vpk {
                         path.push('.');
                         path.push_str(&ext);
                     }
-                    entries.insert(key(&path), Entry { preload, archive, offset, length });
+                    entries.insert(pack_path(&path), Entry { preload, archive, offset, length });
                 }
             }
             if at > tree_end {
                 return None;
             }
         }
-        Some(Self { dir: dir.to_path_buf(), data_start: tree_end as u64, entries })
+        Some(Self { folder: dir.to_path_buf(), data_start: tree_end as u64, entries })
     }
 
     pub fn contains(&self, path: &str) -> bool {
-        self.entries.contains_key(&key(path))
+        self.entries.contains_key(&pack_path(path))
     }
 
     /// Every file under a folder (`models/weapons/`), by its full name.
     pub fn under<'a>(&'a self, folder: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-        let folder = key(folder);
+        let folder = pack_path(folder);
         self.entries.keys().filter(move |k| k.starts_with(&folder)).map(String::as_str)
     }
 
     /// A file's bytes.
     pub fn read(&self, path: &str) -> Option<Vec<u8>> {
-        let entry = self.entries.get(&key(path))?;
+        let entry = self.entries.get(&pack_path(path))?;
         let mut out = entry.preload.clone();
         if entry.length == 0 {
             return Some(out);
         }
         let (file, start) = if entry.archive == IN_DIR {
-            (self.dir.clone(), self.data_start + u64::from(entry.offset))
+            (self.folder.clone(), self.data_start + u64::from(entry.offset))
         } else {
-            let name = self.dir.file_name()?.to_str()?;
+            let name = self.folder.file_name()?.to_str()?;
             let base = name.strip_suffix("_dir.vpk")?;
-            (self.dir.with_file_name(format!("{base}_{:03}.vpk", entry.archive)), u64::from(entry.offset))
+            (self.folder.with_file_name(format!("{base}_{:03}.vpk", entry.archive)), u64::from(entry.offset))
         };
         let mut f = File::open(file).ok()?;
-        f.seek(SeekFrom::Start(start)).ok()?;
+        f.seek(std::io::SeekFrom::Start(start)).ok()?;
         let mut body = vec![0; entry.length as usize];
         f.read_exact(&mut body).ok()?;
         out.extend_from_slice(&body);

@@ -140,7 +140,7 @@ pub mod PhysConstraint {
     pub const flags: usize = 88;
     pub const timeout: usize = 92;
     pub const min_health: usize = 96;
-    pub const max_health: usize = 100;
+    pub const hit_point_ceiling: usize = 100;
     pub const distance: usize = 104;
     pub const damp: usize = 108;
     pub const power: usize = 112;
@@ -162,7 +162,7 @@ pub mod PhysConstraints {
     pub const data: usize = 8;
 }
 
-pub mod DestructibleDef {
+pub mod BreakableDef {
     pub const SIZE: usize = 24;
     pub const ALIGN: usize = 4;
     pub const name: usize = 0;
@@ -250,8 +250,8 @@ pub mod XModel {
     pub const lodRampType: usize = 7;
     pub const boneNames: usize = 8;
     pub const parentList: usize = 12;
-    pub const quats: usize = 16;
-    pub const trans: usize = 20;
+    pub const rotation_quaternions: usize = 16;
+    pub const shift_offset: usize = 20;
     pub const partClassification: usize = 24;
     pub const baseMat: usize = 28;
     pub const surfs: usize = 32;
@@ -571,7 +571,7 @@ pub mod ClipInfo {
     pub const leafbrushNodesCount: usize = 24;
     pub const leafbrushNodes: usize = 28;
     pub const numLeafBrushes: usize = 32;
-    pub const leafbrushes: usize = 36;
+    pub const brush_leaf_indices: usize = 36;
     pub const numBrushVerts: usize = 40;
     pub const brushVerts: usize = 44;
     pub const nuinds: usize = 48;
@@ -619,7 +619,7 @@ pub mod clipMap_t {
     pub const numLeafs: usize = 100;
     pub const leafs: usize = 104;
     pub const vertCount: usize = 108;
-    pub const verts: usize = 112;
+    pub const vertex_points: usize = 112;
     pub const triCount: usize = 116;
     pub const triIndices: usize = 120;
     pub const triEdgeIsWalkable: usize = 124;
@@ -694,7 +694,7 @@ pub mod MapTriggers {
     pub const count: usize = 0;
     pub const models: usize = 4;
     pub const hullCount: usize = 8;
-    pub const hulls: usize = 12;
+    pub const collision_volumes: usize = 12;
     pub const slabCount: usize = 16;
     pub const slabs: usize = 20;
 }
@@ -794,7 +794,7 @@ pub mod GfxWorldDraw {
     pub const reflectionProbes: usize = 4;
     pub const reflectionProbeTextures: usize = 8;
     pub const lightmapCount: usize = 12;
-    pub const lightmaps: usize = 16;
+    pub const light_atlases: usize = 16;
     pub const lightmapPrimaryTextures: usize = 20;
     pub const lightmapSecondaryTextures: usize = 24;
     pub const vertexCount: usize = 28;
@@ -1361,7 +1361,7 @@ pub mod FxEffectDef {
     pub const occlusionQueryScaleRange: usize = 68;
 }
 
-pub mod FxImpactTable {
+pub mod FxHitTable {
     pub const SIZE: usize = 8;
     pub const ALIGN: usize = 4;
     pub const name: usize = 0;
@@ -1728,7 +1728,7 @@ pub mod VehicleDef {
     pub const wheelChildTakesSteerYaw: usize = 272;
     pub const maxSpeed: usize = 276;
     pub const maxSpeedVertical: usize = 280;
-    pub const accel: usize = 284;
+    pub const speed_up_rate: usize = 284;
     pub const accelVertical: usize = 288;
     pub const rotRate: usize = 292;
     pub const rotAccel: usize = 296;
@@ -2086,16 +2086,16 @@ pub mod XAnimNotifyInfo {
 pub mod XAnimDeltaPart {
     pub const SIZE: usize = 12;
     pub const ALIGN: usize = 4;
-    pub const trans: usize = 0;
+    pub const shift_offset: usize = 0;
     pub const quat2: usize = 4;
     pub const quat: usize = 8;
 }
 
-pub mod DObjAnimMat {
+pub mod BonePoseMat {
     pub const SIZE: usize = 32;
     pub const ALIGN: usize = 4;
     pub const quat: usize = 0;
-    pub const trans: usize = 16;
+    pub const shift_offset: usize = 16;
     pub const transWeight: usize = 28;
 }
 
@@ -2311,7 +2311,7 @@ pub mod MaterialTypeInfo {
     pub const techniqueSetPrefix: usize = 4;
 }
 
-pub mod MaterialPass {
+pub mod MaterialStage {
     pub const SIZE: usize = 24;
     pub const ALIGN: usize = 4;
     pub const vertexDecl: usize = 0;
@@ -2323,7 +2323,7 @@ pub mod MaterialPass {
     pub const customSamplerFlags: usize = 15;
     pub const precompiledIndex: usize = 16;
     pub const materialType: usize = 17;
-    pub const args: usize = 20;
+    pub const arg_rows: usize = 20;
 }
 
 pub mod MaterialTechnique {
@@ -2432,7 +2432,7 @@ pub mod cplane_s {
     pub const pad: usize = 18;
 }
 
-pub mod ClipMaterial {
+pub mod ClipSurfaceKind {
     pub const SIZE: usize = 12;
     pub const ALIGN: usize = 4;
     pub const name: usize = 0;
@@ -2489,7 +2489,7 @@ pub mod cbrush_t {
     pub const axial_cflags: usize = 36;
     pub const axial_sflags: usize = 60;
     pub const numverts: usize = 84;
-    pub const verts: usize = 88;
+    pub const vertex_points: usize = 88;
 }
 
 pub mod Bounds {
@@ -2524,7 +2524,7 @@ pub mod cNode_t {
     pub const children: usize = 4;
 }
 
-pub mod CollisionPartition {
+pub mod CollTriGroup {
     pub const SIZE: usize = 16;
     pub const ALIGN: usize = 4;
     pub const triCount: usize = 0;
@@ -2540,7 +2540,7 @@ pub mod CollisionAabbTreeIndex {
     pub const partitionIndex: usize = 0;
 }
 
-pub mod CollisionAabbTree {
+pub mod CollBoxTree {
     pub const SIZE: usize = 32;
     pub const ALIGN: usize = 16;
     pub const origin: usize = 0;
@@ -3123,7 +3123,7 @@ pub mod GfxLightRegion {
     pub const SIZE: usize = 8;
     pub const ALIGN: usize = 4;
     pub const hullCount: usize = 0;
-    pub const hulls: usize = 4;
+    pub const collision_volumes: usize = 4;
 }
 
 pub mod GfxStaticModelInst {
@@ -3148,10 +3148,10 @@ pub mod srfTriangles_t {
     pub const baseIndex: usize = 44;
 }
 
-pub mod GfxSurface {
+pub mod GfxDrawSurfRec {
     pub const SIZE: usize = 80;
     pub const ALIGN: usize = 16;
-    pub const tris: usize = 0;
+    pub const triangle_list: usize = 0;
     pub const material: usize = 48;
     pub const lightmapIndex: usize = 52;
     pub const reflectionProbeIndex: usize = 53;
@@ -3245,7 +3245,7 @@ pub mod Glyph {
     pub const letter: usize = 0;
     pub const x0: usize = 2;
     pub const y0: usize = 3;
-    pub const dx: usize = 4;
+    pub const step_along_x: usize = 4;
     pub const pixelWidth: usize = 5;
     pub const pixelHeight: usize = 6;
     pub const s0: usize = 8;
@@ -4355,7 +4355,7 @@ pub mod FxElemDef {
     pub const billboardPivot: usize = 284;
 }
 
-pub mod FxImpactEntry {
+pub mod FxHitRow {
     pub const SIZE: usize = 144;
     pub const ALIGN: usize = 4;
     pub const nonflesh: usize = 0;
@@ -4600,8 +4600,8 @@ pub mod XModelCollTri_s {
     pub const SIZE: usize = 48;
     pub const ALIGN: usize = 4;
     pub const plane: usize = 0;
-    pub const svec: usize = 16;
-    pub const tvec: usize = 32;
+    pub const surface_tangent: usize = 16;
+    pub const surface_bitangent: usize = 32;
 }
 
 pub mod PhysGeomList {
@@ -4616,7 +4616,7 @@ pub mod MaterialStreamRouting {
     pub const SIZE: usize = 2;
     pub const ALIGN: usize = 1;
     pub const source: usize = 0;
-    pub const dest: usize = 1;
+    pub const write_target: usize = 1;
 }
 
 pub mod MaterialVertexStreamRouting {
@@ -4798,7 +4798,7 @@ pub mod SndAlias {
     pub const dopplerScale: usize = 84;
     pub const minPriorityThreshold: usize = 86;
     pub const maxPriorityThreshold: usize = 87;
-    pub const probability: usize = 88;
+    pub const chance_weight: usize = 88;
     pub const occlusionLevel: usize = 89;
     pub const minPriority: usize = 90;
     pub const maxPriority: usize = 91;
@@ -4884,8 +4884,8 @@ pub mod SSkinModel {
     pub const ALIGN: usize = 4;
     pub const numVerts: usize = 0;
     pub const numTris: usize = 4;
-    pub const verts: usize = 8;
-    pub const tris: usize = 12;
+    pub const vertex_points: usize = 8;
+    pub const triangle_list: usize = 12;
 }
 
 pub mod SSkinAnim {
@@ -5267,16 +5267,16 @@ pub mod FxElemMarkVisuals {
     pub const materials: usize = 0;
 }
 
-pub mod FxTrailDef {
+pub mod FxStreakDef {
     pub const SIZE: usize = 28;
     pub const ALIGN: usize = 4;
     pub const scrollTimeMsec: usize = 0;
     pub const repeatDist: usize = 4;
     pub const splitDist: usize = 8;
     pub const vertCount: usize = 12;
-    pub const verts: usize = 16;
+    pub const vertex_points: usize = 16;
     pub const indCount: usize = 20;
-    pub const inds: usize = 24;
+    pub const index_run_values: usize = 24;
 }
 
 pub mod FxSpotLightDef {
@@ -5329,7 +5329,7 @@ pub mod GlassDef {
 pub mod XSurfaceCollisionTree {
     pub const SIZE: usize = 40;
     pub const ALIGN: usize = 4;
-    pub const trans: usize = 0;
+    pub const shift_offset: usize = 0;
     pub const scale: usize = 12;
     pub const nodeCount: usize = 24;
     pub const nodes: usize = 28;
@@ -5520,7 +5520,7 @@ pub mod BrushWrapper {
     pub const axial_cflags: usize = 36;
     pub const axial_sflags: usize = 60;
     pub const numverts: usize = 84;
-    pub const verts: usize = 88;
+    pub const vertex_points: usize = 88;
     pub const planes: usize = 92;
 }
 

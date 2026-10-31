@@ -49,18 +49,18 @@ fn stripe() -> &'static Stripe {
     &COUNTS[index]
 }
 
-const UNKNOWN: u8 = 0;
+const UNCLASSIFIED: u8 = 0;
 const LOOKING: u8 = 1;
 const OFF: u8 = 2;
 const ON: u8 = 3;
 
-static COUNTING: AtomicU8 = AtomicU8::new(UNKNOWN);
+static COUNTING: AtomicU8 = AtomicU8::new(UNCLASSIFIED);
 
 /// Whether allocations are being counted (`BO2MP_COUNTING_ALLOC` is set).
 pub fn counting_enabled() -> bool {
     match COUNTING.load(Ordering::Relaxed) {
         ON => true,
-        UNKNOWN => look_up_counting(),
+        UNCLASSIFIED => look_up_counting(),
         _ => false,
     }
 }
@@ -68,7 +68,7 @@ pub fn counting_enabled() -> bool {
 #[cold]
 fn look_up_counting() -> bool {
     if COUNTING
-        .compare_exchange(UNKNOWN, LOOKING, Ordering::Relaxed, Ordering::Relaxed)
+        .compare_exchange(UNCLASSIFIED, LOOKING, Ordering::Relaxed, Ordering::Relaxed)
         .is_err()
     {
         return COUNTING.load(Ordering::Relaxed) == ON;
@@ -97,73 +97,73 @@ static BACKING: std::alloc::System = std::alloc::System;
 
 /// The process's global allocator: mimalloc on Windows, the system heap
 /// elsewhere, counting while `BO2MP_COUNTING_ALLOC` is set.
-pub struct ProcessCountingAllocator;
+pub struct TallyingHeap;
 
 // SAFETY: every call goes to the backing allocator with the caller's own
 // arguments; the counting beside it touches no memory the caller owns.
-unsafe impl GlobalAlloc for ProcessCountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+unsafe impl GlobalAlloc for TallyingHeap {
+    unsafe fn alloc(&self, shape: Layout) -> *mut u8 {
         if counting_enabled() {
-            tally_allocation(layout.size());
+            tally_allocation(shape.size());
         }
         // SAFETY: the caller's contract, passed on.
-        unsafe { BACKING.alloc(layout) }
+        unsafe { BACKING.alloc(shape) }
     }
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+    unsafe fn alloc_zeroed(&self, shape: Layout) -> *mut u8 {
         if counting_enabled() {
-            tally_allocation(layout.size());
+            tally_allocation(shape.size());
         }
         // SAFETY: the caller's contract, passed on.
-        unsafe { BACKING.alloc_zeroed(layout) }
+        unsafe { BACKING.alloc_zeroed(shape) }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+    unsafe fn dealloc(&self, block: *mut u8, shape: Layout) {
         if counting_enabled() {
-            tally_free(layout.size());
+            tally_free(shape.size());
         }
         // SAFETY: the caller's contract, passed on.
-        unsafe { BACKING.dealloc(ptr, layout) }
+        unsafe { BACKING.dealloc(block, shape) }
     }
 
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    unsafe fn realloc(&self, block: *mut u8, shape: Layout, resized_byte_count: usize) -> *mut u8 {
         if counting_enabled() {
-            tally_free(layout.size());
-            tally_allocation(new_size);
+            tally_free(shape.size());
+            tally_allocation(resized_byte_count);
         }
         // SAFETY: the caller's contract, passed on.
-        unsafe { BACKING.realloc(ptr, layout, new_size) }
+        unsafe { BACKING.realloc(block, shape, resized_byte_count) }
     }
 }
 
 /// The process's allocation totals; all zero while counting is off.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ProcessAllocationStats {
+pub struct HeapUsageTally {
     /// Allocations made; growing one counts as another.
-    pub process_allocations: u64,
+    pub allocation_count: u64,
     /// Bytes those allocations asked for.
-    pub process_allocation_bytes: u64,
+    pub heap_bytes_handed_out: u64,
     /// Bytes given back.
     pub process_freed_bytes: u64,
 }
 
-pub fn process_allocations() -> ProcessAllocationStats {
+pub fn process_allocations() -> HeapUsageTally {
     COUNTS
         .iter()
-        .fold(ProcessAllocationStats::default(), |mut total, stripe| {
-            total.process_allocations += stripe.allocations.load(Ordering::Relaxed);
-            total.process_allocation_bytes += stripe.allocated.load(Ordering::Relaxed);
+        .fold(HeapUsageTally::default(), |mut total, stripe| {
+            total.allocation_count += stripe.allocations.load(Ordering::Relaxed);
+            total.heap_bytes_handed_out += stripe.allocated.load(Ordering::Relaxed);
             total.process_freed_bytes += stripe.freed.load(Ordering::Relaxed);
             total
         })
 }
 
 /// Bytes allocated and not yet given back, or None while counting is off.
-pub fn process_live_heap_bytes() -> Option<u64> {
+pub fn heap_bytes_in_use() -> Option<u64> {
     counting_enabled().then(|| {
         let total = process_allocations();
         total
-            .process_allocation_bytes
+            .heap_bytes_handed_out
             .saturating_sub(total.process_freed_bytes)
     })
 }
@@ -171,19 +171,20 @@ pub fn process_live_heap_bytes() -> Option<u64> {
 /// Hands freed heap pages back to the system after a big unload, and says
 /// how long that took. Only glibc's heap needs asking; the others return
 /// them on their own.
-pub fn release_freed_heap() -> Duration {
-    let started = Instant::now();
+pub fn return_spare_heap() -> Duration {
+    let began = Instant::now();
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: malloc_trim only reorganises glibc's own free lists.
+    // SAFETY: the trim only reorganises glibc's own free lists.
     unsafe {
-        malloc_trim(0);
+        trim_free_heap(0);
     }
-    started.elapsed()
+    began.elapsed()
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 unsafe extern "C" {
-    fn malloc_trim(pad: usize) -> std::ffi::c_int;
+    #[link_name = "malloc_trim"]
+    fn trim_free_heap(keep_bytes: usize) -> std::ffi::c_int;
 }
 
 #[cfg(test)]
@@ -205,9 +206,9 @@ mod tests {
             thread.join().expect("tally thread");
         }
         let after = process_allocations();
-        assert_eq!(after.process_allocations - before.process_allocations, 4);
+        assert_eq!(after.allocation_count - before.allocation_count, 4);
         assert_eq!(
-            after.process_allocation_bytes - before.process_allocation_bytes,
+            after.heap_bytes_handed_out - before.heap_bytes_handed_out,
             400
         );
         assert_eq!(after.process_freed_bytes - before.process_freed_bytes, 160);
@@ -219,13 +220,13 @@ mod tests {
         // SAFETY: the layout is non-zero; the block is grown with the same
         // alignment and freed with its final size.
         unsafe {
-            let block = ProcessCountingAllocator.alloc_zeroed(layout);
+            let block = TallyingHeap.alloc_zeroed(layout);
             assert!(!block.is_null());
             assert_eq!(*block.add(63), 0);
             *block = 7;
-            let grown = ProcessCountingAllocator.realloc(block, layout, 256);
+            let grown = TallyingHeap.realloc(block, layout, 256);
             assert_eq!(*grown, 7);
-            ProcessCountingAllocator
+            TallyingHeap
                 .dealloc(grown, Layout::from_size_align(256, 16).expect("layout"));
         }
     }

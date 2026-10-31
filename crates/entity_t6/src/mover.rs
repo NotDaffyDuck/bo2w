@@ -1,15 +1,15 @@
 //! BO2's mover history from `bg_mover.cpp`: `mover_info_t` keeps the last
-//! 32 origins and angles of a moving entity, and
-//! `BG_AdjustPositionForMover` carries a point (and optionally a facing)
+//! 32 origins and heading of a moving entity, and
+//! `BG_AdjustPositionForMover` carries a point (and optionally a heading)
 //! riding it from one time to another, turning with the mover as well as
 //! moving with it.
 //!
 //! MW2 only shifted the point by the mover's trajectory; BO2 replays the
 //! recorded positions and applies the full rigid move.
 
-use crate::angles::{angle_subtract, cos_sin, dot, vectoangles};
-use crate::entity_type::{ENTITYNUM_NONE, ENTITYNUM_WORLD};
-use crate::link::angles_to_axis;
+use crate::angles::{cos_sin, dot, vectoangles};
+use crate::entity_type::{NO_ENTITY_SLOT, ENTITYNUM_WORLD};
+use crate::link::axis_of_angles;
 
 /// Records kept per mover.
 pub const MOVER_RECORDS: usize = 32;
@@ -27,8 +27,8 @@ pub fn keeps_mover_history(e_flags2: i32, is_vehicle: bool) -> bool {
 /// `mover_record_t`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MoverRecord {
-    pub origin: [f32; 3],
-    pub angles: [f32; 3],
+    pub spot: [f32; 3],
+    pub heading: [f32; 3],
     pub time: i32,
 }
 
@@ -45,8 +45,8 @@ fn older(i: usize) -> usize {
 
 /// `LerpAngleVector`: each angle moves the short way round by `frac`.
 #[must_use]
-pub fn lerp_angle_vector(from: [f32; 3], to: [f32; 3], frac: f32) -> [f32; 3] {
-    core::array::from_fn(|i| angle_subtract(to[i], from[i]) * frac + from[i])
+pub fn lerp_angle_vector(start_turn: [f32; 3], end_turn: [f32; 3], blend: f32) -> [f32; 3] {
+    core::array::from_fn(|i| crate::angles::turn_delta(end_turn[i], start_turn[i]) * blend + start_turn[i])
 }
 
 /// `vectosignedpitch`: pitch in (-180, 180], down positive. Straight up
@@ -63,23 +63,23 @@ pub fn vectosignedpitch(v: [f32; 3]) -> f32 {
 /// `AxisToAngles`: pitch and yaw from the forward vector, roll from where
 /// the left vector ends up once yaw and pitch are undone.
 #[must_use]
-pub fn axis_to_angles(axis: [[f32; 3]; 3]) -> [f32; 3] {
-    let mut angles = vectoangles(axis[0]);
-    let left = axis[1];
-    let (cy, sy) = cos_sin(-angles[1]);
+pub fn axis_to_angles(basis: [[f32; 3]; 3]) -> [f32; 3] {
+    let [fwd_row, left, _up_row] = basis;
+    let mut heading = vectoangles(fwd_row);
+    let (cy, sy) = cos_sin(-heading[1]);
     let ty = left[0] * sy + left[1] * cy;
     let tx = left[0] * cy - left[1] * sy;
-    let (cp, sp) = cos_sin(-angles[0]);
-    let t = [left[2] * sp + tx * cp, ty, left[2] * cp - tx * sp];
+    let (codepoint, sp) = cos_sin(-heading[0]);
+    let t = [left[2] * sp + tx * codepoint, ty, left[2] * codepoint - tx * sp];
     let p = vectosignedpitch(t);
-    angles[2] = if t[1] >= 0.0 {
+    heading[2] = if t[1] >= 0.0 {
         -p
     } else if p >= 0.0 {
         p - 180.0
     } else {
         p + 180.0
     };
-    angles
+    heading
 }
 
 /// `axis^T * v`: a world vector put into this axis' frame.
@@ -95,9 +95,9 @@ fn to_world(axis: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
 impl MoverInfo {
     /// `mover_info_t::init`: every record starts as this one.
     #[must_use]
-    pub fn new(origin: [f32; 3], angles: [f32; 3], time: i32) -> Self {
+    pub fn new(spot: [f32; 3], heading: [f32; 3], time: i32) -> Self {
         Self {
-            records: [MoverRecord { origin, angles, time }; MOVER_RECORDS],
+            records: [MoverRecord { spot, heading, time }; MOVER_RECORDS],
             last: 0,
         }
     }
@@ -105,15 +105,15 @@ impl MoverInfo {
     /// `sv_update_mover_info` for a new mover: start the history, then
     /// add this same record (which overwrites the first, same time).
     #[must_use]
-    pub fn start(origin: [f32; 3], angles: [f32; 3], time: i32) -> Self {
-        let mut info = Self::new(origin, angles, time);
-        info.add_record(origin, angles, time);
+    pub fn start(spot: [f32; 3], heading: [f32; 3], time: i32) -> Self {
+        let mut info = Self::new(spot, heading, time);
+        info.add_record(spot, heading, time);
         info
     }
 
     /// `mover_info_t::add_record`: a later time takes the next slot, the
     /// same time overwrites the newest, an earlier time is dropped.
-    pub fn add_record(&mut self, origin: [f32; 3], angles: [f32; 3], time: i32) {
+    pub fn add_record(&mut self, spot: [f32; 3], heading: [f32; 3], time: i32) {
         let newest = self.records[self.last];
         if newest.time > time {
             return;
@@ -122,8 +122,8 @@ impl MoverInfo {
             self.last = (self.last + 1) % MOVER_RECORDS;
             self.records[self.last].time = time;
         }
-        self.records[self.last].origin = origin;
-        self.records[self.last].angles = angles;
+        self.records[self.last].spot = spot;
+        self.records[self.last].heading = heading;
     }
 
     #[must_use]
@@ -141,19 +141,19 @@ impl MoverInfo {
     ///
     /// At or before the oldest record gives the oldest; at or after the
     /// newest gives the newest; between two records it lerps. When no pair
-    /// brackets the time (a ring with times out of order) `origin` and
-    /// `angles` are left as they were, as BO2 does.
-    pub fn get_position(&self, time: i32, origin: &mut [f32; 3], angles: &mut [f32; 3]) {
+    /// brackets the time (a ring with times out of order) `spot` and
+    /// `heading` are left as they were, as BO2 does.
+    pub fn get_position(&self, time: i32, spot: &mut [f32; 3], heading: &mut [f32; 3]) {
         let oldest = &self.records[(self.last + 1) % MOVER_RECORDS];
         if time <= oldest.time {
-            *origin = oldest.origin;
-            *angles = oldest.angles;
+            *spot = oldest.spot;
+            *heading = oldest.heading;
             return;
         }
         let mut newer = self.last;
         if self.records[newer].time <= time {
-            *origin = self.records[newer].origin;
-            *angles = self.records[newer].angles;
+            *spot = self.records[newer].spot;
+            *heading = self.records[newer].heading;
             return;
         }
         let mut old = older(newer);
@@ -162,8 +162,8 @@ impl MoverInfo {
             if a.time <= time && time <= b.time {
                 let span = (b.time - a.time) as f32;
                 let frac = if span > 0.0 { (time - a.time) as f32 / span } else { 0.0 };
-                *origin = core::array::from_fn(|i| (b.origin[i] - a.origin[i]) * frac + a.origin[i]);
-                *angles = lerp_angle_vector(a.angles, b.angles, frac);
+                *spot = core::array::from_fn(|i| (b.spot[i] - a.spot[i]) * frac + a.spot[i]);
+                *heading = lerp_angle_vector(a.heading, b.heading, frac);
                 return;
             }
             newer = old;
@@ -175,8 +175,8 @@ impl MoverInfo {
     /// turned between its last two records.
     #[must_use]
     pub fn apply_rotation(&self, v: [f32; 3]) -> [f32; 3] {
-        let now = angles_to_axis(self.newest().angles);
-        let before = angles_to_axis(self.previous().angles);
+        let now = axis_of_angles(self.newest().heading);
+        let before = axis_of_angles(self.previous().heading);
         to_world(&now, to_local(&before, v))
     }
 
@@ -192,55 +192,57 @@ impl MoverInfo {
     #[must_use]
     pub fn apply_rotation_translation(&self, p: [f32; 3]) -> [f32; 3] {
         let (now, before) = (self.newest(), self.previous());
-        let now_axis = angles_to_axis(now.angles);
-        let before_axis = angles_to_axis(before.angles);
-        let d = core::array::from_fn(|i| p[i] - before.origin[i]);
+        let now_axis = axis_of_angles(now.heading);
+        let before_axis = axis_of_angles(before.heading);
+        let d = core::array::from_fn(|i| p[i] - before.spot[i]);
         let w = to_world(&now_axis, to_local(&before_axis, d));
-        core::array::from_fn(|i| now.origin[i] + w[i])
+        core::array::from_fn(|i| now.spot[i] + w[i])
     }
 }
 
-/// Where the mover is when it has no history: its `trBase` origin and
-/// angles (the server's current state, or the client's previous snapshot).
+/// Where the mover is when it has no history: its `trBase` spot and
+/// heading (the server's current state, or the client's previous snapshot).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MoverBase {
-    pub origin: [f32; 3],
-    pub angles: [f32; 3],
+    pub spot: [f32; 3],
+    pub heading: [f32; 3],
 }
 
-/// `BG_AdjustPositionForMover`: move `origin` (and `angles`, when given)
-/// riding entity `mover_num` from `from_time` to `to_time`. The world and
-/// "no entity" are left alone.
+/// `BG_AdjustPositionForMover`: carry the rider position `pos` (and `heading`, when given)
+/// along with the entity `ride_ent` it rides, from time `t_start` to
+/// `t_end`. The world and "no entity" carry nothing.
 pub fn adjust_position_for_mover(
-    mover_num: i32,
+    ride_ent: i32,
     base: MoverBase,
     info: Option<&MoverInfo>,
-    from_time: i32,
-    to_time: i32,
-    origin: &mut [f32; 3],
-    angles: Option<&mut [f32; 3]>,
+    t_start: i32,
+    t_end: i32,
+    pos: &mut [f32; 3],
+    heading: Option<&mut [f32; 3]>,
 ) {
-    if mover_num == ENTITYNUM_NONE || mover_num == ENTITYNUM_WORLD {
+    if matches!(ride_ent, NO_ENTITY_SLOT | ENTITYNUM_WORLD) {
         return;
     }
-    let (mut from_origin, mut from_angles) = (base.origin, base.angles);
-    let (mut to_origin, mut to_angles) = (base.origin, base.angles);
-    if let Some(info) = info {
-        info.get_position(from_time, &mut from_origin, &mut from_angles);
-        info.get_position(to_time, &mut to_origin, &mut to_angles);
+    let mut before = (base.spot, base.heading);
+    let mut after = before;
+    if let Some(history) = info {
+        history.get_position(t_start, &mut before.0, &mut before.1);
+        history.get_position(t_end, &mut after.0, &mut after.1);
     }
-    let from_axis = angles_to_axis(from_angles);
-    let to_axis = angles_to_axis(to_angles);
-    let d = core::array::from_fn(|i| origin[i] - from_origin[i]);
-    let w = to_world(&to_axis, to_local(&from_axis, d));
-    *origin = core::array::from_fn(|i| w[i] + to_origin[i]);
-    if let Some(angles) = angles {
+    let (from_origin, from_angles) = before;
+    let (to_origin, to_angles) = after;
+    let from_axis = axis_of_angles(from_angles);
+    let to_axis = axis_of_angles(to_angles);
+    let offset = core::array::from_fn(|i| pos[i] - from_origin[i]);
+    let carried = to_world(&to_axis, to_local(&from_axis, offset));
+    *pos = core::array::from_fn(|i| carried[i] + to_origin[i]);
+    if let Some(heading) = heading {
         // phys_full_inv_multiply_mat then phys_full_multiply_mat on the
         // rider's axis: each axis row goes into the mover's old frame, then
         // back out of its new one.
-        let own = angles_to_axis(*angles);
+        let own = axis_of_angles(*heading);
         let moved = own.map(|row| to_world(&to_axis, to_local(&from_axis, row)));
-        *angles = axis_to_angles(moved);
+        *heading = axis_to_angles(moved);
     }
 }
 
@@ -266,7 +268,7 @@ mod tests {
         m.add_record([99.0, 0.0, 0.0], [0.0; 3], 120);
         m.add_record([20.0, 5.0, 0.0], [0.0, 90.0, 0.0], 200);
         assert_eq!(m.last, 2);
-        assert_eq!(m.previous().origin, [10.0, 0.0, 0.0]);
+        assert_eq!(m.previous().spot, [10.0, 0.0, 0.0]);
         let (mut o, mut a) = ([0.0; 3], [0.0; 3]);
         m.get_position(175, &mut o, &mut a);
         assert!(close3(o, [15.0, 2.5, 0.0]) && close3(a, [0.0, 90.0, 0.0]));
@@ -293,11 +295,11 @@ mod tests {
     #[test]
     fn axis_round_trip() {
         for ang in [[10.0, 30.0, 20.0], [-40.0, 200.0, -70.0], [0.0, 0.0, 0.0]] {
-            let back = axis_to_angles(angles_to_axis(ang));
-            let again = angles_to_axis(back);
-            let axis = angles_to_axis(ang);
-            for r in 0..3 {
-                assert!(close3(again[r], axis[r]), "{ang:?} -> {back:?}");
+            let back = axis_to_angles(axis_of_angles(ang));
+            let again = axis_of_angles(back);
+            let axis = axis_of_angles(ang);
+            for (got, want) in again.iter().zip(axis.iter()) {
+                assert!(close3(*got, *want), "{ang:?} -> {back:?}");
             }
         }
         assert!(close(vectosignedpitch([1.0, 0.0, 1.0]), -45.0));

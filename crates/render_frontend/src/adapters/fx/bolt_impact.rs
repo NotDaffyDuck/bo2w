@@ -6,71 +6,79 @@
 //! for effects (bullet hits play at the point too), so a body hit plays where
 //! the bolt went in, turned to the hit normal, as BO2 does off a body.
 
-use assets::PreparedWeapons;
+use assets::StagedWeapons;
 use bevy::prelude::*;
-use render_fx::combat::play_impact_table_cell;
+use render_fx::battle_fx::play_impact_table_room;
 use render_fx::{
-    CombatFxDump, EntityMarks, FxJournalCursor, HostFxSystem, PreparedFxCatalog,
-    PreparedFxElemInfos, PreparedImpactFx,
+    EntityMarkBoard, EffectJournalCursor, EffectsSystemHandle, ReadyFxBook,
+    PreparedFxElemTable, ReadyHitFx,
 };
 
-use crate::adapters::fx::{present::FxScene, world_mark::FrontendFxScene};
-use crate::prepare::scene::world::WorldScene;
+use crate::adapters::fx::{effect_play::EffectStage, world_decal::FrontendEffectStage};
+use crate::prepare::scene::world::LevelStage;
+
+/// The impact table is Black Ops II's only when it was loaded as such.
+fn is_t6_table(impact_effect: Option<&ReadyHitFx>) -> bool {
+    impact_effect
+        .and_then(|prepared| prepared.0.as_ref())
+        .is_some_and(|table| table.t6)
+}
+
+/// The surface normal a hit plays along; a hit without a direction faces up.
+fn facing(direction: [f32; 3]) -> [f32; 3] {
+    if direction == [0.0; 3] {
+        [0.0, 0.0, 1.0]
+    } else {
+        direction
+    }
+}
+
+/// The entity a mark is left on: a player struck, never the world itself.
+fn marked_entity(other: impl TryInto<u16>) -> Option<u16> {
+    let number: u16 = other.try_into().ok()?;
+    (u32::from(number) < fx_t6::runtime::FX_ENTITYNUM_WORLD).then_some(number)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn play(
     hit: On<net::EntityBoltImpact>,
-    weapons: Option<Res<PreparedWeapons>>,
-    catalog: Option<Res<PreparedFxCatalog>>,
-    impact_fx: Option<Res<PreparedImpactFx>>,
-    mut elem_infos: ResMut<PreparedFxElemInfos>,
-    mut host: ResMut<HostFxSystem>,
-    mut cursor: ResMut<FxJournalCursor>,
-    mut combat: ResMut<CombatFxDump>,
-    scene: Option<Res<WorldScene>>,
-    marks: Res<EntityMarks>,
+    weapons: Option<Res<StagedWeapons>>,
+    effect_book: Option<Res<ReadyFxBook>>,
+    impact_effect: Option<Res<ReadyHitFx>>,
+    mut fx_elem_info: ResMut<PreparedFxElemTable>,
+    mut host: ResMut<EffectsSystemHandle>,
+    mut cursor: ResMut<EffectJournalCursor>,
+    scene: Option<Res<LevelStage>>,
+    marks: Res<EntityMarkBoard>,
 ) {
-    // Black Ops II's impact table only.
-    if !impact_fx
-        .as_ref()
-        .and_then(|fx| fx.0.as_ref())
-        .is_some_and(|t| t.t6)
-    {
-        return;
-    }
-    let p = hit.event.payload;
-    let Some(impact_type) = weapons
+    let strike = hit.event.payload;
+    let table_type = weapons
         .as_deref()
-        .and_then(|w| w.0.facts_of(p.weapon))
-        .map(|f| f.impact_type)
-    else {
+        .and_then(|prepared| prepared.0.summary_for(strike.weapon))
+        .map(|facts| facts.impact_kind_id);
+    // Black Ops II's impact table only.
+    let (true, Some(impact_kind_id)) = (is_t6_table(impact_effect.as_deref()), table_type) else {
         return;
-    };
-    let normal = if p.direction == [0.0, 0.0, 0.0] {
-        [0.0, 0.0, 1.0]
-    } else {
-        p.direction
     };
     // A mark it leaves goes on the player it struck, as a bullet's does.
-    let previous_mark_entity = host.0.spawn_mark_entity;
-    host.0.spawn_mark_entity = u16::try_from(p.other_entity_num)
-        .ok()
-        .filter(|&n| u32::from(n) < fx_t6::runtime::FX_ENTITYNUM_WORLD);
-    let view = FrontendFxScene::wrap(scene.as_deref(), &marks);
-    play_impact_table_cell(
-        impact_type,
-        p.origin,
-        normal,
-        p.surf_type,
+    let kept = std::mem::replace(
+        &mut host.0.stain_target_entity,
+        marked_entity(strike.other_entity_num),
+    );
+    let view = FrontendEffectStage::wrap(scene.as_deref(), &marks);
+    play_impact_table_room(
+        impact_kind_id,
+        strike.origin,
+        facing(strike.direction),
+        strike.surf_type,
         0,
         0,
-        catalog.as_deref(),
-        impact_fx.as_deref(),
-        &mut elem_infos.0,
+        effect_book.as_deref(),
+        impact_effect.as_deref(),
+        &mut fx_elem_info.0,
         &mut host,
         &mut cursor,
-        &mut combat,
-        view.as_ref().map(|s| s as &dyn FxScene),
+        view.as_ref().map(|s| s as &dyn EffectStage),
     );
-    host.0.spawn_mark_entity = previous_mark_entity;
+    host.0.stain_target_entity = kept;
 }

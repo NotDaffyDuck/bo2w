@@ -4,10 +4,10 @@
 //! the composition. Values are read little-endian at `fastfile_t6::layout` offsets, from the
 //! weapon's variant bytes and its WeaponDef bytes.
 
-use fastfile_t6::layout::{WeaponDef as D, WeaponVariantDef as V};
+use fastfile_t6::layout::{WeaponDef, WeaponVariantDef};
 
 /// BO2 `weapType_t`.
-pub mod weap_type {
+pub mod gun_family_code {
     pub const BULLET: u8 = 0;
     pub const GRENADE: u8 = 1;
     pub const PROJECTILE: u8 = 2;
@@ -15,12 +15,12 @@ pub mod weap_type {
     pub const GAS: u8 = 4;
     pub const BOMB: u8 = 5;
     pub const MINE: u8 = 6;
-    pub const MELEE: u8 = 7;
+    pub const CLOSE_COMBAT: u8 = 7;
     pub const RIOTSHIELD: u8 = 8;
 }
 
 /// BO2 `weapClass_t`.
-pub mod weap_class {
+pub mod gun_kind_ids {
     pub const RIFLE: u8 = 0;
     pub const MG: u8 = 1;
     pub const SMG: u8 = 2;
@@ -32,9 +32,31 @@ pub mod weap_class {
     pub const NON_PLAYER: u8 = 8;
     pub const GAS: u8 = 9;
     pub const ITEM: u8 = 10;
-    pub const MELEE: u8 = 11;
+    pub const CLOSE_COMBAT: u8 = 11;
     pub const KILLSTREAK_ALT_STORED_WEAPON: u8 = 12;
     pub const PISTOL_SPREAD: u8 = 13;
+
+    /// What the scripts' `weaponclass` returns for BO2 class `raw`.
+    #[must_use]
+    pub fn name(raw: i32) -> &'static str {
+        match raw {
+            0 => "rifle",
+            1 => "mg",
+            2 => "smg",
+            3 => "spread",
+            4 => "pistol",
+            5 => "grenade",
+            6 => "rocketlauncher",
+            7 => "turret",
+            8 => "non-player",
+            9 => "gas",
+            10 => "item",
+            11 => "melee",
+            12 => "killstreak alt stored weapon",
+            13 => "pistol spread",
+            _ => "none",
+        }
+    }
 }
 
 /// BO2 `weapInventoryType_t`.
@@ -43,7 +65,7 @@ pub mod inventory {
     pub const OFFHAND: u8 = 1;
     pub const ITEM: u8 = 2;
     pub const ALTMODE: u8 = 3;
-    pub const MELEE: u8 = 4;
+    pub const CLOSE_COMBAT: u8 = 4;
     pub const DWLEFTHAND: u8 = 5;
 }
 
@@ -67,7 +89,7 @@ pub mod fire_type {
 }
 
 /// BO2 `OffhandClass`.
-pub mod offhand_class {
+pub mod secondary_hand_category {
     pub const NONE: u8 = 0;
     pub const FRAG_GRENADE: u8 = 1;
     pub const SMOKE_GRENADE: u8 = 2;
@@ -99,33 +121,33 @@ fn rd_u8(b: &[u8], at: usize) -> u8 {
     b.get(at).copied().unwrap_or(0)
 }
 
-fn rd_bool(b: &[u8], at: usize) -> bool {
-    rd_u8(b, at) != 0
+fn rd_bool(b: &[u8], off: usize) -> bool {
+    rd_u8(b, off) != 0
 }
 
 /// Window 1: what every mechanic needs to know about a weapon.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoreFacts {
-    pub weap_type: u8,
+    pub gun_family_code: u8,
     pub weap_class: u8,
-    pub inventory_type: u8,
+    pub carry_slot_kind: u8,
     pub fire_type: u8,
-    pub offhand_class: u8,
+    pub secondary_hand_category: u8,
     pub offhand_slot: u8,
     pub unlimited_ammo: bool,
     pub no_drops_or_raises: bool,
     pub can_use_in_vehicle: bool,
-    pub bolt_action: bool,
+    pub manual_cycle: bool,
     pub dual_wield: bool,
     pub alt_weapon_ads_only: bool,
     /// Variant `altWeaponIndex` (0 = none).
     pub alt_weapon: u32,
     /// Def `dualWieldWeaponIndex`: the left-hand gun (0 = none).
     pub dual_wield_weapon: u32,
-    pub clip_size: i32,
+    pub magazine_capacity: i32,
     pub burst_delay_time: i32,
     /// `bClipOnly`: the clip is the whole weapon (no stock).
-    pub clip_only: bool,
+    pub motion_clip_exclusive: bool,
     pub has_detonator: bool,
     pub plantable: bool,
     pub hold_button_to_throw: bool,
@@ -157,35 +179,35 @@ pub struct CoreFacts {
 impl CoreFacts {
     pub fn read(variant: &[u8], def: &[u8]) -> Self {
         Self {
-            weap_type: rd_u8(def, D::weapType),
-            weap_class: rd_u8(def, D::weapClass),
-            inventory_type: rd_u8(def, D::inventoryType),
-            fire_type: rd_u8(def, D::fireType),
-            offhand_class: rd_u8(def, D::offhandClass),
-            offhand_slot: rd_u8(def, D::offhandSlot),
-            unlimited_ammo: rd_bool(def, D::unlimitedAmmo),
-            no_drops_or_raises: rd_bool(def, D::bNoDropsOrRaises),
-            can_use_in_vehicle: rd_bool(def, D::bCanUseInVehicle),
-            bolt_action: rd_bool(def, D::bBoltAction),
-            dual_wield: rd_bool(def, D::bDualWield),
-            alt_weapon_ads_only: rd_bool(def, D::bAltWeaponAdsOnly),
-            alt_weapon: rd_u32(variant, V::altWeaponIndex),
-            dual_wield_weapon: rd_u32(def, D::dualWieldWeaponIndex),
-            clip_size: rd_i32(variant, V::iClipSize),
-            burst_delay_time: rd_i32(def, D::iBurstDelayTime),
-            clip_only: rd_bool(def, D::bClipOnly),
-            has_detonator: rd_bool(def, D::hasDetonator),
-            plantable: rd_bool(def, D::plantable),
-            hold_button_to_throw: rd_bool(def, D::holdButtonToThrow),
-            alt_weapon_disable_switching: rd_bool(def, D::bAltWeaponDisableSwitching),
-            guided_missile_type: rd_i32(def, D::guidedMissileType),
+            gun_family_code: rd_u8(def, WeaponDef::weapType),
+            weap_class: rd_u8(def, WeaponDef::weapClass),
+            carry_slot_kind: rd_u8(def, WeaponDef::inventoryType),
+            fire_type: rd_u8(def, WeaponDef::fireType),
+            secondary_hand_category: rd_u8(def, WeaponDef::offhandClass),
+            offhand_slot: rd_u8(def, WeaponDef::offhandSlot),
+            unlimited_ammo: rd_bool(def, WeaponDef::unlimitedAmmo),
+            no_drops_or_raises: rd_bool(def, WeaponDef::bNoDropsOrRaises),
+            can_use_in_vehicle: rd_bool(def, WeaponDef::bCanUseInVehicle),
+            manual_cycle: rd_bool(def, WeaponDef::bBoltAction),
+            dual_wield: rd_bool(def, WeaponDef::bDualWield),
+            alt_weapon_ads_only: rd_bool(def, WeaponDef::bAltWeaponAdsOnly),
+            alt_weapon: rd_u32(variant, WeaponVariantDef::altWeaponIndex),
+            dual_wield_weapon: rd_u32(def, WeaponDef::dualWieldWeaponIndex),
+            magazine_capacity: rd_i32(variant, WeaponVariantDef::iClipSize),
+            burst_delay_time: rd_i32(def, WeaponDef::iBurstDelayTime),
+            motion_clip_exclusive: rd_bool(def, WeaponDef::bClipOnly),
+            has_detonator: rd_bool(def, WeaponDef::hasDetonator),
+            plantable: rd_bool(def, WeaponDef::plantable),
+            hold_button_to_throw: rd_bool(def, WeaponDef::holdButtonToThrow),
+            alt_weapon_disable_switching: rd_bool(def, WeaponDef::bAltWeaponDisableSwitching),
+            guided_missile_type: rd_i32(def, WeaponDef::guidedMissileType),
             anim_slots: 0,
             has_gun_model: false,
-            ignore_attachments: rd_bool(variant, V::bIgnoreAttachments),
+            ignore_attachments: rd_bool(variant, WeaponVariantDef::bIgnoreAttachments),
             charge_root: 0,
-            carried_killstreak: rd_bool(def, D::bIsCarriedKillstreakWeapon),
-            bullet_impact_explode: rd_bool(def, D::bBulletImpactExplode),
-            armor_piercing: rd_bool(def, D::armorPiercing),
+            carried_killstreak: rd_bool(def, WeaponDef::bIsCarriedKillstreakWeapon),
+            bullet_impact_explode: rd_bool(def, WeaponDef::bBulletImpactExplode),
+            armor_piercing: rd_bool(def, WeaponDef::armorPiercing),
         }
     }
 }
@@ -194,7 +216,7 @@ impl CoreFacts {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MissileFacts {
     /// `iProjectileSpeed`: units a second.
-    pub projectile_speed: i32,
+    pub missile_velocity: i32,
     /// `destabilizationRateTime`: seconds between turns; 0 = it flies straight.
     pub destabilize_rate_time: f32,
     /// `destabilizationCurvatureMax`: the most it turns, degrees a second on each axis.
@@ -206,10 +228,10 @@ pub struct MissileFacts {
 impl MissileFacts {
     pub fn read(_variant: &[u8], def: &[u8]) -> Self {
         Self {
-            projectile_speed: rd_i32(def, D::iProjectileSpeed),
-            destabilize_rate_time: f32::from_bits(rd_u32(def, D::destabilizationRateTime)),
-            destabilize_curvature_max: f32::from_bits(rd_u32(def, D::destabilizationCurvatureMax)),
-            destabilize_distance: rd_i32(def, D::destabilizeDistance),
+            missile_velocity: rd_i32(def, WeaponDef::iProjectileSpeed),
+            destabilize_rate_time: f32::from_bits(rd_u32(def, WeaponDef::destabilizationRateTime)),
+            destabilize_curvature_max: f32::from_bits(rd_u32(def, WeaponDef::destabilizationCurvatureMax)),
+            destabilize_distance: rd_i32(def, WeaponDef::destabilizeDistance),
         }
     }
 }
@@ -239,14 +261,14 @@ impl TurretFacts {
     pub fn read(_variant: &[u8], def: &[u8]) -> Self {
         let f = |at| f32::from_bits(rd_u32(def, at));
         Self {
-            left_arc: f(D::leftArc),
-            right_arc: f(D::rightArc),
-            top_arc: f(D::topArc),
-            bottom_arc: f(D::bottomArc),
-            scan_speed: f(D::scanSpeed),
-            scan_accel: f(D::scanAccel),
-            scan_pause_ms: rd_i32(def, D::scanPauseTime),
-            barrel_type: rd_u32(def, D::barrelType),
+            left_arc: f(WeaponDef::leftArc),
+            right_arc: f(WeaponDef::rightArc),
+            top_arc: f(WeaponDef::topArc),
+            bottom_arc: f(WeaponDef::bottomArc),
+            scan_speed: f(WeaponDef::scanSpeed),
+            scan_accel: f(WeaponDef::scanAccel),
+            scan_pause_ms: rd_i32(def, WeaponDef::scanPauseTime),
+            barrel_type: rd_u32(def, WeaponDef::barrelType),
         }
     }
 
@@ -271,14 +293,14 @@ impl TurretFacts {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CameraShake {
     pub scale: f32,
-    pub duration_ms: i32,
+    pub span_ms: i32,
     pub radius: i32,
 }
 
 impl CameraShake {
     /// BO2 starts one only when it has both a length and a radius.
     pub fn is_set(&self) -> bool {
-        self.duration_ms != 0 && self.radius != 0
+        self.span_ms != 0 && self.radius != 0
     }
 }
 
@@ -299,14 +321,14 @@ impl ShakeFacts {
         let f = |at| f32::from_bits(rd_u32(def, at));
         Self {
             fire: CameraShake {
-                scale: f(D::cameraShakeScale),
-                duration_ms: rd_i32(def, D::cameraShakeDuration),
-                radius: rd_i32(def, D::cameraShakeRadius),
+                scale: f(WeaponDef::cameraShakeScale),
+                span_ms: rd_i32(def, WeaponDef::cameraShakeDuration),
+                radius: rd_i32(def, WeaponDef::cameraShakeRadius),
             },
             explosion: CameraShake {
-                scale: f(D::explosionCameraShakeScale),
-                duration_ms: rd_i32(def, D::explosionCameraShakeDuration),
-                radius: rd_i32(def, D::explosionCameraShakeRadius),
+                scale: f(WeaponDef::explosionCameraShakeScale),
+                span_ms: rd_i32(def, WeaponDef::explosionCameraShakeDuration),
+                radius: rd_i32(def, WeaponDef::explosionCameraShakeRadius),
             },
         }
     }
@@ -335,17 +357,17 @@ pub struct SwitchFacts {
 impl SwitchFacts {
     pub fn read(variant: &[u8], def: &[u8]) -> Self {
         Self {
-            drop: rd_i32(def, D::iDropTime),
-            raise: rd_i32(def, D::iRaiseTime),
-            alt_drop: rd_i32(def, D::iAltDropTime),
-            alt_raise: rd_i32(variant, V::iAltRaiseTime),
-            quick_drop: rd_i32(def, D::quickDropTime),
-            quick_raise: rd_i32(def, D::quickRaiseTime),
-            first_raise: rd_i32(def, D::iFirstRaiseTime),
-            empty_raise: rd_i32(def, D::iEmptyRaiseTime),
-            empty_drop: rd_i32(def, D::iEmptyDropTime),
-            no_quick_drop_when_empty: rd_bool(def, D::bNoQuickDropWhenEmpty),
-            cancel_auto_holster_when_empty: rd_bool(def, D::cancelAutoHolsterWhenEmpty),
+            drop: rd_i32(def, WeaponDef::iDropTime),
+            raise: rd_i32(def, WeaponDef::iRaiseTime),
+            alt_drop: rd_i32(def, WeaponDef::iAltDropTime),
+            alt_raise: rd_i32(variant, WeaponVariantDef::iAltRaiseTime),
+            quick_drop: rd_i32(def, WeaponDef::quickDropTime),
+            quick_raise: rd_i32(def, WeaponDef::quickRaiseTime),
+            first_raise: rd_i32(def, WeaponDef::iFirstRaiseTime),
+            empty_raise: rd_i32(def, WeaponDef::iEmptyRaiseTime),
+            empty_drop: rd_i32(def, WeaponDef::iEmptyDropTime),
+            no_quick_drop_when_empty: rd_bool(def, WeaponDef::bNoQuickDropWhenEmpty),
+            cancel_auto_holster_when_empty: rd_bool(def, WeaponDef::cancelAutoHolsterWhenEmpty),
         }
     }
 }
@@ -389,19 +411,19 @@ impl Default for AttachmentScales {
 
 impl AttachmentScales {
     pub fn fold(atts: &[&[u8]]) -> Self {
-        use fastfile_t6::layout::WeaponAttachment as A;
+        use fastfile_t6::layout::WeaponAttachment;
         let rd = |a: &[u8], at: usize| f32::from_le_bytes(a[at..at + 4].try_into().unwrap());
         let mut s = Self::default();
         for a in &atts[..atts.len().min(3)] {
-            s.fire_time *= rd(a, A::fFireTimeScale);
-            s.ads_in *= rd(a, A::fAdsTransInTimeScale);
-            s.ads_out *= rd(a, A::fAdsTransOutTimeScale);
-            s.reload *= rd(a, A::fReloadTimeScale);
-            s.reload_empty *= rd(a, A::fReloadEmptyTimeScale);
-            s.reload_add *= rd(a, A::fReloadAddTimeScale);
-            s.reload_quick *= rd(a, A::fReloadQuickTimeScale);
-            s.reload_quick_empty *= rd(a, A::fReloadQuickEmptyTimeScale);
-            s.reload_quick_add *= rd(a, A::fReloadQuickAddTimeScale);
+            s.fire_time *= rd(a, WeaponAttachment::fFireTimeScale);
+            s.ads_in *= rd(a, WeaponAttachment::fAdsTransInTimeScale);
+            s.ads_out *= rd(a, WeaponAttachment::fAdsTransOutTimeScale);
+            s.reload *= rd(a, WeaponAttachment::fReloadTimeScale);
+            s.reload_empty *= rd(a, WeaponAttachment::fReloadEmptyTimeScale);
+            s.reload_add *= rd(a, WeaponAttachment::fReloadAddTimeScale);
+            s.reload_quick *= rd(a, WeaponAttachment::fReloadQuickTimeScale);
+            s.reload_quick_empty *= rd(a, WeaponAttachment::fReloadQuickEmptyTimeScale);
+            s.reload_quick_add *= rd(a, WeaponAttachment::fReloadQuickAddTimeScale);
         }
         s
     }
@@ -416,16 +438,16 @@ pub const PLAYER_CLIP_SIZE_MULTIPLIER: f32 = 1.0;
 /// BG_GetClipSize: a stack-fire attachment's own clip; otherwise the gun's clip times the
 /// dvar and every attachment's `clipSizeScale`, rounded, at least 1 (a one-round clip stays 1).
 pub fn attachment_clip_size(clip: i32, atts: &[&[u8]]) -> i32 {
-    use fastfile_t6::layout::WeaponAttachment as A;
+    use fastfile_t6::layout::WeaponAttachment;
     let rd_i = |a: &[u8], at: usize| i32::from_le_bytes(a[at..at + 4].try_into().unwrap());
     let rd_f = |a: &[u8], at: usize| f32::from_le_bytes(a[at..at + 4].try_into().unwrap());
     let mut scale = PLAYER_CLIP_SIZE_MULTIPLIER;
     for a in &atts[..atts.len().min(3)] {
-        if rd_i(a, A::attachmentType) == ATTACHMENT_STACKFIRE {
-            return rd_i(a, A::iClipSize);
+        if rd_i(a, WeaponAttachment::attachmentType) == ATTACHMENT_STACKFIRE {
+            return rd_i(a, WeaponAttachment::iClipSize);
         }
         // BO2 asserts the scale is above 0; a blank one leaves the clip alone here.
-        let s = rd_f(a, A::clipSizeScale);
+        let s = rd_f(a, WeaponAttachment::clipSizeScale);
         if s > 0.0 {
             scale *= s;
         }
@@ -439,12 +461,12 @@ pub fn attachment_clip_size(clip: i32, atts: &[&[u8]]) -> i32 {
 
 /// BG_GetFireType: a stack-fire attachment's fire type, else the gun's.
 pub fn attachment_fire_type(fire_type: u8, atts: &[&[u8]]) -> u8 {
-    use fastfile_t6::layout::WeaponAttachment as A;
+    use fastfile_t6::layout::WeaponAttachment;
     let rd_i = |a: &[u8], at: usize| i32::from_le_bytes(a[at..at + 4].try_into().unwrap());
     atts[..atts.len().min(3)]
         .iter()
-        .find(|a| rd_i(a, A::attachmentType) == ATTACHMENT_STACKFIRE)
-        .map_or(fire_type, |a| rd_i(a, A::fireType) as u8)
+        .find(|a| rd_i(a, WeaponAttachment::attachmentType) == ATTACHMENT_STACKFIRE)
+        .map_or(fire_type, |a| rd_i(a, WeaponAttachment::fireType) as u8)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -525,29 +547,28 @@ impl FactsTable {
         Self::default()
     }
 
-    pub fn set(&mut self, weapon: u32, name: &str, facts: T6WeaponFacts) {
-        let i = weapon as usize;
+    pub fn set(&mut self, gun: u32, label: impl Into<String>, facts: T6WeaponFacts) {
+        let i = gun as usize;
         if self.rows.len() <= i {
             self.rows.resize(i + 1, T6WeaponFacts::default());
-            self.names.resize(i + 1, String::new());
+            self.names.resize_with(i + 1, String::new);
         }
         self.rows[i] = facts;
-        self.names[i] = name.to_owned();
+        self.names[i] = label.into();
     }
 
-    pub fn get(&self, weapon: u32) -> T6WeaponFacts {
-        // Unknown index: no weapon, all-zero facts.
+    pub fn get(&self, gun: u32) -> T6WeaponFacts {
+        // Unknown index: no gun, all-zero facts.
         self.rows
-            .get(weapon as usize)
+            .get(gun as usize)
             .copied()
-            .unwrap_or(T6WeaponFacts::default())
+            .unwrap_or_default()
     }
 
-    pub fn name(&self, weapon: u32) -> &str {
+    pub fn name(&self, gun: u32) -> &str {
         self.names
-            .get(weapon as usize)
-            .map(String::as_str)
-            .unwrap_or("")
+            .get(gun as usize)
+            .map_or("", String::as_str)
     }
 
     pub fn len(&self) -> usize {
@@ -555,7 +576,7 @@ impl FactsTable {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.rows.len() == 0
     }
 
     pub fn find(&self, name: &str) -> Option<u32> {
@@ -571,28 +592,28 @@ impl FactsTable {
     /// attachment uniques.
     pub fn from_dump(text: &str) -> Self {
         let mut t = Self::new();
-        let mut links: Vec<(u32, String, String)> = Vec::new();
-        for (i, line) in text.lines().enumerate() {
-            if let Some(rest) = line.strip_prefix("#att\t") {
-                if let Some((name, bytes)) = rest
+        let mut links = Vec::<(u32, String, String)>::new();
+        for (i, entry) in text.lines().enumerate() {
+            if let Some(rest) = entry.strip_prefix("#att\t") {
+                if let Some((tag, bytes)) = rest
                     .split_once('\t')
                     .and_then(|(n, h)| Some((n, unhex(h)?)))
                 {
-                    t.attachments.insert(name.to_owned(), bytes);
+                    t.attachments.insert(tag.to_owned(), bytes);
                 }
                 continue;
             }
-            if let Some(rest) = line.strip_prefix("#attu\t") {
-                if let Some((name, bytes)) = rest
+            if let Some(rest) = entry.strip_prefix("#attu\t") {
+                if let Some((tag, bytes)) = rest
                     .split_once('\t')
                     .and_then(|(n, h)| Some((n, unhex(h)?)))
                 {
-                    t.uniques.insert(name.to_owned(), bytes);
+                    t.uniques.insert(tag.to_owned(), bytes);
                 }
                 continue;
             }
-            let mut parts = line.split('\t');
-            let (Some(name), Some(v), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
+            let mut fields = entry.split('\t');
+            let (Some(label), Some(v), Some(d)) = (fields.next(), fields.next(), fields.next()) else {
                 continue;
             };
             let (Some(v), Some(d)) = (unhex(v), unhex(d)) else {
@@ -603,8 +624,8 @@ impl FactsTable {
             // Indexes in the bytes are the fastfile's, not ours.
             f.core.alt_weapon = 0;
             f.core.dual_wield_weapon = 0;
-            let (mut alt, mut dual) = (String::new(), String::new());
-            for col in parts {
+            let (mut alt, mut dual) = <(String, String)>::default();
+            for col in fields {
                 match col.split_once('=') {
                     Some(("slots", x)) => {
                         f.core.anim_slots = u128::from_str_radix(x, 16).unwrap_or(0)
@@ -618,7 +639,7 @@ impl FactsTable {
             if !alt.is_empty() || !dual.is_empty() {
                 links.push((index, alt, dual));
             }
-            t.set(index, name, f);
+            t.set(index, label, f);
         }
         for (index, alt, dual) in links {
             let alt = t.find(&alt).unwrap_or(0);
@@ -692,7 +713,7 @@ impl FactsTable {
         for i in 1..n {
             let c = self.rows[i].core;
             let a = c.alt_weapon as usize;
-            if c.inventory_type != inventory::ALTMODE && a != 0 && a != i && a < n && parent[a] == 0 {
+            if c.carry_slot_kind != inventory::ALTMODE && a != 0 && a != i && a < n && parent[a] == 0 {
                 parent[a] = i;
             }
         }
@@ -721,7 +742,7 @@ impl FactsTable {
     pub fn ammo_clip_weapon(&self, weapon: u32) -> u32 {
         let c = self.get(weapon).core;
         let mut w = weapon;
-        if c.inventory_type == inventory::ALTMODE
+        if c.carry_slot_kind == inventory::ALTMODE
             && !c.ignore_attachments
             && !c.dual_wield
             && c.alt_weapon != 0
@@ -740,10 +761,10 @@ impl FactsTable {
     pub fn ammo_pool_weapon(&self, weapon: u32) -> u32 {
         let c = self.get(weapon).core;
         let mut w = weapon;
-        if c.inventory_type == inventory::ALTMODE && !c.ignore_attachments && c.alt_weapon != 0 {
+        if c.carry_slot_kind == inventory::ALTMODE && !c.ignore_attachments && c.alt_weapon != 0 {
             w = c.alt_weapon;
         }
-        if c.dual_wield && c.inventory_type == inventory::DWLEFTHAND && c.dual_wield_weapon != 0 {
+        if c.dual_wield && c.carry_slot_kind == inventory::DWLEFTHAND && c.dual_wield_weapon != 0 {
             w = c.dual_wield_weapon;
         }
         if c.fire_type == fire_type::CHARGESHOT && c.charge_root != 0 {
@@ -756,7 +777,7 @@ impl FactsTable {
     /// folded in (BO2's getters read the variant's attachments; without the default
     /// attachment asset they compare against an all-zero one, as BO2's no-fastfile loader).
     fn fold_attachments(&self, name: &str, f: &mut T6WeaponFacts) {
-        let Some((_, atts)) = name.split_once('+') else {
+        let Some((_base, atts)) = name.split_once('+') else {
             return;
         };
         let atts: Vec<&[u8]> = atts
@@ -770,23 +791,23 @@ impl FactsTable {
         let default = self
             .attachments
             .get(DEFAULT_ATTACHMENT)
-            .map_or(&zero[..], Vec::as_slice);
-        f.spread.apply_attachments(&atts, default);
+            .map_or(&zero[..], |v| v.as_slice());
+        f.spread.fold_in_addons(&atts, default);
         f.att = AttachmentScales::fold(&atts);
         f.reload.scale_by_attachments(&f.att);
-        f.ads.apply_attachments(&atts, default, f.att.ads_in, f.att.ads_out);
-        f.core.clip_size = attachment_clip_size(f.core.clip_size, &atts);
+        f.ads.fold_in_addons(&atts, default, f.att.ads_in, f.att.ads_out);
+        f.core.magazine_capacity = attachment_clip_size(f.core.magazine_capacity, &atts);
         f.core.fire_type = attachment_fire_type(f.core.fire_type, &atts);
         // BG_IsDualMag: Fast Mag's quick reloads, unless the gun ignores its attachments.
         if !f.core.ignore_attachments {
-            use fastfile_t6::layout::WeaponAttachment as A;
-            f.reload.dual_mag |= atts[..atts.len().min(3)].iter().any(|a| a[A::bDualMag] != 0);
+            use fastfile_t6::layout::WeaponAttachment;
+            f.reload.dual_mag |= atts[..atts.len().min(3)].iter().any(|a| a[WeaponAttachment::bDualMag] != 0);
         }
         // BO2's alt-mode flag getters also take any of the gun's attachments' flags (select fire, Hybrid).
-        use fastfile_t6::layout::WeaponAttachment as A;
+        use fastfile_t6::layout::WeaponAttachment;
         for a in &atts[..atts.len().min(3)] {
-            f.core.alt_weapon_ads_only |= a[A::bAltWeaponAdsOnly] != 0;
-            f.core.alt_weapon_disable_switching |= a[A::bAltWeaponDisableSwitching] != 0;
+            f.core.alt_weapon_ads_only |= a[WeaponAttachment::bAltWeaponAdsOnly] != 0;
+            f.core.alt_weapon_disable_switching |= a[WeaponAttachment::bAltWeaponDisableSwitching] != 0;
         }
     }
 
@@ -797,7 +818,7 @@ impl FactsTable {
     /// from the base unique's wins; else the gun's own value stays. The segmented flag is the
     /// gun's or any slot's, unless the gun ignores its attachments.
     fn fold_uniques(&self, name: &str, f: &mut T6WeaponFacts) {
-        use fastfile_t6::layout::WeaponAttachmentUnique as U;
+        use fastfile_t6::layout::WeaponAttachmentUnique;
         let Some((gun, atts)) = name.split_once('+') else {
             return;
         };
@@ -821,15 +842,15 @@ impl FactsTable {
                 .find(|&x| x != rd_i32(base, at))
                 .unwrap_or(own)
         };
-        f.switch.first_raise = pick(U::iFirstRaiseTime, f.switch.first_raise);
-        if f.core.inventory_type != inventory::ALTMODE {
-            f.switch.alt_raise = pick(U::iAltRaiseTime, f.switch.alt_raise);
-            f.switch.alt_drop = pick(U::iAltDropTime, f.switch.alt_drop);
+        f.switch.first_raise = pick(WeaponAttachmentUnique::iFirstRaiseTime, f.switch.first_raise);
+        if f.core.carry_slot_kind != inventory::ALTMODE {
+            f.switch.alt_raise = pick(WeaponAttachmentUnique::iAltRaiseTime, f.switch.alt_raise);
+            f.switch.alt_drop = pick(WeaponAttachmentUnique::iAltDropTime, f.switch.alt_drop);
         }
-        f.reload.ammo_add = pick(U::iReloadAmmoAdd, f.reload.ammo_add);
-        f.reload.start_add = pick(U::iReloadStartAdd, f.reload.start_add);
+        f.reload.ammo_add = pick(WeaponAttachmentUnique::iReloadAmmoAdd, f.reload.ammo_add);
+        f.reload.start_add = pick(WeaponAttachmentUnique::iReloadStartAdd, f.reload.start_add);
         if !f.core.ignore_attachments {
-            f.reload.segmented |= slots.iter().any(|u| rd_bool(u, U::bSegmentedReload));
+            f.reload.segmented |= slots.iter().any(|u| rd_bool(u, WeaponAttachmentUnique::bSegmentedReload));
         }
     }
 }
@@ -893,23 +914,34 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use super::gun_kind_ids;
+
+    #[test]
+    fn script_class_names_follow_bo2s_numbers() {
+        assert_eq!(gun_kind_ids::name(i32::from(gun_kind_ids::GAS)), "gas");
+        assert_eq!(gun_kind_ids::name(i32::from(gun_kind_ids::CLOSE_COMBAT)), "melee");
+        assert_eq!(gun_kind_ids::name(i32::from(gun_kind_ids::PISTOL)), "pistol");
+        assert_eq!(gun_kind_ids::name(i32::from(gun_kind_ids::PISTOL_SPREAD)), "pistol spread");
+        assert_eq!(gun_kind_ids::name(-1), "none");
+    }
+
     use super::*;
 
     #[test]
     fn a_rockets_wobble_reads_from_its_def() {
         // smaw_mp's: 2500 units a second, a turn every 0.4 s after 300 units, 10 degrees.
-        let mut d = vec![0u8; D::SIZE];
-        d[D::iProjectileSpeed..D::iProjectileSpeed + 4].copy_from_slice(&2500i32.to_le_bytes());
-        d[D::destabilizationRateTime..D::destabilizationRateTime + 4]
+        let mut d = vec![0u8; WeaponDef::SIZE];
+        d[WeaponDef::iProjectileSpeed..WeaponDef::iProjectileSpeed + 4].copy_from_slice(&2500i32.to_le_bytes());
+        d[WeaponDef::destabilizationRateTime..WeaponDef::destabilizationRateTime + 4]
             .copy_from_slice(&0.4f32.to_le_bytes());
-        d[D::destabilizationCurvatureMax..D::destabilizationCurvatureMax + 4]
+        d[WeaponDef::destabilizationCurvatureMax..WeaponDef::destabilizationCurvatureMax + 4]
             .copy_from_slice(&10.0f32.to_le_bytes());
-        d[D::destabilizeDistance..D::destabilizeDistance + 4].copy_from_slice(&300i32.to_le_bytes());
+        d[WeaponDef::destabilizeDistance..WeaponDef::destabilizeDistance + 4].copy_from_slice(&300i32.to_le_bytes());
         let t = FactsTable::from_dump(&dump_line("smaw_mp", &[0u8; 600], &d, 0, true, "", ""));
         assert_eq!(
             t.get(1).missile,
             MissileFacts {
-                projectile_speed: 2500,
+                missile_velocity: 2500,
                 destabilize_rate_time: 0.4,
                 destabilize_curvature_max: 10.0,
                 destabilize_distance: 300,
@@ -920,18 +952,18 @@ mod tests {
     #[test]
     fn a_turrets_arcs_read_from_its_def() {
         // auto_gun_turret_mp's (the Sentry Gun).
-        let mut d = vec![0u8; D::SIZE];
+        let mut d = vec![0u8; WeaponDef::SIZE];
         for (at, x) in [
-            (D::leftArc, 65.0f32),
-            (D::rightArc, 65.0),
-            (D::topArc, 45.0),
-            (D::bottomArc, 20.0),
-            (D::scanSpeed, 60.0),
-            (D::scanAccel, 30.0),
+            (WeaponDef::leftArc, 65.0f32),
+            (WeaponDef::rightArc, 65.0),
+            (WeaponDef::topArc, 45.0),
+            (WeaponDef::bottomArc, 20.0),
+            (WeaponDef::scanSpeed, 60.0),
+            (WeaponDef::scanAccel, 30.0),
         ] {
             d[at..at + 4].copy_from_slice(&x.to_le_bytes());
         }
-        d[D::scanPauseTime..D::scanPauseTime + 4].copy_from_slice(&500i32.to_le_bytes());
+        d[WeaponDef::scanPauseTime..WeaponDef::scanPauseTime + 4].copy_from_slice(&500i32.to_le_bytes());
         let t = FactsTable::from_dump(&dump_line("auto_gun_turret_mp", &[0u8; 600], &d, 0, true, "", ""));
         assert_eq!(
             t.get(1).turret,
@@ -954,7 +986,11 @@ mod tests {
     /// fires itself. Its type reads from its def.
     #[test]
     fn a_vehicle_guns_barrels_go_round_by_its_type() {
-        let gun = |barrel_type| TurretFacts { barrel_type, ..Default::default() };
+        let gun = |barrel_type| {
+            let mut gun = TurretFacts::default();
+            gun.barrel_type = barrel_type;
+            gun
+        };
         let round = |barrel_type, shots| {
             let mut last = 0;
             (0..shots)
@@ -973,8 +1009,8 @@ mod tests {
         assert_eq!(gun(3).barrels(2), (0, 4));
         assert_eq!(round(4, 5), [1, 2, 3, 0, 1]);
         assert_eq!(gun(5).barrels(2), (3, 2));
-        let mut d = vec![0u8; D::SIZE];
-        d[D::barrelType..D::barrelType + 4].copy_from_slice(&4u32.to_le_bytes());
+        let mut d = vec![0u8; WeaponDef::SIZE];
+        d[WeaponDef::barrelType..WeaponDef::barrelType + 4].copy_from_slice(&4u32.to_le_bytes());
         let t = FactsTable::from_dump(&dump_line("ai_tank_drone_gun_mp", &[0u8; 600], &d, 0, true, "", ""));
         assert_eq!(t.get(1).turret.barrel_type, 4);
     }
@@ -983,46 +1019,46 @@ mod tests {
     fn a_weapons_camera_shakes_read_from_its_def() {
         // cobra_20mm_mp's: fires with 0.05 for 100 ms out to 100, goes off
         // with 0.5 for 500 ms out to 512.
-        let mut d = vec![0u8; D::SIZE];
-        for (at, x) in [(D::cameraShakeScale, 0.05f32), (D::explosionCameraShakeScale, 0.5)] {
+        let mut d = vec![0u8; WeaponDef::SIZE];
+        for (at, x) in [(WeaponDef::cameraShakeScale, 0.05f32), (WeaponDef::explosionCameraShakeScale, 0.5)] {
             d[at..at + 4].copy_from_slice(&x.to_le_bytes());
         }
         for (at, x) in [
-            (D::cameraShakeDuration, 100i32),
-            (D::cameraShakeRadius, 100),
-            (D::explosionCameraShakeDuration, 500),
-            (D::explosionCameraShakeRadius, 512),
+            (WeaponDef::cameraShakeDuration, 100i32),
+            (WeaponDef::cameraShakeRadius, 100),
+            (WeaponDef::explosionCameraShakeDuration, 500),
+            (WeaponDef::explosionCameraShakeRadius, 512),
         ] {
             d[at..at + 4].copy_from_slice(&x.to_le_bytes());
         }
         let t = FactsTable::from_dump(&dump_line("cobra_20mm_mp", &[0u8; 600], &d, 0, true, "", ""));
         let shake = t.get(1).shake;
-        assert_eq!(shake.fire, CameraShake { scale: 0.05, duration_ms: 100, radius: 100 });
-        assert_eq!(shake.explosion, CameraShake { scale: 0.5, duration_ms: 500, radius: 512 });
+        assert_eq!(shake.fire, CameraShake { scale: 0.05, span_ms: 100, radius: 100 });
+        assert_eq!(shake.explosion, CameraShake { scale: 0.5, span_ms: 500, radius: 512 });
         assert!(shake.fire.is_set() && shake.explosion.is_set());
         // Without a radius, or a length, it does not shake.
-        assert!(!CameraShake { scale: 0.5, duration_ms: 500, radius: 0 }.is_set());
-        assert!(!CameraShake { scale: 0.5, duration_ms: 0, radius: 512 }.is_set());
+        assert!(!CameraShake { scale: 0.5, span_ms: 500, radius: 0 }.is_set());
+        assert!(!CameraShake { scale: 0.5, span_ms: Default::default(), radius: 512 }.is_set());
     }
 
     #[test]
     fn attachment_rows_fold_their_attachments() {
-        use fastfile_t6::layout::WeaponAttachment as A;
+        use fastfile_t6::layout::WeaponAttachment;
         let (v, d) = ([0u8; 600], vec![0u8; 2048]);
-        let mut laser = vec![0u8; A::SIZE];
-        laser[A::laserSight] = 1;
-        laser[A::perks..A::perks + 8].copy_from_slice(&(1u64 << 3).to_le_bytes());
+        let mut laser = vec![0u8; WeaponAttachment::SIZE];
+        laser[WeaponAttachment::laserSight] = 1;
+        laser[WeaponAttachment::perks..WeaponAttachment::perks + 8].copy_from_slice(&(1u64 << 3).to_le_bytes());
         for (at, x) in [
-            (A::fFireTimeScale, 0.8f32),
-            (A::fAdsTransInTimeScale, 0.5),
-            (A::fAdsTransOutTimeScale, 1.0),
+            (WeaponAttachment::fFireTimeScale, 0.8f32),
+            (WeaponAttachment::fAdsTransInTimeScale, 0.5),
+            (WeaponAttachment::fAdsTransOutTimeScale, 1.0),
         ] {
             laser[at..at + 4].copy_from_slice(&x.to_le_bytes());
         }
         let dump = [
             dump_line("gun_mp", &v, &d, 0, true, "", ""),
             attachment_line("steadyaim", &laser),
-            attachment_line(DEFAULT_ATTACHMENT, &[0u8; A::SIZE]),
+            attachment_line(DEFAULT_ATTACHMENT, &[0u8; WeaponAttachment::SIZE]),
         ]
         .join("\n");
         let t = FactsTable::from_dump(&dump).reindexed([(4, "gun_mp"), (9, "gun_mp+steadyaim")]);
@@ -1036,35 +1072,35 @@ mod tests {
 
     #[test]
     fn sight_attachments_set_the_aim_speed_and_zoom() {
-        use fastfile_t6::layout::WeaponAttachment as A;
+        use fastfile_t6::layout::WeaponAttachment;
         let (v, d) = ([0u8; 600], vec![0u8; 2048]);
         let att = |kind: i32, fields: &[(usize, f32)]| {
-            let mut a = vec![0u8; A::SIZE];
-            a[A::attachmentType..A::attachmentType + 4].copy_from_slice(&kind.to_le_bytes());
+            let mut a = vec![0u8; WeaponAttachment::SIZE];
+            a[WeaponAttachment::attachmentType..WeaponAttachment::attachmentType + 4].copy_from_slice(&kind.to_le_bytes());
             for &(at, x) in fields {
                 a[at..at + 4].copy_from_slice(&x.to_le_bytes());
             }
             a
         };
         let acog = att(1, &[
-            (A::fAdsTransInTimeScale, 0.5),
-            (A::fAdsTransOutTimeScale, 0.8),
-            (A::fAdsZoomFov1, 40.0),
-            (A::fAdsZoomInFrac, 0.5),
+            (WeaponAttachment::fAdsTransInTimeScale, 0.5),
+            (WeaponAttachment::fAdsTransOutTimeScale, 0.8),
+            (WeaponAttachment::fAdsZoomFov1, 40.0),
+            (WeaponAttachment::fAdsZoomInFrac, 0.5),
         ]);
         let vzoom = att(crate::pm::ads::ATTACHMENT_VZOOM, &[
-            (A::fAdsTransInTimeScale, 0.9),
-            (A::fAdsTransOutTimeScale, 1.0),
-            (A::fAdsZoomFov1, 30.0),
-            (A::fAdsZoomFov2, 20.0),
-            (A::fAdsZoomFov3, 10.0),
-            (A::fAdsZoomInFrac, 0.4),
+            (WeaponAttachment::fAdsTransInTimeScale, 0.9),
+            (WeaponAttachment::fAdsTransOutTimeScale, 1.0),
+            (WeaponAttachment::fAdsZoomFov1, 30.0),
+            (WeaponAttachment::fAdsZoomFov2, 20.0),
+            (WeaponAttachment::fAdsZoomFov3, 10.0),
+            (WeaponAttachment::fAdsZoomInFrac, 0.4),
         ]);
         let dump = [
             dump_line("gun_mp", &v, &d, 0, true, "", ""),
             attachment_line("acog", &acog),
             attachment_line("vzoom", &vzoom),
-            attachment_line(DEFAULT_ATTACHMENT, &[0u8; A::SIZE]),
+            attachment_line(DEFAULT_ATTACHMENT, &[0u8; WeaponAttachment::SIZE]),
         ]
         .join("
 ");
@@ -1081,9 +1117,9 @@ mod tests {
     #[test]
     fn reads_switch_times_at_layout_offsets() {
         let mut def = vec![0u8; 2048];
-        def[D::iDropTime..D::iDropTime + 4].copy_from_slice(&450i32.to_le_bytes());
-        def[D::iFirstRaiseTime..D::iFirstRaiseTime + 4].copy_from_slice(&1200i32.to_le_bytes());
-        def[D::bNoDropsOrRaises] = 1;
+        def[WeaponDef::iDropTime..WeaponDef::iDropTime + 4].copy_from_slice(&450i32.to_le_bytes());
+        def[WeaponDef::iFirstRaiseTime..WeaponDef::iFirstRaiseTime + 4].copy_from_slice(&1200i32.to_le_bytes());
+        def[WeaponDef::bNoDropsOrRaises] = 1;
         let f = T6WeaponFacts::read(&[0u8; 600], &def);
         assert_eq!(f.switch.drop, 450);
         assert_eq!(f.switch.first_raise, 1200);
@@ -1101,16 +1137,16 @@ mod tests {
     pub fn ammo_remap_dump() -> FactsTable {
         let v = [0u8; 600];
         let mut v_own = [0u8; 600];
-        v_own[V::bIgnoreAttachments] = 1;
+        v_own[WeaponVariantDef::bIgnoreAttachments] = 1;
         let d = vec![0u8; 2048];
         let mut alt = d.clone();
-        alt[D::inventoryType] = inventory::ALTMODE;
+        alt[WeaponDef::inventoryType] = inventory::ALTMODE;
         let mut right = d.clone();
-        right[D::bDualWield] = 1;
+        right[WeaponDef::bDualWield] = 1;
         let mut left = right.clone();
-        left[D::inventoryType] = inventory::DWLEFTHAND;
+        left[WeaponDef::inventoryType] = inventory::DWLEFTHAND;
         let mut charge = d.clone();
-        charge[D::fireType] = fire_type::CHARGESHOT;
+        charge[WeaponDef::fireType] = fire_type::CHARGESHOT;
         let dump = [
             dump_line("ar_mp", &v, &d, 0, true, "sf_ar_mp", ""),
             dump_line("sf_ar_mp", &v, &alt, 0, true, "ar_mp", ""),
@@ -1267,14 +1303,14 @@ mod tests {
 
     #[test]
     fn an_attachment_sets_the_alt_mode_flags() {
-        use fastfile_t6::layout::WeaponAttachment as A;
+        use fastfile_t6::layout::WeaponAttachment;
         let v = [0u8; 600];
         let d = vec![0u8; 2048];
-        let mut sf = vec![0u8; A::SIZE];
-        sf[A::bAltWeaponDisableSwitching] = 1;
-        let mut optic = vec![0u8; A::SIZE];
-        optic[A::bAltWeaponAdsOnly] = 1;
-        optic[A::bAltWeaponDisableSwitching] = 1;
+        let mut sf = vec![0u8; WeaponAttachment::SIZE];
+        sf[WeaponAttachment::bAltWeaponDisableSwitching] = 1;
+        let mut optic = vec![0u8; WeaponAttachment::SIZE];
+        optic[WeaponAttachment::bAltWeaponAdsOnly] = 1;
+        optic[WeaponAttachment::bAltWeaponDisableSwitching] = 1;
         let dump = [
             attachment_line("sf", &sf),
             attachment_line("dualoptic", &optic),
@@ -1295,68 +1331,68 @@ mod tests {
     /// An attachment that changes nothing: every scale 1, as BO2's own attachments are unless
     /// they say otherwise.
     fn plain_attachment() -> Vec<u8> {
-        use fastfile_t6::layout::WeaponAttachment as A;
-        let mut a = vec![0u8; A::SIZE];
+        use fastfile_t6::layout::WeaponAttachment;
+        let mut a = vec![0u8; WeaponAttachment::SIZE];
         for at in [
-            A::fFireTimeScale,
-            A::fAdsTransInTimeScale,
-            A::fAdsTransOutTimeScale,
-            A::fReloadTimeScale,
-            A::fReloadEmptyTimeScale,
-            A::fReloadAddTimeScale,
-            A::fReloadQuickTimeScale,
-            A::fReloadQuickEmptyTimeScale,
-            A::fReloadQuickAddTimeScale,
-            A::clipSizeScale,
+            WeaponAttachment::fFireTimeScale,
+            WeaponAttachment::fAdsTransInTimeScale,
+            WeaponAttachment::fAdsTransOutTimeScale,
+            WeaponAttachment::fReloadTimeScale,
+            WeaponAttachment::fReloadEmptyTimeScale,
+            WeaponAttachment::fReloadAddTimeScale,
+            WeaponAttachment::fReloadQuickTimeScale,
+            WeaponAttachment::fReloadQuickEmptyTimeScale,
+            WeaponAttachment::fReloadQuickAddTimeScale,
+            WeaponAttachment::clipSizeScale,
         ] {
             a[at..at + 4].copy_from_slice(&1f32.to_le_bytes());
         }
         a
     }
 
-    fn put_f32(b: &mut [u8], at: usize, x: f32) {
+    fn write_real32(b: &mut [u8], at: usize, x: f32) {
         b[at..at + 4].copy_from_slice(&x.to_le_bytes());
     }
 
-    fn put_i32(b: &mut [u8], at: usize, x: i32) {
+    fn poke_int32(b: &mut [u8], at: usize, x: i32) {
         b[at..at + 4].copy_from_slice(&x.to_le_bytes());
     }
 
     /// A 30-round rifle (reload 2475 ms, empty 3000, quick 1500, add 500) with BO2 MP's
     /// Fast Mag, Extended Mag, Rapid Fire and Tri-Bolt numbers (patch weapon assets).
     fn rifle_with_mags(ignore_attachments: bool) -> FactsTable {
-        use fastfile_t6::layout::WeaponAttachment as A;
-        let mut v = vec![0u8; V::SIZE];
-        let mut d = vec![0u8; D::SIZE];
-        put_i32(&mut v, V::iClipSize, 30);
-        put_i32(&mut v, V::iReloadTime, 2475);
-        put_i32(&mut v, V::iReloadEmptyTime, 3000);
-        put_i32(&mut v, V::iReloadQuickTime, 1500);
-        put_i32(&mut d, D::iReloadAddTime, 500);
-        put_i32(&mut d, D::iFireTime, 100);
-        v[V::bIgnoreAttachments] = ignore_attachments as u8;
+        use fastfile_t6::layout::WeaponAttachment;
+        let mut v = vec![0u8; WeaponVariantDef::SIZE];
+        let mut d = vec![0u8; WeaponDef::SIZE];
+        poke_int32(&mut v, WeaponVariantDef::iClipSize, 30);
+        poke_int32(&mut v, WeaponVariantDef::iReloadTime, 2475);
+        poke_int32(&mut v, WeaponVariantDef::iReloadEmptyTime, 3000);
+        poke_int32(&mut v, WeaponVariantDef::iReloadQuickTime, 1500);
+        poke_int32(&mut d, WeaponDef::iReloadAddTime, 500);
+        poke_int32(&mut d, WeaponDef::iFireTime, 100);
+        v[WeaponVariantDef::bIgnoreAttachments] = ignore_attachments as u8;
         let mut dualclip = plain_attachment();
         for at in [
-            A::fReloadTimeScale,
-            A::fReloadEmptyTimeScale,
-            A::fReloadAddTimeScale,
-            A::fReloadQuickTimeScale,
-            A::fReloadQuickEmptyTimeScale,
+            WeaponAttachment::fReloadTimeScale,
+            WeaponAttachment::fReloadEmptyTimeScale,
+            WeaponAttachment::fReloadAddTimeScale,
+            WeaponAttachment::fReloadQuickTimeScale,
+            WeaponAttachment::fReloadQuickEmptyTimeScale,
         ] {
-            put_f32(&mut dualclip, at, 0.675);
+            write_real32(&mut dualclip, at, 0.675);
         }
-        dualclip[A::bDualMag] = 1;
+        dualclip[WeaponAttachment::bDualMag] = 1;
         let mut extclip = plain_attachment();
-        put_f32(&mut extclip, A::fReloadTimeScale, 1.1);
-        put_f32(&mut extclip, A::clipSizeScale, 1.345);
+        write_real32(&mut extclip, WeaponAttachment::fReloadTimeScale, 1.1);
+        write_real32(&mut extclip, WeaponAttachment::clipSizeScale, 1.345);
         let mut rf = plain_attachment();
-        put_f32(&mut rf, A::fFireTimeScale, 0.75);
+        write_real32(&mut rf, WeaponAttachment::fFireTimeScale, 0.75);
         let mut stackfire = plain_attachment();
-        put_i32(&mut stackfire, A::attachmentType, ATTACHMENT_STACKFIRE);
-        put_i32(&mut stackfire, A::fireType, fire_type::STACKED as i32);
-        put_i32(&mut stackfire, A::iClipSize, 3);
-        put_f32(&mut stackfire, A::stackFireSpread, 4.0);
-        put_f32(&mut stackfire, A::stackFireAccuracyDecay, 0.9);
+        poke_int32(&mut stackfire, WeaponAttachment::attachmentType, ATTACHMENT_STACKFIRE);
+        poke_int32(&mut stackfire, WeaponAttachment::fireType, fire_type::STACKED as i32);
+        poke_int32(&mut stackfire, WeaponAttachment::iClipSize, 3);
+        write_real32(&mut stackfire, WeaponAttachment::stackFireSpread, 4.0);
+        write_real32(&mut stackfire, WeaponAttachment::stackFireAccuracyDecay, 0.9);
         let dump = [
             dump_line("rifle_mp", &v, &d, 0, true, "", ""),
             attachment_line("dualclip", &dualclip),
@@ -1386,7 +1422,7 @@ mod tests {
         assert_eq!(fast.reload_empty, 2025);
         assert_eq!(fast.reload_quick, 1012);
         assert_eq!(fast.reload_add, 337);
-        assert_eq!(t.get(2).core.clip_size, 30);
+        assert_eq!(t.get(2).core.magazine_capacity, 30);
     }
 
     #[test]
@@ -1401,12 +1437,12 @@ mod tests {
     fn extended_mag_grows_the_clip_and_slows_the_reload() {
         let t = rifle_with_mags(false);
         // BG_GetClipSize: round(30 * 1.345) = 40.
-        assert_eq!(t.get(3).core.clip_size, 40);
+        assert_eq!(t.get(3).core.magazine_capacity, 40);
         assert_eq!(t.get(3).reload.reload, 2722);
         assert_eq!(t.get(3).reload.reload_empty, 3000);
         assert!(!t.get(3).reload.dual_mag);
         // Two attachments fold together.
-        assert_eq!(t.get(6).core.clip_size, 40);
+        assert_eq!(t.get(6).core.magazine_capacity, 40);
         assert_eq!(t.get(6).att.fire_time, 0.75);
     }
 
@@ -1415,7 +1451,7 @@ mod tests {
         let t = rifle_with_mags(false);
         assert_eq!(t.get(1).core.fire_type, fire_type::FULLAUTO);
         assert_eq!(t.get(5).core.fire_type, fire_type::STACKED);
-        assert_eq!(t.get(5).core.clip_size, 3);
+        assert_eq!(t.get(5).core.magazine_capacity, 3);
         assert_eq!(t.get(4).core.fire_type, fire_type::FULLAUTO);
         // BG_GetStackFireSpread / BG_GetStackFireAccuracyDecay: the attachment's own values.
         assert_eq!(t.get(5).spread.stack_fire_spread, 4.0);
@@ -1425,50 +1461,50 @@ mod tests {
 
     #[test]
     fn a_one_round_clip_stays_one() {
-        use fastfile_t6::layout::WeaponAttachment as A;
+        use fastfile_t6::layout::WeaponAttachment;
         let mut ext = plain_attachment();
-        put_f32(&mut ext, A::clipSizeScale, 1.4);
+        write_real32(&mut ext, WeaponAttachment::clipSizeScale, 1.4);
         assert_eq!(attachment_clip_size(1, &[&ext]), 1);
         assert_eq!(attachment_clip_size(5, &[&ext]), 7);
         // A blank scale (0) leaves the clip alone instead of emptying it.
-        assert_eq!(attachment_clip_size(30, &[&[0u8; A::SIZE]]), 30);
+        assert_eq!(attachment_clip_size(30, &[&[0u8; WeaponAttachment::SIZE]]), 30);
     }
 
     /// An attachment unique with BO2 MP's override fields:
     /// [first raise, alt raise, alt drop, reload ammo add, start add, segmented].
     fn unique(vals: [i32; 6]) -> Vec<u8> {
-        use fastfile_t6::layout::WeaponAttachmentUnique as U;
-        let mut u = vec![0u8; U::SIZE];
+        use fastfile_t6::layout::WeaponAttachmentUnique;
+        let mut u = vec![0u8; WeaponAttachmentUnique::SIZE];
         for (at, x) in [
-            U::iFirstRaiseTime,
-            U::iAltRaiseTime,
-            U::iAltDropTime,
-            U::iReloadAmmoAdd,
-            U::iReloadStartAdd,
+            WeaponAttachmentUnique::iFirstRaiseTime,
+            WeaponAttachmentUnique::iAltRaiseTime,
+            WeaponAttachmentUnique::iAltDropTime,
+            WeaponAttachmentUnique::iReloadAmmoAdd,
+            WeaponAttachmentUnique::iReloadStartAdd,
         ]
         .into_iter()
         .zip(vals)
         {
-            put_i32(&mut u, at, x);
+            poke_int32(&mut u, at, x);
         }
-        u[U::bSegmentedReload] = vals[5] as u8;
+        u[WeaponAttachmentUnique::bSegmentedReload] = vals[5] as u8;
         u
     }
 
     /// The KSG (shell by shell, one at a time) and AN-94 with their real attachment uniques:
     /// Fast Mag loads two shells, MMS and Laser change the first raise, Select Fire's drop.
     fn guns_with_uniques(alt_mode: bool) -> FactsTable {
-        let (mut v, mut d) = (vec![0u8; V::SIZE], vec![0u8; D::SIZE]);
-        put_i32(&mut d, D::iFirstRaiseTime, 1150);
-        put_i32(&mut d, D::iReloadAmmoAdd, 1);
-        put_i32(&mut d, D::iReloadStartAdd, 1);
-        d[D::bSegmentedReload] = 1;
+        let (mut v, mut d) = (vec![0u8; WeaponVariantDef::SIZE], vec![0u8; WeaponDef::SIZE]);
+        poke_int32(&mut d, WeaponDef::iFirstRaiseTime, 1150);
+        poke_int32(&mut d, WeaponDef::iReloadAmmoAdd, 1);
+        poke_int32(&mut d, WeaponDef::iReloadStartAdd, 1);
+        d[WeaponDef::bSegmentedReload] = 1;
         let ksg = dump_line("ksg_mp", &v, &d, 0, true, "", "");
-        let mut d = vec![0u8; D::SIZE];
-        put_i32(&mut d, D::iFirstRaiseTime, 1600);
-        put_i32(&mut v, V::iAltRaiseTime, 700);
+        let mut d = vec![0u8; WeaponDef::SIZE];
+        poke_int32(&mut d, WeaponDef::iFirstRaiseTime, 1600);
+        poke_int32(&mut v, WeaponVariantDef::iAltRaiseTime, 700);
         if alt_mode {
-            d[D::inventoryType] = inventory::ALTMODE;
+            d[WeaponDef::inventoryType] = inventory::ALTMODE;
         }
         let an94 = dump_line("an94_mp", &v, &d, 0, true, "", "");
         let dump = [
@@ -1556,7 +1592,7 @@ mod tests {
             let f = t.get(i as u32 + 1);
             println!(
                 "{n:24} clip {:3} fire_type {} fire x{:.3} reload {:5} empty {:5} quick {:5} add {:4} dual_mag {}",
-                f.core.clip_size,
+                f.core.magazine_capacity,
                 f.core.fire_type,
                 f.att.fire_time,
                 f.reload.reload,

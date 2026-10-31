@@ -7,11 +7,11 @@
 //! 140 of 720). The steady line goes while he holds the key.
 
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
-use frame::{ClientSet, HudInputView};
-use net::{ClientActionInput, LocalPresentClient, PresentedSnapshot};
+use frame::{ClientStep, OverlayControlSnapshot};
+use net::{PlayerControlSnapshot, HostViewClient, ShownWorldFrame};
 
-use crate::layers::{UiLayer, UiLayerVisibility};
+use crate::{MainWindow, covering_node, pinned_node};
+use crate::tiers::{OverlayTier, OverlayStackShown};
 
 /// The lines' centres in the 720-high root, from the real game.
 const STEADY_Y: f32 = 110.0;
@@ -46,13 +46,13 @@ pub(crate) fn hint_lines(
 fn update(
     mut commands: Commands,
     roots: Query<(Entity, &ScopeHintRoot)>,
-    window: Query<&Window, With<PrimaryWindow>>,
-    presented: Option<Res<PresentedSnapshot>>,
-    local: Option<Res<LocalPresentClient>>,
-    weapons: Option<Res<assets::PreparedWeapons>>,
+    window: MainWindow,
+    presented: Option<Res<ShownWorldFrame>>,
+    local: Option<Res<HostViewClient>>,
+    weapons: Option<Res<assets::StagedWeapons>>,
     strings: Option<Res<assets::T6Ui>>,
-    keys: Option<Res<HudInputView>>,
-    actions: Option<Res<ClientActionInput>>,
+    keys: Option<Res<OverlayControlSnapshot>>,
+    actions: Option<Res<PlayerControlSnapshot>>,
     fonts: Option<Res<crate::bo2_font::Bo2Fonts>>,
 ) {
     let wanted = (|| {
@@ -62,12 +62,12 @@ fn update(
             weapons.as_deref()?,
             strings.as_deref()?,
         );
-        let ps = p.alive_player(l.0)?;
-        if ps.f_weapon_pos_frac < 1.0 || !w.0.overlay_is_hud_iris(ps.weapon) {
+        let ps = p.living_participant(l.0)?;
+        if ps.weapon_raise_fraction < 1.0 || !w.0.scope_is_iris(ps.weapon) {
             return None;
         }
-        let facts = w.0.facts_of(ps.weapon as u32)?;
-        let holding = actions.as_deref().is_some_and(|a| a.client.kb.holdbreath.active);
+        let facts = w.0.summary_for(ps.weapon as u32)?;
+        let holding = actions.as_deref().is_some_and(|a| a.client.pressed_key_latch.holdbreath.active);
         let keys = keys.as_deref().cloned().unwrap_or_default();
         let unbound = "UNBOUND".to_owned();
         let lines: Vec<(String, f32)> = hint_lines(
@@ -84,7 +84,7 @@ fn update(
         .collect();
         (!lines.is_empty()).then_some((lines, keys))
     })();
-    let (Some((lines, keys)), Ok(win), Some(fonts)) = (wanted, window.single(), fonts.as_deref()) else {
+    let (Some((lines, keys)), Some(win), Some(fonts)) = (wanted, window.shown(), fonts.as_deref()) else {
         for (e, _) in &roots {
             commands.entity(e).try_despawn();
         }
@@ -107,26 +107,16 @@ fn update(
     commands
         .spawn((
             ScopeHintRoot { shows },
-            UiLayer::Hud,
-            UiLayerVisibility,
-            Node {
-                position_type: PositionType::Absolute,
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                ..default()
-            },
+            OverlayTier::Hud,
+            OverlayStackShown,
+            covering_node(),
         ))
-        .with_children(|root| {
+        .with_children(|outer| {
             for (text, y) in &lines {
                 let runs = crate::zm_hud::hint_runs(text, &keys);
                 let plain: String = runs.iter().map(|(t, _)| t.as_str()).collect();
                 let width = fonts.line_width("Default", &plain, px);
-                root.spawn(Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(win.width() * 0.5 - width * 0.5),
-                    top: Val::Px(y * scale - px * 0.6),
-                    ..default()
-                })
+                outer.spawn(pinned_node(win.width() * 0.5 - width * 0.5, y * scale - px * 0.6))
                 .with_children(|c| {
                     fonts.spawn_line(c, "Default", &runs, px, 1.0 * scale);
                 });
@@ -134,8 +124,8 @@ fn update(
         });
 }
 
-pub(crate) fn register(app: &mut App) {
-    app.add_systems(Update, update.after(crate::bo2_font::load_bo2_fonts).in_set(ClientSet::Ui));
+pub(crate) fn register(host: &mut App) {
+    host.add_systems(Update, update.after(crate::bo2_font::load_bo2_fonts).in_set(ClientStep::Ui));
 }
 
 #[cfg(test)]

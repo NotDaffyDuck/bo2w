@@ -4,24 +4,27 @@
 //! A segment reaches the client two ways. The server's confirmed hits come as
 //! `EntityBulletHit` events; they are queued as [`BulletHitFx`] and played by
 //! [`play_queued_hits`], which runs once this frame's bolts are posed. The
-//! player's own pellets are drawn at once from `PendingPelletFx` without
+//! player's own pellets are drawn at once from `QueuedPelletEffect` without
 //! waiting for the server, and [`play_predicted_pellets`] plays those.
 
 use asset_game::FxName;
-use assets::PreparedWeapons;
+use assets::StagedWeapons;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use entity_t6::event as ev;
-use fx::FxBoltTarget;
-use net::{CEntity, CEntitySlots, LocalPresentClient, PendingPelletFx};
-use render_fx::combat::play_pellet_segment;
-use render_fx::{FxJournalCursor, PreparedImpactFx, PreparedTracers, TracerDrawGate, TracerWorld};
+use entity_t6::event;
+use fx::EffectBoltTarget;
+use net::{ClientEntityRecord, EntityTableCells, HostViewClient, QueuedPelletEffect};
+use render_fx::battle_fx::spawn_pellet_leg_effect;
+use render_fx::{
+    EffectJournalCursor, JournalCount, ReadyHitFx, StagedStreaks, TracerRenderGuard,
+    StreakLevel,
+};
 
 use super::stage::{FxLedger, FxStage};
 use super::viewpoint::Viewpoint;
-use crate::adapters::anim::fpv_present::FpvBoltTargets;
-use crate::adapters::anim::remote_body::RemoteFxBolts;
-use crate::adapters::fx::present::FxScene;
+use crate::adapters::motion::gun_present::AttachTagGoals;
+use crate::adapters::motion::peer_body::OtherBodyEffectTags;
+use crate::adapters::fx::effect_play::EffectStage;
 
 /// A confirmed bullet hit waiting for its frame's poses.
 #[derive(Message)]
@@ -35,16 +38,16 @@ pub(super) struct BulletHitFx {
 /// One straight piece of a bullet's path, and what it ended on.
 struct Segment {
     attacker: i32,
-    weapon: u32,
-    correlation: u32,
-    pellet: u16,
+    gun_no: u32,
+    link_id: u32,
+    pellet_no: u16,
     hand: u8,
     from: [f32; 3],
     to: [f32; 3],
-    normal: [f32; 3],
-    surf_type: u8,
-    surface_flags: u32,
-    flesh_flags: u32,
+    nrm: [f32; 3],
+    face_type: u8,
+    surf_flags: u32,
+    body_flags: u32,
 }
 
 impl From<&sim::EntityEventPayload> for Segment {
@@ -54,16 +57,16 @@ impl From<&sim::EntityEventPayload> for Segment {
     fn from(event: &sim::EntityEventPayload) -> Self {
         Self {
             attacker: event.attacker_entity_num,
-            weapon: event.weapon,
-            correlation: event.correlation,
-            pellet: event.pellet,
+            gun_no: event.weapon,
+            link_id: event.correlation,
+            pellet_no: event.pellet,
             hand: event.hand,
             from: event.origin2,
             to: event.origin,
-            normal: event.direction,
-            surf_type: event.surf_type,
-            surface_flags: event.surface_flags,
-            flesh_flags: event.event_parm as u32,
+            nrm: event.direction,
+            face_type: event.surf_type,
+            surf_flags: event.surface_flags,
+            body_flags: event.event_parm as u32,
         }
     }
 }
@@ -72,16 +75,16 @@ impl From<&sim::PelletFxRecord> for Segment {
     fn from(record: &sim::PelletFxRecord) -> Self {
         Self {
             attacker: record.attacker,
-            weapon: record.weapon,
-            correlation: record.correlation,
-            pellet: record.pellet,
+            gun_no: record.weapon,
+            link_id: record.correlation,
+            pellet_no: record.pellet,
             hand: record.hand,
             from: record.start,
             to: record.end,
-            normal: record.normal,
-            surf_type: record.surf_type,
-            surface_flags: record.surface_flags,
-            flesh_flags: u32::from(record.flesh_flags),
+            nrm: record.normal,
+            face_type: record.surf_type,
+            surf_flags: record.surface_flags,
+            body_flags: u32::from(record.body_hit_bits),
         }
     }
 }
@@ -91,7 +94,7 @@ impl From<&sim::PelletFxRecord> for Segment {
 fn is_hit_on_self(code: i32) -> bool {
     matches!(
         u8::try_from(code),
-        Ok(ev::BULLET_HIT_CLIENT_SMALL | ev::BULLET_HIT_CLIENT_LARGE | ev::BULLET_HIT_CLIENT_SHIELD)
+        Ok(event::ROUND_HIT_BODY_SMALL | event::ROUND_HIT_BODY_LARGE | event::BULLET_HIT_CLIENT_SHIELD)
     )
 }
 
@@ -103,18 +106,33 @@ fn mark_entity(other_entity_num: i32) -> Option<u16> {
         .filter(|&number| u32::from(number) < fx_t6::runtime::FX_ENTITYNUM_WORLD)
 }
 
-/// Everything `play_pellet_segment` reads or writes, in one parameter.
+/// Where bolts can be found: on the viewmodel, or on another entity's body.
+#[derive(SystemParam)]
+pub(super) struct BoltLookup<'w, 's> {
+    others: Query<'w, 's, &'static OtherBodyEffectTags>,
+    own: Res<'w, AttachTagGoals>,
+    slots: Res<'w, EntityTableCells>,
+}
+
+impl BoltLookup<'_, '_> {
+    /// The blade of the knife that the player with entity `number` swung.
+    fn knife_of_body(&self, number: i32) -> Option<EffectBoltTarget> {
+        let number = u16::try_from(number).ok()?;
+        let entity = self.slots.object_at_index(number)?;
+        self.others.get(entity).ok()?.knife
+    }
+}
+
+/// Everything `spawn_pellet_leg_effect` reads or writes, in one parameter.
 #[derive(SystemParam)]
 pub(super) struct Pellets<'w, 's> {
-    others: Query<'w, 's, &'static RemoteFxBolts>,
-    own: Res<'w, FpvBoltTargets>,
-    slots: Res<'w, CEntitySlots>,
-    impact_fx: Option<Res<'w, PreparedImpactFx>>,
-    weapons: Option<Res<'w, PreparedWeapons>>,
-    tracers: Option<Res<'w, PreparedTracers>>,
-    tracer_world: ResMut<'w, TracerWorld>,
-    gate: ResMut<'w, TracerDrawGate>,
-    local: Res<'w, LocalPresentClient>,
+    bolts: BoltLookup<'w, 's>,
+    impact_effect: Option<Res<'w, ReadyHitFx>>,
+    gun_table: Option<Res<'w, StagedWeapons>>,
+    tracers: Option<Res<'w, StagedStreaks>>,
+    streak_level: ResMut<'w, StreakLevel>,
+    gate: ResMut<'w, TracerRenderGuard>,
+    viewer: Res<'w, HostViewClient>,
     stage: FxStage<'w>,
     ledger: FxLedger<'w>,
 }
@@ -122,39 +140,39 @@ pub(super) struct Pellets<'w, 's> {
 impl Pellets<'_, '_> {
     fn play(&mut self, segment: &Segment, impact: bool) {
         let parts = self.stage.parts();
-        play_pellet_segment(
+        spawn_pellet_leg_effect(
             segment.attacker,
-            segment.weapon,
-            segment.correlation,
-            segment.pellet,
+            segment.gun_no,
+            segment.link_id,
+            segment.pellet_no,
             segment.hand,
             segment.from,
             segment.to,
-            segment.normal,
-            segment.surf_type,
-            segment.surface_flags,
-            segment.flesh_flags,
+            segment.nrm,
+            segment.face_type,
+            segment.surf_flags,
+            segment.body_flags,
             impact,
-            &self.others,
-            &self.own,
-            &self.slots,
+            &self.bolts.others,
+            &self.bolts.own,
+            &self.bolts.slots,
             parts.catalog,
             parts.infos,
-            self.impact_fx.as_deref(),
-            self.weapons.as_deref(),
+            self.impact_effect.as_deref(),
+            self.gun_table.as_deref(),
             self.tracers.as_deref(),
-            &mut self.tracer_world,
+            &mut self.streak_level,
             &mut self.gate,
-            i32::try_from(self.local.0.0).unwrap_or(0),
+            i32::try_from(self.viewer.0.0).unwrap_or(0),
             parts.host,
             &mut self.ledger.cursor,
             &mut self.ledger.combat,
-            parts.scene.as_ref().map(|scene| scene as &dyn FxScene),
+            parts.scene.as_ref().map(|scene| scene as &dyn EffectStage),
         );
     }
 }
 
-pub(super) fn queue_bullet_hit(hit: On<net::EntityBulletHit>, mut queue: MessageWriter<BulletHitFx>) {
+pub(super) fn queue_bullet_hit(hit: On<net::BulletStrike>, mut queue: MessageWriter<BulletHitFx>) {
     queue.write(BulletHitFx {
         payload: hit.event.payload,
         on_self: is_hit_on_self(hit.event.event.0),
@@ -165,35 +183,35 @@ pub(super) fn play_queued_hits(mut hits: MessageReader<BulletHitFx>, mut pellets
     for hit in hits.read() {
         // The mark sticks to the entity that was hit, only for this segment.
         let sticks_to = mark_entity(hit.payload.other_entity_num);
-        let before = core::mem::replace(&mut pellets.stage.host().spawn_mark_entity, sticks_to);
+        let before = core::mem::replace(&mut pellets.stage.host().stain_target_entity, sticks_to);
         pellets.play(&Segment::from(&hit.payload), !hit.on_self);
-        pellets.stage.host().spawn_mark_entity = before;
+        pellets.stage.host().stain_target_entity = before;
     }
 }
 
 pub(super) fn play_predicted_pellets(
-    mut pending: ResMut<PendingPelletFx>,
+    mut queued_debris: ResMut<QueuedPelletEffect>,
     mut pellets: Pellets,
 ) {
-    if pending.0.is_empty() {
+    if queued_debris.0.is_empty() {
         return;
     }
-    for record in core::mem::take(&mut pending.0) {
-        let cursor = &mut pellets.ledger.cursor;
-        cursor.pellet_played = cursor.pellet_played.saturating_add(1);
+    for record in core::mem::take(&mut queued_debris.0) {
+        pellets.ledger.cursor.bump(JournalCount::Pellets);
         pellets.play(&Segment::from(&record), true);
     }
 }
 
 const KNIFE_HIT_EFFECT: &str = "impacts/flesh_hit_knife";
+const T6_KNIFE_HIT_EFFECT: &str = "impacts/fx_flesh_hit_knife_mp";
 
 /// The bolt a knife's blood rides: on the viewmodel's blade for the player
 /// who swung it, on the body's blade for everyone else.
 fn knife_bolt(
     viewed: bool,
-    own: &FpvBoltTargets,
-    other: impl FnOnce() -> Option<FxBoltTarget>,
-) -> Option<FxBoltTarget> {
+    own: &AttachTagGoals,
+    other: impl FnOnce() -> Option<EffectBoltTarget>,
+) -> Option<EffectBoltTarget> {
     if viewed {
         own.knife[0].or(own.knife[1])
     } else {
@@ -202,46 +220,45 @@ fn knife_bolt(
 }
 
 pub(super) fn knife_blood(
-    hit: On<net::EntityMeleeBlood>,
-    identities: Query<&CEntity>,
-    others: Query<&RemoteFxBolts>,
-    own: Res<FpvBoltTargets>,
-    slots: Res<CEntitySlots>,
+    strike: On<net::MeleeBloodAt>,
+    identities: Query<&ClientEntityRecord>,
+    bolts: BoltLookup,
     view: Viewpoint,
     mut stage: FxStage,
-    mut cursor: ResMut<FxJournalCursor>,
+    mut cursor: ResMut<EffectJournalCursor>,
 ) {
     let Some(mut play) = stage.playback() else {
         return;
     };
     let viewed = identities
-        .get(hit.entity)
+        .get(strike.entity)
         .ok()
         .is_some_and(|identity| view.is_viewed_body(identity));
-    let target = knife_bolt(viewed, &own, || {
-        u16::try_from(hit.event.payload.number)
-            .ok()
-            .and_then(|number| slots.entity_for_number(number))
-            .and_then(|entity| others.get(entity).ok())
-            .and_then(|bolts| bolts.knife)
+    let target = knife_bolt(viewed, &bolts.own, || {
+        bolts.knife_of_body(strike.event.payload.number)
     });
-    let mut played = 0;
-    play.bolted(Some(FxName::engine(KNIFE_HIT_EFFECT)), target, &mut played);
-    cursor.impact_played = cursor.impact_played.saturating_add(played);
+    let mut fired_count = 0;
+    // bo2zm: Black Ops II's own knife blood (its name differs from the old engine's).
+    let blood = match play.defs().level_scope() {
+        asset_core::AssetCategoryScope::T6 => FxName::new(asset_core::AssetCategoryScope::T6, T6_KNIFE_HIT_EFFECT),
+        _ => FxName::engine(KNIFE_HIT_EFFECT),
+    };
+    play.bolted(Some(blood), target, &mut fired_count);
+    cursor.add(JournalCount::ImpactPlayed, fired_count);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn bolt(dobj: u32) -> FxBoltTarget {
-        FxBoltTarget {
+    fn bolt(dobj: u32) -> EffectBoltTarget {
+        EffectBoltTarget {
             dobj,
             bone: 0,
-            centity_teleport: false,
-            orientation: fx::FxBoltOrientation {
-                origin: [0.0; 3],
-                axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            client_actor_teleport: false,
+            orientation: fx::AttachPointFrame {
+                origin: Vec3::ZERO.to_array(),
+                axis: [Vec3::X, Vec3::Y, Vec3::Z].map(|unit| unit.to_array()),
             },
         }
     }
@@ -258,10 +275,10 @@ mod tests {
             hand: 1,
             origin: [10.0, 11.0, 12.0],
             origin2: [1.0, 2.0, 3.0],
-            direction: [0.0, 0.0, 1.0],
+            direction: Vec3::Z.to_array(),
             surf_type: 9,
             surface_flags: 0xABCD,
-            simulation_flags: 0,
+            wall_pass_bits: 0,
         }
     }
 
@@ -269,15 +286,15 @@ mod tests {
     fn a_hit_event_puts_each_field_where_the_segment_wants_it() {
         let segment = Segment::from(&payload());
         assert_eq!(segment.attacker, 3);
-        assert_eq!((segment.weapon, segment.correlation), (5, 6));
-        assert_eq!((segment.pellet, segment.hand), (7, 1));
+        assert_eq!((segment.gun_no, segment.link_id), (5, 6));
+        assert_eq!((segment.pellet_no, segment.hand), (7, 1));
         // The start travels in origin2, the end in origin.
         assert_eq!(segment.from, [1.0, 2.0, 3.0]);
         assert_eq!(segment.to, [10.0, 11.0, 12.0]);
-        assert_eq!(segment.normal, [0.0, 0.0, 1.0]);
-        assert_eq!((segment.surf_type, segment.surface_flags), (9, 0xABCD));
+        assert_eq!(segment.nrm, [0.0, 0.0, 1.0]);
+        assert_eq!((segment.face_type, segment.surf_flags), (9, 0xABCD));
         // And the flesh flags in the event parameter, whole.
-        assert_eq!(segment.flesh_flags, 0x1_0004);
+        assert_eq!(segment.body_flags, 0x1_0004);
     }
 
     #[test]
@@ -290,10 +307,10 @@ mod tests {
             hand: 1,
             start: [1.0, 2.0, 3.0],
             end: [10.0, 11.0, 12.0],
-            normal: [0.0, 0.0, 1.0],
+            normal: Vec3::Z.to_array(),
             surf_type: 9,
             surface_flags: 0xABCD,
-            flesh_flags: 4,
+            body_hit_bits: 4,
         };
         let predicted = Segment::from(&record);
         let confirmed = Segment::from(&sim::EntityEventPayload {
@@ -303,17 +320,17 @@ mod tests {
         assert_eq!(predicted.attacker, confirmed.attacker);
         assert_eq!(predicted.from, confirmed.from);
         assert_eq!(predicted.to, confirmed.to);
-        assert_eq!(predicted.normal, confirmed.normal);
-        assert_eq!(predicted.flesh_flags, confirmed.flesh_flags);
-        assert_eq!(predicted.surface_flags, confirmed.surface_flags);
+        assert_eq!(predicted.nrm, confirmed.nrm);
+        assert_eq!(predicted.body_flags, confirmed.body_flags);
+        assert_eq!(predicted.surf_flags, confirmed.surf_flags);
     }
 
     #[test]
     fn only_the_three_own_body_codes_are_hits_on_self() {
         for code in [
-            ev::BULLET_HIT_CLIENT_SMALL,
-            ev::BULLET_HIT_CLIENT_LARGE,
-            ev::BULLET_HIT_CLIENT_SHIELD,
+            event::ROUND_HIT_BODY_SMALL,
+            event::ROUND_HIT_BODY_LARGE,
+            event::BULLET_HIT_CLIENT_SHIELD,
         ] {
             assert!(is_hit_on_self(i32::from(code)));
             // A code that only matches once squeezed into a byte is not one.
@@ -336,7 +353,7 @@ mod tests {
 
     #[test]
     fn the_viewer_swings_the_blade_of_his_viewmodel() {
-        let mut own = FpvBoltTargets::default();
+        let mut own = AttachTagGoals::default();
         own.knife[1] = Some(bolt(8));
         let got = knife_bolt(true, &own, || panic!("his own blade needs no lookup"));
         assert_eq!(got.map(|t| t.dobj), Some(8));
@@ -348,7 +365,7 @@ mod tests {
 
     #[test]
     fn anyone_else_swings_the_blade_of_their_body() {
-        let mut own = FpvBoltTargets::default();
+        let mut own = AttachTagGoals::default();
         own.knife[0] = Some(bolt(4));
         let got = knife_bolt(false, &own, || Some(bolt(15)));
         assert_eq!(got.map(|t| t.dobj), Some(15));

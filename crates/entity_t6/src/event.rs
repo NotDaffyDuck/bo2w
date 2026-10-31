@@ -4,12 +4,12 @@
 
 pub const NONE: u8 = 0;
 pub const FOLIAGE_SOUND: u8 = 1;
-pub const STOP_WEAPON_SOUND: u8 = 2;
+pub const GUN_SOUND_OFF: u8 = 2;
 pub const STOP_SOUND_ALIAS: u8 = 3;
 pub const SOUND_ALIAS: u8 = 4;
 pub const SOUND_ALIAS_NOTIFY: u8 = 5;
 pub const SOUND_BATTLECHAT_ALIAS: u8 = 6;
-pub const STOPSOUNDS: u8 = 7;
+pub const ALL_SOUNDS_OFF: u8 = 7;
 pub const STANCE_FORCE_STAND: u8 = 8;
 pub const STANCE_FORCE_CROUCH: u8 = 9;
 pub const STANCE_FORCE_PRONE: u8 = 10;
@@ -35,9 +35,9 @@ pub const WEAPON_SWITCH_STARTED: u8 = 29;
 pub const PULLBACK_WEAPON: u8 = 30;
 pub const FIRE_WEAPON_SCRIPTED: u8 = 31;
 pub const FIRE_WEAPON: u8 = 32;
-pub const FIRE_WEAPON_LASTSHOT: u8 = 33;
-pub const FIRE_WEAPON_LEFT: u8 = 34;
-pub const FIRE_WEAPON_LASTSHOT_LEFT: u8 = 35;
+pub const GUN_LAST_ROUND: u8 = 33;
+pub const GUN_LEFT_HAND: u8 = 34;
+pub const GUN_LAST_ROUND_LEFT: u8 = 35;
 pub const FIRE_RICOCHET: u8 = 36;
 pub const RECHAMBER_WEAPON: u8 = 37;
 pub const EJECT_BRASS: u8 = 38;
@@ -64,17 +64,17 @@ pub const FIRE_BARREL_1: u8 = 58;
 pub const FIRE_BARREL_2: u8 = 59;
 pub const FIRE_BARREL_3: u8 = 60;
 pub const FIRE_BARREL_4: u8 = 61;
-pub const BULLET_HIT: u8 = 62;
-pub const BULLET_HIT_SHIELD: u8 = 63;
+pub const ROUND_HIT: u8 = 62;
+pub const ROUND_HIT_SHIELD: u8 = 63;
 pub const BULLET_HIT_CLIENT_SHIELD: u8 = 64;
 pub const EXPLOSIVE_IMPACT_ON_SHIELD: u8 = 65;
 pub const EXPLOSIVE_SPLASH_ON_SHIELD: u8 = 66;
-pub const BULLET_HIT_CLIENT_SMALL: u8 = 67;
-pub const BULLET_HIT_CLIENT_LARGE: u8 = 68;
+pub const ROUND_HIT_BODY_SMALL: u8 = 67;
+pub const ROUND_HIT_BODY_LARGE: u8 = 68;
 pub const DESTRUCTIBLE_BULLET_HIT: u8 = 69;
 pub const DESTRUCTIBLE_EXPLOSION_HIT: u8 = 70;
-pub const GRENADE_BOUNCE: u8 = 71;
-pub const GRENADE_EXPLODE: u8 = 72;
+pub const BOMB_HOP: u8 = 71;
+pub const BOMB_BURST: u8 = 72;
 pub const ROCKET_EXPLODE: u8 = 73;
 pub const ROCKET_EXPLODE_NOMARKS: u8 = 74;
 pub const FLASHBANG_EXPLODE: u8 = 75;
@@ -138,7 +138,7 @@ pub const FOOTSTEP_CROUCHWALK: u8 = 132;
 pub const FOOTSTEP_PRONE: u8 = 133;
 pub const LADDER_HAND_GRAB: u8 = 134;
 pub const MANTLE: u8 = 135;
-pub const JUMP: u8 = 136;
+pub const LEAP: u8 = 136;
 pub const LANDING_FIRST: u8 = 137;
 pub const LANDING_LAST: u8 = 168;
 pub const LANDING_PAIN_FIRST: u8 = 169;
@@ -213,11 +213,11 @@ pub enum EventAction {
     RaisePickup,
     /// A gun's shot: the player's (31-35), a mounted turret's (56-57), a
     /// barrel's (58-61) or a vehicle turret's (201).
-    WeaponFire,
+    GunShot,
     /// A vehicle gunner's shot (202-209); `gunner_of_fire_event` says whose.
     GunnerFire,
     /// `EV_FIRE_RICOCHET`, `EV_RECHAMBER_WEAPON`, `EV_EJECT_BRASS`.
-    EjectBrass,
+    ShellEject,
     /// `EV_FIRE_MELEE`: dyn ents and glass near the swing react.
     FireMelee,
     PrepOffhand,
@@ -225,7 +225,7 @@ pub enum EventAction {
     SwitchOffhand,
     DeployRiotshield,
     MeleeHit,
-    MeleeBlood,
+    MeleeGore,
     /// `EV_BULLET_HIT`, `EV_BULLET_HIT_SHIELD`: impact effect and sound.
     BulletHit,
     /// `EV_BULLET_HIT_CLIENT_SHIELD`: the shield bearer's own hit.
@@ -260,7 +260,7 @@ pub enum EventAction {
     /// lock-on needed, can't plant, can't go prone, invalid stance.
     Hint,
     /// `EV_FOOTSTEP_*` and `EV_LADDER_HAND_GRAB` (128-134).
-    Footstep,
+    FootfallMsg,
     Mantle,
     Jump,
     /// 137-200: a landing on `surface`, painful or not.
@@ -286,68 +286,67 @@ pub enum EventAction {
 /// the weapon death and damage effects); BO2 errors on those with
 /// "Unknown event".
 #[must_use]
-pub const fn event_action(ev: u8) -> Option<EventAction> {
-    use EventAction as A;
-    if let Some((surface, pain)) = landing_of_event(ev) {
-        return Some(A::Landing { surface, pain });
+pub const fn event_action(code: u8) -> Option<EventAction> {
+    if let Some((surface, pain)) = landing_of_event(code) {
+        return Some(EventAction::Landing { surface, pain });
     }
-    Some(match ev {
-        FOLIAGE_SOUND => A::Foliage,
+    Some(match code {
+        FOLIAGE_SOUND => EventAction::Foliage,
         2..=7 | 13 | 14 | 18..=21 | 24 | 25 | 27 | 28 | 30 | 39 | 41..=46 | 54 | 108..=110
-        | SCOPE_ZOOM | STACKFIRE => A::Sound,
-        8..=10 => A::Stance,
-        ITEM_PICKUP | AMMO_PICKUP => A::Pickup,
+        | SCOPE_ZOOM | STACKFIRE => EventAction::Sound,
+        8..=10 => EventAction::Stance,
+        ITEM_PICKUP | AMMO_PICKUP => EventAction::Pickup,
         EMPTYCLIP | RELOAD_START_NOTIFY | RELOAD_ADDAMMO | WEAPON_SWITCH_STARTED
         | PREP_RIOTSHIELD | LOWER_RIOTSHIELD | GRENADE_DROP | GRENADE_SUICIDE
-        | KILLSTREAK_DAMAGE | JAM_WEAPON | SETLOCALWIND | ALLOWPITCH => A::Ignored,
-        EMPTY_OFFHAND => A::EmptyOffhand,
-        RESET_ADS => A::ResetAds,
-        RAISE_PICKUP_WEAPON => A::RaisePickup,
-        31..=35 | 56..=61 | FIRE_VEHICLE_TURRET => A::WeaponFire,
-        202..=209 => A::GunnerFire,
-        FIRE_RICOCHET | RECHAMBER_WEAPON | EJECT_BRASS => A::EjectBrass,
-        FIRE_MELEE => A::FireMelee,
-        PREP_OFFHAND => A::PrepOffhand,
-        USE_OFFHAND => A::UseOffhand,
-        SWITCH_OFFHAND => A::SwitchOffhand,
-        DEPLOY_RIOTSHIELD => A::DeployRiotshield,
-        MELEE_HIT => A::MeleeHit,
-        MELEE_BLOOD => A::MeleeBlood,
-        BULLET_HIT | BULLET_HIT_SHIELD => A::BulletHit,
-        BULLET_HIT_CLIENT_SHIELD => A::BulletHitClientShield,
-        EXPLOSIVE_IMPACT_ON_SHIELD | EXPLOSIVE_SPLASH_ON_SHIELD => A::ShieldBlast,
-        BULLET_HIT_CLIENT_SMALL | BULLET_HIT_CLIENT_LARGE => A::BulletHitClient,
-        DESTRUCTIBLE_BULLET_HIT | DESTRUCTIBLE_EXPLOSION_HIT => A::DestructibleHit,
-        GRENADE_BOUNCE => A::GrenadeBounce,
-        72..=77 | DUD_EXPLODE | FIRE_EXPLODE => A::Explosion,
-        SENSOR_GRENADE_EXPLODE => A::SensorGrenade,
+        | KILLSTREAK_DAMAGE | JAM_WEAPON | SETLOCALWIND | ALLOWPITCH => EventAction::Ignored,
+        EMPTY_OFFHAND => EventAction::EmptyOffhand,
+        RESET_ADS => EventAction::ResetAds,
+        RAISE_PICKUP_WEAPON => EventAction::RaisePickup,
+        31..=35 | 56..=61 | FIRE_VEHICLE_TURRET => EventAction::GunShot,
+        202..=209 => EventAction::GunnerFire,
+        FIRE_RICOCHET | RECHAMBER_WEAPON | EJECT_BRASS => EventAction::ShellEject,
+        FIRE_MELEE => EventAction::FireMelee,
+        PREP_OFFHAND => EventAction::PrepOffhand,
+        USE_OFFHAND => EventAction::UseOffhand,
+        SWITCH_OFFHAND => EventAction::SwitchOffhand,
+        DEPLOY_RIOTSHIELD => EventAction::DeployRiotshield,
+        MELEE_HIT => EventAction::MeleeHit,
+        MELEE_BLOOD => EventAction::MeleeGore,
+        ROUND_HIT | ROUND_HIT_SHIELD => EventAction::BulletHit,
+        BULLET_HIT_CLIENT_SHIELD => EventAction::BulletHitClientShield,
+        EXPLOSIVE_IMPACT_ON_SHIELD | EXPLOSIVE_SPLASH_ON_SHIELD => EventAction::ShieldBlast,
+        ROUND_HIT_BODY_SMALL | ROUND_HIT_BODY_LARGE => EventAction::BulletHitClient,
+        DESTRUCTIBLE_BULLET_HIT | DESTRUCTIBLE_EXPLOSION_HIT => EventAction::DestructibleHit,
+        BOMB_HOP => EventAction::GrenadeBounce,
+        72..=77 | DUD_EXPLODE | FIRE_EXPLODE => EventAction::Explosion,
+        SENSOR_GRENADE_EXPLODE => EventAction::SensorGrenade,
         CHANGE_TO_DUD | DUD_IMPACT | TIMED_FX | MOLOTOV_FLOAT | PLAY_FX | PLAY_FX_ON_TAG => {
-            A::PlayFx
+            EventAction::PlayFx
         }
-        FAKE_FIRE => A::FakeFire,
-        88..=92 => A::Physics,
-        CREATE_DYNENT => A::CreateDynent,
-        BLOOD_IMPACTS => A::BloodImpacts,
-        SETWETNESS => A::Wetness,
-        EARTHQUAKE => A::Earthquake,
-        MISSILE_REMOTE_BOOST => A::RemoteMissileBoost,
-        112..=117 => A::Rumble,
-        OBITUARY | REVIVE_OBITUARY => A::Obituary,
-        DIRECTIONAL_HIT_INDICATOR => A::DirectionalHitIndicator,
-        123..=127 | CANNOTPLANT | CANT_EQUIP_PRONE | STANCE_INVALID => A::Hint,
-        128..=134 => A::Footstep,
-        MANTLE => A::Mantle,
-        JUMP => A::Jump,
-        START_CAMERA_TWEEN => A::CameraTween,
-        DESTRUCTIBLE_DISABLE_PIECES => A::DestructiblePieces,
-        DTP_LAUNCH | DTP_LAND => A::DiveToProne,
-        SLIDE_START | SLIDE_STOP => A::Slide,
-        BOLT_IMPACT | BOLT_IMPALE => A::BoltImpact,
-        FACE_EVENT => A::FaceEvent,
-        228..=231 => A::Buoyancy,
-        GIB => A::Gib,
-        ENTER_VEHICLE | EXIT_VEHICLE => A::VehicleNotify,
-        IMMEDIATE_RAGDOLL => A::Ragdoll,
+        FAKE_FIRE => EventAction::FakeFire,
+        88..=92 => EventAction::Physics,
+        CREATE_DYNENT => EventAction::CreateDynent,
+        BLOOD_IMPACTS => EventAction::BloodImpacts,
+        SETWETNESS => EventAction::Wetness,
+        EARTHQUAKE => EventAction::Earthquake,
+        MISSILE_REMOTE_BOOST => EventAction::RemoteMissileBoost,
+        112..=117 => EventAction::Rumble,
+        OBITUARY | REVIVE_OBITUARY => EventAction::Obituary,
+        DIRECTIONAL_HIT_INDICATOR => EventAction::DirectionalHitIndicator,
+        123..=127 | CANNOTPLANT | CANT_EQUIP_PRONE | STANCE_INVALID => EventAction::Hint,
+        128..=134 => EventAction::FootfallMsg,
+        MANTLE => EventAction::Mantle,
+        LEAP => EventAction::Jump,
+        START_CAMERA_TWEEN => EventAction::CameraTween,
+        DESTRUCTIBLE_DISABLE_PIECES => EventAction::DestructiblePieces,
+        DTP_LAUNCH | DTP_LAND => EventAction::DiveToProne,
+        SLIDE_START | SLIDE_STOP => EventAction::Slide,
+        BOLT_IMPACT | BOLT_IMPALE => EventAction::BoltImpact,
+        FACE_EVENT => EventAction::FaceEvent,
+        228..=231 => EventAction::Buoyancy,
+        GIB => EventAction::Gib,
+        ENTER_VEHICLE | EXIT_VEHICLE => EventAction::VehicleNotify,
+        IMMEDIATE_RAGDOLL => EventAction::Ragdoll,
         _ => return None,
     })
 }
@@ -363,13 +362,13 @@ pub const fn fire_weapon_event(left_gun: bool, clip_empty: bool) -> u8 {
 /// weapon.
 #[must_use]
 pub const fn is_left_gun_fire(ev: u8) -> bool {
-    matches!(ev, FIRE_WEAPON_LEFT | FIRE_WEAPON_LASTSHOT_LEFT)
+    matches!(ev, GUN_LEFT_HAND | GUN_LAST_ROUND_LEFT)
 }
 
 /// The shots that emptied the clip, as `CG_FireWeapon` tests them.
 #[must_use]
 pub const fn is_last_shot_fire(ev: u8) -> bool {
-    matches!(ev, FIRE_WEAPON_LASTSHOT | FIRE_WEAPON_LASTSHOT_LEFT)
+    matches!(ev, GUN_LAST_ROUND | GUN_LAST_ROUND_LEFT)
 }
 
 /// A vehicle gunner's shot: `EV_FIRE_GUNNER_1` plus the gunner (0-3), or
@@ -395,8 +394,8 @@ pub const fn gunner_of_fire_event(ev: u8) -> Option<usize> {
 /// `_SMALL`. The victim gets `EV_BULLET_HIT` instead, and every other
 /// bullet strike is `EV_BULLET_HIT` too.
 #[must_use]
-pub const fn client_bullet_hit_event(rifle_bullet: bool) -> u8 {
-    BULLET_HIT_CLIENT_SMALL + rifle_bullet as u8
+pub const fn client_bullet_hit_event(long_gun_round: bool) -> u8 {
+    ROUND_HIT_BODY_SMALL + long_gun_round as u8
 }
 
 /// A landing on `surface` (0-31), painful or not.
@@ -437,7 +436,7 @@ pub const fn footstep_of_event(ev: u8) -> Option<u8> {
 /// height and dips 4 per 26 units past 12, plus 4, at most 24; from 12
 /// or less it leaves the view alone.
 #[must_use]
-pub fn land_change(pain: bool, parm: i32, fall_min: f32, fall_max: f32) -> Option<f32> {
+pub fn touchdown_dip(pain: bool, parm: i32, fall_min: f32, fall_max: f32) -> Option<f32> {
     if !pain {
         return Some(-(parm as f32));
     }
@@ -470,9 +469,9 @@ mod tests {
     #[test]
     fn fire_events() {
         assert_eq!(fire_weapon_event(false, false), FIRE_WEAPON);
-        assert_eq!(fire_weapon_event(false, true), FIRE_WEAPON_LASTSHOT);
-        assert_eq!(fire_weapon_event(true, false), FIRE_WEAPON_LEFT);
-        assert_eq!(fire_weapon_event(true, true), FIRE_WEAPON_LASTSHOT_LEFT);
+        assert_eq!(fire_weapon_event(false, true), GUN_LAST_ROUND);
+        assert_eq!(fire_weapon_event(true, false), GUN_LEFT_HAND);
+        assert_eq!(fire_weapon_event(true, true), GUN_LAST_ROUND_LEFT);
         assert!(is_left_gun_fire(35) && !is_left_gun_fire(33));
         assert!(is_last_shot_fire(33) && is_last_shot_fire(35) && !is_last_shot_fire(32));
         assert_eq!(gunner_fire_event(0, false), FIRE_GUNNER_1);
@@ -480,8 +479,8 @@ mod tests {
         assert_eq!(gunner_of_fire_event(FIRE_GUNNER_3A), Some(2));
         assert_eq!(gunner_of_fire_event(FIRE_VEHICLE_TURRET), None);
         assert_eq!(event_action(FIRE_GUNNER_2A), Some(EventAction::GunnerFire));
-        assert_eq!(client_bullet_hit_event(true), BULLET_HIT_CLIENT_LARGE);
-        assert_eq!(client_bullet_hit_event(false), BULLET_HIT_CLIENT_SMALL);
+        assert_eq!(client_bullet_hit_event(true), ROUND_HIT_BODY_LARGE);
+        assert_eq!(client_bullet_hit_event(false), ROUND_HIT_BODY_SMALL);
     }
 
     #[test]
@@ -490,16 +489,16 @@ mod tests {
         assert_eq!(landing_event(31, true), LANDING_PAIN_LAST);
         assert_eq!(landing_of_event(LANDING_FIRST + 7), Some((7, false)));
         assert_eq!(landing_of_event(LANDING_PAIN_FIRST + 3), Some((3, true)));
-        assert_eq!(landing_of_event(JUMP), None);
+        assert_eq!(landing_of_event(LEAP), None);
         assert_eq!(event_action(170), Some(EventAction::Landing { surface: 1, pain: true }));
         assert_eq!(footstep_of_event(LADDER_HAND_GRAB), Some(6));
         assert_eq!(footstep_of_event(MANTLE), None);
-        assert_eq!(land_change(false, 9, 0.0, 0.0), Some(-9.0));
+        assert_eq!(touchdown_dip(false, 9, 0.0, 0.0), Some(-9.0));
         // 0% of the range from a 12 unit minimum: no dip.
-        assert_eq!(land_change(true, 0, 12.0, 128.0), None);
+        assert_eq!(touchdown_dip(true, 0, 12.0, 128.0), None);
         // 25 units: 13 past 12, (13 / 26 + 1) * 4 = 6.
-        assert_eq!(land_change(true, 50, 0.0, 50.0), Some(-6.0));
+        assert_eq!(touchdown_dip(true, 50, 0.0, 50.0), Some(-6.0));
         // 200 units: 32, held to 24.
-        assert_eq!(land_change(true, 100, 12.0, 200.0), Some(-24.0));
+        assert_eq!(touchdown_dip(true, 100, 12.0, 200.0), Some(-24.0));
     }
 }

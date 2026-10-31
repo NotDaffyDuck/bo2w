@@ -13,7 +13,7 @@ pub struct SunShadowClipPlanes {
 }
 
 impl SunShadowClipPlanes {
-    pub const EMPTY: Self = Self { planes: [[0.0; 4]; SUN_SHADOW_MAX_CLIP_PLANES], count: 0 };
+    pub const BLANK: Self = Self { planes: [[0.0; 4]; SUN_SHADOW_MAX_CLIP_PLANES], count: 0 };
 
     /// Adds a plane and says whether it fit. A refused plane is simply lost:
     /// the volume gets looser, which costs draw calls but never drops a caster.

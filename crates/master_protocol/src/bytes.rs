@@ -2,13 +2,13 @@
 //! one byte (0 or 1), text is a length byte followed by UTF-8.
 
 use crate::{
-    AdvertId, ContentFlags, EndpointRole, MemberId, ProtocolError, RoomPhase, SessionCloseReason,
+    ListingId, AssetCoverageBits, PeerKindTag, RoomOccupantId, ControlCodecFault, LobbyStage, RoomShutdownCause,
 };
 
 /// A fixed-layout value: written without failing, read with a check.
 pub(crate) trait Scalar: Copy {
     fn emit(self, out: &mut Out);
-    fn parse(src: &mut In<'_>) -> Result<Self, ProtocolError>;
+    fn parse(src: &mut In<'_>) -> Result<Self, ControlCodecFault>;
 }
 
 /// Output buffer with chained writes.
@@ -27,12 +27,12 @@ impl Out {
     }
 
     /// Text over `cap` bytes (or over 255) is refused with its length.
-    pub(crate) fn text(&mut self, value: &str, cap: usize) -> Result<&mut Self, ProtocolError> {
-        let len = u8::try_from(value.len())
+    pub(crate) fn put_text(&mut self, text: &str, cap: usize) -> Result<&mut Self, ControlCodecFault> {
+        let len = u8::try_from(text.len())
             .ok()
             .filter(|&len| usize::from(len) <= cap)
-            .ok_or(ProtocolError::LengthExceeded(value.len()))?;
-        Ok(self.put(len).raw(value.as_bytes()))
+            .ok_or(ControlCodecFault::SizeOverLimit(text.len()))?;
+        Ok(self.put(len).raw(text.as_bytes()))
     }
 }
 
@@ -46,35 +46,35 @@ impl<'a> In<'a> {
         Self { left: bytes }
     }
 
-    pub(crate) fn get<T: Scalar>(&mut self) -> Result<T, ProtocolError> {
+    pub(crate) fn get<T: Scalar>(&mut self) -> Result<T, ControlCodecFault> {
         T::parse(self)
     }
 
-    pub(crate) fn take(&mut self, count: usize) -> Result<&'a [u8], ProtocolError> {
-        if self.left.len() < count {
-            return Err(ProtocolError::Truncated);
+    pub(crate) fn chunk(&mut self, len: usize) -> Result<&'a [u8], ControlCodecFault> {
+        if self.left.len() < len {
+            return Err(ControlCodecFault::Truncated);
         }
-        let (head, tail) = self.left.split_at(count);
+        let (head, tail) = self.left.split_at(len);
         self.left = tail;
         Ok(head)
     }
 
-    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], ProtocolError> {
+    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], ControlCodecFault> {
         let mut out = [0u8; N];
-        out.copy_from_slice(self.take(N)?);
+        out.copy_from_slice(self.chunk(N)?);
         Ok(out)
     }
 
     /// A length over `cap` is refused before the text itself is read.
-    pub(crate) fn text(&mut self, cap: usize) -> Result<String, ProtocolError> {
+    pub(crate) fn text(&mut self, cap: usize) -> Result<String, ControlCodecFault> {
         let len = usize::from(self.get::<u8>()?);
         if len > cap {
-            return Err(ProtocolError::LengthExceeded(len));
+            return Err(ControlCodecFault::SizeOverLimit(len));
         }
-        let raw = self.take(len)?;
+        let raw = self.chunk(len)?;
         core::str::from_utf8(raw)
             .map(str::to_owned)
-            .map_err(|_| ProtocolError::InvalidUtf8)
+            .map_err(|_| ControlCodecFault::TextNotUtf8)
     }
 
     /// Everything not read yet.
@@ -83,11 +83,11 @@ impl<'a> In<'a> {
     }
 
     /// A body must be used up exactly; spare bytes make it invalid.
-    pub(crate) fn finish(self) -> Result<(), ProtocolError> {
+    pub(crate) fn finish(self) -> Result<(), ControlCodecFault> {
         if self.left.is_empty() {
             Ok(())
         } else {
-            Err(ProtocolError::InvalidBody)
+            Err(ControlCodecFault::MalformedContent)
         }
     }
 }
@@ -99,7 +99,7 @@ macro_rules! big_endian {
                 out.raw(&self.to_be_bytes());
             }
 
-            fn parse(src: &mut In<'_>) -> Result<Self, ProtocolError> {
+            fn parse(src: &mut In<'_>) -> Result<Self, ControlCodecFault> {
                 src.array().map(<$int>::from_be_bytes)
             }
         }
@@ -113,46 +113,46 @@ impl Scalar for bool {
         out.put(u8::from(self));
     }
 
-    fn parse(src: &mut In<'_>) -> Result<Self, ProtocolError> {
+    fn parse(src: &mut In<'_>) -> Result<Self, ControlCodecFault> {
         match src.get::<u8>()? {
             0 => Ok(false),
             1 => Ok(true),
-            _ => Err(ProtocolError::InvalidBody),
+            _ => Err(ControlCodecFault::MalformedContent),
         }
     }
 }
 
-impl Scalar for AdvertId {
+impl Scalar for ListingId {
     fn emit(self, out: &mut Out) {
         out.raw(&self.0);
     }
 
-    fn parse(src: &mut In<'_>) -> Result<Self, ProtocolError> {
+    fn parse(src: &mut In<'_>) -> Result<Self, ControlCodecFault> {
         src.array().map(Self)
     }
 }
 
-impl Scalar for MemberId {
+impl Scalar for RoomOccupantId {
     fn emit(self, out: &mut Out) {
         out.raw(&self.0);
     }
 
-    fn parse(src: &mut In<'_>) -> Result<Self, ProtocolError> {
+    fn parse(src: &mut In<'_>) -> Result<Self, ControlCodecFault> {
         src.array().map(Self)
     }
 }
 
-impl Scalar for ContentFlags {
+impl Scalar for AssetCoverageBits {
     fn emit(self, out: &mut Out) {
         out.put(self.0);
     }
 
-    fn parse(src: &mut In<'_>) -> Result<Self, ProtocolError> {
+    fn parse(src: &mut In<'_>) -> Result<Self, ControlCodecFault> {
         src.get().map(Self)
     }
 }
 
-/// A one-byte enum and its wire codes. Unknown codes read as `InvalidBody`.
+/// A one-byte enum and its wire codes. Unknown codes read as `MalformedContent`.
 macro_rules! byte_enum {
     ($ty:ident { $($variant:ident = $code:literal),* $(,)? }) => {
         impl Scalar for $ty {
@@ -163,16 +163,16 @@ macro_rules! byte_enum {
                 out.put(code);
             }
 
-            fn parse(src: &mut In<'_>) -> Result<Self, ProtocolError> {
+            fn parse(src: &mut In<'_>) -> Result<Self, ControlCodecFault> {
                 match src.get::<u8>()? {
                     $($code => Ok($ty::$variant),)*
-                    _ => Err(ProtocolError::InvalidBody),
+                    _ => Err(ControlCodecFault::MalformedContent),
                 }
             }
         }
     };
 }
 
-byte_enum!(EndpointRole { Cli = 0, Host = 1, Join = 2 });
-byte_enum!(RoomPhase { Gathering = 0, Loading = 1, Running = 2 });
-byte_enum!(SessionCloseReason { HostLeft = 0, LeaseExpired = 1, Overload = 2 });
+byte_enum!(PeerKindTag { Cli = 0, Host = 1, Join = 2 });
+byte_enum!(LobbyStage { Gathering = 0, Loading = 1, Running = 2 });
+byte_enum!(RoomShutdownCause { HostLeft = 0, TenancyLapsed = 1, Overload = 2, Kicked = 3 });
