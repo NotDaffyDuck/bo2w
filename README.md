@@ -18,11 +18,45 @@ it, so matches follow the game's real rules without touching the original execut
 > - This is an unofficial, free fan project, not affiliated with or endorsed by Activision, Treyarch or Infinity Ward.
 >   Buy Black Ops II to support the people who made it.
 
-**Last updated:** 2026-10-31
+**Last updated:** 2026-11-01
 
 > **Work in progress.** Matches against Black Ops II's own bots play on every multiplayer map, started from BO2's own
 > menus, and Nuketown Zombies plays to a real game over. It is not finished: the list under [What's next](#whats-next)
 > is still being worked through, one item at a time, each checked side by side with Black Ops II.
+
+## Latest updates
+
+### 2026-11-01
+
+**Sound**
+- Combat sounds (impacts, footsteps, voices) are loaded before the match starts, so they no longer arrive late.
+- Gear rattle: your character's gear makes its BO2 sounds when you move.
+
+**Guns and movement**
+- The sniper scope shows at full aim again.
+- Melee swings use BO2's own hit shape.
+- Dive and fall landing damage now matches BO2.
+- Legs swing straight into the run, with no shimmy.
+
+**Maps and bots**
+- Drone: the first-person hands are fixed. Each multiplayer map dresses you in its factions' arms.
+- Pod: better bot routes and doorway fixes.
+- Raid map fixes and pond water.
+
+**Menus and on-screen hints**
+- Custom Games set-up opens and lets you edit the rules.
+- A new pickup hint and a "stuck" pulse.
+
+### 2026-10-31
+
+- Fresh start of `main` as the fan engine (see [A fresh start](#a-fresh-start-2026-10-31)).
+- Bullets go through walls as in BO2 (up to five walls).
+- BO2's lag compensation for players and for moving map parts.
+- Killcam uses BO2's match flags.
+- Bots use Nuketown's jump spots, Frostbite's routes, ladders and water edges.
+- The lobby's game type sets the match rules.
+
+Older changes are in [MULTIPLAYER.md](MULTIPLAYER.md).
 
 ## A fresh start (2026-10-31)
 
@@ -63,14 +97,6 @@ More detail (settings, mods, how it works) is in [MULTIPLAYER.md](MULTIPLAYER.md
 - First-person hands on Nightclub, Slums and Turbine; screen shake.
 - Maps: the Pod doorway, Drone's lights, Meltdown.
 - A full play-test build, then the polish list in [MULTIPLAYER.md](MULTIPLAYER.md#coming-soon).
-
-## Recent changes
-
-- 2026-11-01: Drone's first-person hands fixed (a multiplayer map wears its factions' arms), gear rattle sounds, combat sounds (impacts, steps, voices) loaded before the match, dive and fall landing damage fixed, sniper scope shows at full aim again, Custom Games set-up opens and edits rules, melee swings use BO2's mask, legs swing to the run without shimmy, Pod bot routes and doorway fixes, new pickup hint and "stuck" pulse, pond water, Raid map fixes.
-
-- 2026-10-31: fresh start of `main` as the fan engine: bullets through walls as in BO2, BO2's lag compensation for
-  players and moving map parts, killcam match flags, bots on Nuketown's jump spots and Frostbite's routes, ladders,
-  water edges, and the lobby's game type setting the match rules.
 
 ## Credits and license
 
