@@ -279,7 +279,7 @@ pub(super) async fn walk_prepared_match(
     }
 
     if facts.compass_heading.is_none() {
-        notes.push("compass gap: worldspawn has no northyaw — map is drawn north-up".into());
+        notes.push("compass gap: the map's north was never read — map is drawn north-up".into());
     }
     notes.extend(translation_summary);
 

@@ -144,6 +144,15 @@ fn mark_frame<const PART: usize>() {
     }
 }
 
+/// The frame length (ms) above which a gap is logged: 250 unless `BO2MP_FRAME_GAP_MS` lowers it
+/// (a measured run wants the 40 to 100 ms hitches a player feels, not only the stalls).
+fn frame_gap_floor_ms() -> f64 {
+    static FLOOR: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("BO2MP_FRAME_GAP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250.0)
+    })
+}
+
 /// A frame that came long after the last one, logged with the time each
 /// part of it took (finding stalls). "after Last" is the render world's
 /// extraction and the wait for the frame to show.
@@ -153,7 +162,7 @@ fn log_frame_gaps(mut last: Local<Option<std::time::Instant>>, mut last_cpu: Loc
     let marks = FRAME_MARKS.lock().map(|m| *m).unwrap_or([None; 5]);
     if let Some(prev) = *last {
         let ms = (now - prev).as_secs_f64() * 1000.0;
-        if ms > 250.0 {
+        if ms > frame_gap_floor_ms() {
             let span = |a: Option<std::time::Instant>, b: Option<std::time::Instant>| match (a, b) {
                 (Some(a), Some(b)) if b >= a => format!("{:.0}", (b - a).as_secs_f64() * 1000.0),
                 _ => "?".to_owned(),
@@ -943,6 +952,7 @@ fn build_body(
     catalog: Option<&asset_model::LevelWeaponRoster>,
     script: &T6PlayerAnims,
 ) -> Option<Built> {
+    let t_start = clock_now();
     let mut names = key.body.split(';');
     let model = names.next().unwrap_or("");
     let Some(entry) = fpv.0.by_label(asset_core::AssetCategoryScope::T6, model) else {
@@ -1014,6 +1024,7 @@ fn build_body(
     // handles a grenade or a piece of equipment (the script's grenadeAnim:
     // a throw, a claymore planted), that item is in his hand instead of the
     // gun.
+    let t_models = ms_since(t_start);
     let weapon = key.weap;
     let mut right_gun = None;
     if !key.corpse
@@ -1054,6 +1065,7 @@ fn build_body(
             parts.extend(gun_parts(registry, catalog, left, Some((0, "tag_weapon_left")), base));
         }
     }
+    let t_guns = ms_since(t_start);
     let Some(dobj) = build_dobj(&parts) else {
         note_once(locals, format!("bo2mp body: {model} has no skeleton to pose"));
         return None;
@@ -1067,6 +1079,10 @@ fn build_body(
         u16::try_from(slot).ok()
     };
     let (flash, brass) = (gun_tag("tag_flash"), gun_tag("tag_brass"));
+    let t_all = ms_since(t_start);
+    if t_all > 20.0 {
+        warn!(World, "bo2mp slow: build_body {model} weapon {weapon}: body+tag models {t_models:.1} ms, guns {:.1} ms, skeleton+sets {:.1} ms", t_guns - t_models, t_all - t_guns);
+    }
     Some(Built {
         upper: upper_body(&dobj),
         all: dobj.full_part_set(),

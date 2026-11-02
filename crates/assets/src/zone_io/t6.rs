@@ -1375,6 +1375,19 @@ impl ZoneChannel for T6Lane {
                     }
                     Err(e) => load_log.push(format!("t6 colour table: none ({e})")),
                 }
+                // bo2mp Raid: the outdoor lookup's picture (`$outdoor`, held in
+                // the zone) and its matrix; no material names it.
+                let outdoor = world.outdoor_image.and_then(|k| capture.images.get(k.index));
+                match (outdoor, packs.as_ref()) {
+                    (Some(img), Some(p)) => match super::t6_materials::link_outdoor_image(&mut mat_list, p, img) {
+                        Ok(_) => {
+                            world_draw.exterior_texture_label = Some(img.name.clone());
+                            world_draw.openair_lookup = world.outdoor_lookup.map(f32::to_bits);
+                        }
+                        Err(e) => load_log.push(format!("t6 outdoor image {}: {e}", img.name)),
+                    },
+                    _ => load_log.push("t6 outdoor image: none in GfxWorld".to_owned()),
+                }
                 // The sun light and colour the client scripts'
                 // r_lightTweakSunLight / SunColor replace (Buried 13, TranZit
                 // 12, Nuketown 15; Origins 0.38 0.78 1) and the sky intensity
@@ -1506,6 +1519,17 @@ impl ZoneChannel for T6Lane {
                         prepare,
                         ..Default::default()
                     },
+                    // bo2mp Raid: getnorthyaw reads the worldspawn `northyaw`,
+                    // 0 (north up) on a map without one, as Raid is.
+                    compass_heading: Some(
+                        capture
+                            .map_ents
+                            .iter()
+                            .flat_map(|text| asset_t6::parse_entities(text))
+                            .find(|e| e.classname() == "worldspawn")
+                            .and_then(|e| e.get("northyaw")?.trim().parse().ok())
+                            .unwrap_or(0.0),
+                    ),
                     ..Default::default()
                 };
                 // codmp: each window's own surfaces, where it stands (what

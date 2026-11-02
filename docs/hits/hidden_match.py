@@ -116,7 +116,7 @@ def main():
     ap.add_argument("--oldschool", action="store_true")
     a = ap.parse_args()
     extra, summary, drawn = KINDS[a.kind]
-    d = f"headless/{a.name or f'fan-{a.kind}{a.streaks if a.kind == "streaks" else ""}-{a.map}'}"
+    d = f"D:/bo2mp/headless/{a.name or f'fan-{a.kind}{a.streaks if a.kind == "streaks" else ""}-{a.map}'}"
     os.makedirs(f"{d}/bo2mp-artifacts", exist_ok=True)
     for f in ("run.log", "run.out"):
         if os.path.exists(f"{d}/{f}"):

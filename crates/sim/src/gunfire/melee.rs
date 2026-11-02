@@ -2,7 +2,7 @@
 
 use super::shot_log;
 use crate::shot_trace::{
-    ServerModelSource, ShotRayRequest, ShotPathLeg, HitTargetId, HITLOC_SHIELD, SHOT_WORLD_FILTER, shot_legs_with_filter,
+    ServerModelSource, ShotRayRequest, ShotPathLeg, HitTargetId, HITLOC_SHIELD, MASK_MELEE, shot_legs_with_filter,
     pane_from_hit,
 };
 use crate::step_view::StepWorldView;
@@ -80,7 +80,7 @@ fn scan_swing(
     let lines = lunge_probe_total(width, height);
     for (index, offset) in LUNGE_PROBE_SPREAD.iter().take(lines).enumerate() {
         let end = lunge_probe_tip(spot, ahead, right, up, range, width, height, *offset);
-        let mut ray = ShotRayRequest { from: start, to: end, bits: SHOT_WORLD_FILTER, skip_client_hit: None, ignore_model: None, ignore: None };
+        let mut ray = ShotRayRequest { from: start, to: end, bits: MASK_MELEE, skip_client_hit: None, ignore_model: None, ignore: None };
         ray.ignore = Some(attacker);
         let (legs, _) = shot_legs_with_filter(
             world.collision_solids(),

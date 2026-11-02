@@ -465,7 +465,7 @@ fn apply_profile(s: &mut frame::PlayerPrefsBundle, key: &str, raw: &str) {
 fn settings_bridge(hud: &mut LuiHud, settings: &mut ResMut<frame::PlayerPrefsBundle>) {
     if hud.settings_rev != Some(settings.revision) {
         // What the game's own code follows straight away: gore and corpses
-        // TODO(rw-zm): sim::set_t6_profile comes with the sim/t6 delta
+        // TODO(rw-zm): sim::set_t6_profile comes with the sim/t6 delta (D:/bo2mp/rw-zm-deltas)
         // (the game's rules), texture filtering (the samplers).
         sim::set_t6_profile(settings.mature, settings.corpses);
         asset_core::t6_set_aniso(match settings.tex_filter {
@@ -766,6 +766,19 @@ fn restart_in(front: OtherFrontEnd) -> std::io::Result<u32> {
 /// The party changed (`party_statechanged`, or a menu's
 /// `SystemNeedsUpdate(_, "lobby")`): the lobbies get `partylobby_update` and
 /// `gamelobby_update` with who is in the lobby (him alone).
+/// `word` leaves the public lobby: its countdown and map vote end (true
+/// when a countdown was running).
+fn left_public_lobby(word: &str, m: &mut hks_t6::mp::MpState) -> bool {
+    if !["xstopparty", "xstopallparties", "xstoppartykeeptogether", "xstartprivateparty"]
+        .iter()
+        .any(|w| word.eq_ignore_ascii_case(w))
+    {
+        return false;
+    }
+    m.vote = None;
+    m.public_start_ms.take().is_some() | m.public_start_in.take().is_some()
+}
+
 fn lobby_update(hud: &mut LuiHud) {
     let get = hud.host.field("Engine", "GetPlayersInLobby");
     let members = hud.host.call(get, vec![]).and_then(|r| r.into_iter().next()).unwrap_or(Value::Nil);
@@ -919,6 +932,16 @@ fn engine_calls(hud: &mut LuiHud, io: &mut LuiIo<'_, '_>, local: Option<&HostVie
                         }
                     }
                     continue;
+                }
+                // He left the public lobby (publicgamelobby.lua's LeaveLobby:
+                // stop the party, back to a private one): its countdown and
+                // map vote end with it, so Custom Games starts only on START
+                // MATCH, with the map set then.
+                if !hud.frontend
+                    && let Some(mp) = hud.mp.as_ref()
+                    && left_public_lobby(word, &mut mp.borrow_mut())
+                {
+                    diag::info!(Ui, "front end: left the public lobby, its countdown stopped");
                 }
                 // The public lobby's map voter: MINT_COUNTER, PREVIOUS, RANDOM
                 // (`xpartyveto 1` / `2` / `3`).
@@ -6253,5 +6276,29 @@ mod fire_material_tests {
         assert_eq!(fire_material(3, false), "hud_mp_firerate_burst");
         assert_eq!(fire_material(5, false), "hud_mp_firerate_burst");
         assert_eq!(fire_material(8, false), "hud_mp_firerate_burst");
+    }
+}
+
+#[cfg(test)]
+mod public_lobby_tests {
+    use super::left_public_lobby;
+
+    #[test]
+    fn leaving_the_public_lobby_stops_its_countdown() {
+        let mut m = hks_t6::mp::MpState::default();
+        m.playlist = Some(0);
+        m.public_start_ms = Some(25_000.0);
+        // In the public lobby: its own commands keep the countdown.
+        assert!(!left_public_lobby("xpartyveto", &mut m));
+        assert_eq!(m.public_start_ms, Some(25_000.0));
+        // Back to a private party (Custom Games): no countdown, so its
+        // match starts only on START MATCH, with the map set then.
+        assert!(left_public_lobby("xstartprivateparty", &mut m));
+        assert_eq!((m.public_start_ms, m.public_start_in), (None, None));
+        // The countdown waiting for the front end's first frame goes too.
+        m.public_start_in = Some(25_000.0);
+        assert!(left_public_lobby("xstopparty", &mut m));
+        assert_eq!(m.public_start_in, None);
+        assert!(!left_public_lobby("xstopparty", &mut m));
     }
 }

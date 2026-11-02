@@ -30,6 +30,8 @@ mod lui_frontend; // bo2mp lane C
 mod lui_hud; // bo2zm M4
 mod lui_scene; // bo2mp menus: the front end's 3D backdrop
 mod name_tags; // bo2mp: names over heads in BO2's font
+mod pickup_hint; // bo2mp: "Press F to swap for" a gun on the ground
+mod stuck_pulse; // bo2mp: an enemy semtex or bolt stuck to him beats on his screen
 mod rcxd_hint; // bo2mp RC-XD
 mod rcxd_screen; // bo2mp RC-XD
 mod scope_hint; // bo2mp scope lane

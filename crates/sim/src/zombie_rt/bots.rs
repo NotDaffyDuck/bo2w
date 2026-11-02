@@ -60,6 +60,9 @@ struct NegLink {
 }
 
 const NEG_JUMP: u32 = 0x80_0000;
+/// A jump link whose end is this much above its begin goes up a ledge (the
+/// mantle's lowest lip, `CLIMB_LIP_LOWEST_RISE`).
+const CLIMB_LINK_RISE: f32 = 18.0;
 const NEG_LADDER: u32 = 0x40_0000;
 const NEG_DROP: u32 = 0x200_0000;
 
@@ -128,8 +131,7 @@ pub(crate) struct Bot {
     /// The route point it was stuck short of, and when that stuck began.
     stuck_next: Option<([f32; 3], i64)>,
     /// The point its route came from to `path[0]` (where it planned, or
-    /// the last point it passed): it has passed `path[0]` once it is
-    /// beyond the line across that point.
+    /// the last point it passed).
     prev: Option<[f32; 3]>,
     /// Counts new routes; with the route's length it names the step a
     /// cached far-sight answer belongs to.
@@ -306,6 +308,32 @@ fn irand(n: u32, now: i64, lo: i64, hi: i64) -> i64 {
     z = (z ^ z >> 27).wrapping_mul(MIX_2);
     z ^= z >> 31;
     lo + (z % span as u64) as i64
+}
+
+/// BO2's Path_TrimCompletedPath test: a route point is passed once it lies
+/// behind `spot` along the lookahead direction `dir`.
+fn behind_lookahead(spot: [f32; 3], pt: [f32; 3], dir: [f32; 3]) -> bool {
+    dir[0] * (pt[0] - spot[0]) + dir[1] * (pt[1] - spot[1]) <= 0.0
+}
+
+/// BO2's route starts where the bot stands; ours at the nearest node, which
+/// can lie behind it. Is the first point `a` passed, behind the bot along the
+/// way on to the point `b` after it (BO2's trim test, that way as the
+/// lookahead)?
+fn start_behind(spot: [f32; 3], a: [f32; 3], b: [f32; 3]) -> bool {
+    let d = [b[0] - spot[0], b[1] - spot[1]];
+    let len = d[0].hypot(d[1]);
+    len > 1.0 && behind_lookahead(spot, a, [d[0] / len, d[1] / len, 0.0])
+}
+
+/// How many leading route points (never the last, at most 3) lie behind the
+/// bot on the way on to the point after them ([`start_behind`]): the most
+/// `k` with every point before `path[k]` behind it on the way there.
+fn start_points_behind(spot: [f32; 3], path: &[[f32; 3]]) -> usize {
+    (1..path.len().min(4))
+        .filter(|&k| path[..k].iter().all(|&a| start_behind(spot, a, path[k])))
+        .last()
+        .unwrap_or(0)
 }
 
 /// BO2's lookahead down a route: along the route from where the bot is
@@ -1825,11 +1853,28 @@ pub(super) fn drive(sim: &mut World, now: i64) {
         let at_goal = goal
             .as_ref()
             .is_none_or(|g| dist2d(spot, g.pos) <= g.radius.max(16.0));
-        // Past a route point once beyond the line across it (the walk cuts
-        // corners toward its lookahead, so it seldom touches one), or (BO2's
-        // Path_TrimCompletedPath) once it lies behind the bot along its last
-        // lookahead, when that walk was clear or the amount has shrunk to
-        // half: a nearest node behind it is no walk back.
+        // Past a route point (BO2's Path_TrimCompletedPath) once it lies
+        // behind the bot along its last lookahead, when that walk was clear
+        // or the amount has shrunk to half: a nearest node behind it is no
+        // walk back. Ours (BO2's route starts where the bot stands, ours at
+        // the node it planned from): leading points behind the bot on the way
+        // on to the point after them are passed while that walk is clear; our
+        // lookahead always runs through the first point, so it walked back to
+        // it and on again until the failsafe (Pod bot 2 at -587 -1715, 10-31).
+        // No line or 24-unit rule (BO2 has none): it passed Pod's doorway
+        // point (-728 392) once the bot slid 30 units east of it along the
+        // wall, and the shrunk walk check from inside the ledge wedge called
+        // the way on to (-784 192) clear, so it aimed into the wall's end.
+        let start_passed = {
+            let (k, on) = {
+                let zm = sim.resource::<Zm>();
+                let rhs = &zm.bots[&n];
+                let lead = rhs.path.iter().take_while(|&&a| !rhs.negs.iter().any(|l| l.entry == a)).count();
+                let k = start_points_behind(spot, &rhs.path).min(lead);
+                (k, rhs.path.get(k).copied())
+            };
+            if k > 0 && on.is_some_and(|q| walk_clear(sim, spot, q)) { k } else { 0 }
+        };
         let (route, seen_key, seen) = {
             let mut zm = sim.resource_mut::<Zm>();
             let rhs = zm.bots.get_mut(&n).unwrap();
@@ -1853,15 +1898,12 @@ pub(super) fn drive(sim: &mut World, now: i64) {
                 if rhs.negs.iter().any(|l| l.entry == pt) {
                     break;
                 }
-                let from = rhs.prev.unwrap_or(spot);
-                let d = [pt[0] - from[0], pt[1] - from[1]];
-                let beyond = d[0] * d[0] + d[1] * d[1] > 1.0
-                    && (spot[0] - pt[0]) * d[0] + (spot[1] - pt[1]) * d[1] >= 0.0;
-                let behind = trim.is_some_and(|tt| tt[0] * (pt[0] - spot[0]) + tt[1] * (pt[1] - spot[1]) <= 0.0);
-                if !(beyond || behind || dist2d(spot, pt) < 24.0) {
+                let behind = trim.is_some_and(|tt| behind_lookahead(spot, pt, tt));
+                let line = had - rhs.path.len() < start_passed;
+                if !(behind || line) {
                     break;
                 }
-                why.push(if beyond { 'b' } else if behind { 'h' } else { 'n' });
+                why.push(if behind { 'h' } else { 'b' });
                 rhs.prev = Some(pt);
                 rhs.path.remove(0);
             }
@@ -2303,6 +2345,21 @@ pub(super) fn drive(sim: &mut World, now: i64) {
             glass_check = l.flags & NEG_JUMP != 0 && rhs.neg_began && now % 1000 == 0;
             rhs.neg_began = true;
         }
+        // Fan change, not BO2 (playtest : the pull-up on medium and smaller
+        // climbs too). BO2's bot taps jump only at the begin (Bot_Think), so it
+        // jumps onto a ledge it could climb; here, up in the air on a jump link
+        // that goes up, it holds jump while a mantle ledge is in reach, and the
+        // climb (Mantle_CheckLedge wants jump held) takes over.
+        if let Some((l, _)) = rhs.neg
+            && l.flags & NEG_JUMP != 0
+            && l.end[2] > l.entry[2] + CLIMB_LINK_RISE
+            && rhs.neg_began
+            && !grounded_now
+            && !mantling
+            && ledge
+        {
+            press |= buttons::LEAP;
+        }
         if next.is_some() && !ladder && climb_blocked && taking.is_none() {
             press |= buttons::LEAP;
         }
@@ -2723,6 +2780,64 @@ mod tests {
         assert!(!link_done(NEG_JUMP, false, false, false, 14.0));
         assert!(!link_done(NEG_JUMP, false, true, true, 14.0));
         assert!(!link_done(NEG_JUMP, false, true, false, 15.0));
+    }
+
+    #[test]
+    fn a_doorway_point_stays_until_the_bot_is_through() {
+        // Pod: the doorway node (-728 392) in the wall at y 376..384, gap
+        // x -761..-697; the bot slid along the wall to 17 units from it.
+        // BO2 keeps the point (it is ahead along the lookahead), so the
+        // walk still bends through the gap; aimed straight at the next node
+        // (-784 192) it ran into the wall's end and stood there.
+        let spot = [-743.0, 400.0, 417.0];
+        let route = [[-728.0, 392.0, 420.0], [-784.0, 192.0, 420.0], [-784.0, 64.0, 420.0]];
+        let (la, _) = lookahead(spot, &route, 32768.0).unwrap();
+        let d = [la[0] - spot[0], la[1] - spot[1]];
+        let len = d[0].hypot(d[1]);
+        assert!(!behind_lookahead(spot, route[0], [d[0] / len, d[1] / len, 0.0]));
+        // Blocked, the amount shrinks and the point comes in along the
+        // doorway's leg: the walk there crosses the wall line in the gap,
+        // with the body's 15 units clear of both ends.
+        let (la, _) = lookahead(spot, &route, 1000.0).unwrap();
+        assert!(la[1] < 376.0);
+        let t = (spot[1] - 380.0) / (spot[1] - la[1]);
+        let x = spot[0] + (la[0] - spot[0]) * t;
+        assert!(x > -761.0 + 15.0 && x < -697.0 - 15.0, "crosses at x {x}");
+        // Once it is through, the point is behind it and passed.
+        let spot = [-735.0, 360.0, 420.0];
+        let (la, _) = lookahead(spot, &route, 32768.0).unwrap();
+        let d = [la[0] - spot[0], la[1] - spot[1]];
+        let len = d[0].hypot(d[1]);
+        assert!(behind_lookahead(spot, route[0], [d[0] / len, d[1] / len, 0.0]));
+    }
+
+    #[test]
+    fn start_points_behind_pass_points_left_behind_but_not_the_doorway() {
+        // A route planned from a node behind the bot: both points it walked
+        // past are behind it on the way to the one ahead.
+        let spot = [0.0, 100.0, 0.0];
+        let path = [[0.0, 40.0, 0.0], [10.0, 80.0, 0.0], [0.0, 300.0, 0.0]];
+        assert_eq!(start_points_behind(spot, &path), 2);
+        // Never the last point.
+        assert_eq!(start_points_behind(spot, &[[0.0, 40.0, 0.0], [0.0, 300.0, 0.0]]), 1);
+        // Pod's doorway point stays, both where the bot slid to 17 units
+        // west of it and where it ended 30 units east of it (episode 2,
+        // 10-31: the old line rule passed it there).
+        let route = [[-728.0, 392.0, 420.0], [-784.0, 192.0, 420.0], [-784.0, 64.0, 420.0]];
+        assert_eq!(start_points_behind([-743.0, 400.0, 417.0], &route), 0);
+        assert_eq!(start_points_behind([-695.0, 400.0, 416.0], &route), 0);
+    }
+
+    #[test]
+    fn a_route_start_behind_the_bot_is_passed() {
+        // Pod bot 2: planned from (-592 -1760), 45 units behind it, with the
+        // route on north to (-562 -1520); it walked back there and on again.
+        let spot = [-587.0, -1715.0, 388.0];
+        assert!(start_behind(spot, [-592.0, -1760.0, 387.0], [-562.0, -1520.0, 388.0]));
+        // The doorway point ahead of it on the way to the next node stays.
+        assert!(!start_behind([-743.0, 400.0, 417.0], [-728.0, 392.0, 420.0], [-784.0, 192.0, 420.0]));
+        // A point ahead on a straight route stays.
+        assert!(!start_behind([0.0, 0.0, 0.0], [0.0, 50.0, 0.0], [0.0, 200.0, 0.0]));
     }
 
     #[test]

@@ -19,9 +19,11 @@ fn add_frame_systems(host: &mut App) {
 }
 
 /// Every widget's own registration, run in this order.
-const WIDGET_HOOKS: [fn(&mut App); 12] = [
+const WIDGET_HOOKS: [fn(&mut App); 14] = [
     crate::zm_hud::register_zm_hud_systems,
     crate::scope_hint::register,
+    crate::pickup_hint::register,
+    crate::stuck_pulse::register,
     crate::rcxd_hint::register,
     crate::rcxd_screen::register,
     crate::target_highlights::register,

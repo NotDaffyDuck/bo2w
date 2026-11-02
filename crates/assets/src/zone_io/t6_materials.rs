@@ -523,6 +523,8 @@ fn embedded_image(image: &ImageRef) -> Result<Image, String> {
         // read as stored; the bigger ones (embers, chalk) are colour.
         28 if image.width == 1 && image.height == 1 => (TextureFormat::Rgba8Unorm, 4, 1),
         28 | 29 => (TextureFormat::Rgba8UnormSrgb, 4, 1),
+        // bo2mp Raid: A8 (the world's `$outdoor` lookup), read as one channel.
+        65 => (TextureFormat::R8Unorm, 1, 1),
         other => return Err(format!("in-zone DXGI format {other} is not drawn yet")),
     };
     let (w, h) = (u32::from(image.width), u32::from(image.height));
@@ -656,6 +658,18 @@ fn flat_image(name: &str) -> Image {
     texture_2d(1, 1, 1, TextureFormat::Rgba8UnormSrgb, vec![shade, shade, shade, if fx_gap { 0x00 } else { 0xff }])
 }
 
+/// bo2mp Raid: the world's outdoor lookup picture (`GfxWorld::outdoorImage`,
+/// `$outdoor`), which no material names, linked under its own name.
+pub(crate) fn link_outdoor_image(
+    catalog: &mut SurfaceShaderRoster,
+    packs: &PackSet,
+    image: &ImageRef,
+) -> Result<usize, String> {
+    let gpu = decode(packs, image)?;
+    let row = built_row(image.name.clone(), SEMANTIC_COLOR, false, image.width, image.height, gpu);
+    Ok(catalog.add_texture(row))
+}
+
 /// bo2mp maps: a shine map named `,<image>` is a picture another zone holds
 /// (common_mp's `global_normal_flat_16x16` in Aftermath's puddle decals).
 /// Until the earlier-zones pass gives it its pixels it draws as an empty
@@ -714,12 +728,16 @@ fn half_bits(v: f32) -> u16 {
 /// (`water_cubes`): horizonColor and its slot counted from the probe
 /// array's end (1 = last; 0 = none), customReflectionProbeScale, and the
 /// distance fade (the alphas of waterColorShallow and waterColorDeepDelta)
-/// with 1 when its shader takes no sun shadow.
+/// with 1 when its shader takes no sun shadow; the pool's 13 its
+/// refraction: the thickness scale (waterControlVar1.w: 1 / the depth
+/// behind it at which it turns fully opaque) and the offset in pixels (8).
 /// The pond (`cod7waterflowreflect`, kind 3) packs its own: 0..2 its three
 /// normal layers (Lo, Lo, Hi), 4 raw, 5 the weights, 6 fresnel bias and
 /// scale, 7 the kind, 8 and 9 scatter and body (deep), 10 normalMapScale
 /// (fresnel normal, reflection normal), 11 its cube's slot, 12
-/// probeScale (its w the opacity).
+/// probeScale (its w the opacity), 13 its refraction (thickness scale:
+/// waterColorDeepScatterDelta.w; offset: waterColorShallowScatter.w), and
+/// in 7's xyz its screen reflection's three ray lengths (rayDistance).
 fn water_table(material: &asset_t6::MaterialRef, kind: u8, own_cube: usize, unshadowed: bool) -> Vec<[f32; 4]> {
     let c = |hash: u32| {
         material
@@ -753,7 +771,7 @@ fn water_table(material: &asset_t6::MaterialRef, kind: u8, own_cube: usize, unsh
             [0.0; 4],
             [0.0; 4],
             [0.0; 4],
-            [0.0; 4],
+            [control1[3], 8.0, 0.0, 0.0],
         ]
     } else if kind == 2 {
         // cod7waterflowreflect: normalUVScrollA (normalMapHi), B and C
@@ -774,13 +792,16 @@ fn water_table(material: &asset_t6::MaterialRef, kind: u8, own_cube: usize, unsh
             [1.0, 0.0, 1.0, 0.0],
             [1.0, 1.0, 1.0, 0.0],
             [0.0, 0.0, shallow[3], deep[3]],
-            [0.0, 0.0, 0.0, 3.0],
+            {
+                let ray = c(0x9356_8369);
+                [ray[0], ray[1], ray[2], 3.0]
+            },
             add(c(0xe887_d68c), c(0xeef4_77a2)),
             add(shallow, deep),
             c(0xe618_4bb7),
             [0.0, 0.0, 0.0, own_cube as f32],
             c(0x27d0_bbb2),
-            [0.0; 4],
+            [c(0xeef4_77a2)[3], c(0xe887_d68c)[3], 0.0, 0.0],
         ]
     } else {
         // cod7watershore: normalUVscroll_0123, normalUVcontrol0/2/3 (uv =
@@ -1060,6 +1081,9 @@ pub(crate) fn link_materials_with(
     let mut emissive_only = 0usize;
     let mut emissive_names: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
+    // bo2mp Raid: pictures a shadow-only material names but no zone here
+    // holds (`wpc/shadowcaster`'s `,shadow`); never drawn in colour, so no gap.
+    let mut shadow_only: Vec<String> = Vec::new();
     let mut draws: HashMap<T6Draw, usize> = HashMap::new();
     let mut cube_names: Option<Vec<String>> = None;
     for mi in wanted {
@@ -1174,6 +1198,7 @@ pub(crate) fn link_materials_with(
         *draws.entry(kind).or_default() += 1;
 
         let mut textures: Vec<SurfaceImageAttachment> = Vec::with_capacity(4);
+        let caster = draw.blend == asset_core::T6Blend::CasterOnly;
         // Decodes a capture image (following a comma reference into another
         // zone) and links it into the catalog, once per image.
         let mut link = |key: asset_t6::AssetIdentity,
@@ -1194,7 +1219,8 @@ pub(crate) fn link_materials_with(
                 let gpu = match decode(packs?, picked) {
                     Ok(gpu) => gpu,
                     Err(why) => {
-                        failures.push(format!("{}: {why}", picked.name));
+                        let gap = format!("{} (material {}): {why}", picked.name, mat_def.name);
+                        if caster { shadow_only.push(gap) } else { failures.push(gap) }
                         return None;
                     }
                 };
@@ -1547,12 +1573,14 @@ pub(crate) fn link_materials_with(
         local.insert(mi, catalog.add_material(row));
     }
     let summary = format!(
-        "t6 materials: {} linked ({coloured} with a colour map, {uncoloured} without), {decoded} colour maps decoded from packs, {emissive_only} emissive-only drawn unlit, {} failed; draws {:?}",
+        "t6 materials: {} linked ({coloured} with a colour map, {uncoloured} without), {decoded} colour maps decoded from packs, {emissive_only} emissive-only drawn unlit, {} failed, {} shadow-only without their picture; draws {:?}",
         local.len(),
         failures.len(),
+        shadow_only.len(),
         draws
     );
     let gaps = failures.iter().take(40).map(|gap| format!("t6 colour map gap: {gap}"));
+    let gaps = gaps.chain(shadow_only.iter().take(40).map(|gap| format!("t6 shadow-only picture gap: {gap}")));
     let emissive = emissive_names.iter().map(|n| format!("t6 emissive-only material: {n}"));
     let load_log = std::iter::once(summary).chain(gaps).chain(emissive).collect();
     T6Materials { local, load_log }

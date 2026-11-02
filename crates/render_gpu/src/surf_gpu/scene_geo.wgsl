@@ -151,6 +151,55 @@ struct T6Probes {
 @group(3) @binding(0) var probe_cubes: texture_cube_array<f32>;
 @group(3) @binding(1) var probe_sampler: sampler;
 @group(3) @binding(2) var<uniform> probes: T6Probes;
+#ifdef REFRACT
+// bo2mp: refracting water (pools, ponds): the scene depth and a copy of the
+// frame as the world pass left it (BO2's resolved scene and its depth).
+@group(3) @binding(3) var scene_depth: texture_depth_2d;
+@group(3) @binding(4) var scene_copy: texture_2d<f32>;
+
+// The copy at framebuffer pixel `px`, back to the light BO2 squares from
+// its resolve: the roll-off above 0.75 undone (bo2_final), still encoded.
+fn scene_encoded(px: vec2<f32>) -> vec3<f32> {
+    let dims = vec2<f32>(textureDimensions(scene_copy));
+    let r = textureSampleLevel(scene_copy, probe_sampler, clamp(px, vec2(0.5), dims - 0.5) / dims, 0.0).rgb;
+    let unrolled = 0.75 - log2(max(1.0 - (r - 0.75) / 0.25, vec3(0.0001))) / 5.77078;
+    return select(r, unrolled, r > vec3(0.75));
+}
+
+// The linear light behind framebuffer pixel `px` (encoded squared, over
+// the exposure).
+fn scene_light(px: vec2<f32>) -> vec3<f32> {
+    let e = scene_encoded(px);
+    return e * e / max(t6.sun_dir_exposure.w, 0.000001);
+}
+
+// How far the scene behind pixel `clip` lies past the water at `world`,
+// times `inv`, clamped to 0..1 (BO2's water thickness: zNear / depth less
+// the water's view depth).
+fn scene_thickness(clip: vec4<f32>, world: vec3<f32>, inv: f32) -> f32 {
+    let scene_d = textureLoad(scene_depth, vec2<i32>(clip.xy), 0);
+    let uv = (clip.xy - cam.viewport.xy) / cam.viewport.zw;
+    let ndc = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, scene_d, 1.0);
+    let scene_view = cam.view_from_clip * ndc;
+    let scene_z = select(1e9, -scene_view.z / scene_view.w, scene_d > 0.0);
+    let water_z = -(cam.view_from_world * vec4(world, 1.0)).z;
+    return saturate((scene_z - water_z) * inv);
+}
+
+// The framebuffer pixel of world point `p` and how far a reflection ray
+// that lands there has left the screen (BO2's pond: past 95%..97.5% of the
+// half-screen it fades over the next 5%..2.5%, smoothed; 1 behind the eye).
+fn ssr_hit(p: vec3<f32>, edge: f32, k: f32) -> vec3<f32> {
+    let clip = cam.clip_from_world * vec4(p, 1.0);
+    if (clip.w <= 0.0) {
+        return vec3(0.0, 0.0, 1.0);
+    }
+    let ndc = clip.xy / clip.w;
+    let f = saturate((max(abs(ndc.x), abs(ndc.y)) - edge) * k);
+    let uv = ndc * vec2(0.5, -0.5) + 0.5;
+    return vec3(cam.viewport.xy + uv * cam.viewport.zw, f * f * (3.0 - 2.0 * f));
+}
+#endif
 #endif
 
 struct WorldIn {
@@ -804,7 +853,8 @@ fn fragment_lightmapped(in: Varyings) -> @location(0) vec4<f32> {
     // (the sea: its own reflection cube),
     // relit by the light here over the light the probe saw straight up;
     // the sun adds two highlight lobes. The game refracts the scene behind
-    // by the water's opacity; here the water blends over it instead.
+    // by the water's opacity; so does REFRACT (pools and ponds), else the
+    // water blends over it.
     let wl0 = textureLoad(colour_map, vec2<i32>(0, 0), 0);
     let wl1 = textureLoad(colour_map, vec2<i32>(1, 0), 0);
     let wl2 = textureLoad(colour_map, vec2<i32>(2, 0), 0);
@@ -855,7 +905,7 @@ fn fragment_lightmapped(in: Varyings) -> @location(0) vec4<f32> {
     // the lightmap (main page plus a quarter of the second, as the pool).
     // The game draws water = f * reflection + (1 - f) * mix(scene behind,
     // light * body, vertex alpha * probeScale.w); here as one blend over
-    // the scene. Left out: the refraction offset of the scene behind, the
+    // the scene (REFRACT: as the game, below). Without it: no refraction offset of the scene behind, the
     // screen-space reflection rays (the cube is the shader's own answer
     // where they miss) and the depth soft edge.
     let wpk = wlw.x + wlw.y + wlw.z + wlw.w;
@@ -904,6 +954,27 @@ fn fragment_lightmapped(in: Varyings) -> @location(0) vec4<f32> {
         textureSample(foam_mask, colour_sampler, wuvm23.xy).w,
         textureSample(foam_mask, colour_sampler, wuvm23.zw).y);
     let wfoam_on = wshore_on && textureDimensions(foam_noise).x > 1u && textureDimensions(foam_mask).x > 1u;
+#ifdef REFRACT
+    // bo2mp: the pond as BO2 draws it: three screen-space reflection rays
+    // (texel 7: their lengths) read the frame, faded where they leave the
+    // screen to its own cube; the scene behind offset by the reflecting
+    // normal (texel 13.y pixels) times the thickness (13.x a unit), which
+    // also fades the water in from its shoreline.
+    if (wc1.w > 2.5) {
+        let wq = in.world_position;
+        let h0 = ssr_hit(wq + wpd * wc1.x, 0.95, 20.0);
+        let h1 = ssr_hit(wq + wpd * wc1.y, 0.9625, 26.666666);
+        let h2 = ssr_hit(wq + wpd * wc1.z, 0.975, 40.0);
+        let wscube = wpcube * wpcube * wcube_s.rgb * ((h0.z + h1.z + h2.z) / 3.0);
+        let wsr = (scene_encoded(h0.xy) * (1.0 - h0.z) + scene_encoded(h1.xy) * (1.0 - h1.z)
+            + scene_encoded(h2.xy) * (1.0 - h2.z)) / 3.0;
+        let wsrefl = wsr * wsr / max(t6.sun_dir_exposure.w, 0.000001) + wscube;
+        let wthick = scene_thickness(in.clip_pos, wq, wcube_f.x);
+        let wrefr = scene_light(in.clip_pos.xy + wpr.xy * (wcube_f.y * wthick));
+        let wpw = wpfres * wsrefl + (1.0 - wpfres) * mix(wrefr, wpbody, wpa);
+        return vec4(bo2_out(mix(wrefr, bo2_fog(wpw, wq), wthick)), 1.0);
+    }
+#endif
     if (wc1.w > 2.5) {
         return vec4(bo2_out(bo2_fog(wprgb, in.world_position)), wpalpha);
     }
@@ -990,6 +1061,17 @@ fn fragment_lightmapped(in: Varyings) -> @location(0) vec4<f32> {
     // carry alpha 0 at their edges (Frostbite's distant sea).
     let wvalpha = select(in.tint.a, 1.0, wc1.w > 1.5);
     let wa = saturate(select(wbody.a, wca.a, wsea) * wvalpha);
+#ifdef REFRACT
+    // bo2mp: the pool as BO2 draws it: the scene behind offset by the normal
+    // (texel 13.y pixels) times the root of the thickness (13.x a unit),
+    // under the water by its opacity, fogged, faded in from the shoreline.
+    if (!wsea) {
+        let wthick = scene_thickness(in.clip_pos, in.world_position, wcube_f.x);
+        let wrefr = scene_light(in.clip_pos.xy + wn.xy * (wcube_f.y * sqrt(wthick)));
+        let wpool = (1.0 - wa) * wrefr + wa * wsolid + wadd;
+        return vec4(bo2_out(mix(wrefr, bo2_fog(wpool, in.world_position), wthick)), 1.0);
+    }
+#endif
     let wout = wsolid + wadd / max(wa, 0.05);
     return vec4(bo2_out(bo2_fog(wout, in.world_position)), wa);
 #endif

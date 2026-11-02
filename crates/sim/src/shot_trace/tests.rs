@@ -314,6 +314,51 @@ fn ten_units_of_a_forty_unit_surface_cost_a_quarter() {
 }
 
 #[test]
+fn the_last_wall_before_open_air_is_paid_for() {
+    // BO2 traces back from the end of the shot to find where the bullet came out of the last wall.
+    let legs = legs_through_walls(&[(100.0, 109.75)]);
+    let exit = legs.iter().find(|leg| leaves_a_surface(leg)).expect("an exit");
+    assert!((exit.depth - 10.0).abs() < 1e-3 && (exit.to[0] - (109.75 + CLIP)).abs() < 0.01, "{exit:?}");
+    let last = legs.last().expect("legs");
+    assert!((last.to[0] - 2000.0).abs() < 0.01 && (last.harm_multiplier - 0.75).abs() < 1e-4, "{last:?}");
+}
+
+#[test]
+fn a_bullet_stopped_inside_the_last_wall_flies_no_further() {
+    // 50 units of a surface 40 deep for the gun: nothing is left to come out the far side.
+    let legs = legs_through_walls(&[(100.0, 150.0)]);
+    assert!(legs.iter().all(|leg| !leaves_a_surface(leg)), "{legs:?}");
+    assert!(legs.iter().all(|leg| leg.to[0] < 150.0), "{legs:?}");
+}
+
+#[test]
+fn broken_panes_between_walls_cost_no_pass() {
+    // BO2's broken glass has no collision (bo2mp Bullet_Trace never meets it), and the world sweep leaves broken panes
+    // out the same way, so the bullet still reaches six walls with a broken pane between each.
+    let mut brushes: Vec<_> =
+        (1..=7).map(|n| box_brush([n as f32 * 100.0, -50.0, -50.0], [n as f32 * 100.0 + 0.5, 50.0, 50.0], 2 << 20)).collect();
+    brushes.extend((1..=6).map(|n| {
+        let x = n as f32 * 100.0 + 50.0;
+        SolidBrush {
+            solid_bits: HARD_SURFACE_FLAG | weapon_t6::penetration::BRUSH_IS_PANE,
+            glass_hit_code: n,
+            ..box_brush([x, -50.0, -50.0], [x + 0.1, 50.0, 50.0], 0)
+        }
+    }));
+    let mut table = BulletPierceDepthChart::empty();
+    table.put_depth(3, 2, 40.0);
+    let pen = PierceCapability { wall_pierce_class: 3, wall_pierce_scale: 1.0, long_gun_round: false, impact_explode: false };
+    // NOT_GLASS: no pane blocks shots, so every pane is already broken.
+    let (legs, _) = trace_shot_legs(&brushes, &[], &query([0.0; 3], [2000.0, 0.0, 0.0]), pen, &table, NOT_GLASS);
+    let struck: Vec<f32> = legs.iter().filter(|leg| !leaves_a_surface(leg)).map(|leg| leg.to[0]).collect();
+    assert_eq!(struck.len(), 6, "{struck:?}");
+    assert!(struck.iter().zip(1..).all(|(x, n)| (x - (n as f32 * 100.0 - CLIP)).abs() < 0.01), "{struck:?}");
+    let paid: Vec<_> = legs.iter().filter(|leg| leaves_a_surface(leg)).collect();
+    assert_eq!(paid.len(), 5);
+    assert!(paid.iter().all(|leg| (leg.depth - 1.0).abs() < 1e-4), "{paid:?}");
+}
+
+#[test]
 fn a_bullet_that_cannot_penetrate_goes_through_at_most_twelve_panes() {
     let panes: Vec<_> = (1..=14)
         .map(|n| {
@@ -378,6 +423,18 @@ fn the_shooter_is_never_hit_and_a_player_already_hit_is_skipped() {
     q.ignore = None;
     q.skip_client_hit = Some(SeatNo(7));
     assert!(matches!(trace_shot(&[], &bystander, &q, NOT_GLASS), RayResult::Miss { .. }));
+}
+
+#[test]
+fn a_swing_and_a_bullet_are_stopped_by_their_own_contents() {
+    let only = |bits: u32| [SolidBrush { solid_bits: bits, ..box_brush([100.0, -50.0, -50.0], [150.0, 50.0, 50.0], 0) }];
+    let mut swing = query([0.0; 3], [1000.0, 0.0, 0.0]);
+    swing.bits = MASK_MELEE;
+    let bullet = query([0.0; 3], [1000.0, 0.0, 0.0]);
+    assert!(matches!(trace_shot(&only(0x80), &[], &swing, NOT_GLASS), RayResult::Hit { .. }));
+    assert!(matches!(trace_shot(&only(0x80), &[], &bullet, NOT_GLASS), RayResult::Miss { .. }));
+    assert!(matches!(trace_shot(&only(0x20), &[], &swing, NOT_GLASS), RayResult::Miss { .. }));
+    assert!(matches!(trace_shot(&only(0x20), &[], &bullet, NOT_GLASS), RayResult::Hit { .. }));
 }
 
 #[test]

@@ -59,12 +59,14 @@ More detail (settings, mods, how it works) is in [MULTIPLAYER.md](MULTIPLAYER.md
 
 ## What's next
 
-- Bots: no more stalls in Pod's doorway or at Drone's jump spots; every map's climbs measured.
-- Maps: Concert's and Hijacked's water matching BO2; side-by-side pictures of every map.
-- Scorestreaks: each one checked side by side with BO2.
+- Sound: fix sound cutting out when a sound loads in the middle of a match.
+- First-person hands on Nightclub, Slums and Turbine; screen shake.
+- Maps: the Pod doorway, Drone's lights, Meltdown.
 - A full play-test build, then the polish list in [MULTIPLAYER.md](MULTIPLAYER.md#coming-soon).
 
 ## Recent changes
+
+- 2026-11-01: Drone's first-person hands fixed (a multiplayer map wears its factions' arms), gear rattle sounds, combat sounds (impacts, steps, voices) loaded before the match, dive and fall landing damage fixed, sniper scope shows at full aim again, Custom Games set-up opens and edits rules, melee swings use BO2's mask, legs swing to the run without shimmy, Pod bot routes and doorway fixes, new pickup hint and "stuck" pulse, pond water, Raid map fixes.
 
 - 2026-10-31: fresh start of `main` as the fan engine: bullets through walls as in BO2, BO2's lag compensation for
   players and moving map parts, killcam match flags, bots on Nuketown's jump spots and Frostbite's routes, ladders,

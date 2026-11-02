@@ -46,8 +46,7 @@ const ITERATIONS: usize = 8;
 pub(crate) const MASK_PHYS_WORLD: u32 = 0xc11;
 /// `phys_dragLinear` and `phys_dragAngular` (per second; rbint.c takes
 /// `1 - min(dt x drag, 0.9)` off a body's speed and spin each step), BO2's
-/// defaults as its server registers them,
-/// x1 as phys.c gives a ragdoll body.
+/// defaults as its server registers them), x1 as phys.c gives a ragdoll body.
 const DRAG_LINEAR: f32 = 0.03;
 const DRAG_ANGULAR: f32 = 0.5;
 /// rbint.c's `m_max_avel`, set for every rigid body (radians a second).

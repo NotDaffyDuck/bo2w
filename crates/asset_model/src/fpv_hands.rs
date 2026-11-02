@@ -79,12 +79,24 @@ fn kit_arms(loaded: &FirstPersonMeshRoster, space: AssetCategoryScope, kit: &Tro
     arms_matching_body(&kit.torso, &offered).filter(|label| loaded.holds(space, label))
 }
 
-/// The stand-in arms: the game's own if loaded; failing that, on a
-/// multiplayer map, whichever faction arms sort first (until a class script
-/// picks a side, none is more right than another).
+/// The stand-in arms. On a multiplayer map, whichever of its factions' arms
+/// sort first (`c_<land>_mp_<faction>_*_viewhands`, from the map's
+/// `faction_*_mp` zones): the class scripts' `setviewmodel` then picks the
+/// team's own, and that swap needs arms with the same bones (a map's two
+/// factions share them). The Zombies suit only when no faction is loaded: a
+/// multiplayer map that also carries Zombies weapons holds it too, and in
+/// the hands of every team it was the wrong arms. Otherwise the game's own
+/// default, then whichever arms sort first.
 fn default_arms(loaded: &FirstPersonMeshRoster, space: AssetCategoryScope) -> Option<String> {
     if space != AssetCategoryScope::T6 {
         return None;
+    }
+    let mp_faction = loaded
+        .labels_in(space)
+        .filter(|label| label.contains("_mp_") && label.ends_with("_viewhands"))
+        .min();
+    if let Some(label) = mp_faction {
+        return Some(label.to_owned());
     }
     if loaded.holds(space, DEFAULT_ARMS) {
         return Some(DEFAULT_ARMS.to_owned());
@@ -137,6 +149,19 @@ mod tests {
         let catalog = catalog_of(&["c_usa_mp_seal6_viewhands", "c_rus_mp_spetsnaz_viewhands"]);
         let hands = FirstPersonArms::choose(&catalog, T6, None, None, T6);
         assert_eq!(picked(&hands), Some("c_rus_mp_spetsnaz_viewhands"));
+    }
+
+    #[test]
+    fn a_multiplayer_map_wears_its_factions_arms_not_the_zombies_suit() {
+        let catalog = catalog_of(&[
+            DEFAULT_ARMS,
+            "c_zom_hazmat_viewhands_light",
+            "c_usa_mp_seal6_longsleeve_viewhands",
+            "c_chn_mp_pla_armorsleeve_viewhands",
+        ]);
+        let hands = FirstPersonArms::choose(&catalog, T6, None, None, T6);
+        assert!(matches!(hands, FirstPersonArms::StockDefault { .. }));
+        assert_eq!(picked(&hands), Some("c_chn_mp_pla_armorsleeve_viewhands"));
     }
 
     #[test]

@@ -185,6 +185,7 @@ fn run_command(
     record_move(world, at, commanded_move, outcome);
 
     run_weapon(world, at, seq, elapsed);
+    super::close::settle_player_events(world, at.tick, id);
     world.store_prior_input(id, seq.buttons, seq.angles);
     world.set_old_cmd_move(id, keys_as_sent);
     Some(seq)

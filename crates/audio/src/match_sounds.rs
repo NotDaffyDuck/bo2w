@@ -15,7 +15,7 @@ use frame::{ClientStep, StartupPersona, GameSessionClosed, ReturnedToMenu};
 use crate::cue_names::motion_preload_cues;
 use crate::map_sound_set::{SoundBankCompose, BankLoadTried, CatalogNameSpace};
 use crate::clip_bank::{WaveformHandle, ClipRepository, waveforms_for_cue};
-use crate::match_voices::{AnnouncerRoutes, t6_announcer_aliases, team_voice_aliases};
+use crate::match_voices::{AnnouncerRoutes, t6_announcer_aliases, t6_combat_aliases, team_voice_aliases};
 use crate::play_core::AudioCatalogRes;
 
 /// Set once every clip the match needs is decoded.
@@ -362,6 +362,9 @@ fn gather<'a>(
             lines.len()
         );
         wants.push_all(AssetCategoryScope::T6, lines);
+        let combat = t6_combat_aliases(catalog);
+        diag::info!(Audio, "audio: {} combat aliases queued (impacts, steps, voices)", combat.len());
+        wants.push_all(AssetCategoryScope::T6, combat);
     }
 
     for alias in &src.type10.0 {
@@ -391,7 +394,9 @@ fn queue_match_set(
         return;
     }
     // bo2zm: a silent run prepares no clips, even when it logs sound.
-    if silent.is_some() {
+    // BO2MP_SOUND_DECODE=1 (debug only, with BO2MP_SOUND=off and BO2MP_SOUND_LOG=1):
+    // still decode them, so a muted run carries the real decode load.
+    if silent.is_some() && std::env::var_os("BO2MP_SOUND_DECODE").is_none() {
         settle_without_clips(
             &mut ready,
             loading.as_deref(),

@@ -8,7 +8,8 @@
 //! The crossbow's stuck explosive bolt blinks and beeps the same way (BO2's client script for
 //! the explosive bolt), its light on its `tag_origin`.
 //!
-//! Not done here: the buzz and the "stuck" pulse on the screen of an enemy it sticks to.
+//! Not done here: the buzz. The "stuck" pulse on the screen of an enemy it sticks to is the UI's
+//! (`ui::stuck_pulse`).
 
 use std::collections::BTreeMap;
 

@@ -125,6 +125,25 @@ pub(crate) fn t6_announcer_aliases(bank: &asset_audio::AudioRoster) -> Vec<Strin
         .collect()
 }
 
+/// Bot-play sounds that a match first asks for mid-game: other players' footsteps,
+/// bullet impacts on every surface, and the soldiers' pain, death and callout lines.
+/// Without preparing them here, their clips decode on the worker threads while the
+/// match is already running (the early lag), and the first plays are dropped.
+pub(crate) fn t6_combat_aliases(bank: &asset_audio::AudioRoster) -> Vec<String> {
+    t6_alias_names(bank)
+        .filter(|name| {
+            let lowered = name.to_ascii_lowercase();
+            lowered.starts_with("prj_bullet_impact_")
+                || (lowered.starts_with("fly_step_") && lowered.contains("_npc_"))
+                || (lowered.starts_with("vox_")
+                    && ["_pain_", "_kill_", "_threat_", "_attack_"]
+                        .iter()
+                        .any(|part| lowered.contains(part)))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Where each announcer alias of the match is actually played from.
 #[derive(Resource, Default)]
 pub(crate) struct AnnouncerRoutes(HashMap<String, (AssetCategoryScope, String)>);

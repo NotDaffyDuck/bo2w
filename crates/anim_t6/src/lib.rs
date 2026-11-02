@@ -542,6 +542,18 @@ impl T6PlayerAnims {
         self.ladder.get(usize::from(anim)).copied().unwrap_or(false)
     }
 
+    /// A strafe animation: a movement item that plays it holds `direction
+    /// left` or `direction right` (BG_AnimParseAnimScript flags it 0x10 or
+    /// 0x20, and BG_PlayerAngles keeps its legs to the view).
+    pub fn is_strafe(&self, anim: u16) -> bool {
+        self.move_blocks.iter().flat_map(|(_, items)| items).any(|item| {
+            item.conds
+                .iter()
+                .any(|c| c.name == "direction" && c.all_but.is_none() && c.values.iter().any(|v| v == "left" || v == "right"))
+                && item.commands.iter().any(|c| c.anim == anim)
+        })
+    }
+
     /// The first command naming this animation (its blend and duration).
     pub fn command_of(&self, anim: u16) -> Option<&T6AnimCommand> {
         self.move_blocks
@@ -874,5 +886,42 @@ mod tests {
         assert_eq!(walk(30.5), "pb_walk_up");
         assert_eq!(walk(-30.0), "pb_walk");
         assert_eq!(walk(-31.0), "pb_walk_down");
+    }
+
+    #[test]
+    fn a_direction_left_or_right_anim_is_a_strafe() {
+        const RUN: &str = "DEFINES
+ANIMATIONS
+STATE COMBAT
+{
+	run
+	{
+		direction left
+		{
+			legs pb_run_left
+		}
+		direction right
+		{
+			legs pb_run_right
+		}
+		direction backward
+		{
+			legs pb_run_back
+		}
+		default
+		{
+			legs pb_run_fast
+		}
+	}
+}
+EVENTS
+";
+        let s = T6PlayerAnims::parse(RUN, "none
+default").unwrap();
+        let strafe = |name: &str| s.is_strafe(s.anims.iter().position(|a| a == name).unwrap() as u16);
+        assert!(strafe("pb_run_left"));
+        assert!(strafe("pb_run_right"));
+        assert!(!strafe("pb_run_back"));
+        assert!(!strafe("pb_run_fast"));
     }
 }

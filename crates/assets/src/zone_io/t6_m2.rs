@@ -4467,6 +4467,10 @@ pub(crate) fn load_t6_combat(
                             // a weapon's own indicatorIcon).
                             | "hud_grenadepointer"
                             | "hud_grenadethrowback"
+                            // The "stuck" pulse of an enemy semtex or bolt
+                            // stuck to him (the stuck menu, ui_mp).
+                            | "hud_icon_stuck_semtex"
+                            | "hud_icon_stuck_arrow"
                             | "hud_indicator_arrow"
                             // The mouse buttons' pictures his key hints
                             // draw (`^BBUTTON_MOUSE_LEFT^`, the RC-XD's

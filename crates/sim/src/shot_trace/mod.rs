@@ -55,6 +55,9 @@ pub const MASK_PLAYER_DEAD: u32 = 0x0081_0011;
 pub const MASK_SHOT: u32 = 0x0280_e833;
 /// What a bullet is stopped by in the static world.
 pub const SHOT_WORLD_FILTER: u32 = MASK_SHOT;
+/// What a melee swing's traces are stopped by: the mask `Melee_Trace` hands `G_LocationalTraceAllowChildren`. It
+/// differs from [`MASK_SHOT`] in one pair of bits (0x80 in, 0x20 out).
+pub const MASK_MELEE: u32 = 0x0280_e893;
 
 const PLAYER_HALF_WIDTH: f32 = 15.0;
 const PLAYER_HEIGHT: f32 = 70.0;

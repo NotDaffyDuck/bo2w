@@ -372,10 +372,19 @@ pub(crate) fn scope_zoom(
     pos_frac: f32,
     into_sights: bool,
 ) -> Option<f32> {
-    let windows = [facts.aim_out_share, facts.aim_in_share];
     iris_overlay_configured(def)
-        .then(|| windows[usize::from(into_sights)])
+        .then(|| scope_window(facts.aim_in_share, facts.aim_out_share, pos_frac, into_sights))
         .and_then(|window| weapon_t6::aim::reticle_zoom(pos_frac, window))
+}
+
+/// Which share of the travel `CG_GetWeapReticleZoom` reads. It takes the
+/// zoom-in share only while `bPositionToADS` says the gun is moving into the
+/// sights, and a gun resting in them is not: Black Ops II's snipers have a
+/// zoom-in share of 0 (`dsr50_mp`, `svu_mp`, the XPR-50; zoom-out 0.05), so
+/// read through the zoom-in window they would never show their scope. Fully
+/// in, every other gun comes out at 1 through either window.
+pub(crate) fn scope_window(in_share: f32, out_share: f32, pos_frac: f32, into_sights: bool) -> f32 {
+    if into_sights && pos_frac < 1.0 { in_share } else { out_share }
 }
 
 /// Why nothing is drawn this frame.
@@ -736,6 +745,18 @@ mod tests {
             right_x: right,
             bottom_y: bottom,
         }
+    }
+
+    #[test]
+    fn a_sniper_resting_in_its_sights_shows_the_scope() {
+        // The DSR-50: zoom in 0, zoom out 0.05.
+        let at_rest = scope_window(0.0, 0.05, 1.0, true);
+        assert_eq!(weapon_t6::aim::reticle_zoom(1.0, at_rest), Some(1.0));
+        // On the way in it stays off until it arrives.
+        assert_eq!(weapon_t6::aim::reticle_zoom(0.9, scope_window(0.0, 0.05, 0.9, true)), None);
+        // An ACOG (in 0.5) reads its own window on the way in.
+        assert_eq!(scope_window(0.5, 0.4, 0.8, true), 0.5);
+        assert_eq!(scope_window(0.5, 0.4, 0.8, false), 0.4);
     }
 
     #[test]

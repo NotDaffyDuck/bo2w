@@ -1003,7 +1003,15 @@ impl<'a, 'w, 's> Stage<'a, 'w, 's> {
         } else {
             let chained = Want::new(want.namespace, name, want.class, want.epoch)
                 .at(want.spot, want.source_entity_no);
-            self.start(&chained, depth + 1).result
+            let report = self.start(&chained, depth + 1);
+            // bo2mp: BO2's step gear (fly_gear_npc, fly_gear_plr), body falls
+            // and jump exertions are aliases with no file of their own that
+            // only chain on (to fly_cloth_npc, fly_weight_plr, ...); the layer
+            // came to what that chained sound came to, not to the empty alias.
+            match report.layered {
+                Some((_, deeper)) if report.result == PlaybackVerdict::Failed(PlaybackBlocker::NoPcm) => deeper,
+                _ => report.result,
+            }
         };
         Some((name.to_owned(), outcome))
     }
@@ -1151,7 +1159,10 @@ impl<'a, 'w, 's> Stage<'a, 'w, 's> {
             .iter()
             .flat_map(|link| waveforms_for_cue(bank, want.namespace, link));
         for wanted in std::iter::once(reel.clone()).chain(linked) {
-            store.req_in(wanted);
+            let sent = store.req_in(wanted);
+            if sent && store.tardy_preloads() > 0 {
+                diag::warn!(Audio, "sound: alias {:?} asked for a clip the match set missed", want.alias);
+            }
         }
         match store.ready_pcm(reel) {
             Some(Ok(pcm)) => ClipFetch::Decoded(pcm),
@@ -2596,6 +2607,29 @@ mod tests {
                 assert!(rig.pending.entries.is_empty())
             }
             other => panic!("unexpected outcome {other}"),
+        }
+    }
+
+    #[test]
+    fn a_layer_with_no_clip_of_its_own_reports_the_sound_it_chains_to() {
+        // BO2's fly_gear_npc: no file, secondary fly_cloth_npc.
+        let stub = SnapshotSoundAlias {
+            layered_alias: Some("cloth".to_owned()),
+            ..clipless()
+        };
+        let mut rig = Rig::new(vec![
+            sound("step", vec![row()]),
+            sound("gear", vec![stub]),
+            sound("cloth", vec![row()]),
+        ]);
+        rig.clips = Some(ClipRepository::start(Arc::new(rig.bank.clone()), None));
+        let clip = key();
+        let started = rig.run(|stage| stage.submit(&want("step"), 0, chosen(&clip, Some("gear"), 1)));
+        let (name, gear) = started.layered.expect("the gear layer is followed");
+        assert_eq!(name, "gear");
+        assert_ne!(gear, PlaybackVerdict::Failed(PlaybackBlocker::NoPcm));
+        if gear == PlaybackVerdict::Pending {
+            assert!(rig.pending.entries.iter().any(|queued| queued.alias == "cloth"));
         }
     }
 

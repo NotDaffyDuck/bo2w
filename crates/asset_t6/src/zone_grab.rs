@@ -526,6 +526,10 @@ pub struct WorldRef {
     pub probe_grid: Option<LightGridRef>,
     /// `GfxWorld::lutMaterial`: the map's colour grading material.
     pub lut_material: Option<AssetIdentity>,
+    /// `GfxWorld::outdoorImage` (`$outdoor`): the outdoor lookup's picture.
+    pub outdoor_image: Option<AssetIdentity>,
+    /// `GfxWorld::outdoorLookupMatrix`: world space to that picture.
+    pub outdoor_lookup: [f32; 16],
     /// `GfxWorld::lutVolumes`: per volume its box, control word, transition
     /// time and the band of the LUT image it picks.
     pub lut_volumes: Vec<([f32; 3], [f32; 3], u32, u32, u32)>,
@@ -2522,6 +2526,14 @@ impl ZoneCapture {
             probe_list,
             sky_box_model: string_field(s, w, GfxWorld::skyBoxModel)?,
             lut_material: self.asset_at(s, w.shifted_by(GfxWorld::lutMaterial))?,
+            outdoor_image: self.asset_at(s, w.shifted_by(GfxWorld::outdoorImage))?,
+            outdoor_lookup: {
+                let mut m = [0.0; 16];
+                for (i, v) in m.iter_mut().enumerate() {
+                    *v = s.float_from_bytes(w, GfxWorld::outdoorLookupMatrix + i * 4)?;
+                }
+                m
+            },
             lut_volumes: {
                 let n = s.uint_from_bytes(w, GfxWorld::lutVolumeCount)? as usize;
                 let mut v = Vec::with_capacity(n);

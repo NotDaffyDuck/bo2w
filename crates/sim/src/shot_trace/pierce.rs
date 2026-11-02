@@ -353,13 +353,16 @@ fn fly_through_surfaces(shot: &Shot<'_>, table: &BulletPierceDepthChart) -> (Vec
         skip_client_hit = entered.collider.client().or(skip_client_hit);
         let ignore_model = entered.collider.script_model().or(probe.ignore_model);
         let leg_start = entered.end;
-        let entry_pos = entered.end;
 
         // The trace starts inside what was entered and meets the next surface beyond it.
         let far = match shot.trace_on(inside_start, skip_client_hit, ignore_model) {
             RayResult::Hit { end: till, normal, struck, .. } => Impact { end: till, face_dir: normal, collider: struck },
             RayResult::Miss { end: till } => {
-                legs.push(leg(path, strength, leg_start, till, [0.0; 3], None, false));
+                // Out into open air. BO2 still traces back from the end of the shot to where the bullet came out of
+                // the last surface, and pays for it.
+                if pay_for_surface(shot, table, &entered, deepest, till, None, &mut strength, &mut legs).is_some() {
+                    legs.push(leg(path, strength, leg_start, till, [0.0; 3], None, false));
+                }
                 break;
             }
             RayResult::BeganInside { .. } => {
@@ -382,56 +385,13 @@ fn fly_through_surfaces(shot: &Shot<'_>, table: &BulletPierceDepthChart) -> (Vec
         shot.note_glass_hit(far.collider, far.end);
 
         // Trace back from the far surface to find where the bullet came out of what it entered.
-        let back_dir = negated(dir);
-        let back_end = point_ahead(entry_pos, STEP_BACKCAST_NUDGE, back_dir);
-        let back_start = advance_trace(
-            far.end,
-            negated(far.face_dir),
-            back_dir,
-            far.collider.is_world(),
-            STEP_BACKCAST_NUDGE,
-        )
-        .unwrap_or(far.end);
-        let back = shot.trace_to(
-            back_start,
-            back_end,
-            far.collider.client(),
-            far.collider.script_model().or(probe.ignore_model),
-        );
-        let exit = match back {
-            RayResult::Hit { end: till, struck, .. } => Some((till, struck.depth_surf(0), is_sky(struck))),
-            RayResult::BeganInside { end: till, struck, .. } => {
-                Some((till, struck.map_or(0, |c| c.depth_surf(0)), struck.is_some_and(is_sky)))
-            }
-            _ => None,
-        };
-
-        // With no exit found the far leg carries no thickness and nothing is paid.
-        let thickness = match exit {
-            None => 0.0,
-            Some((exit_pos, exit_surf, exit_is_sky)) => {
-                let crossed = distance(entry_pos, exit_pos).max(PIERCE_DEPTH_MINIMUM);
-                // The thinner of the entry and exit allowances applies, except that a sky face is a fixed depth.
-                let allowance = if exit_is_sky {
-                    SKY_PENETRATION_DEPTH
-                } else {
-                    deepest.min(table.depth(shot.pen.wall_pierce_class, exit_surf) * shot.pen.wall_pierce_scale)
-                };
-                if allowance <= 0.0 {
-                    break;
-                }
-                strength -= crossed / allowance;
-                if strength <= SPENT_BULLET {
-                    break;
-                }
-                legs.push(ShotPathLeg {
-                    passed_through_wall: true,
-                    depth: crossed,
-                    face_bits: leg_surface_with_exit_flag(entered.collider),
-                    ..leg(path, strength, entry_pos, exit_pos, dir, Some(entered.collider), false)
-                });
-                crossed
-            }
+        let back_start =
+            advance_trace(far.end, negated(far.face_dir), negated(dir), far.collider.is_world(), STEP_BACKCAST_NUDGE)
+                .unwrap_or(far.end);
+        let Some(thickness) =
+            pay_for_surface(shot, table, &entered, deepest, back_start, Some(far.collider), &mut strength, &mut legs)
+        else {
+            break;
         };
 
         prior_face = far.collider.depth_surf(prior_face);
@@ -440,6 +400,59 @@ fn fly_through_surfaces(shot: &Shot<'_>, table: &BulletPierceDepthChart) -> (Vec
         entered = far;
     }
     (legs, last_struck)
+}
+
+/// Traces back from `back_start` to just short of where the bullet entered `entered`, to find where it came out,
+/// never seeing `beyond` (what it met next, if anything); pays the thickness out of `strength` and adds the exit leg.
+/// The thickness paid, 0 when no way out is found; `None` when the bullet is stopped inside.
+#[allow(clippy::too_many_arguments)]
+fn pay_for_surface(
+    shot: &Shot<'_>,
+    table: &BulletPierceDepthChart,
+    entered: &Impact,
+    deepest: f32,
+    back_start: [f32; 3],
+    beyond: Option<HitTargetId>,
+    strength: &mut f32,
+    legs: &mut Vec<ShotPathLeg>,
+) -> Option<f32> {
+    let back_dir = negated(shot.dir);
+    let back_end = point_ahead(entered.end, STEP_BACKCAST_NUDGE, back_dir);
+    let back = shot.trace_to(
+        back_start,
+        back_end,
+        beyond.and_then(|c| c.client()),
+        beyond.and_then(|c| c.script_model()).or(shot.query.ignore_model),
+    );
+    let (exit_pos, exit_surf, exit_is_sky) = match back {
+        RayResult::Hit { end: till, struck, .. } => (till, struck.depth_surf(0), is_sky(struck)),
+        RayResult::BeganInside { end: till, struck, .. } => {
+            (till, struck.map_or(0, |c| c.depth_surf(0)), struck.is_some_and(is_sky))
+        }
+        // With no way out found nothing is paid.
+        _ => return Some(0.0),
+    };
+    let crossed = distance(entered.end, exit_pos).max(PIERCE_DEPTH_MINIMUM);
+    // The thinner of the entry and exit allowances applies, except that a sky face is a fixed depth.
+    let allowance = if exit_is_sky {
+        SKY_PENETRATION_DEPTH
+    } else {
+        deepest.min(table.depth(shot.pen.wall_pierce_class, exit_surf) * shot.pen.wall_pierce_scale)
+    };
+    if allowance <= 0.0 {
+        return None;
+    }
+    *strength -= crossed / allowance;
+    if *strength <= SPENT_BULLET {
+        return None;
+    }
+    legs.push(ShotPathLeg {
+        passed_through_wall: true,
+        depth: crossed,
+        face_bits: leg_surface_with_exit_flag(entered.collider),
+        ..leg(ShotRouteKind::Penetrate, *strength, entered.end, exit_pos, shot.dir, Some(entered.collider), false)
+    });
+    Some(crossed)
 }
 
 /// The surface flags of the exit mark left on `collider`.

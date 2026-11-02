@@ -57,6 +57,8 @@ struct Track {
     legs_yaw: f32,
     /// Turning in place: 1 right, -1 left, 0 not.
     turning: i8,
+    /// The legs are swinging to their goal (BG_SwingAngles' `swinging`).
+    legs_swinging: bool,
     /// His view's yaw last tick (degrees): which way a turn in place goes.
     last_view: f32,
     /// The dive to prone last tick: 0 none, 1 in the air, 2 sliding.
@@ -460,8 +462,15 @@ const TURN_START_DEG: f32 = 45.0;
 const TURN_MAX_DEG: f32 = 90.0;
 /// How fast the legs come round turning in place (degrees/s).
 const TURN_SPEED_DEG: f32 = 180.0;
-/// How fast the legs twist to a move's direction (degrees/s).
-const TWIST_SPEED_DEG: f32 = 540.0;
+/// BO2's `bg_swingSpeed`.
+const SWING_SPEED: f32 = 0.15;
+/// BO2's `bg_legYawTolerance` and `bg_legYawCrouchTolerance`: how far the legs may sit off their goal before they swing.
+const LEG_YAW_TOLERANCE: f32 = 40.0;
+const LEG_YAW_CROUCH_TOLERANCE: f32 = 10.0;
+/// The legs never sit further than this from their goal (BG_PlayerAngles).
+const LEG_YAW_CLAMP: f32 = 150.0;
+/// How fast the legs twist to a crawl's direction (degrees/s).
+const PRONE_TWIST_SPEED_DEG: f32 = 540.0;
 
 fn norm180(mut a: f32) -> f32 {
     while a > 180.0 {
@@ -477,11 +486,40 @@ fn approach(from: f32, to: f32, step: f32) -> f32 {
     if (to - from).abs() <= step { to } else { from + step * (to - from).signum() }
 }
 
-/// One tick of the legs' yaw: moving, they face the move within its 4-way
-/// animation (a diagonal twists them up to 45 degrees); standing, they stay
-/// put until the view is `TURN_START_DEG` away, then turn in place to it.
-/// Returns the legs' offset from the view (degrees).
-fn legs_yaw_step(track: &mut Track, ps: &AvatarState, ground: bool, direction: &str) -> f32 {
+/// BG_SwingAngles: `angle` stays put while it is within
+/// `tolerance` of `dest`; once off, it swings there (`swinging` holds) by
+/// `max(0.5, |gap| * 0.05) * frame_ms * speed` a frame, and is never more than
+/// `clamp` from it.
+fn swing_angles(dest: f32, tolerance: f32, clamp: f32, speed: f32, frame_ms: f32, angle: &mut f32, swinging: &mut bool) {
+    if !*swinging {
+        if norm180(*angle - dest).abs() <= tolerance {
+            return;
+        }
+        *swinging = true;
+    }
+    let gap = norm180(dest - *angle);
+    let step = (gap.abs() * 0.05).max(0.5) * frame_ms * speed;
+    let moved = if step < gap.abs() {
+        step * gap.signum()
+    } else {
+        *swinging = false;
+        gap
+    };
+    *angle = (*angle + moved).rem_euclid(360.0);
+    let gap = norm180(dest - *angle);
+    if gap > clamp {
+        *angle = (dest - clamp).rem_euclid(360.0);
+    } else if gap < -clamp {
+        *angle = (dest + clamp).rem_euclid(360.0);
+    }
+}
+
+/// One tick of the legs' yaw: moving, they swing to BO2's goal (a strafe
+/// animation's legs face the view, any other the view plus his movement
+/// direction); standing, they stay put until the view is `TURN_START_DEG`
+/// away, then turn in place to it. `strafe`: his legs play a `direction
+/// left/right` animation. Returns the legs' offset from the view (degrees).
+fn legs_yaw_step(track: &mut Track, ps: &AvatarState, ground: bool, strafe: bool) -> f32 {
     let view = ps.look_angles[1];
     let dt = crate::SIM_STEP_MILLIS as f32 / 1000.0;
     if !track.present {
@@ -502,18 +540,34 @@ fn legs_yaw_step(track: &mut Track, ps: &AvatarState, ground: bool, direction: &
         track.legs_yaw = view + off;
         return off;
     }
-    if ground && xy_speed(ps) > MOVE_THRESHOLD {
+    let flags = ps.e_flags;
+    let prone = flags & playerstate_t6::game::entity_flag_bits::LYING_FLAT != 0;
+    if ground && !prone && xy_speed(ps) > MOVE_THRESHOLD {
+        track.turning = 0;
+        // BG_PlayerAngles: BG_AnimParseAnimScript flags a
+        // `direction left/right` animation 0x10/0x20, and its legs
+        // swing to the view with no tolerance; any other goes to the view plus
+        // the movement direction (PM_SetMovementDir), with the leg-yaw
+        // tolerance until it starts to swing.
+        let (dest, tolerance) = if strafe {
+            track.legs_swinging = false;
+            (view, 0.0)
+        } else if track.legs_swinging {
+            (view + ps.move_heading as f32, 0.0)
+        } else if flags & playerstate_t6::game::entity_flag_bits::CROUCH_BIT != 0 {
+            (view + ps.move_heading as f32, LEG_YAW_CROUCH_TOLERANCE)
+        } else {
+            (view + ps.move_heading as f32, LEG_YAW_TOLERANCE)
+        };
+        let frame_ms = crate::SIM_STEP_MILLIS as f32;
+        swing_angles(dest, tolerance, LEG_YAW_CLAMP, SWING_SPEED, frame_ms, &mut track.legs_yaw, &mut track.legs_swinging);
+        return norm180(track.legs_yaw - view);
+    } else if ground && xy_speed(ps) > MOVE_THRESHOLD {
+        // Crawling prone: the legs twist toward the crawl.
         track.turning = 0;
         let heading = ps.velocity[1].atan2(ps.velocity[0]).to_degrees();
-        let rel = norm180(heading - view);
-        let center = match direction {
-            "left" => 90.0,
-            "right" => -90.0,
-            "backward" => 180.0,
-            _ => 0.0,
-        };
-        let want = norm180(rel - center).clamp(-45.0, 45.0);
-        off = approach(off, want, TWIST_SPEED_DEG * dt);
+        let want = norm180(heading - view).clamp(-45.0, 45.0);
+        off = approach(off, want, PRONE_TWIST_SPEED_DEG * dt);
     } else if ground {
         if track.turning != 0 {
             // BO2's PM_Footsteps_TurnAnim: the turn anim follows the way the view
@@ -648,9 +702,11 @@ fn advance_third(
     };
     // BO2's Mantle_Move plays the mantle each tick before the gun's events: no
     // part timer, kept while already playing, forced over what plays.
+    let mut climb_legs_only = false;
     if p.mantling
         && let Some((command, _)) = mantle_command(sim, script, pstate, &facts(false), p.client)
     {
+        climb_legs_only = command.part == T6AnimPart::Legs;
         let _ = track.body.execute(
             &table.command(&command),
             [1.0; 2],
@@ -703,6 +759,12 @@ fn advance_third(
         }
     }
     if clear_torso {
+        prone_clear_torso(&mut track.body, &table);
+    }
+    // Fan change, not BO2 (playtest : the pull-up on smaller climbs too):
+    // the script's 21 and 27 climbs are legs only, so the arms kept the gun;
+    // here the torso is cleared and the climb plays on the whole body.
+    if climb_legs_only {
         prone_clear_torso(&mut track.body, &table);
     }
     let conds = facts(false);
@@ -978,7 +1040,8 @@ pub(super) fn advance(world: &mut World) {
             "hip"
         };
         let was_turning = track.turning;
-        let legs_off = legs_yaw_step(&mut track, &pstate, ground, direction);
+        let strafe = t6_anim_index(pstate.legs_anim).is_some_and(|a| script.is_strafe(a));
+        let legs_off = legs_yaw_step(&mut track, &pstate, ground, strafe);
         if std::env::var_os("BO2MP_BODYLOG").is_some()
             && (track.turning != was_turning || world.resource::<Zm>().clock_millis % 1000 == 0)
         {
@@ -1098,11 +1161,16 @@ pub(super) fn advance(world: &mut World) {
                 slope,
                 ..T6AnimFacts::default()
             };
-            if mantling
-                && let Some((command, left_ms)) = mantle_command(world, &script, &pstate, &facts, c)
-                && t6_anim_index(ps_new.legs_anim) != Some(command.anim)
-            {
-                apply(&mut ps_new, &mut track.holds, &command, Some(left_ms));
+            if mantling && let Some((command, left_ms)) = mantle_command(world, &script, &pstate, &facts, c) {
+                if t6_anim_index(ps_new.legs_anim) != Some(command.anim) {
+                    apply(&mut ps_new, &mut track.holds, &command, Some(left_ms));
+                }
+                // Fan change, not BO2: a legs-only climb (21, 27) plays on the
+                // whole body (no torso: the body draws the legs' climb there).
+                if command.part == T6AnimPart::Legs {
+                    ps_new.torso_anim = 0;
+                    track.holds[1] = 0;
+                }
             }
             if let Some(mut mt) = movetype(&pstate) {
                 if mt == "idle" && track.turning != 0 {
@@ -1166,6 +1234,7 @@ pub(super) fn advance(world: &mut World) {
             present: true,
             holds: track.holds,
             legs_yaw: track.legs_yaw,
+            legs_swinging: track.legs_swinging,
             turning: track.turning,
             last_view: track.last_view,
             dive: dive_phase(&pstate),
@@ -2037,6 +2106,51 @@ mod still_tests {
     }
 
     #[test]
+    fn running_straight_the_legs_hold_through_a_wobbling_view() {
+        let mut track = Track {
+            present: true,
+            ..Track::default()
+        };
+        let mut ps = AvatarState::ZERO;
+        ps.velocity = [250.0, 0.0, 0.0];
+        // BO2 (BG_SwingAngles, bg_legYawTolerance 40): the legs keep their yaw
+        // while the view and the move wobble a few degrees either way.
+        for (view, heading) in [(0.0, 0), (6.0, -6), (-6.0, 8), (4.0, -10), (-5.0, 5)] {
+            ps.look_angles[1] = view;
+            ps.move_heading = heading;
+            legs_yaw_step(&mut track, &ps, true, false);
+            assert_eq!(track.legs_yaw, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_diagonal_run_eases_the_legs_round_to_it() {
+        let mut track = Track {
+            present: true,
+            ..Track::default()
+        };
+        let mut ps = AvatarState::ZERO;
+        ps.velocity = [200.0, 200.0, 0.0];
+        ps.move_heading = 45;
+        let mut last = 0.0;
+        for _ in 0..40 {
+            legs_yaw_step(&mut track, &ps, true, false);
+            // Each step at most max(0.5, gap * 0.05) * frame * bg_swingSpeed.
+            let gap: f32 = 45.0 - last;
+            let most = (gap * 0.05).max(0.5) * crate::SIM_STEP_MILLIS as f32 * 0.15;
+            assert!(track.legs_yaw - last <= most + 1e-3);
+            assert!(track.legs_yaw <= 45.0);
+            last = track.legs_yaw;
+        }
+        assert!((track.legs_yaw - 45.0).abs() < 1e-3);
+        // A strafe animation's legs swing back to the view.
+        for _ in 0..40 {
+            legs_yaw_step(&mut track, &ps, true, true);
+        }
+        assert!(track.legs_yaw.abs() < 1e-3 || (track.legs_yaw - 360.0).abs() < 1e-3);
+    }
+
+    #[test]
     fn a_turn_in_place_follows_the_way_the_view_moves() {
         let mut track = Track {
             present: true,
@@ -2045,14 +2159,14 @@ mod still_tests {
         let mut ps = AvatarState::ZERO;
         // He turns right past 45 degrees: the legs turn right.
         ps.look_angles[1] = -50.0;
-        legs_yaw_step(&mut track, &ps, true, "");
+        legs_yaw_step(&mut track, &ps, true, false);
         assert_eq!(track.turning, 1);
         // Mid-turn he swings the view back left: BO2 plays the left turn.
         ps.look_angles[1] = -40.0;
-        legs_yaw_step(&mut track, &ps, true, "");
+        legs_yaw_step(&mut track, &ps, true, false);
         assert_eq!(track.turning, -1);
         // The view holds still: the turn keeps its way.
-        legs_yaw_step(&mut track, &ps, true, "");
+        legs_yaw_step(&mut track, &ps, true, false);
         assert_eq!(track.turning, -1);
     }
 }

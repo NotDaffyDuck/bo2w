@@ -3,7 +3,7 @@
 
 use bevy_ecs::prelude::World;
 use movement_t6::bridge::drain_player_happenings;
-use playerstate_t6::game::{InputCommand, buttons};
+use playerstate_t6::game::{AvatarState, InputCommand, buttons};
 
 use super::hazard::{apply_fall_damage, drown_players};
 use super::{StallGuard, FrameTicket, step_view_of, is_alive};
@@ -68,23 +68,41 @@ fn announce_trigger_release(level: &mut StepWorldView, step: StepNo, id: SeatNo,
     }
 }
 
-/// Turns the events the movement code queued on each player into their consequences. Today
-/// only a hard landing has one: it hurts.
+/// Turns the events the movement code queued on each player into their consequences. Each
+/// command's are settled right after it runs (`settle_player_events`); this catches any left.
 fn settle_movement_events(world: &mut StepWorldView, tick: StepNo) {
-    let mut landings = Vec::new();
-    world.for_each_player_mut(|id, pstate| {
-        let mut caret = i32::from(pstate.predictable_event_sequence_old);
-        drain_player_happenings(pstate, &mut caret, |event| {
-            if entity_t6::EventCode(event.event).hurts_on_landing() {
-                landings.push((id, event.event_arg, pstate.hit_point_ceiling, pstate.origin));
-            }
-        });
-        // The sequence is masked to 0x7ff, so it fits BO2's i16.
-        pstate.predictable_event_sequence_old = caret as i16;
-    });
-    for (id, parm, hit_point_ceiling, spot) in landings {
+    let mut ids = Vec::new();
+    world.for_each_player_mut(|id, _| ids.push(id));
+    for id in ids {
+        settle_player_events(world, tick, id);
+    }
+}
+
+/// Turns the events one player's moves queued since the last look into their consequences.
+/// Today only a hard landing has one: it hurts. Black Ops II does this after every command
+/// (`ClientThink_real`: the sequence before `Pmove`, `ClientEvents` after it): the ring holds
+/// only four, so a frame's worth of commands (a dive's landing, its slide, the gun) would
+/// overwrite the landing before a once-a-frame look saw it.
+pub(super) fn settle_player_events(world: &mut StepWorldView, tick: StepNo, id: SeatNo) {
+    let Some(pstate) = world.occupant_mut(id) else { return };
+    for (parm, hit_point_ceiling, spot) in take_landings(pstate) {
         apply_fall_damage(world, tick, id, parm, hit_point_ceiling, spot);
     }
+}
+
+/// The hurting landings queued since the last look (each one's parm, max health and spot);
+/// marks everything queued as seen.
+fn take_landings(pstate: &mut AvatarState) -> Vec<(i32, i32, [f32; 3])> {
+    let mut landings = Vec::new();
+    let mut caret = i32::from(pstate.predictable_event_sequence_old);
+    drain_player_happenings(pstate, &mut caret, |event| {
+        if entity_t6::EventCode(event.event).hurts_on_landing() {
+            landings.push((event.event_arg, pstate.hit_point_ceiling, pstate.origin));
+        }
+    });
+    // The sequence is masked to 0x7ff, so it fits BO2's i16.
+    pstate.predictable_event_sequence_old = caret as i16;
+    landings
 }
 
 /// Builds the snapshot of the frame (when this world serves clients) and stores it for the
@@ -200,5 +218,34 @@ fn report_snapshot_events(snapshot: &TickSnapshot) {
             stock.map(|row| row.scavenger),
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_landings;
+    use movement_t6::bridge::queue_forecast_happening;
+    use playerstate_t6::game::AvatarState;
+
+    const PAIN: i32 = entity_t6::event::LANDING_PAIN_FIRST as i32;
+    const STEP: i32 = entity_t6::event::FOOTSTEP_RUN as i32;
+
+    #[test]
+    fn a_landing_is_hurt_by_the_command_that_made_it_not_lost_to_the_next_ones() {
+        let mut ps = AvatarState { hit_point_ceiling: 100, ..AvatarState::ZERO };
+        // The landing's command: looked at right after it, as BO2 does.
+        queue_forecast_happening(&mut ps, PAIN, 40);
+        assert_eq!(take_landings(&mut ps), vec![(40, 100, [0.0; 3])]);
+        for _ in 0..4 {
+            queue_forecast_happening(&mut ps, STEP, 2);
+        }
+        assert!(take_landings(&mut ps).is_empty(), "a landing hurts once");
+
+        // Looked at once for the whole frame, four later events push it out of the ring.
+        queue_forecast_happening(&mut ps, PAIN, 40);
+        for _ in 0..4 {
+            queue_forecast_happening(&mut ps, STEP, 2);
+        }
+        assert!(take_landings(&mut ps).is_empty());
     }
 }

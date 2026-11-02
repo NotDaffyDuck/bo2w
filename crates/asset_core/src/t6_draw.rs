@@ -169,6 +169,10 @@ pub struct T6Draw {
     /// fresnel, the sun's highlight; drawn blended (the game refracts the
     /// scene behind instead).
     pub water: bool,
+    /// bo2mp: water that refracts the scene behind it (`cod7water` pools,
+    /// `cod7waterflowreflect` ponds: they read the frame and its depth).
+    /// Packed in bit 24 of a water code (water has no extra layers).
+    pub water_refract: bool,
     /// bo2mp: BO2's emissive flow (`cod7emissiveflow`: molten lava): the
     /// rock lit by the sun, a glow from its colour remap by emissive masks.
     pub flow: bool,
@@ -292,6 +296,12 @@ pub fn t6_water_kind(name: &str) -> Option<u8> {
             "cod7waterflowreflect" => Some(2),
             _ => None,
         })
+}
+
+/// A water technique set whose shader refracts the frame behind it (pools and
+/// ponds; the seas' `cod7watershore` draws over the scene without).
+fn water_refracts(name: &str) -> bool {
+    matches!(t6_water_kind(name), Some(0 | 2))
 }
 
 /// An objective technique set (`mc_objective_*`).
@@ -436,6 +446,7 @@ impl T6Draw {
             foliage: foliage_technique(set_name),
             sway: sway_technique(set_name),
             water,
+            water_refract: water_refracts(set_name),
             flow: flow_technique(set_name),
             tile: tile_technique(set_name),
             flag: flag_technique(set_name),
@@ -500,6 +511,7 @@ impl T6Draw {
             foliage: foliage_technique(set_name),
             sway: sway_technique(set_name),
             water: t6_water_kind(set_name).is_some(),
+            water_refract: water_refracts(set_name),
             flow: flow_technique(set_name),
             tile: tile_technique(set_name),
             flag: flag_technique(set_name),
@@ -518,7 +530,7 @@ impl T6Draw {
     /// layered in bit 6, alpha tested in bit 7, cull in bits 8..9 (0 none,
     /// 1 back, 2 front), polygon offset in bits 10..11, the unlit colour
     /// scale's log2 in bits 12..14, a particle cloud in bit 15, the sort
-    /// key in bits 16..23, extra layers 1 and 2 in bits 24..25 and 26..27, an
+    /// key in bits 16..23, extra layers 1 and 2 in bits 24..25 and 26..27 (a refracting water in bit 24), an
     /// objective in bit 28, foliage in bit 29, water in bit 30, emissive flow in bit 31;
     /// a lit emissive tile in bit 12, a lit view-model glass in bit 15, an unlit animated screen in bit 15, a lit layer 1 test layer in bit 13
     /// (a layer 2 test layer is drawn as blend), a lit projected decal as bits
@@ -547,14 +559,14 @@ impl T6Draw {
             | u32::from(self.polygon_offset & 3) << 10
             | u32::from(self.unlit_scale_exp & 7) << 12
             | u32::from(self.draw_order) << 16
-            | layer_code(self.layers[0]) << 24
-            | layer_code(self.layers[1]) << 26
+            | if self.water { 0 } else { layer_code(self.layers[0]) << 24 | layer_code(self.layers[1]) << 26 }
             | if self.effect { 0x20 } else { 0 }
             | if self.cloud { 0x8000 } else { 0 }
             | if self.sheet { Self::SHEET_MARK } else { 0 }
             | if self.objective { 0x1000_0000 } else { 0 }
             | if self.foliage { 0x2000_0000 } else { 0 }
             | if self.water { 0x4000_0000 } else { 0 }
+            | if self.water && self.water_refract { 0x0100_0000 } else { 0 }
             | if self.flow { 0x8000_0000 } else { 0 }
             | if self.tile && !self.unlit { 0x1000 } else { 0 }
             | if self.layers[0] == 4 && !self.unlit {

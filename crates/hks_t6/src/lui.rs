@@ -504,6 +504,18 @@ std::thread_local! {
     static MISSING_METHODS: RefCell<std::collections::BTreeSet<String>> = RefCell::default();
 }
 
+/// The element fields BO2's UI scripts keep themselves whose names start
+/// with `setup` (read and written as fields, never called as methods in
+/// any of its scripts): not engine widget setups.
+const SCRIPT_SETUP_FIELDS: [&str; 6] = [
+    "setupCarouselMode",
+    "setupElementsFunction",
+    "setupForWarningPulse",
+    "setupGameButton",
+    "setupGameFlyoutBG",
+    "setupGameFlyoutContainer",
+];
+
 /// The engine widget setups the scripts asked for that are not built.
 pub fn missing_methods() -> Vec<String> {
     MISSING_METHODS.with(|m| m.borrow().iter().cloned().collect())
@@ -535,8 +547,11 @@ pub fn construct(vm: &mut Vm, kind: &'static str) -> Value {
         let native = natives.borrow().read_key(&key);
         // An engine widget setup we do not draw yet (`setupGlobe`, ...): a
         // do-nothing method, named in `missing_methods` (what to build next).
+        // BO2's own data fields named setup... stay nil until set, as any
+        // unset field (the lobby's `if body.setupGameFlyoutBG then` closes
+        // its SETUP GAME flyout only when there is one).
         if matches!(native, Value::Nil)
-            && let Some(name) = key.as_str().filter(|k| k.starts_with("setup"))
+            && let Some(name) = key.as_str().filter(|k| k.starts_with("setup") && !SCRIPT_SETUP_FIELDS.contains(k))
         {
             MISSING_METHODS.with(|m| m.borrow_mut().insert(name.to_owned()));
             return Ok(vec![vm.native("stub_setup", |_, _| Ok(vec![]))]);
@@ -1814,6 +1829,25 @@ mod tests {
         s.right_edge = 5.0;
         let r = place(&s, parent);
         assert_eq!((r[0], r[2]), (45.0, 55.0));
+    }
+
+    /// The Custom Games lobby's SETUP GAME: BO2's `RemoveSetupGameFlyout`
+    /// closes `body.setupGameFlyoutBG` only when there is one, so an unset
+    /// field of that name is nil (not the stand-in for a widget setup the
+    /// engine lacks, which failed with "attempt to index a function value"
+    /// and the flyout never opened); a real widget setup still stands in.
+    #[test]
+    fn a_scripts_own_setup_field_is_nil_until_set() {
+        let mut vm = Vm::new();
+        install(&mut vm);
+        let body = construct(&mut vm, "element");
+        for k in ["setupGameFlyoutBG", "setupGameFlyoutContainer", "setupGameButton"] {
+            assert!(matches!(vm.lookup_index(&body, &Value::str(k)).unwrap(), Value::Nil), "{k}");
+        }
+        assert!(!matches!(vm.lookup_index(&body, &Value::str("setupGlobe")).unwrap(), Value::Nil));
+        let bg = construct(&mut vm, "element");
+        vm.set_index(&body, Value::str("setupGameFlyoutBG"), bg).unwrap();
+        assert!(matches!(vm.lookup_index(&body, &Value::str("setupGameFlyoutBG")).unwrap(), Value::User(_)));
     }
 
     /// A vertical list stacks its children by their own heights, `spacing`

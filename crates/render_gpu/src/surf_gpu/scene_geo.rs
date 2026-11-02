@@ -67,6 +67,17 @@ pub fn geometry_inspect_enabled() -> bool {
 struct OverlayScratch {
     draws: Vec<HeldDrawItem>,
     model_rows: Vec<ModelMatrixRow>,
+    /// bo2mp: the frame as the world pass left it, which refracting water
+    /// reads (BO2's resolved scene copy); remade when the view's format or
+    /// size changes.
+    scene_copy: Option<SceneCopy>,
+}
+
+struct SceneCopy {
+    texture: bevy::render::render_resource::Texture,
+    view: bevy::render::render_resource::TextureView,
+    format: TextureFormat,
+    size: bevy::render::render_resource::Extent3d,
 }
 
 /// bo2zm: frame pacing and prop counts over a window, logged every 5 s.
@@ -799,6 +810,14 @@ const STYLE_WORLD_OWN: u32 = 0x04;
 /// Style bits of a lit lightmapped water surface.
 const STYLE_WATER: u32 = STYLE_WORLD_OWN;
 
+/// Draw-code bit of a water code: it refracts the frame behind it (BO2's
+/// pools and ponds read the scene's colour and depth; the seas do not).
+const T6_WATER_REFRACT: u32 = 0x0100_0000;
+/// Style bit (world styles only): a refracting water, drawn after the world
+/// pass over a copy of the frame and the scene depth (group 3: the probes,
+/// then the depth and the copy at bindings 3 and 4).
+const STYLE_REFRACT: u32 = 0x10_0000;
+
 /// A lit lightmapped water style.
 fn style_water(style: u32) -> bool {
     style & STYLE_LIGHTMAPPED != 0
@@ -1306,6 +1325,11 @@ fn t6_styles(world: &[u32], props: &[[u32; 4]]) -> Vec<ShadeKind> {
                 world_style(code, true) | STYLE_SHINE,
             ));
         }
+        if code & T6_WATER_REFRACT != 0 && style_water(world_style(code, true)) {
+            styles.insert(ShadeKind::WorldTextured(
+                world_style(code, true) | STYLE_SHINE | STYLE_REFRACT,
+            ));
+        }
     }
     for draw in props {
         let code = draw[2];
@@ -1361,6 +1385,9 @@ struct OverlayTextureGroups {
     /// bo2zm: group 3 of shine surfaces: the probes' cube array, its
     /// sampler and their lighting table, for the cube array's slot.
     probes: Option<(u32, BindGroup)>,
+    /// bo2mp: the probes' cube array view and sampler, which refracting
+    /// water binds again beside the frame's copy.
+    probe_parts: Option<(bevy::render::render_resource::TextureView, Sampler)>,
     probe_table: Option<Buffer>,
     probe_written: Option<Arc<Vec<[[f32; 4]; 3]>>>,
 }
@@ -1384,6 +1411,9 @@ struct OverlayPipelines {
     probe_layout: BindGroupLayoutDescriptor,
     /// bo2zm: group 3 of soft effects: the scene depth (binding 0).
     soft_layout: BindGroupLayoutDescriptor,
+    /// bo2mp: group 3 of refracting water: the probes' bindings, then the
+    /// scene depth and the frame's copy (bindings 3 and 4).
+    refract_layout: BindGroupLayoutDescriptor,
     program: Handle<Shader>,
 }
 
@@ -1448,6 +1478,7 @@ impl ShadeKind {
             (has(STYLE_LIGHTMAPPED) && has(T6_LAYERED), "UNTINTED"),
             (shine, "SHINE"),
             (shine && style_water(style), "WATER"),
+            (!prop && shine && style_water(style) && has(STYLE_REFRACT), "REFRACT"),
             (shine && style_flow(style), "FLOW"),
             (prop && has(STYLE_OBJECTIVE), "OBJECTIVE"),
             (lit_prop && has(STYLE_FOLIAGE), "FOLIAGE"),
@@ -1539,7 +1570,8 @@ impl ShadeKind {
         match self {
             // bo2mp: water blends here (the game refracts instead) but stays solid in depth,
             // as the game's: the sky, drawn last where nothing is, must not cover an open sea.
-            Self::WorldTextured(style) if style_water(style) => true,
+            // A refracting one draws over the read-only depth it reads.
+            Self::WorldTextured(style) if style_water(style) => style & STYLE_REFRACT == 0,
             // The blended ones leave depth alone.
             Self::WorldTextured(style) | Self::PropTextured(style) => style & 3 == 0,
             Self::Sky => false,
@@ -1588,6 +1620,9 @@ impl OverlayPipelines {
             }
             WorldTextured(style) if style_layers(style) => {
                 vec![view, &self.layered_texture_layout, &self.lightmap_layout]
+            }
+            WorldTextured(style) if style & STYLE_REFRACT != 0 => {
+                vec![view, &self.shine_texture_layout, &self.lightmap_layout, &self.refract_layout]
             }
             WorldTextured(style) if style & STYLE_SHINE != 0 => {
                 vec![view, &self.shine_texture_layout, &self.lightmap_layout, &self.probe_layout]
@@ -1893,6 +1928,19 @@ fn make_overlay_layouts(mut commands: Commands, asset_srv: Res<AssetServer>) {
                     (0, texture_cube_array(TextureSampleType::Float { filterable: true })),
                     (1, linear_sampler()),
                     (2, constants(T6_PROBES_BYTES)),
+                ),
+            ),
+        ),
+        refract_layout: BindGroupLayoutDescriptor::new(
+            "bo2mp_geometry_diagnostic_refract",
+            &BindGroupLayoutEntries::with_indices(
+                FRAGMENT_ONLY,
+                (
+                    (0, texture_cube_array(TextureSampleType::Float { filterable: true })),
+                    (1, linear_sampler()),
+                    (2, constants(T6_PROBES_BYTES)),
+                    (3, texture_depth_2d()),
+                    (4, colour_map()),
                 ),
             ),
         ),
@@ -2461,6 +2509,7 @@ fn bind_texture_groups(
         textures.layer_groups.clear();
         textures.shine_groups.clear();
         textures.probes = None;
+        textures.probe_parts = None;
         textures.generation = registry.revision_stamp;
     }
     // His texture filtering row changed: a new sampler, new bind groups.
@@ -2470,6 +2519,7 @@ fn bind_texture_groups(
         textures.layer_groups.clear();
         textures.shine_groups.clear();
         textures.probes = None;
+        textures.probe_parts = None;
         textures.sampler = None;
         textures.aniso = aniso;
     }
@@ -2775,6 +2825,7 @@ fn bind_shine_groups(
                 (2, table.as_entire_binding()),
             )),
         );
+        textures.probe_parts = Some((view.tex_view.clone(), probe_sampler.clone()));
         textures.probes = Some((slot, group));
     }
 }
@@ -3089,7 +3140,7 @@ fn draw_overlay_scene(
         return;
     }
     let products = &colour_frame.frame_products.0;
-    let OverlayScratch { draws, model_rows } = &mut *spare;
+    let OverlayScratch { draws, model_rows, scene_copy } = &mut *spare;
     draws.clear();
     let ordered = [FrameOutputKind::Colour, FrameOutputKind::Emissive]
         .into_iter()
@@ -3200,6 +3251,13 @@ fn draw_overlay_scene(
     // bo2zm: world surfaces drawn untextured (diagnostic colours), a few ids.
     let mut untextured: Vec<u16> = Vec::new();
     let mut untextured_n = 0u32;
+    // bo2mp: pools and ponds refract the frame behind them (BO2 reads its
+    // resolved scene copy and depth); they draw after this pass, over a copy
+    // of what it left (`BO2MP_T6_NO_REFRACT`: in place, as before).
+    let refract_on = std::env::var_os("BO2MP_T6_NO_REFRACT").is_none()
+        && col_out.sampled_main_texture().is_none()
+        && world_textures.probe_parts.is_some();
+    let mut refract_later: Vec<usize> = Vec::new();
     for blended_phase in [false, true] {
         let order = if blended_phase {
             &blended_order
@@ -3230,6 +3288,17 @@ fn draw_overlay_scene(
                         continue;
                     };
                     let key = binding.key();
+                    if refract_on
+                        && surface_draw(item) & T6_WATER_REFRACT != 0
+                        && binding.style & STYLE_SHINE != 0
+                        && style_water(binding.style)
+                        && binding.texture_group.is_some()
+                        && binding.lighting.is_some()
+                        && t6_pipeline(ShadeKind::WorldTextured(binding.style | STYLE_REFRACT)).is_some()
+                    {
+                        refract_later.push(index);
+                        continue;
+                    }
                     let textured = binding
                         .texture_group
                         .zip(t6_pipeline(key))
@@ -3557,6 +3626,47 @@ fn draw_overlay_scene(
         &world_textures,
     );
     drop(rp);
+    // bo2mp: the frame so far, for the refracting water to read, and its
+    // group 3 (the probes again, the scene depth and that copy).
+    let refract_group = (!refract_later.is_empty())
+        .then(|| {
+            let (probe_view, probe_sampler) = world_textures.probe_parts.as_ref()?;
+            let table = world_textures.probe_table.as_ref()?;
+            let main = col_out.main_texture();
+            let size = main.size();
+            let format = col_out.main_texture_format();
+            if scene_copy.as_ref().is_none_or(|have| have.format != format || have.size != size) {
+                let texture = gpu_dev.create_texture(&bevy::render::render_resource::TextureDescriptor {
+                    label: Some("bo2mp_refract_scene_copy"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: bevy::render::render_resource::TextureDimension::D2,
+                    format,
+                    usage: bevy::render::render_resource::TextureUsages::TEXTURE_BINDING
+                        | bevy::render::render_resource::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&bevy::render::render_resource::TextureViewDescriptor::default());
+                *scene_copy = Some(SceneCopy { texture, view, format, size });
+            }
+            let copy = scene_copy.as_ref()?;
+            frame_ctx
+                .command_encoder()
+                .copy_texture_to_texture(main.as_image_copy(), copy.texture.as_image_copy(), size);
+            Some(gpu_dev.create_bind_group(
+                "bo2mp_refract",
+                &pipes.get_bind_group_layout(&diagnostic_pipeline.refract_layout),
+                &BindGroupEntries::sequential((
+                    probe_view,
+                    probe_sampler,
+                    table.as_entire_binding(),
+                    depth.view(),
+                    &copy.view,
+                )),
+            ))
+        })
+        .flatten();
     let mut rp = begin_pass(
         &mut frame_ctx,
         "bo2zm_effects_pass",
@@ -3564,6 +3674,47 @@ fn draw_overlay_scene(
         depth.read_only_attachment(),
         view_binds,
     );
+    // bo2mp: the refracting pools and ponds, by sort key, over the copy.
+    if let (Some(group), Some(vert_buf), Some(ix_buf)) =
+        (refract_group.as_ref(), geometry.world.vertex.as_ref(), geometry.world.index.as_ref())
+    {
+        bind_mesh(&mut rp, vert_buf, ix_buf);
+        rp.set_bind_group(3, group, &[]);
+        let mut bound_offset = None;
+        for &index in &refract_later {
+            let item = &draws[index];
+            let HeldDrawKind::World { surf, .. } = item.kind else {
+                continue;
+            };
+            let (Some(&(first_ix, ix_count)), Some(binding)) = (
+                geometry.world.ranges.get(usize::from(surf)),
+                world_surface_binding(&geometry, &world_lightmaps, &world_textures, surf),
+            ) else {
+                continue;
+            };
+            let (Some(pipeline), Some(texture_group), Some((lighting, _))) = (
+                t6_pipeline(ShadeKind::WorldTextured(binding.style | STYLE_REFRACT)),
+                binding.texture_group,
+                binding.lighting,
+            ) else {
+                continue;
+            };
+            if ix_count == 0 || !retained_within("world", first_ix, ix_count, geometry.world.index_count) {
+                continue;
+            }
+            let draw_depth = DepthLayer::of_draw(&item.kind, item.key).viewport_depth();
+            if bound_offset != Some(draw_depth) {
+                apply_viewport(&mut rp, rect, draw_depth);
+                bound_offset = Some(draw_depth);
+            }
+            rp.set_render_pipeline(pipeline);
+            rp.set_bind_group(1, texture_group, &[]);
+            rp.set_bind_group(2, lighting, &[]);
+            let instance = binding.instance(u32::from(at(&geometry.world_surface_primary, surf, 0)));
+            rp.draw_indexed(first_ix..first_ix.saturating_add(ix_count), 0, instance..instance + 1);
+            tallies.world.draw();
+        }
+    }
     // bo2zm 27c: Black Ops II's cloud sheets (Die Rise's cloud floor, `scrolling_zfeather`), by
     // sort key: over the sky, fading where the scene behind them is near (its depth is read-only
     // here).
