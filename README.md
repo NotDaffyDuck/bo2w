@@ -18,13 +18,17 @@ it, so matches follow the game's real rules without touching the original execut
 > - This is an unofficial, free fan project, not affiliated with or endorsed by Activision, Treyarch or Infinity Ward.
 >   Buy Black Ops II to support the people who made it.
 
-**Last updated:** 2026-11-01
+**Last updated:** 2026-11-02
 
 > **Work in progress.** Matches against Black Ops II's own bots play on every multiplayer map, started from BO2's own
 > menus, and Nuketown Zombies plays to a real game over. It is not finished: the list under [What's next](#whats-next)
 > is still being worked through, one item at a time, each checked side by side with Black Ops II.
 
 ## Latest updates
+
+### 2026-11-02
+
+- Enemies' legs keep their step when they switch between walking and running, with no more leg shake.
 
 ### 2026-11-01
 

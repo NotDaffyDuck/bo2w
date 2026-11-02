@@ -408,20 +408,31 @@ struct Change {
     client_no: u32,
 }
 
+/// Animations still fading out on a part (BO2's tree has no cap; past this
+/// the faintest is dropped).
+const FADING_MAX: usize = 6;
+
 #[derive(Clone, Copy, Default, Debug)]
 struct PartTrack {
     cur: Playing,
-    prev: Option<Playing>,
+    /// The current animation's weight when it was switched to (BO2 blends a
+    /// goal weight from the weight the animation has, not from 0).
+    cur_from: f32,
+    /// The others still fading out, each with its weight at the switch.
+    fading: [Option<(Playing, f32)>; FADING_MAX],
     switched: i32,
     crossfade_millis: i32,
 }
 
 impl PartTrack {
     /// A new animation on this part, as BG_SetNewAnimation takes it: it
-    /// blends in by BO2's rules ([`t6_blend_ms`]), and a moving loop taking
-    /// over from what was not one starts where the clock and his client
-    /// number put it ([`t6_loop_start`]). `clip` gives a value's clip
-    /// (length in seconds, looping).
+    /// blends in by BO2's rules ([`t6_blend_ms`]), every other animation on
+    /// the part blending out over the same time (XAnimClearTreeGoalWeights),
+    /// each from the weight it has now. A moving loop with no weight left
+    /// starts at the time of the moving loop it takes over from, or where
+    /// the clock and his client number put it when that was none
+    /// ([`t6_loop_start`]); one still fading keeps its time. `clip` gives a
+    /// value's clip (length in seconds, looping).
     fn see(
         &mut self,
         value: i32,
@@ -448,49 +459,83 @@ impl PartTrack {
             stance_hold_ms: change.stance_hold_ms,
             first: change.first,
         });
+        // Every animation on the part with the weight it has now.
+        let mut all = [None; FADING_MAX + 1];
+        if !change.first && self.cur.value != 0 {
+            all[0] = Some((self.cur, self.cur_weight(change.now)));
+            let s = self.progress(change.now);
+            for (slot, f) in all[1..].iter_mut().zip(self.fading) {
+                *slot = f.map(|(p, w0)| (p, w0 * (1.0 - s)));
+            }
+        }
+        let same = |p: &Playing| new.is_some() && t6_anim_index(p.value) == new;
+        let kept = all.iter().flatten().find(|(p, w)| same(p) && *w > 0.0).copied();
         let mut phase = 0.0;
         if moving(new)
             && let Some((len, true)) = reel(value)
         {
-            let old_clip = old.and_then(|_| reel(self.cur.value));
-            if !(moving(old) && old_clip.is_some_and(|(_, looping)| looping)) {
-                let old_ms = old_clip.map(|(l, _)| (l * 1000.0) as i32);
-                phase = t6_loop_start(change.now, old_ms, change.client_no) * len;
+            if let Some((p, _)) = kept {
+                phase = p.phase;
+            } else {
+                let old_clip = old.and_then(|_| reel(self.cur.value));
+                phase = match old_clip {
+                    Some((old_len, true)) if moving(old) => {
+                        (self.cur.phase / old_len.max(1e-3)).rem_euclid(1.0) * len
+                    }
+                    _ => {
+                        let old_ms = old_clip.map(|(l, _)| (l * 1000.0) as i32);
+                        t6_loop_start(change.now, old_ms, change.client_no) * len
+                    }
+                };
             }
         }
-        self.prev = (!change.first && self.cur.value != 0).then_some(self.cur);
+        let mut fading: Vec<(Playing, f32)> =
+            all.iter().flatten().filter(|(p, w)| !same(p) && *w > 0.01).copied().collect();
+        fading.sort_by(|a, b| b.1.total_cmp(&a.1));
+        self.fading = [None; FADING_MAX];
+        for (slot, f) in self.fading.iter_mut().zip(fading) {
+            *slot = Some(f);
+        }
         self.cur = Playing { value, phase };
+        self.cur_from = kept.map_or(0.0, |(_, w)| w);
         self.switched = change.now;
         self.crossfade_millis = blend.max(1);
     }
 
-    /// BG_PlayerAnimation_VerifyAnim: the old animation is cleared once its
+    /// How far the last switch's blend has gone (0 to 1).
+    fn progress(&self, now: i32) -> f32 {
+        t6_blend_weight(now, self.switched, self.crossfade_millis)
+    }
+
+    fn cur_weight(&self, now: i32) -> f32 {
+        if self.fading.iter().all(Option::is_none) {
+            return 1.0;
+        }
+        self.cur_from + (1.0 - self.cur_from) * self.progress(now)
+    }
+
+    /// BG_PlayerAnimation_VerifyAnim: an old animation is cleared once its
     /// weight reaches 0 (the new one is all in).
     fn verify(&mut self, now: i32) {
-        if t6_verify_anim(1.0 - t6_blend_weight(now, self.switched, self.crossfade_millis)) {
-            self.prev = None;
+        if t6_verify_anim(1.0 - self.progress(now)) {
+            self.fading = [None; FADING_MAX];
         }
     }
 
-    /// Both animations on by `dt` seconds at `rate`.
+    /// Every animation on by `dt` seconds at `rate`.
     fn step_on(&mut self, dt: f32, rate: f32) {
         self.cur.phase += dt * rate;
-        if let Some(prev) = self.prev.as_mut() {
-            prev.phase += dt * rate;
+        for (p, _) in self.fading.iter_mut().flatten() {
+            p.phase += dt * rate;
         }
     }
 
-    /// (playing, weight) pairs: the current one fading in over the previous.
+    /// (playing, weight) pairs: the current one first, fading in over the
+    /// others.
     fn weighted(&self, now: i32) -> Vec<(Playing, f32)> {
-        let w = t6_blend_weight(now, self.switched, self.crossfade_millis);
-        let mut out = vec![(self.cur, w)];
-        if let Some(prev) = self.prev
-            && w < 1.0
-        {
-            out.push((prev, 1.0 - w));
-        } else {
-            out[0].1 = 1.0;
-        }
+        let s = self.progress(now);
+        let mut out = vec![(self.cur, self.cur_weight(now))];
+        out.extend(self.fading.iter().flatten().map(|&(p, w0)| (p, w0 * (1.0 - s))).filter(|(_, w)| *w > 0.0));
         out
     }
 }
@@ -557,6 +602,13 @@ const CLOCK_BACK_REPLAY_MS: i32 = 250;
 fn body_log() -> bool {
     static BODYLOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     env_flag(&BODYLOG, "BO2MP_BODYLOG")
+}
+
+/// Whether every drawn frame of another player's body is logged
+/// (BO2MP_SHAKELOG): grep the log for "shakelog:".
+fn shake_log() -> bool {
+    static SHAKELOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&SHAKELOG, "BO2MP_SHAKELOG")
 }
 
 /// Whether the environment variable is set, looked up once and kept in `cell`.
@@ -2053,6 +2105,27 @@ fn collect_t6_bodies(
         let grounding = clock_now();
         let origin = rt.origin;
         let body_yaw = if climbing { rt.angles[1] + track.legs_yaw } else { rt.angles[1] };
+        if shake_log() && !corpse && Some(client_in) != local_id {
+            // His ankles where they are drawn (body space) and what his legs blend.
+            let foot = |n: &str| dobj.find(n).and_then(|i| world.get(i)).map_or([0.0; 2], |m| [m.w_axis.x, m.w_axis.y]);
+            let (fl, fr) = (foot("j_ankle_le"), foot("j_ankle_ri"));
+            let mix: Vec<String> = track
+                .legs
+                .weighted(now)
+                .iter()
+                .map(|(p, w)| {
+                    let name = script.anim_name(p.value).unwrap_or("?");
+                    let len = xanim_set.0.clip(asset_core::AssetCategoryScope::T6, name).map_or(1.0, |c| c.duration().max(1e-3));
+                    format!("{name}@{:.3}*{w:.2}", (p.phase / len).rem_euclid(1.0))
+                })
+                .collect();
+            info!(
+                World,
+                "shakelog: t {now} c {} at {:.1} {:.1} {:.1} yaw {:.2} legs {legs:#x} torso {torso:#x} legsyaw {:.1} drawn {:?} snap {} feet {:.1} {:.1} {:.1} {:.1} mix {}",
+                client_in.0, origin[0], origin[1], origin[2], rt.angles[1], track.legs_yaw,
+                rt.shown_participant.map(|(_, at)| at), snapshot.tick.0, fl[0], fl[1], fr[0], fr[1], mix.join(" "),
+            );
+        }
         let body_rot = Quat::from_rotation_z(body_yaw.to_radians());
         let mut world_to_local = Mat4::from_scale_rotation_translation(Vec3::splat(1.0), body_rot, origin.into());
         // A corpse rests on the ground under it: tilted along its length to
@@ -2440,5 +2513,75 @@ mod slide_tests {
         assert_eq!(slide_step(&mut fx, false, 3, 130), (None, false));
         // A new slide starts it again.
         assert_eq!(slide_step(&mut fx, true, 3, 140), (Some(SlideRumble::Start), true));
+    }
+}
+
+mod part_track_tests {
+    #![cfg(test)]
+    use super::*;
+
+    const SCRIPT: &str = "DEFINES\nANIMATIONS\nSTATE COMBAT\n{\n\trun\n\t{\n\t\tdefault\n\t\t{\n\t\t\tboth pb_run\n\t\t}\n\t}\n\twalk\n\t{\n\t\tdefault\n\t\t{\n\t\t\tboth pb_walk\n\t\t}\n\t}\n}\nEVENTS\n";
+
+    fn script() -> T6PlayerAnims {
+        let mut s = T6PlayerAnims::parse(SCRIPT, "none\ndefault").unwrap();
+        s.set_speeds(&[("pb_run".into(), 190.0), ("pb_walk".into(), 75.0)]);
+        s
+    }
+
+    /// The packed value of the named animation, with the toggle bit when asked.
+    fn value(s: &T6PlayerAnims, name: &str, toggle: bool) -> i32 {
+        let n = s.anims.iter().position(|a| a == name).unwrap() as i32 + 1;
+        if toggle { n | anim_t6::T6_ANIM_TOGGLE } else { n }
+    }
+
+    fn change(now: i32, first: bool) -> Change {
+        Change { now, first, stance_hold_ms: 0, client_no: 3 }
+    }
+
+    /// Both loops one second long.
+    fn reel(_: i32) -> Option<(f32, bool)> {
+        Some((1.0, true))
+    }
+
+    fn weight_of(track: &PartTrack, now: i32, v: i32) -> f32 {
+        track.weighted(now).iter().filter(|(p, _)| t6_anim_index(p.value) == t6_anim_index(v)).map(|(_, w)| w).sum()
+    }
+
+    #[test]
+    fn a_walk_taking_over_a_run_starts_at_the_runs_time() {
+        let s = script();
+        let (run, walk) = (value(&s, "pb_run", false), value(&s, "pb_walk", true));
+        let mut track = PartTrack::default();
+        track.see(run, change(0, true), &s, &reel);
+        track.step_on(0.4, 1.0);
+        let at = (track.cur.phase / 1.0).rem_euclid(1.0);
+        track.see(walk, change(400, false), &s, &reel);
+        assert!((track.cur.phase - at).abs() < 1e-4, "walk starts at {} not the run's {at}", track.cur.phase);
+    }
+
+    #[test]
+    fn a_run_back_inside_the_blend_keeps_its_weight_and_time() {
+        let s = script();
+        let (run, walk, run_again) = (value(&s, "pb_run", false), value(&s, "pb_walk", true), value(&s, "pb_run", false));
+        let mut track = PartTrack::default();
+        track.see(run, change(0, true), &s, &reel);
+        track.step_on(1.3, 1.0);
+        track.see(walk, change(1300, false), &s, &reel);
+        let blend = track.crossfade_millis;
+        // A quarter of the way into the walk's blend the run is back.
+        let back = 1300 + blend / 4;
+        let run_w = weight_of(&track, back, run);
+        track.step_on(blend as f32 / 4000.0, 1.0);
+        let run_phase = track.weighted(back).iter().find(|(p, _)| t6_anim_index(p.value) == t6_anim_index(run)).unwrap().0.phase;
+        track.see(run_again, change(back, false), &s, &reel);
+        // No jump: the run has the weight it had, and its time.
+        assert!((weight_of(&track, back, run) - run_w).abs() < 1e-4, "run weight {} -> {}", run_w, weight_of(&track, back, run));
+        assert!((weight_of(&track, back, walk) - (1.0 - run_w)).abs() < 1e-4);
+        assert!((track.cur.phase - run_phase).abs() < 1e-4);
+        // And the weights still add up to one on the way in.
+        let mid = back + track.crossfade_millis / 2;
+        assert!((weight_of(&track, mid, run) + weight_of(&track, mid, walk) - 1.0).abs() < 1e-4);
+        track.verify(back + track.crossfade_millis);
+        assert_eq!(track.weighted(back + track.crossfade_millis).len(), 1);
     }
 }
